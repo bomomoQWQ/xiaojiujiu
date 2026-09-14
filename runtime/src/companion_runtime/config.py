@@ -138,9 +138,15 @@ class DriveConfig:
 
 @dataclass(slots=True)
 class SilenceConfig:
-    """Baseline utility of staying silent."""
+    """Baseline utility of staying silent.
 
-    base: float = 0.15
+    ``base`` is the value of *not* acting when nothing else pushes either way.
+    It is deliberately positive: silence is the safe default, and a character
+    should only speak when it has a concrete reason, not merely because time has
+    passed.
+    """
+
+    base: float = 0.28
     restraint_gain: float = 0.35
     boundary_gain: float = 0.30
     cooldown_gain: float = 0.25
@@ -251,12 +257,20 @@ class CandidateConfig:
 
 @dataclass(slots=True)
 class OutboxConfig:
-    """Asynchronous delivery queue."""
+    """Asynchronous delivery queue.
+
+    ``retry_backoff_seconds`` defaults to **0**: a negatively acknowledged row
+    becomes claimable again immediately. This matters because a caller that
+    nacks and then retries at once is by far the common case (the host's own
+    retry queue already owns pacing), and a hidden service-side delay makes the
+    retry look like it was silently dropped. Set it above zero only if the
+    Runtime should throttle retries itself.
+    """
 
     lease_seconds: float = 45.0
     max_attempts: int = 3
     max_batch: int = 20
-    retry_backoff_seconds: float = 15.0
+    retry_backoff_seconds: float = 0.0
 
 
 @dataclass(slots=True)
@@ -441,6 +455,9 @@ def resolve_paths(config: RuntimeConfig, base_dir: str | os.PathLike[str] | None
     root = Path(base_dir) if base_dir is not None else Path.cwd()
     for attribute in ("database_path", "raw_log_path"):
         value = getattr(config.storage, attribute)
+        # The in-memory sentinel is not a filesystem path and must pass through.
+        if not value or value == ":memory:":
+            continue
         candidate = Path(value)
         if not candidate.is_absolute():
             candidate = root / candidate

@@ -363,6 +363,38 @@ def test_permanent_boundary_has_no_expiry() -> None:
     assert boundaries[0].expires_at is None
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "永远别联系我",
+        "永远不要联系我",
+        "以后都不用主动找我了",
+        "以后别主动找我",
+        "从今往后不要再联系我",
+        "再也别找我",
+    ],
+)
+def test_open_ended_phrasings_are_never_time_boxed(text: str) -> None:
+    """Each open-ended phrasing yields exactly one unexpiring boundary.
+
+    Several of these sentences also match the broad temporal rule (they contain
+    "别...联系我" with no time qualifier). The rule table is ordered so the
+    permanent rule wins and the deduplication keeps the stronger classification.
+    If that ordering regressed, the boundary would silently expire after ~24h and
+    proactive contact would resume -- the defect this parametrisation guards.
+    """
+    boundaries = boundary_module.detect_boundaries(
+        make_event(text), state=RuntimeState(), config=RuntimeConfig(), now=BASE_TIME
+    )
+    assert len(boundaries) == 1, f"{text!r} produced {len(boundaries)} boundaries"
+    assert boundaries[0].type == BoundaryType.PERMANENT.value, text
+    assert boundaries[0].expires_at is None, text
+    assert boundaries[0].allow_proactive is False
+    assert boundaries[0].allow_reply is True
+    # And it is still in force a year later.
+    assert boundaries[0].is_active(BASE_TIME + timedelta(days=365))
+
+
 def test_boundary_lifecycle_and_expiry() -> None:
     """Boundaries apply inside their window and lapse afterwards."""
     boundary = Boundary(
@@ -426,11 +458,27 @@ def test_nearest_expiry_returns_soonest_future_boundary() -> None:
 
 
 def test_boundary_blocks_endogenous_action_even_under_extreme_pressure(runtime: Runtime) -> None:
-    """Invariant 5: pressure can never override an explicit boundary."""
+    """Invariant 5: pressure can never override an explicit boundary.
+
+    The assertion that the boundary is classified as *permanent* is load-bearing,
+    not decoration. A time-boxed (temporal) boundary legitimately lapses, so at the
+    +72h round below it would no longer be in force and the correct outcome would
+    be ``no_candidate_beats_silence``. Without pinning the classification, a
+    regression that downgraded "永远..." to a 24h window would turn this test green
+    while silently re-permitting proactive contact against an open-ended user
+    instruction -- exactly the failure mode this test exists to catch.
+    """
     runtime.process_user_message(content="永远别联系我", timestamp=BASE_TIME)
     # ``allow_proactive`` is derived state recomputed on every tick.
     runtime.lazy_tick(BASE_TIME + timedelta(seconds=1))
     assert runtime.state().allow_proactive is False
+
+    declared = runtime.projections.boundaries.list_all()
+    assert len(declared) == 1
+    assert declared[0].type == BoundaryType.PERMANENT.value, (
+        "an open-ended instruction must not be downgraded to a time-boxed boundary"
+    )
+    assert declared[0].expires_at is None
 
     later = BASE_TIME + timedelta(hours=72)
     outcome = runtime.endogenous_round(now=later, force=True)
@@ -445,6 +493,91 @@ def test_boundary_blocks_endogenous_action_even_under_extreme_pressure(runtime: 
     )
     assert all(utility["total"] == float("-inf") for utility in decision["utilities"])
     assert runtime.projections.attempts.count_in_flight() == 0
+
+
+@pytest.mark.parametrize(
+    "hours",
+    [0.5, 1, 6, 12, 24, 48, 72, 168, 24 * 365],
+)
+def test_permanent_boundary_never_lapses_at_any_time(runtime: Runtime, hours: float) -> None:
+    """A permanent boundary blocks outreach at every point on the time axis.
+
+    This is the time-swept form of the test above. The single-timestamp version
+    only samples one moment; a regression in expiry handling could pass there and
+    fail here. One year out is included deliberately: nothing about an open-ended
+    instruction changes with elapsed time.
+    """
+    runtime.process_user_message(content="永远别联系我", timestamp=BASE_TIME)
+    runtime.lazy_tick(BASE_TIME + timedelta(seconds=1))
+
+    later = BASE_TIME + timedelta(hours=hours)
+    outcome = runtime.endogenous_round(now=later, force=True)
+    decision = outcome.decision["outcome"]
+
+    assert runtime.state().allow_proactive is False
+    assert decision["reason"] == "blocked_by_boundary", f"lapsed at +{hours}h"
+    assert decision["acted"] is False
+    assert all(utility["blocked"] for utility in decision["utilities"])
+    assert runtime.projections.attempts.count_in_flight() == 0
+
+
+@pytest.mark.parametrize(
+    ("pressure", "impulse", "restraint"),
+    [(0.0, 0.0, 1.0), (0.5, 0.5, 0.5), (0.99, 1.0, 0.0), (1.0, 1.0, 0.0)],
+)
+def test_boundary_outranks_every_drive_configuration(
+    runtime: Runtime, pressure: float, impulse: float, restraint: float
+) -> None:
+    """No combination of I/R/P lets a hard boundary be bypassed.
+
+    The variant with ``P = 1.0, I = 1.0, R = 0.0`` is the case the architecture
+    document calls out explicitly: "压力 0.99，所以收益压过边界成本" must be
+    impossible.
+    """
+    runtime.process_user_message(content="永远别联系我", timestamp=BASE_TIME)
+    runtime.lazy_tick(BASE_TIME + timedelta(seconds=1))
+    with runtime.db.transaction() as conn:
+        state = runtime.state()
+        state.pressure = pressure
+        state.approach_impulse = impulse
+        state.restraint = restraint
+        runtime.projections.runtime.write(state, conn, expect_version=state.version)
+
+    outcome = runtime.endogenous_round(now=BASE_TIME + timedelta(hours=48), force=True)
+    decision = outcome.decision["outcome"]
+    assert decision["reason"] == "blocked_by_boundary"
+    assert decision["acted"] is False
+    assert all(utility["total"] == float("-inf") for utility in decision["utilities"])
+    assert runtime.projections.attempts.count_in_flight() == 0
+    assert runtime.projections.outbox.list_items() == []
+
+
+def test_time_boxed_boundary_lapses_and_reason_changes_accordingly(runtime: Runtime) -> None:
+    """The mirror case: a temporal boundary must *not* report blocked_by_boundary.
+
+    Documenting both halves of the contract makes it impossible to "fix" one of
+    them by breaking the other. Inside the window the block is hard; after it
+    expires the permission is genuinely restored and silence is a normal decision.
+    """
+    runtime.process_user_message(content="今天不要主动联系我。", timestamp=BASE_TIME)
+    runtime.lazy_tick(BASE_TIME + timedelta(seconds=1))
+
+    declared = runtime.projections.boundaries.list_all()
+    assert len(declared) == 1
+    assert declared[0].type == BoundaryType.TEMPORAL.value
+    assert declared[0].expires_at is not None
+
+    # Inside the window: hard block.
+    inside = runtime.endogenous_round(now=BASE_TIME + timedelta(hours=6), force=True)
+    assert inside.decision["outcome"]["reason"] == "blocked_by_boundary"
+
+    # After the window: permission returns and the reason is no longer a block.
+    after = runtime.endogenous_round(
+        now=declared[0].expires_at + timedelta(hours=1), force=True
+    )
+    assert runtime.state().allow_proactive is True
+    assert after.decision["outcome"]["reason"] != "blocked_by_boundary"
+    assert after.decision["outcome"]["acted"] is False
 
 
 def test_temporal_boundary_expires_and_permission_returns(runtime: Runtime) -> None:

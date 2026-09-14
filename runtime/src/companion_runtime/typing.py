@@ -282,6 +282,9 @@ class RuntimeState:
 
     version: int = 0
     updated_at: datetime | None = None
+    #: When this Runtime came into existence. Used as the anchor for "how long
+    #: has nothing happened" before the first exchange ever occurs.
+    epoch_at: datetime | None = None
     last_tick_at: datetime | None = None
     mood_valence: float = 0.0
     mood_arousal: float = 0.0
@@ -293,6 +296,9 @@ class RuntimeState:
     contact_count_today: int = 0
     last_contact_at: datetime | None = None
     last_user_message_at: datetime | None = None
+    #: Last time anything was exchanged in either direction. Only real events
+    #: write this; ticks never do, so it is a stable anchor for the absence term.
+    last_exchange_at: datetime | None = None
     allow_proactive: bool = True
     foreground_pause_until: datetime | None = None
     values: ValueProfile = field(default_factory=ValueProfile)
@@ -303,6 +309,7 @@ class RuntimeState:
         return {
             "version": self.version,
             "updated_at": _iso(self.updated_at),
+            "epoch_at": _iso(self.epoch_at),
             "last_tick_at": _iso(self.last_tick_at),
             "mood": {
                 "valence": round(self.mood_valence, 6),
@@ -716,12 +723,30 @@ class ActionAttempt:
     superseded_by_event_ids: list[str] = field(default_factory=list)
     outbox_id: str | None = None
 
+    @property
+    def state_enum(self) -> AttemptState:
+        """Return :attr:`state` as an :class:`AttemptState` member.
+
+        ``state`` is deliberately stored as a plain string so it round-trips
+        through SQLite and ``to_dict()`` without any enum adapter. Callers that
+        want the typed member -- and ``.value`` on it -- use this accessor rather
+        than depending on the storage representation.
+
+        Raises:
+            ValueError: If the stored value is not a known attempt state, which
+                would mean the database was written by an incompatible version.
+        """
+        return AttemptState(self.state)
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable rendering."""
         return {
             "attempt_id": self.attempt_id,
             "candidate_id": self.candidate_id,
             "state": self.state,
+            # The same value under an explicitly typed name, for clients that would
+            # rather not assume the storage representation is a bare string.
+            "state_value": self.state_enum.value,
             "intent": self.intent,
             "goal": self.goal,
             "based_on_version": self.based_on_version,

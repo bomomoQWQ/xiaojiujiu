@@ -76,8 +76,12 @@ def config() -> RuntimeConfig:
 
 @pytest.fixture()
 def runtime(config: RuntimeConfig) -> Iterator[Runtime]:
-    """A Runtime over an in-memory database, closed after the test."""
-    instance = Runtime(config, seed=1234, database=Database(":memory:"))
+    """A Runtime over an in-memory database, closed after the test.
+
+    The creation epoch is pinned to :data:`BASE_TIME` so the simulated timeline
+    used throughout the suite starts from a known instant.
+    """
+    instance = Runtime(config, seed=1234, database=Database(":memory:"), created_at=BASE_TIME)
     try:
         yield instance
     finally:
@@ -87,7 +91,9 @@ def runtime(config: RuntimeConfig) -> Iterator[Runtime]:
 @pytest.fixture()
 def harness(config: RuntimeConfig) -> Iterator[Harness]:
     """A Runtime with a delivery service attached."""
-    runtime_instance = Runtime(config, seed=1234, database=Database(":memory:"))
+    runtime_instance = Runtime(
+        config, seed=1234, database=Database(":memory:"), created_at=BASE_TIME
+    )
     transport = NullTransport()
     service = DeliveryService(
         reducer=runtime_instance.reducer,

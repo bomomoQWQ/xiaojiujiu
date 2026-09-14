@@ -1,3 +1,0 @@
-﻿inside rows [{'scope': 'global', 'last_summary_json': None}]
-outside rows [<sqlite3.Row object at 0x00000161A5EF5E10>]
-after set_summary [<sqlite3.Row object at 0x00000161A5EF5F90>]

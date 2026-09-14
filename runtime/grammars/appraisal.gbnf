@@ -1,0 +1,26 @@
+# GBNF grammar for the event-appraisal task.
+#
+# Constrained decoding makes an invalid appraisal impossible: the sampler can
+# only emit one of the enumerated labels and a 0..1 number with at most two
+# decimals. The Runtime still validates the parsed object (local_llm.parse_appraisal),
+# because a grammar guarantees syntax, not semantics.
+
+root        ::= "{" ws "\"direction\"" ws ":" ws direction "," ws
+                "\"impact\"" ws ":" ws number "," ws
+                "\"activation\"" ws ":" ws number "," ws
+                "\"uncertainty\"" ws ":" ws number "," ws
+                "\"relation_signal\"" ws ":" ws relation "," ws
+                "\"responsibility\"" ws ":" ws responsibility "," ws
+                "\"confidence\"" ws ":" ws number ws "}"
+
+direction      ::= "\"+\"" | "\"-\"" | "\"0\"" | "\"+-\""
+
+relation       ::= "\"closeness\"" | "\"slight_approach\"" | "\"neutral\""
+                 | "\"slight_distance\"" | "\"distance\"" | "\"boundary_declare\""
+                 | "\"repair\"" | "\"strong_approach\"" | "\"strong_distance\""
+
+responsibility ::= "\"self\"" | "\"user\"" | "\"third_party\"" | "\"shared\"" | "\"unclear\""
+
+number      ::= digit "." digit | digit "." digit digit | "0" | "1" | "1.0" | "1.00"
+digit       ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+ws          ::= [ \t\n]*

@@ -39,7 +39,6 @@ from .typing import (
     new_id,
 )
 from .utility import ensure_aware, isoformat, parse_datetime, utcnow
-
 LOGGER = logging.getLogger("companion_runtime.projections")
 
 #: Writable columns of ``runtime_state``, in INSERT order. ``runtime_id`` is the
@@ -48,9 +47,11 @@ RUNTIME_STATE_COLUMNS = (
     "runtime_id",
     "version",
     "updated_at",
+    "epoch_at",
     "last_tick_at",
     "last_user_message_at",
     "last_contact_at",
+    "last_exchange_at",
     "cooldown_until",
     "foreground_pause_until",
     "contact_count_today",
@@ -90,19 +91,38 @@ class RuntimeProjection:
         self._db = db
         self.runtime_id = runtime_id
 
-    def ensure(self) -> RuntimeState:
-        """Create the runtime row if missing and return the current state."""
+    def ensure(self, now: datetime | None = None) -> RuntimeState:
+        """Create the runtime row if missing and return the current state.
+
+        Args:
+            now: Creation timestamp for a brand-new row. Callers that drive a
+                simulated or replayed clock must pass their own reference time so
+                the creation epoch does not jump to wall-clock time.
+
+        Returns:
+            The current runtime state.
+        """
         row = self._db.query_one(
             "SELECT * FROM runtime_state WHERE runtime_id = ?", (self.runtime_id,)
         )
         if row is None:
-            now = utcnow()
+            # The row is created with a NULL epoch: the epoch is set by the first
+            # tick, using that caller's clock. Seeding it with wall-clock time
+            # here would break any simulated or replayed timeline.
+            wall_clock = isoformat(utcnow())
+            epoch = isoformat(ensure_aware(now)) if now is not None else None
             with self._db.transaction() as conn:
                 conn.execute(
                     "INSERT OR IGNORE INTO runtime_state("
-                    "runtime_id, version, updated_at, last_tick_at, allow_proactive, values_json"
-                    ") VALUES(?, 0, ?, ?, 1, ?)",
-                    (self.runtime_id, isoformat(now), isoformat(now), dumps(ValueProfile().to_dict())),
+                    "runtime_id, version, updated_at, epoch_at, last_tick_at, allow_proactive, values_json"
+                    ") VALUES(?, 0, ?, ?, ?, 1, ?)",
+                    (
+                        self.runtime_id,
+                        wall_clock,
+                        epoch,
+                        epoch,
+                        dumps(ValueProfile().to_dict()),
+                    ),
                 )
         return self.read()
 
@@ -113,10 +133,12 @@ class RuntimeProjection:
         )
         data = row_to_dict(row, "runtime_state")
         if data is None:
-            return RuntimeState(updated_at=utcnow(), last_tick_at=utcnow())
+            now = utcnow()
+            return RuntimeState(updated_at=now, epoch_at=now, last_tick_at=now)
         return RuntimeState(
             version=int(data.get("version") or 0),
             updated_at=parse_datetime(data.get("updated_at")),
+            epoch_at=parse_datetime(data.get("epoch_at")) or parse_datetime(data.get("updated_at")),
             last_tick_at=parse_datetime(data.get("last_tick_at")),
             mood_valence=float(data.get("mood_valence") or 0.0),
             mood_arousal=float(data.get("mood_arousal") or 0.0),
@@ -128,6 +150,7 @@ class RuntimeProjection:
             contact_count_today=int(data.get("contact_count_today") or 0),
             last_contact_at=parse_datetime(data.get("last_contact_at")),
             last_user_message_at=parse_datetime(data.get("last_user_message_at")),
+            last_exchange_at=parse_datetime(data.get("last_exchange_at")),
             allow_proactive=bool(data.get("allow_proactive", 1)),
             foreground_pause_until=parse_datetime(data.get("foreground_pause_until")),
             values=ValueProfile.from_mapping(data.get("values_json") or {}),
@@ -164,13 +187,16 @@ class RuntimeProjection:
         new_version = max(stored_version, int(state.version)) + 1
         state.version = new_version
         state.updated_at = utcnow()
+        state.epoch_at = state.epoch_at or state.updated_at
         payload = (
             self.runtime_id,
             new_version,
             isoformat(state.updated_at),
+            isoformat(state.epoch_at),
             isoformat(state.last_tick_at),
             isoformat(state.last_user_message_at),
             isoformat(state.last_contact_at),
+            isoformat(state.last_exchange_at),
             isoformat(state.cooldown_until),
             isoformat(state.foreground_pause_until),
             int(state.contact_count_today),
@@ -1716,6 +1742,6 @@ class Projections:
         self.user_model = UserModelProjection(db)
         self.interpretations = InterpretationProjection(db)
 
-    def ensure_defaults(self) -> RuntimeState:
+    def ensure_defaults(self, now: datetime | None = None) -> RuntimeState:
         """Create the runtime row and return it."""
-        return self.runtime.ensure()
+        return self.runtime.ensure(now)

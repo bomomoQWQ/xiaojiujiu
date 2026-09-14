@@ -584,11 +584,41 @@ class Reducer:
         with self._db.transaction() as conn:
             return self._p.outbox.ack(conn, outbox_id, now)
 
-    def nack_outbox(self, outbox_id: str, *, error: str, terminal: bool = False) -> bool:
-        """Return a leased outbox row to the queue or fail it terminally."""
-        stamp = utcnow()
+    def nack_outbox(
+        self,
+        outbox_id: str,
+        *,
+        error: str,
+        terminal: bool = False,
+        now: datetime | None = None,
+        retry_delay_seconds: float | None = None,
+    ) -> bool:
+        """Return a leased outbox row to the queue, or fail it terminally.
+
+        The row becomes claimable **immediately** by default, so a caller that
+        nacks and retries at once sees its retry instead of an unexplained empty
+        claim. Pacing is the caller's concern (the host side owns a retry queue);
+        set ``retry_delay_seconds`` -- or ``config.outbox.retry_backoff_seconds`` --
+        only when the Runtime itself should throttle retries.
+
+        Args:
+            outbox_id: Row to release.
+            error: Reason recorded on the row.
+            terminal: Fail the row outright instead of requeueing it.
+            now: Reference time; defaults to the current UTC time.
+            retry_delay_seconds: Override for how long the row stays unavailable.
+
+        Returns:
+            ``True`` when a leased row was transitioned.
+        """
+        stamp = ensure_aware(now) or utcnow()
+        delay = (
+            self._config.outbox.retry_backoff_seconds
+            if retry_delay_seconds is None
+            else max(0.0, retry_delay_seconds)
+        )
         with self._db.transaction() as conn:
-            retry_at = stamp + timedelta(seconds=self._config.outbox.retry_backoff_seconds)
+            retry_at = stamp + timedelta(seconds=delay)
             return self._p.outbox.nack(
                 conn, outbox_id, error=error, retry_at=retry_at, terminal=terminal
             )
@@ -769,6 +799,7 @@ class Reducer:
                 connection=conn,
             )
             state.last_contact_at = stamp
+            state.last_exchange_at = stamp
             state.contact_count_today += 1
             self._p.situation.upsert(
                 conn,

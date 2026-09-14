@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 
 import pytest
@@ -17,6 +18,7 @@ from companion_runtime.typing import (
     CandidateStatus,
     EventType,
     OutboxKind,
+    OutboxStatus,
     ProtocolAction,
     RawEvent,
     ReconcileAction,
@@ -299,16 +301,65 @@ def test_boundary_declared_mid_flight_aborts_the_send() -> None:
 
 
 def test_retracted_premise_aborts() -> None:
-    """The grounding statement was withdrawn."""
-    decision = _reconcile(new_events=[make_event("刚才说错了，面试其实是今晚")])
+    """The grounding statement was withdrawn, so the prepared message must not go out.
+
+    Topical relevance is what scopes a retraction, and both directions of that
+    contract matter: too strict and a genuine retraction is ignored (the character
+    says something it no longer has grounds for); too loose and any "never mind"
+    cancels an unrelated message. The complementary loose direction is pinned by
+    ``test_unrelated_retraction_does_not_abort_an_unrelated_intent``.
+    """
+    on_topic = _reconcile(new_events=[make_event("刚才说错了，面试其实是今晚")])
+    assert on_topic.action == ReconcileAction.ABORT.value
+    assert on_topic.reason == "premise_retracted"
+    assert on_topic.notes, "the abort must explain itself for the audit trail"
+
+
+def test_retracted_premise_abort_preserves_the_attempt_record(runtime: Runtime) -> None:
+    """An aborted intent is closed, but its history is never erased.
+
+    This is invariant 7 applied to the re-coordination path: the character's
+    intention to speak is a fact that happened, so the attempt keeps its
+    ``committed_at`` even though nothing was sent.
+    """
+    attempt_id, outbox_id, _candidate = _commit_attempt(runtime)
+    event = runtime.events.append(
+        EventType.USER_MESSAGE,
+        actor="user",
+        content="刚才说错了，面试其实是今晚",
+        timestamp=BASE_TIME + timedelta(seconds=2),
+    )
+    decision = runtime.reducer.reconcile_attempt(
+        attempt_id=attempt_id,
+        new_events=[runtime.events.get(event.event_id)],
+        now=BASE_TIME + timedelta(seconds=2),
+    )
     assert decision.action == ReconcileAction.ABORT.value
     assert decision.reason == "premise_retracted"
 
+    stored = runtime.projections.attempts.get(attempt_id)
+    assert stored.state == AttemptState.ABORTED.value
+    assert stored.committed_at is not None, "the intention must remain on record"
+    assert stored.intent, "the original wording must not be blanked out"
+    assert event.event_id in stored.superseded_by_event_ids
+    # The queued delivery is cancelled, so nothing can leak out later.
+    assert runtime.projections.outbox.get(outbox_id).status == OutboxStatus.CANCELLED.value
+
 
 def test_unrelated_retraction_does_not_abort_an_unrelated_intent() -> None:
-    """Retracting a different subject leaves the prepared message alone."""
+    """Retracting a *different* subject leaves the prepared message usable.
+
+    The complement of ``test_retracted_premise_aborts``: topical relevance is what
+    scopes a retraction, so an unrelated "never mind" must only downgrade the
+    wording (RERENDER) rather than cancel the intent outright.
+    """
     decision = _reconcile(new_events=[make_event("刚才说错了，咖啡那件事不算")])
     assert decision.action != ReconcileAction.ABORT.value
+    assert decision.action in {
+        ReconcileAction.RERENDER.value,
+        ReconcileAction.MERGE.value,
+        ReconcileAction.KEEP.value,
+    }
 
 
 def test_ready_to_send_always_rerenders_on_a_new_message() -> None:
@@ -391,7 +442,17 @@ def test_reducer_discards_a_proposal_with_missing_premise(runtime: Runtime) -> N
 
 
 def test_reducer_rebases_a_stale_emotion_evaluation(runtime: Runtime) -> None:
-    """A stale appraisal is recomputed against the current mood, not dropped."""
+    """A stale appraisal is recomputed against the current mood, not dropped.
+
+    Three distinct things must hold, and each has regressed at some point:
+
+    1. the classifier must actually choose REBASE rather than APPLY, which is what
+       the version gap drives;
+    2. the payload must be *damped* by the elapsed time, so the applied impact is
+       strictly smaller than the one that was submitted;
+    3. the appraisal's semantics must survive the rebase -- the direction is a fact
+       about the event and must not be rewritten by the recalculation.
+    """
     event = runtime.events.append(
         EventType.USER_MESSAGE,
         actor="user",
@@ -402,20 +463,56 @@ def test_reducer_rebases_a_stale_emotion_evaluation(runtime: Runtime) -> None:
     # Dispatching from a version far behind the current one is what makes the
     # result stale; the appraisal itself stays valid.
     stale_base_version = runtime.version() - 10
+    submitted_impact = 0.5
     proposal = protocol_module.Proposal(
         task_id="tsk_3",
         task_type=TaskKind.EMOTION_EVAL.value,
         based_on_version=stale_base_version,
         source_event_ids=[event.event_id],
-        payload={"direction": "-", "impact": 0.5, "activation": 0.4, "confidence": 0.8},
+        payload={
+            "direction": "-",
+            "impact": submitted_impact,
+            "activation": 0.4,
+            "confidence": 0.8,
+        },
         created_at=BASE_TIME,
     )
     result = runtime.reducer.process_proposal(proposal)
-    assert result.action == ProtocolAction.REBASE.value
-    assert result.applied is True
-    assert any("staleness" in note for note in result.notes)
+    assert result.action == ProtocolAction.REBASE.value, "a stale result must not APPLY blind"
+    assert result.applied is True, "REBASE must still apply, not silently discard"
+    assert any("staleness" in note for note in result.notes), "rebase notes must be recorded"
+
     active = runtime.projections.emotion.list_active()
-    assert active and active[0].intensity < 0.5
+    assert active, "the impact must be present, not dropped"
+    applied = active[0]
+    # 2. damping really happened (12h of staleness at the rebase horizon).
+    assert applied.intensity < submitted_impact, "stale effect was not damped"
+    # 3. the semantics survived: direction is a fact about the event.
+    assert applied.direction == "-", "rebase must not rewrite the appraisal direction"
+    assert applied.source_event_id == event.event_id
+
+
+def test_rebase_damping_is_monotonic_in_staleness() -> None:
+    """A longer delay damps the same appraisal more, down to a floor.
+
+    This pins the shape of the rebase rule rather than a single value, so the
+    calibration can be retuned without the test either breaking spuriously or
+    silently accepting an undamped result.
+    """
+    payload = {"direction": "-", "impact": 0.6, "activation": 0.5}
+    fresh = protocol_module.rebase_emotion_evaluation(
+        payload, mood_valence=0.0, mood_arousal=0.0, hours_elapsed=0.0
+    )
+    mid = protocol_module.rebase_emotion_evaluation(
+        payload, mood_valence=0.0, mood_arousal=0.0, hours_elapsed=3.0
+    )
+    long = protocol_module.rebase_emotion_evaluation(
+        payload, mood_valence=0.0, mood_arousal=0.0, hours_elapsed=12.0
+    )
+    assert fresh.payload["impact"] > mid.payload["impact"] > long.payload["impact"]
+    assert long.payload["impact"] > 0.0, "damping must never reach zero"
+    # Direction is never touched by the rebase.
+    assert long.payload["direction"] == "-"
 
 
 def test_reducer_applies_candidate_operations_and_rejects_groundless_ones(
@@ -447,17 +544,79 @@ def test_reducer_applies_candidate_operations_and_rejects_groundless_ones(
 
 
 def test_reducer_stores_a_user_model_summary(runtime: Runtime) -> None:
-    """A model-provided prose summary is attached to the user model."""
+    """A model-provided prose summary is attached to the user model.
+
+    This failed during development for a specific and instructive reason: a prose
+    summary arriving before the numeric parameter block had ever been persisted was
+    written with a bare ``UPDATE``, which matched zero rows and was silently
+    dropped. The assertion on the raw database column below is what makes that
+    failure mode impossible to reintroduce -- checking only the in-memory view
+    would miss it whenever the model happens to be holding a cached summary.
+    """
+    summary_text = "用户接受偶尔主动联系。"
     proposal = protocol_module.Proposal(
         task_id="tsk_5",
         task_type=TaskKind.USER_MODEL_SUMMARY.value,
         based_on_version=runtime.version(),
-        payload={"summary": "用户接受偶尔主动联系。", "confidence": 0.7},
+        payload={"summary": summary_text, "confidence": 0.7},
     )
     result = runtime.reducer.process_proposal(proposal)
     assert result.applied is True
+
+    # 1. The write is durable: it is in the database, not only in memory.
+    row = runtime.db.query_one(
+        "SELECT last_summary_json FROM user_model_params WHERE scope = 'global'"
+    )
+    assert row is not None, "the parameter row must be created when it did not exist"
+    persisted = json.loads(row["last_summary_json"])
+    assert persisted["summary"] == summary_text
+    assert persisted["confidence"] == pytest.approx(0.7)
+
+    # 2. A freshly constructed model reads it back (survives a process restart).
     view = runtime.reload_user_model().semantic_view()
-    assert "偶尔主动联系" in view["summary"]
+    assert summary_text in view["summary"]
+
+    # 3. And an entirely new Runtime over the same storage sees it too.
+    survivor = Runtime(
+        runtime.config,
+        seed=1,
+        database=runtime.db,
+        created_at=BASE_TIME,
+    )
+    assert summary_text in survivor.user_model.semantic_view()["summary"]
+
+
+def test_user_model_summary_survives_a_restart(tmp_path) -> None:
+    """The summary is durable across a real close/reopen cycle on a file database.
+
+    Complements the test above by exercising the on-disk path, so a durability
+    regression (for example a summary written outside the committing transaction)
+    is caught rather than masked by the in-memory database.
+    """
+    db_path = str(tmp_path / "summary.sqlite3")
+    first = Runtime(
+        build_config(), seed=4, database=Database(db_path), created_at=BASE_TIME
+    )
+    try:
+        result = first.reducer.process_proposal(
+            protocol_module.Proposal(
+                task_id="tsk_persist",
+                task_type=TaskKind.USER_MODEL_SUMMARY.value,
+                based_on_version=first.version(),
+                payload={"summary": "用户偏好简短直接的消息。", "confidence": 0.6},
+            )
+        )
+        assert result.applied is True
+    finally:
+        first.close()
+
+    second = Runtime(
+        build_config(), seed=5, database=Database(db_path), created_at=BASE_TIME
+    )
+    try:
+        assert "用户偏好简短直接的消息" in second.user_model.semantic_view()["summary"]
+    finally:
+        second.close()
 
 
 def test_task_snapshot_round_trip(runtime: Runtime) -> None:

@@ -114,6 +114,9 @@ class MessageOutcome:
     observation_id: str | None = None
     reply_blocked: bool = False
     proactive_paused_until: datetime | None = None
+    #: Which appraiser produced the emotional reading: ``rule`` (degradation
+    #: Level 0) or ``local_model`` (Level 2). Both satisfy the same contract.
+    appraisal_source: str = "rule"
     narrative: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -129,6 +132,7 @@ class MessageOutcome:
             "observation_id": self.observation_id,
             "reply_blocked": self.reply_blocked,
             "proactive_paused_until": isoformat(self.proactive_paused_until),
+            "appraisal_source": self.appraisal_source,
             "narrative": self.narrative,
         }
 
@@ -174,8 +178,20 @@ class Runtime:
         *,
         seed: int | None = None,
         database: Database | None = None,
+        created_at: datetime | None = None,
     ) -> None:
-        """Wire up storage, projections and the cognitive components."""
+        """Wire up storage, projections and the cognitive components.
+
+        Args:
+            config: Resolved configuration; defaults to :class:`RuntimeConfig`.
+            seed: Seed for the internal RNG; ``None`` means system entropy.
+            database: Optional pre-built database handle (used by tests for
+                ``:memory:`` databases).
+            created_at: Creation epoch for a brand-new Runtime. Defaults to the
+                current UTC time. Callers that drive a simulated or replayed
+                timeline should pass their own reference time here so the absence
+                term does not start from a wall-clock instant in the future.
+        """
         self.config = config or RuntimeConfig()
         storage: StorageConfig = self.config.storage
         self._db = database or Database(
@@ -185,12 +201,22 @@ class Runtime:
         self.mirror_path = storage.raw_log_path if storage.mirror_raw_events else None
         self.events = EventLog(self._db, self.mirror_path)
         self.projections = Projections(self._db, self.config.runtime_id)
-        self.projections.ensure_defaults()
+        # The runtime row is created here so that maintenance tooling always sees a
+        # fully initialised database. The version stays at 0 until a real tick or
+        # event occurs, and ``lazy_tick`` may still install its own epoch the first
+        # time it is driven.
+        self.projections.ensure_defaults(created_at)
         self.memory_store = memory_module.MemoryStore(self.projections.memory, self.config)
         self.user_model = UserInteractionModel(self.projections.user_model, self.config)
         self.rng = random.Random(seed)
         self._write_lock = threading.RLock()
         self._worker_id = f"runtime-{new_id('task').split('_')[-1]}"
+        #: Optional Level 2 accelerator (the fine-tuned 2B model on the CPU).
+        #: Disabled unless ``CR_LOCAL_MODEL_ENABLED`` is set, so the Runtime stays
+        #: dependency-free and deterministic by default.
+        from .local_llm import LocalModelClient, LocalModelConfig
+
+        self.local_model = LocalModelClient(LocalModelConfig.from_env())
         self.reducer = Reducer(
             db=self._db,
             events=self.events,
@@ -264,8 +290,20 @@ class Runtime:
         stamp = ensure_aware(now) or utcnow()
         report = TickReport()
         with self.write_session():
-            state = self.projections.runtime.ensure()
-            last = state.last_tick_at or state.updated_at or stamp
+            state = self.projections.runtime.ensure(stamp)
+            # The base clock is the creation epoch: a fresh Runtime measures
+            # absence from when it was created, not from whenever the current
+            # process started. The supplied clock is clamped to be no earlier than
+            # the epoch, so driving a simulated timeline stays monotonic instead of
+            # producing a negative elapsed time that silently clamps to zero.
+            base = ensure_aware(state.epoch_at) or stamp
+            if stamp < base:
+                LOGGER.warning(
+                    "lazy_tick called with a time earlier than the creation epoch; "
+                    "using the epoch as the base clock"
+                )
+                stamp = base
+            last = state.last_tick_at or base
             dt = delta_seconds(stamp, last)
             report.dt_seconds = dt
             report.changed = dt > 0.0
@@ -493,10 +531,31 @@ class Runtime:
                     context={"stated_busy": any(marker in content for marker in BUSY_MARKERS)},
                 )
                 from .emotion import appraise_event, apply_new_emotion_events
+                from .local_llm import LocalModelClient, LocalModelConfig
 
-                evaluation = appraise_event(
-                    event, state=state, config=self.config.emotion, user_busy_probability=busy
-                )
+                # Level 2 first: the fine-tuned 2B model, when it is running and
+                # answers inside its deadline with a payload that satisfies the
+                # frozen contract. Anything else degrades to the rule-based
+                # Level 0 appraiser, so a model outage is invisible upstream.
+                evaluation = None
+                if self.local_model.config.enabled:
+                    summary = "；".join(
+                        str(item.get("content", ""))
+                        for item in self.projections.situation.list_active(limit=5)
+                    )
+                    semantic = self.local_model.appraise(
+                        content,
+                        context_summary=summary,
+                        boundary_state=proactive_verdict.reason or "none",
+                    )
+                    if not semantic.degraded:
+                        evaluation = semantic.evaluation
+                        outcome.appraisal_source = "local_model"
+                if evaluation is None:
+                    evaluation = appraise_event(
+                        event, state=state, config=self.config.emotion, user_busy_probability=busy
+                    )
+                    outcome.appraisal_source = "rule"
                 existing_emotions = self.projections.emotion.list_active()
                 _, created = apply_new_emotion_events(
                     evaluations=[(event, evaluation)],
@@ -608,6 +667,7 @@ class Runtime:
                 self._invalidate_candidates(conn, now=stamp, user_message=content)
 
                 state.last_user_message_at = stamp
+                state.last_exchange_at = stamp
                 # ``allow_proactive`` itself is not written here: it is derived on
                 # every tick from the live boundaries, so writing it would only
                 # create a second source of truth.
@@ -935,12 +995,25 @@ class Runtime:
         The absence term must collapse as soon as *anything* happens - the user
         replying counts just as much as the character speaking, otherwise silence
         pressure would keep accumulating through an active conversation.
+
+        The anchor is a dedicated ``last_exchange_at`` field written only by real
+        events. It must **not** fall back to ``last_tick_at``: that field is
+        written by every tick, so using it would collapse the elapsed time to the
+        length of the most recent tick and the approach drive would never build.
+
+        When nothing has ever been exchanged, the anchor is the oldest known
+        timestamp for the Runtime (its creation epoch). Taking the earliest rather
+        than the newest matters when the caller drives a simulated timeline that
+        starts in the past: a "created just now" epoch would otherwise make the
+        elapsed time negative and silently clamp to zero.
         """
-        last = motivation_module._latest(state.last_contact_at, state.last_user_message_at)
-        if last is None:
-            reference = state.last_tick_at or state.updated_at or now
-            return delta_seconds(now, reference) / 3600.0
-        return delta_seconds(now, last) / 3600.0
+        anchor = state.last_exchange_at
+        if anchor is None:
+            anchor = state.epoch_at
+        if anchor is None:
+            candidates = [value for value in (state.updated_at, now) if value is not None]
+            anchor = min(candidates) if candidates else now
+        return delta_seconds(now, anchor) / 3600.0
 
     def _last_refresh_at(self) -> datetime | None:
         """Return when candidates were last refreshed."""

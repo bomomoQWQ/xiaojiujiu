@@ -395,9 +395,9 @@ def target_drives(inputs: DriveInputs, *, state: RuntimeState, config: RuntimeCo
     impulse_logit = (
         -1.60
         + 1.60 * max(0.0, inputs.emotion_tendency)
-        + 0.75 * values.user_care * inputs.unfinished
+        + 0.90 * values.user_care * inputs.unfinished
         + 0.60 * inputs.memory_activation
-        + (1.25 + 0.30 * values.relationship_maintenance) * absence_term
+        + (0.85 + 0.25 * values.relationship_maintenance) * absence_term
         + 0.20 * values.curiosity
         - (0.55 + 0.35 * values.boundary_respect) * inputs.boundary_pressure
         - 0.40 * inputs.user_busy

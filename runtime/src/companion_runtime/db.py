@@ -18,6 +18,7 @@ reducer is allowed to touch the projection tables.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -26,6 +27,8 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 from .utility import ensure_aware, isoformat, parse_datetime
+
+LOGGER = logging.getLogger("companion_runtime.db")
 
 SCHEMA_VERSION = 1
 
@@ -44,9 +47,11 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         runtime_id            TEXT PRIMARY KEY,
         version               INTEGER NOT NULL,
         updated_at            TEXT NOT NULL,
+        epoch_at              TEXT,
         last_tick_at          TEXT,
         last_user_message_at  TEXT,
         last_contact_at       TEXT,
+        last_exchange_at      TEXT,
         cooldown_until        TEXT,
         foreground_pause_until TEXT,
         contact_count_today   INTEGER NOT NULL DEFAULT 0,
@@ -494,8 +499,15 @@ class Database:
 
     # -------------------------------------------------------------- migration
 
+    #: Columns added after the first released schema. Each entry is applied with
+    #: ``ALTER TABLE`` when missing, so an existing database upgrades in place.
+    ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+        ("runtime_state", "epoch_at", "TEXT"),
+        ("runtime_state", "last_exchange_at", "TEXT"),
+    )
+
     def migrate(self) -> int:
-        """Create every table and record the schema version.
+        """Create every table, apply column additions and record the version.
 
         Returns:
             The current :data:`SCHEMA_VERSION`.
@@ -503,6 +515,13 @@ class Database:
         with self.transaction() as conn:
             for statement in SCHEMA_STATEMENTS:
                 conn.execute(statement)
+            for table, column, column_type in self.ADDED_COLUMNS:
+                existing = {
+                    row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                if column not in existing:
+                    LOGGER.info("Adding column %s.%s", table, column)
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
             conn.execute(
                 "INSERT INTO schema_meta(key, value, updated_at) VALUES('schema_version', ?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",

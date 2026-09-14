@@ -36,6 +36,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Query, Request
@@ -127,6 +128,9 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
             "active_candidates": len(runtime.projections.candidates.list_active(limit=100)),
             "in_flight_attempts": runtime.projections.attempts.count_in_flight(),
             "outbox": outbox_stats,
+            # Operators need to see which appraisal level is actually live, and
+            # whether the local model has been answered or bypassed.
+            "local_model": runtime.local_model.health(),
             "raw_events": runtime.events.count(),
         }
 
@@ -255,7 +259,23 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
         )
         if not ok:
             raise HTTPException(status_code=404, detail="outbox row not found")
-        return {"ok": True, "outbox_id": outbox_id, "error": error}
+        # Report the resulting attempt state alongside the acknowledgement. A caller
+        # that has just reported a failure needs to assert on the outcome, and
+        # "the call returned 200" says nothing about what the attempt actually
+        # became (it may already have been terminal, in which case this is a no-op).
+        attempt_state: str | None = None
+        item = runtime.projections.outbox.get(outbox_id)
+        if item is not None:
+            attempt_id = str(item.payload.get("attempt_id") or "")
+            attempt = runtime.projections.attempts.get(attempt_id) if attempt_id else None
+            if attempt is not None:
+                attempt_state = attempt.state
+        return {
+            "ok": True,
+            "outbox_id": outbox_id,
+            "error": error,
+            "attempt_state": attempt_state,
+        }
 
     # ------------------------------------------------------------------ outbox
 
@@ -304,15 +324,29 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
 
     @router.post("/outbox/{outbox_id}/nack", tags=["outbox"])
     def nack_outbox(outbox_id: str, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-        """Return a leased row to the queue, or fail it terminally."""
+        """Return a leased row to the queue, or fail it terminally.
+
+        The row is claimable again immediately unless ``retry_delay_seconds`` is
+        given, so a caller that retries at once is not silently given nothing.
+        """
+        delay = payload.get("retry_delay_seconds")
         ok = runtime.reducer.nack_outbox(
             outbox_id,
             error=str(payload.get("error") or "unspecified"),
             terminal=bool(payload.get("terminal", False)),
+            now=_optional_datetime(payload.get("now")),
+            retry_delay_seconds=None if delay is None else float(delay),
         )
         if not ok:
             raise HTTPException(status_code=409, detail="row is not leased")
-        return {"ok": True, "outbox_id": outbox_id}
+        item = runtime.projections.outbox.get(outbox_id)
+        return {
+            "ok": True,
+            "outbox_id": outbox_id,
+            "status": None if item is None else item.status,
+            "attempts": None if item is None else item.attempts,
+            "available_at": None if item is None else isoformat(item.available_at),
+        }
 
     # --------------------------------------------------------------- authorize
 
@@ -335,7 +369,16 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
             state=runtime.state(),
             now=request.now,
         )
-        return verdict.to_dict() | {"action": request.action}
+        # ``allowed`` answers this specific request; ``allow_proactive`` carries the
+        # standing permission, which is what a caller needs when deciding whether
+        # outreach is permitted at all. Reporting both -- and reusing the name
+        # ``GET /boundaries`` already uses -- keeps the two endpoints consistent.
+        # A denial caused by the *reply* gate does not deny proactive contact.
+        reply_only_denial = verdict.reason == "reply_not_permitted"
+        return verdict.to_dict() | {
+            "action": request.action,
+            "allow_proactive": verdict.allowed or reply_only_denial,
+        }
 
     # ------------------------------------------------- rendered / delivery
 
@@ -640,7 +683,14 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
 
     @router.get("/boundaries", tags=["inspect"])
     def get_boundaries(include_revoked: bool = True) -> dict[str, Any]:
-        """Return every boundary and the current permission verdict."""
+        """Return every boundary plus the current permission verdict.
+
+        The verdict is produced for a *prospective proactive contact*, which is
+        the question a caller usually has: "may I initiate right now?". Denials
+        therefore carry ``reason`` and ``blocking_boundary_ids`` rather than an
+        explicit ``allow_proactive`` flag, which only appears on the boundary
+        view itself.
+        """
         now = utcnow()
         boundaries = runtime.projections.boundaries.list_all(include_revoked=include_revoked)
         verdict = authorize(
@@ -652,7 +702,15 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
         )
         return {
             "boundaries": [boundary.to_dict() for boundary in boundaries],
-            "verdict": verdict.to_dict(),
+            "verdict": verdict.to_dict()
+            | {
+                "allow_proactive": verdict.allowed,
+                "active_boundary_ids": [
+                    boundary.boundary_id
+                    for boundary in boundaries
+                    if boundary.is_active(now)
+                ],
+            },
         }
 
     @router.get("/attempts", tags=["inspect"])
@@ -684,6 +742,79 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
         """Return the effective configuration with secrets redacted."""
         payload = settings.to_dict()
         return {key: redact(key, value) for key, value in payload.items()}
+
+    # -------------------------------------------------------------- durability
+
+    @router.get("/maintenance/verify", tags=["durability"])
+    def maintenance_verify() -> dict[str, Any]:
+        """Run integrity and structural consistency checks."""
+        from .maintenance import verify
+
+        result = verify(runtime.db, expect_wal=settings.storage.wal)
+        return result.to_dict()
+
+    @router.post("/maintenance/checkpoint", tags=["durability"])
+    def maintenance_checkpoint(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        """Fold the write-ahead log back into the database file.
+
+        ``TRUNCATE`` (the default) also shrinks the WAL, which is what keeps a
+        long-running sidecar from accumulating an unbounded ``-wal`` file.
+        """
+        from .maintenance import checkpoint
+
+        mode = str(payload.get("mode") or "TRUNCATE")
+        try:
+            return checkpoint(runtime.db, mode=mode).to_dict()
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.post("/maintenance/backup", tags=["durability"])
+    def maintenance_backup(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        """Write a consistent snapshot of the database.
+
+        The snapshot is produced with ``VACUUM INTO``, so it is transactionally
+        consistent and needs no ``-wal`` sidecar to be restorable.
+        """
+        from .maintenance import backup, snapshot_name
+
+        if runtime.db.path == ":memory:":
+            raise HTTPException(
+                status_code=409, detail="cannot back up an in-memory database"
+            )
+        destination = payload.get("destination")
+        if not destination:
+            destination = str(
+                Path(settings.storage.database_path).parent / "backups" / snapshot_name()
+            )
+        try:
+            result = backup(
+                runtime.db,
+                destination,
+                overwrite=bool(payload.get("overwrite", False)),
+                checkpoint_first=bool(payload.get("checkpoint_first", True)),
+            )
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return result.to_dict()
+
+    @router.get("/maintenance/recovery-plan", tags=["durability"])
+    def maintenance_recovery_plan(backup_dir: str | None = None) -> dict[str, Any]:
+        """Return the actions a recovery drill should take for this data directory."""
+        from .maintenance import recovery_plan
+
+        folder = backup_dir or str(Path(settings.storage.database_path).parent / "backups")
+        return recovery_plan(settings.storage.database_path, folder)
+
+    @router.post("/maintenance/tick", tags=["durability"])
+    def maintenance_run(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        """Run the routine durability pass: checkpoint, verify, optionally back up."""
+        from .maintenance import maintenance_tick
+
+        return maintenance_tick(
+            runtime.db,
+            backup_dir=payload.get("backup_dir"),
+            keep=int(payload.get("keep") or 7),
+        )
 
     @router.post("/explain", tags=["context"])
     def explain(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:

@@ -58,6 +58,23 @@ class AuthorizeRequest:
         }
 
 
+def _deny(
+    reason: str,
+    *,
+    constraints: list[str],
+    blocking: list[str],
+    allow_reply: bool,
+) -> AuthorizeResult:
+    """Build a denial verdict, consistently."""
+    return AuthorizeResult(
+        allowed=False,
+        reason=reason,
+        constraints=list(constraints),
+        blocking_boundary_ids=list(blocking),
+        allow_reply=allow_reply,
+    )
+
+
 def authorize(
     request: AuthorizeRequest,
     *,
@@ -93,21 +110,18 @@ def authorize(
     blocking = list(verdict.blocking_ids)
 
     if request.is_proactive and not verdict.allow_proactive:
-        reason = "boundary_blocks_proactive" if blocking else "proactive_disabled"
-        return AuthorizeResult(
-            allowed=False,
-            reason=reason,
+        return _deny(
+            "boundary_blocks_proactive" if blocking else "proactive_disabled",
             constraints=constraints,
-            blocking_boundary_ids=blocking,
+            blocking=blocking,
             allow_reply=verdict.allow_reply,
         )
 
     if not request.is_proactive and not verdict.allow_reply:
-        return AuthorizeResult(
-            allowed=False,
-            reason="reply_not_permitted",
+        return _deny(
+            "reply_not_permitted",
             constraints=constraints,
-            blocking_boundary_ids=blocking,
+            blocking=blocking,
             allow_reply=False,
         )
 
@@ -117,19 +131,17 @@ def authorize(
     # budget no longer apply. Only boundaries can still stop it.
     if request.is_proactive and request.action != "send":
         if runtime_state.cooldown_until is not None and runtime_state.cooldown_until > stamp:
-            return AuthorizeResult(
-                allowed=False,
-                reason="cooldown_active",
+            return _deny(
+                "cooldown_active",
                 constraints=constraints,
-                blocking_boundary_ids=blocking,
+                blocking=blocking,
                 allow_reply=verdict.allow_reply,
             )
         if runtime_state.contact_count_today >= config.drive.max_contacts_per_day:
-            return AuthorizeResult(
-                allowed=False,
-                reason="daily_contact_budget_exhausted",
+            return _deny(
+                "daily_contact_budget_exhausted",
                 constraints=constraints,
-                blocking_boundary_ids=blocking,
+                blocking=blocking,
                 allow_reply=verdict.allow_reply,
             )
 
@@ -137,33 +149,29 @@ def authorize(
     if request.attempt_id is not None:
         attempt = projections.attempts.get(request.attempt_id)
         if attempt is None:
-            return AuthorizeResult(
-                allowed=False,
-                reason="unknown_attempt",
+            return _deny(
+                "unknown_attempt",
                 constraints=constraints,
-                blocking_boundary_ids=blocking,
+                blocking=blocking,
                 allow_reply=verdict.allow_reply,
             )
         attempt_reason = _attempt_blocking_reason(attempt)
         if attempt_reason is not None:
-            return AuthorizeResult(
-                allowed=False,
-                reason=attempt_reason,
+            return _deny(
+                attempt_reason,
                 constraints=constraints,
-                blocking_boundary_ids=blocking,
+                blocking=blocking,
                 allow_reply=verdict.allow_reply,
             )
         if attempt.reconcile_action in {"abort", "resolved"}:
-            return AuthorizeResult(
-                allowed=False,
-                reason=f"attempt_reconciled:{attempt.reconcile_action}",
+            return _deny(
+                f"attempt_reconciled:{attempt.reconcile_action}",
                 constraints=constraints,
-                blocking_boundary_ids=blocking,
+                blocking=blocking,
                 allow_reply=verdict.allow_reply,
             )
         if attempt.rendered_text:
-            text_check = validate_text(attempt.rendered_text, config=config)
-            constraints.extend(text_check)
+            constraints.extend(validate_text(attempt.rendered_text, config=config))
 
     if request.text is not None:
         constraints.extend(validate_text(request.text, config=config))
@@ -171,8 +179,8 @@ def authorize(
     return AuthorizeResult(
         allowed=True,
         reason="permitted",
-        constraints=constraints,
-        blocking_boundary_ids=blocking,
+        constraints=list(dict.fromkeys(constraints)),
+        blocking_boundary_ids=list(blocking),
         allow_reply=verdict.allow_reply,
     )
 

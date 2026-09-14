@@ -1,0 +1,16 @@
+# GBNF grammar for the emotion-explanation task.
+#
+# The grammar fixes the six-field shape and forbids digits and double quotes, so
+# the model cannot invent intensity numbers or stage dialogue. Length and
+# semantic invariants are still checked in code.
+
+root        ::= "{" ws "\"experience\"" ws ":" ws text "," ws
+                "\"focus\"" ws ":" ws text "," ws
+                "\"conflict\"" ws ":" ws text "," ws
+                "\"impulse\"" ws ":" ws text "," ws
+                "\"inhibition\"" ws ":" ws text "," ws
+                "\"expression\"" ws ":" ws text ws "}"
+
+text        ::= "\"" char+ "\""
+char        ::= [^"\\\x00-\x1F0-9]
+ws          ::= [ \t\n]*
