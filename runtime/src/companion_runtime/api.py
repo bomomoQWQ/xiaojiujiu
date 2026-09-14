@@ -863,12 +863,22 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
 
     @router.post("/explain", tags=["context"])
     def explain(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-        """Return the current first-person psychological explanation."""
+        """Return the current first-person psychological explanation.
+
+        With the default ``DisabledProvider`` this is the deterministic template;
+        with a configured provider it is that provider's rendering, cached. Either
+        way the response shape is identical, so callers never branch on it.
+        """
+        from .context import _optional_explanation_provider
         from .emotion import EmotionExplainer
 
         now = _optional_datetime(payload.get("now")) or utcnow()
         runtime.lazy_tick(now)
-        explainer = EmotionExplainer(runtime.projections.emotion, settings)
+        explainer = EmotionExplainer(
+            runtime.projections.emotion,
+            settings,
+            provider=_optional_explanation_provider(runtime),
+        )
         explanation = explainer.explain(
             state=runtime.state(),
             active=runtime.projections.emotion.list_active(),

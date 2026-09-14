@@ -217,6 +217,9 @@ class EndogenousOutcome:
     refreshed_candidates: bool = False
     activated_memory_ids: list[str] = field(default_factory=list)
     version: int = 0
+    #: Outcome of the deep cognition refresh attempted during this round. Always
+    #: present so an operator can tell "nothing needed doing" from "never tried".
+    deep_refresh: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable rendering."""
@@ -228,6 +231,7 @@ class EndogenousOutcome:
             "refreshed_candidates": self.refreshed_candidates,
             "activated_memory_ids": list(self.activated_memory_ids),
             "version": self.version,
+            "deep_refresh": dict(self.deep_refresh),
         }
 
 
@@ -811,13 +815,22 @@ class Runtime:
         now: datetime | None = None,
         force: bool = False,
         create_attempt: bool = True,
+        deep_refresh: bool = True,
     ) -> EndogenousOutcome:
         """Run one endogenous wake-up round (P2): the proactive decision.
+
+        This is the Runtime's periodic heartbeat, so it is also where the
+        low-frequency deep cognition refresh belongs (patch v0.2 section 21):
+        "later I understood" has to be able to happen without an operator asking.
+        The refresh runs *before* the proactive decision so that a newly
+        understood backlog can inform whether to speak, and it is never allowed to
+        block the round - a refresh that declines is simply recorded.
 
         Args:
             now: Reference time.
             force: Bypass the foreground pause and the scheduler gate.
             create_attempt: When a candidate wins, create the action attempt.
+            deep_refresh: Whether this round may spend on a deep refresh.
 
         Returns:
             An :class:`EndogenousOutcome`.
@@ -828,6 +841,13 @@ class Runtime:
         elapsed_seconds = delta_seconds(stamp, self.state().last_tick_at)
         report = self.lazy_tick(stamp)
         outcome = EndogenousOutcome(version=report.version)
+
+        if deep_refresh:
+            try:
+                outcome.deep_refresh = self.deep_refresh(now=stamp).to_dict()
+            except Exception:  # noqa: BLE001 - understanding later is never urgent
+                LOGGER.exception("Deep refresh during the endogenous round failed; continuing")
+                outcome.deep_refresh = {"ran": False, "reason": "error"}
 
         with self.write_session():
             state = self.projections.runtime.ensure()

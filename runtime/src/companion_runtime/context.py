@@ -376,13 +376,41 @@ def build(
 
 
 def runtime_explanation(runtime: Any, now: datetime) -> dict[str, Any]:
-    """Generate (or reuse) the psychological explanation through the explainer."""
+    """Generate (or reuse) the psychological explanation through the explainer.
+
+    The semantic provider is passed in so that a configured one can fill the
+    interpretation cache. It is optional by contract: with the default
+    ``DisabledProvider`` the explainer simply renders the deterministic template,
+    which is the standard deployment.
+    """
     from .emotion import EmotionExplainer
 
-    explainer = EmotionExplainer(runtime.projections.emotion, runtime.config)
+    explainer = EmotionExplainer(
+        runtime.projections.emotion,
+        runtime.config,
+        provider=_optional_explanation_provider(runtime),
+    )
     active = runtime.projections.emotion.list_active()
     state = runtime.state()
     return explainer.explain(state=state, active=active, now=now, rng=runtime.rng)
+
+
+def _optional_explanation_provider(runtime: Any) -> Any:
+    """Return the Runtime's provider only when it can actually explain.
+
+    A disabled or unavailable provider must not be handed to the explainer at all:
+    the explainer treats any provider as "try me first", and a provider that is
+    configured but down would add a pointless failed call on the context path.
+    """
+    provider = getattr(runtime, "semantic_provider", None)
+    if provider is None:
+        return None
+    try:
+        if not provider.available():
+            return None
+    except Exception:  # noqa: BLE001 - an unavailable provider is simply absent
+        return None
+    return provider
 
 
 def _attention_hints(state: RuntimeState, bundle: ContextBundle, now: datetime) -> list[str]:

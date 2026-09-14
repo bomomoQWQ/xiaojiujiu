@@ -25,7 +25,7 @@ import random
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from .config import EmotionConfig, RuntimeConfig
 from .projections import EmotionProjection

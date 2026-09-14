@@ -54,6 +54,11 @@ TASK_SENSITIVITY: Mapping[str, str] = {
     TaskKind.CANDIDATE_GEN.value: "high",
     TaskKind.EMOTION_EXPLAIN.value: "high",
     TaskKind.PROACTIVE_DRAFT.value: "critical",
+    #: A deep refresh reasons about old events, so its conclusions do not decay
+    #: the way a live appraisal does. Marking it "high" would rebase (and damp)
+    #: a reinterpretation merely because the character kept living for a few more
+    #: rounds, which would quietly erase the very thing the refresh discovered.
+    TaskKind.DEEP_REFRESH.value: "low",
 }
 
 #: How many versions may pass before a result of a given sensitivity must be
