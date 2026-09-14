@@ -602,7 +602,10 @@ class CompanionRuntimePlugin(Star):
 
         provider = payload.get("semantic_provider")
         if isinstance(provider, dict):
-            name = as_str(provider.get("name")) or "unknown"
+            # The Runtime reports ``provider``; older drafts of the protocol used
+            # ``name``. Accept both so a version skew degrades to a wrong label
+            # rather than to "unknown".
+            name = as_str(provider.get("provider")) or as_str(provider.get("name")) or "unknown"
             available = bool(provider.get("available"))
             lines = [f"- semantic_provider: {name} (available={available})"]
         else:

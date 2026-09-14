@@ -10,7 +10,7 @@
 | 代码根 | `runtime/src/companion_runtime/` |
 | 测试根 | `runtime/tests/` |
 | 最近一次提交 | `15b39d7`（`feat(runtime): split acting layer from persistent cognition per PATCH v0.2`） |
-| 核对时的测试规模 | `python -m pytest -q` 收集 **608 项，全部通过**（其中 v0.2 相关：`test_semantic.py` 53、`test_providers.py` 73、`test_deep_refresh.py` 约 40、`test_acting_layer_independence.py` 11、`test_cognition_api.py` 9）。数量随开发持续变化，以实际运行为准 |
+| 核对时的测试规模 | `python -m pytest -q` 收集 **603 项，全部通过**（其中 v0.2 相关：`test_semantic.py` 53、`test_providers.py` 65、`test_deep_refresh.py` 40、`test_acting_layer_independence.py` 11、`test_cognition_api.py` 9）。数量随开发持续变化，以实际运行为准 |
 | 核对方式 | 直接阅读源码 + 运行测试 + `git status` / `git diff` 比对 |
 
 > **关于工作区状态的提醒。** 核对时，深层刷新那一批改动（`deep_refresh.py`、`runtime.py` 的 `deep_refresh()`、`reducer.py` 的 `_apply_deep_refresh`、`api.py` 的 `/cognition/*`、`cli.py` 的 `refresh`/`backlog`、`typing.py` 的 `TaskKind.DEEP_REFRESH` 等）**尚未提交**，`git status` 显示为 `M` / `??`。这可随时用 `git status --porcelain` 复核。本文描述的是**工作区当前状态**。
@@ -31,8 +31,8 @@
 | 补丁章节 | 主题 | 代码位置 | 测试 | 状态 |
 |---|---|---|---|---|
 | §0 | 补丁摘要：双层时间模型 | `semantic.py`（模块 docstring）、`runtime.py::Runtime.process_user_message`（结算段注释）、`context.py::PRIORITY_PREAMBLE` | `test_acting_layer_independence.py` | **已实现** |
-| §1 | 为什么重写上一版：不只是"2B 太慢" | `providers.py`（本地模型降级为可选实现）、`local_llm.py`（保留但仅被 `providers.py` 引用） | `test_providers.py`、`test_local_llm.py` | **已实现** |
-| §2 | 实测仍然构成硬约束 | 无代码；落点在 `README.md` 第 15.2 节 | — | **文档/约定** |
+| §1 | 为什么重写上一版：不只是"2B 太慢" | `providers.py::KNOWN_PROVIDER_NAMES`（只剩 `disabled` / `remote_api`）；本地模型实现已整体删除 —— `src/companion_runtime/local_llm.py` 与 `grammars/` 不存在，训练与实验脚本分别归档在 `archive/local_model_training/`、`archive/local_model/scripts/`，`archive/README.md` 记录了放弃理由 | `test_providers.py`（`tests/test_local_llm.py` 已随本地路线一起删除） | **已实现** |
+| §2 | 实测仍然构成硬约束 | 无代码；实测数据已整体归档到 `archive/README.md`（README 第 15 节只保留结论与指向） | — | **文档/约定** |
 | §3 | 新的双层时间模型 | `context.py`（区块划分）、`semantic.py`、`runtime.py` | `test_acting_layer_independence.py::TestTwoTimeScaleContract` | **已实现** |
 | §4 | 即时演出层（由主 LLM 负责） | 宿主侧主 LLM；Runtime 侧只负责不做（`runtime.py::MessageOutcome` 记录本轮结算结论） | `test_acting_layer_independence.py`、`test_api.py` | **已实现** |
 | §4.1 | 主 LLM 本来就拥有即时理解能力 | `context.py::PRIORITY_PREAMBLE`、`context.py::SECTION_PSYCH`（"进入本轮前的长期状态（背景）"）、`context.py` 渲染块末尾的"它描述的是你进入本轮之前的长期状态，不是本轮该怎么反应" | `test_context_block_is_marked_as_background` | **已实现** |
@@ -51,9 +51,9 @@
 | §13 | "追夫火葬场"：允许错过当下，但不能丢失原始证据 | `eventlog.py`（append-only，不变量 1）、`event_semantics` 表、`reducer.py::Reducer._apply_reinterpretation`（新版本 + `reappraisals`，从不回写旧事件） | `test_invariant_1_raw_events_are_never_modified`、`test_invariant_7_reinterpretation_never_rewrites_the_past`、`test_deep_refresh.py::test_history_is_not_rewritten_by_a_reinterpretation` | **已实现** — 证据保全 + 追加式重解释 + 低频自动触发齐备。附注：触发需要宿主/运维发起一次刷新（`POST /cognition/refresh`），Runtime 自身没有定时器 |
 | §14 | 心理解释不再是高频必需品 | `emotion.py::EmotionExplainer._render`（provider 优先，拿不到就 `_render_template`） | `test_emotion_boundaries_unfinished.py`、`test_providers.py::test_explain_state_success_and_template_fallback` | **已实现** |
 | §14.1 | 模板只负责长期底色 | `emotion.py::TEMPLATES_POSITIVE / TEMPLATES_NEGATIVE / TEMPLATES_NEUTRAL`、`EmotionExplainer._render_template`、`context.py::SECTION_PSYCH` | `test_delivery_scheduler_context.py`、`test_context_block_is_marked_as_background` | **已实现** — 模板措辞全部是"进入本轮之前…的底色"口径；测试断言注入块含"背景"与"当前" |
-| §15 | 深层心理解释变成缓存 | `db.py::emotion_explanations`、`projections.py`（`store_explanation` / `cached_explanation`）、`EmotionExplainer.explain_and_store`、`reducer.py::Reducer._apply_interpretation_cache`、`Runtime.deep_refresh` 把 `psychological_interpretation` 装进同一条 proposal | `test_deep_refresh.py::test_the_interpretation_cache_is_updated_and_reused`、`test_providers.py`（`state_key` 缓存契约） | **部分实现** — 缓存、复用、`source="deep_refresh"` 写入与"下一轮直接复用"都在位；补丁要求的 stale 判据（"背景心境明显变化 / 主要活跃事件变化 / 重大重估事件出现"）目前只有 TTL 近似：`task.explain_cache_ttl_seconds = 1800`；`semantic.interpretation_max_age_seconds = 21600` **未被任何生产代码读取** |
-| §16 | 本地 2B 正式从标准架构移除 | `local_llm.py` 保留，但**只被 `providers.py` 引用**；`Runtime` 不 import 它；`config.SemanticConfig.provider` 默认 `"disabled"` | `test_ingest_works_with_no_provider_configured`、`test_no_outbound_socket_is_opened_during_ingest` | **已实现** |
-| §17 | 可选 Semantic Provider | `providers.py`：`SemanticProvider` / `DisabledProvider` / `LocalCPUProvider` / `LocalGPUProvider` / `RemoteAPIProvider` / `build_provider` / `resolve_provider_name` | `test_providers.py`（73 项：四种实现的选择与回落、fail-open、密钥卫生） | **已实现** |
+| §15 | 深层心理解释变成缓存 | `db.py::emotion_explanations`、`projections.py`（`store_explanation` / `cached_explanation`）、`EmotionExplainer.explain_and_store`、`reducer.py::Reducer._apply_interpretation_cache`、`Runtime.deep_refresh` 把 `psychological_interpretation` 装进同一条 proposal | `test_deep_refresh.py::test_the_interpretation_cache_is_updated_and_reused`、`test_providers.py`（`state_key` 缓存契约）、`test_semantic_config_knobs.py::TestInterpretationMaxAge` | **已实现** — 缓存、复用、`source="deep_refresh"` 写入与"下一轮直接复用"都在位。失效判据分两层：cache key 由当前心境与最高情绪强度算出，因此"背景心境明显变化 / 主要活跃事件变化"会直接换 key；`semantic.interpretation_max_age_seconds`（默认 21600）作为兜底 TTL，由 `EmotionExplainer._explanation_ttl_seconds()` 读取，未设时回落 `task.explain_cache_ttl_seconds`。唯一未单独建模的是"重大重估事件"——重估会改动心境与活跃情绪，因此通过 key 间接失效 |
+| §16 | 本地 2B 正式从标准架构移除 | **完全实现，且比补丁要求走得更远：可选实现也一起删了。** 证据：`src/companion_runtime/local_llm.py` 已删除（现仅存于 `archive/local_model/local_llm.py`）、`src/companion_runtime/grammars/` 已删除、`providers.py` 中 `LocalCPUProvider` / `LocalGPUProvider` / `LOCAL_CPU_NAME` / `LOCAL_GPU_NAME` / `_build_local` / `_grammar_text` 全部移除，`KNOWN_PROVIDER_NAMES == {"disabled", "remote_api"}`；`build_provider()` 对 `RETIRED_PROVIDER_NAMES`（`local_cpu` / `local_gpu` / `local` / `cpu` / `gpu` / `llama_cpp`）打 WARNING 后返回 `DisabledProvider`，`resolve_provider_name()` 对退役名字原样返回以便告警说明原因；`config.SemanticConfig.provider` 默认 `"disabled"`；不再有 `CR_LOCAL_MODEL_*` 的任何读者；`training/` 与本地模型脚本已移入 `archive/` | `test_providers.py`（退役名字回落 + 告警）、`test_ingest_works_with_no_provider_configured`、`test_no_outbound_socket_is_opened_during_ingest` | **已实现（完全）** — 不再是"移除核心依赖但保留可选项"，而是"这条路线整体放弃"；原因与实测数据见 `archive/README.md` |
+| §17 | 可选 Semantic Provider | `providers.py`：`SemanticProvider` / `DisabledProvider` / `RemoteAPIProvider` / `build_provider` / `resolve_provider_name` / `RETIRED_PROVIDER_NAMES`；另含模块级 `extract_json()`、`EXPLANATION_FIELDS`、`parse_explanation()`（原先从 `local_llm` 导入，现已内联进 `providers.py`） | `test_providers.py`（65 项：两种实现的选择与回落、退役名字回落 disabled 并告警、fail-open、密钥卫生） | **已实现（实现数量少于补丁原文）** — 端口与契约完整，但补丁原文列出的 `LocalGPUProvider` / `LocalCPUProvider` **已被有意取消**：这两个实现存在的唯一理由是"自己跑权重"，而实测表明本地推理在目标硬件上单次评价要数秒、常驻约 2 GB（见 `archive/README.md`），把这样的组件留在代码里只会让"可选"变成运维负担。因此现在只有 `disabled`（默认）与 `remote_api` 两种。附带变化：`_grammar_for()` 恒返回 `None`（原先捆绑的 GBNF 随本地路线删除，钩子保留给自建网关覆写） |
 | §18 | 强语义模型的新职责：深层认知刷新 | `providers.py`（端口与契约）、`deep_refresh.py`（`evaluate_triggers` / `build_request` / `ground_suggestions`）、`runtime.py::Runtime.deep_refresh`（编排）、`reducer.py::Reducer._apply_deep_refresh`（落地） | `test_deep_refresh.py`（约 40 项） | **已实现** — 管线为：开关 → provider 可用性 → 触发判定 → 只读组装 → 调用 → grounding → 一条 Proposal → Reducer。任一阶段都可以拒绝，且拒绝原因全部如实上报 |
 | §19 | 深层认知刷新输入 | `providers.py::DeepRefreshRequest`（9 个字段与补丁清单一致）、`deep_refresh.py::build_request`（真正组装它：unresolved + 工作局势 + 心境 + 活跃情绪 + 记忆 + 未尽之事 + 用户模型摘要 + 候选 + 关键原文） | `test_deep_refresh.py::TestRequestAssembly`（含"组装请求不写库"与"key_quotes 来自真实事件"） | **已实现** |
 | §20 | 输出建议集（六个字段，只有建议权） | `providers.py::DEEP_REFRESH_FIELDS` / `parse_deep_refresh` / `DeepRefreshSuggestions`；`deep_refresh.py::FIELD_TO_KIND` 把六个字段映射成六种操作；`reducer.py::Reducer._apply_deep_refresh` 逐条落地 | `test_providers.py`（逐字段类型校验、部分畸形、`suggestions` 包装键）、`test_deep_refresh.py::TestGrounding` | **已实现** — 六种 `kind` 都能到达落地端（`test_every_operation_kind_is_reachable`） |
@@ -65,11 +65,11 @@
 | §26 | 对"情绪模块"的重新定义 | `emotion.py`（数值动力学 + 长期底色）+ `semantic.py`（粗粒度方向/强度/时间/来源） | `test_semantic.py`、`test_emotion_boundaries_unfinished.py` | **已实现** |
 | §27 | 对"情绪解释器"的重新定义（低频语义压缩器） | `emotion.py::EmotionExplainer`（模板兜底）+ `providers.py::explain_state` + `reducer.py::Reducer._apply_interpretation_cache` + `context.py::_optional_explanation_provider`（接线点） | `test_providers.py`（含 `state_key` 缓存契约）、`test_delivery_scheduler_context.py`、`test_api.py` | **已实现** — 解释器、模板、缓存写入、深层刷新填充与 provider 接线都在位：`context.runtime_explanation()` 与 `POST /explain` 都会把（可用的）provider 交给 `EmotionExplainer`，不可用时安静退回模板。附注：stale 判据仍用 TTL 近似，见 §15 |
 | §28 | 关键路径预算的最终理解 | `runtime.py::Runtime.process_user_message` 不含任何模型调用；刷新只在独立的 `deep_refresh()` 路径上 | `test_no_outbound_socket_is_opened_during_ingest`（直接拦 `socket.connect`）、`test_deep_refresh.py::test_ingest_does_not_trigger_a_refresh` | **已实现** |
-| §29 | 对弱 VPS 的最终意义 | 无代码；落点在 `README.md` 第 15 节（含实测 CPU 成本量级） | — | **文档/约定** |
+| §29 | 对弱 VPS 的最终意义 | 无代码；落点在 `README.md` 第 15 节（最小常驻集合；实测 CPU 成本量级已归档到 `archive/README.md`，README 不再复述） | — | **文档/约定** |
 | §30 | 旧流程与新流程对比 | 无代码；落点在 `README.md` 第 0 节与第 9.2 节 | — | **文档/约定** |
 | §31 | 典型例子：用户说"算了，也没什么" | `semantic.py::AMBIGUITY_MARKERS`（含 `算了` / `也没什么`）、`classify_event`、`record_unresolved`；后续重解释走 `deep_refresh` → `reducer._apply_reinterpretation` → `reappraisals` | `test_exact_patch_example_is_unresolved`、`test_ambiguous_events_are_deferred_not_guessed`、`test_raw_event_survives_being_unresolved`、`test_unresolved_events_do_not_leak_into_the_block_as_facts`、`test_a_grounded_reinterpretation_settles_the_backlog` | **已实现** — 前半段（不瞎猜、不丢证据）与后半段（后来重新解释并生成 `reappraisal`）都已接通；区别只在于触发那一步需要一次 `POST /cognition/refresh`（无内置定时器） |
 | §32 | 最终架构哲学修正 | `semantic.py` / `providers.py` / `deep_refresh.py` 的模块 docstring、`README.md` 第 0 节与第 5 节 | — | **文档/约定** |
-| §33 | 最终结论 | `providers.py::build_provider`（默认回落 `DisabledProvider`）、`config.py::SemanticConfig.provider = "disabled"`、`local_llm.py` 不在任何生产调用链上 | `test_providers.py`、`test_acting_layer_independence.py` | **已实现** |
+| §33 | 最终结论 | `providers.py::build_provider`（默认回落 `DisabledProvider`，退役名字显式告警）、`config.py::SemanticConfig.provider = "disabled"`；`local_llm.py` **已不存在于 `src/`**（归档于 `archive/local_model/local_llm.py`），因此"不在任何生产调用链上"这句话现在由文件本身的位置保证 | `test_providers.py`、`test_acting_layer_independence.py` | **已实现** |
 
 ---
 
@@ -102,9 +102,10 @@
 |---|---|
 | §7 / §7.1 | 已补齐 7 级链；§7.1 的示例行为仍只能靠 prompt 约定，没有可断言的代码路径（Runtime 只提供背景，无法强制主 LLM 怎么做） |
 | §10.1 | 输出字段名与补丁 JSON 示例不完全一致（`intensity` band 名 vs `impact`），语义等价 |
+| §17 | provider 端口、契约与回落逻辑完全实现；但**实现数量少于补丁原文**：补丁列出的 `LocalGPUProvider` / `LocalCPUProvider` 已被有意取消（本地模型路线整体放弃，见 §16），只剩 `disabled` 与 `remote_api`。`_grammar_for()` 随之恒返回 `None`（钩子保留给自建网关覆写） |
 | §15 | 缓存、事件驱动失效（cache key 由当前心境与最高强度算出）、TTL 兜底三者齐备；补丁列举的"重大重估事件"单独作为失效信号尚未实现——重估会改变心境与活跃事件，因此通过 cache key 间接失效 |
 | §21 | 八条规则 + 最小间隔否决齐全，且已由心跳自动调用；"空候选池"与"空闲"两条额外要求**存在待刷新素材**才会成立，避免全新 Runtime 反复空跑 |
-| §12 / §13 / §31 | 主链路已通（含自动重解释与积压结算）；唯一保留条件是"需要有人发起一次刷新"，且 `resolve_backlog` 未被使用 |
+| §12 / §13 / §31 | 主链路已通（含**自动**重解释与积压结算，由心跳发起）；`resolve_backlog()` 本身仍无调用方，但它编码的 `unresolved_max_age_hours` 策略已由 `build_request()` 执行 |
 
 ---
 
@@ -173,14 +174,24 @@ Select-String -Path src\companion_runtime\protocol.py -Pattern "DEEP_REFRESH"
 
 # 9) 工作区里哪些改动还没提交
 git status --porcelain
+
+# 10) 本地模型路线是否真的清干净了？
+#     （预期：src 下零命中；只有 providers.py 的退休名字常量会命中 local_cpu/local_gpu）
+Get-ChildItem -Recurse src -Filter *.py | Select-String "local_llm|LocalCPUProvider|LocalGPUProvider|CR_LOCAL_MODEL"
+Test-Path src\companion_runtime\local_llm.py        # 预期：False
+Test-Path src\companion_runtime\grammars            # 预期：False
+Test-Path training                                  # 预期：False（已移到 archive\local_model_training）
+Test-Path archive\local_model_training              # 预期：True
 ```
 
 ---
 
 ## 六、一句话总结
 
-补丁 v0.2 的**架构性结论已经落地并可验证**：Runtime 以零模型完整运行、入口路径不做任何模型调用（有拦 `socket.connect` 的结构性测试）、显式事件粗粒度结算、模糊事件诚实记为 `unresolved` 且永不丢失原始事件、心理解释退化为模板 + 缓存、本地 2B 降级为可选的 `LocalCPUProvider`。
+补丁 v0.2 的**架构性结论已经落地并可验证**：Runtime 以零模型完整运行、入口路径不做任何模型调用（有拦 `socket.connect` 的结构性测试）、显式事件粗粒度结算、模糊事件诚实记为 `unresolved` 且永不丢失原始事件、心理解释退化为模板 + 缓存。
+
+**本地模型路线已彻底删除，不是"降级为可选"**：`local_llm.py` 与 `grammars/` 不在 `src/` 里，训练与实验脚本归档在 `archive/`，`providers.py` 只剩 `disabled`（默认）与 `remote_api`（可选低频强语义）两种实现，退役名字（`local_cpu` / `local_gpu` / `llama_cpp` …）会被显式警告后回落到 `disabled`。原因与实测数据见 `archive/README.md`，逐条证据见 §16、§17。
 
 **"后来想明白"这条链也已经接通**：触发判定（八条规则 + 最小间隔否决）→ 只读组装 → provider → grounding（引用不到真实实体就丢弃并记账）→ 一条 Proposal → Reducer 的 APPLY/REBASE/DISCARD → **只有被成功应用的操作真正引用过的事件**才离开 unresolved（`test_only_referenced_events_leave_the_backlog`），重解释永不回写历史。
 
-**剩下的都是"接线"而不是"缺件"**：没有内置调度器去自动发起刷新（要宿主或运维调用 `POST /cognition/refresh` / `companion-runtime refresh`）、`resolve_backlog()` 与 `unresolved_max_age_hours` 未被使用、`template_fallback` 与 `interpretation_max_age_seconds` 尚未被消费、优先级 preamble 只声明到 5 级。逐条见第二节。
+**剩下的都是"边界"而不是"缺件"**：本轮审计发现的 12 条接线缺口（无调度器、配置项无消费者、provider 未接进解释器、优先级链被压缩等）已全部修好并各自补了回归测试，逐条见第二节。仍然未实现的三条都是**有意的既有边界**，与 v0.2 无关：embedding 检索仍是词法降级、没有常驻记忆巩固 worker、没有 Prometheus 指标导出。

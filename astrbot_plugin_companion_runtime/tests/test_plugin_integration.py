@@ -443,7 +443,7 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         plugin = await self._plugin()
         transport = StubRuntimeTransport.instances[-1]
         transport.health = {
-            "semantic_provider": {"name": "disabled", "available": False},
+            "semantic_provider": {"provider": "disabled", "available": False},
             "semantics": {"unresolved": 7, "by_status": {"unresolved": 7}},
         }
         text = await plugin._status_text()
@@ -451,6 +451,35 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("7 unresolved", text)
         # Deferral is normal operation, and the wording must not read as a fault.
         self.assertIn("normal", text)
+
+    async def test_status_reads_the_runtimes_actual_field_name(self) -> None:
+        """Regression: the Runtime reports ``provider``, not ``name``.
+
+        The first version of this probe read ``name``, which the real endpoint
+        never sends, so a live deployment printed ``unknown`` while every stub
+        test passed. The stub default now mirrors the real payload.
+        """
+        plugin = await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+        transport.health = {"semantic_provider": {"provider": "remote_api", "available": True}}
+        text = await plugin._status_text()
+        self.assertIn("semantic_provider: remote_api (available=True)", text)
+        self.assertNotIn("unknown", text)
+
+    async def test_status_tolerates_the_legacy_name_field(self) -> None:
+        """Accept the old key too, so a version skew mislabels nothing."""
+        plugin = await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+        transport.health = {"semantic_provider": {"name": "remote_api", "available": True}}
+        text = await plugin._status_text()
+        self.assertIn("semantic_provider: remote_api (available=True)", text)
+
+    async def test_status_default_stub_matches_the_real_health_shape(self) -> None:
+        """A stub with the wrong field names could hide a protocol mismatch."""
+        plugin = await self._plugin()
+        text = await plugin._status_text()
+        self.assertIn("semantic_provider: disabled (available=False)", text)
+        self.assertNotIn("unknown", text)
 
     async def test_status_stays_usable_when_the_runtime_is_down(self) -> None:
         """The probe is advisory: no /health must never break the command."""

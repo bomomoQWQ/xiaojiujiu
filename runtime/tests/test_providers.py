@@ -1,8 +1,8 @@
 """Tests for the optional Semantic Provider port (patch v0.2 sections 16-21).
 
 The whole suite is offline: every provider gets an injected transport, so the
-degradation contracts are proven without a network, a llama.cpp server or a
-remote model. The suite covers the four things the integration depends on:
+degradation contracts are proven without a network and without any endpoint at
+all. The suite covers the four things the integration depends on:
 
 * ``disabled`` is the default, and every unknown name or failed construction
   falls back to it without raising;

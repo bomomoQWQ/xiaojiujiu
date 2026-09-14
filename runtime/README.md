@@ -35,8 +35,8 @@
 
 两条结论直接改变了部署形态：
 
-1. **当前这一轮的即时理解与情感表现，本来就应该由主 LLM 完成。** 主 LLM 在当前轮已经能看到宿主设定、上下文、用户原话和 Runtime 状态，不需要 Runtime 先同步调用一个 2B 模型把"这句话是失落 0.46"算出来再喂给它。那条路径既昂贵，又重复了主 LLM 已有的能力。
-2. **本地 2B 生成式模型不再是标准依赖。** 它已从标准架构移除，只作为可选 `SemanticProvider` 的一种实现保留（见第 7 节）。弱 VPS 上不再需要常驻权重、不再需要 llama.cpp 进程、不再需要推理队列。
+1. **当前这一轮的即时理解与情感表现，本来就应该由主 LLM 完成。** 主 LLM 在当前轮已经能看到宿主设定、上下文、用户原话和 Runtime 状态，不需要 Runtime 先同步调用一个生成式模型把"这句话是失落 0.46"算出来再喂给它。那条路径既昂贵，又重复了主 LLM 已有的能力。
+2. **本地模型路线已被整体放弃。** 它不只是"不再是标准依赖"，而是连可选实现一起删除了：`providers.py` 只保留两种实现 —— `disabled`（默认，标准配置）与 `remote_api`（可选的低频强语义，见第 7 节）。弱 VPS 上不再需要常驻权重、不再需要本地推理进程、不再需要推理队列。放弃原因与实测数据见 `archive/README.md`。
 
 > **Runtime 不依赖任何生成式模型也能完整运行。** 默认配置（`semantic.provider = "disabled"`）下：显式事件由规则表做粗粒度结算，模糊事件记为 `unresolved`，心理解释退化为确定性代码模板，记忆检索是词法重合，用户模型是在线贝叶斯。以上全部无需任何模型，且都有自动测试守着（`tests/test_acting_layer_independence.py` 会在 ingest 路径上直接拦断 `socket.connect`，证明这一轮不会拨出任何网络连接）。
 
@@ -65,9 +65,8 @@ runtime/
 │   ├── eventlog.py                append-only 原始事件日志（+ 可选 JSONL 镜像）
 │   ├── projections.py             当前投影读写（runtime_state / 记忆 / 候选 / outbox / event_semantics ...）
 │   ├── semantic.py                【v0.2】粗粒度语义结算：classify_event / 锚点表 / 歧义否决 / unresolved
-│   ├── providers.py               【v0.2】可选 SemanticProvider 端口与四种实现 + 深层刷新契约
+│   ├── providers.py               【v0.2】可选 SemanticProvider 端口与两种实现（disabled / remote_api）+ 深层刷新契约
 │   ├── deep_refresh.py            【v0.2】深层认知刷新：触发判定 / 请求组装 / 建议 grounding
-│   ├── local_llm.py               本地小模型客户端（Qwen 系微调 + llama.cpp 端点，**仅被 providers.py 使用**）
 │   ├── emotion.py                 事件评价 → 情绪动力学 → 心理解释（长期底色模板 + 缓存）
 │   ├── boundaries.py              边界状态机（语言检测、生命周期、硬约束裁决）
 │   ├── unfinished.py              未尽之事状态机（检测、生命周期、唤醒锚点）
@@ -89,7 +88,7 @@ runtime/
 │   └── cli.py                     命令行入口
 └── tests/                         单元 / 集成 / 耐久性测试
     ├── test_semantic.py                       【v0.2】锚点表、歧义否决、相关性、unresolved
-    ├── test_providers.py                      【v0.2】四种 provider、契约校验、降级、密钥卫生
+    ├── test_providers.py                      【v0.2】两种 provider、退役名字回落与告警、契约校验、降级、密钥卫生
     ├── test_deep_refresh.py                   【v0.2】触发优先级、grounding、刷新编排、历史不被重写
     ├── test_cognition_api.py                  【v0.2】/cognition/refresh 与 /cognition/backlog 契约
     ├── test_acting_layer_independence.py      【v0.2】ingest 路径不依赖任何生成式模型（结构性证明）
@@ -218,7 +217,7 @@ max_attempts = 3
 retry_backoff_seconds = 0   # 0 = nack 后立即可再领取（推荐；节流交给宿主重试队列）
 
 [semantic]                    # 【v0.2】两个时间尺度的策略（全部有默认值）
-provider = "disabled"         # disabled | local_cpu | local_gpu | remote_api
+provider = "disabled"         # disabled | remote_api
 settle_on_ingest = true       # 入口处跑粗粒度规则结算（纯规则，无模型）
 deep_refresh_enabled = true   # 允许低频深层认知刷新
 unresolved_backlog_threshold = 8
@@ -247,7 +246,7 @@ $env:CR_SEMANTIC__SETTLE_ON_INGEST = "true"
 
 | 字段 | 默认值 | 含义 | 生产消费者 |
 |---|---|---|---|
-| `provider` | `"disabled"` | 要构建的 provider。`disabled` 是标准设置 | `Runtime.__init__` → `build_provider()` |
+| `provider` | `"disabled"` | 要构建的 provider，只有两个合法值：`disabled`（标准设置）与 `remote_api`。已退役的本地名字会被显式警告并回落到 `disabled`（见 7.3） | `Runtime.__init__` → `build_provider()` |
 | `settle_on_ingest` | `true` | 入口路径上是否跑粗粒度规则结算 | `Runtime.process_user_message` |
 | `deep_refresh_enabled` | `true` | 是否允许低频深层刷新 | `Runtime.deep_refresh`（总开关，关掉就立刻返回 `disabled`） |
 | `unresolved_backlog_threshold` | `8` | 积压多少条 unresolved 才够触发一次刷新 | `deep_refresh.evaluate_triggers`（触发规则 `unresolved_backlog`） |
@@ -676,16 +675,28 @@ health() -> dict[str, Any]
 2. **Fail-open。** 不可用、超时、连不上、JSON 畸形 → 返回 `None` 或 `degraded=True` 的建议集，**从不抛异常**。
 3. **Secret-safe。** 远端 key 只从 `CR_SEMANTIC_API_KEY` 读取，永不落盘、永不进日志、永不出现在 `repr()` 或 `health()` 里（只报 `configured` / `not configured`）。key 只存在于一个闭包单元里，连 `vars()` 都取不到。
 
-### 7.2 四种实现
+### 7.2 两种实现
 
 | 实现 | `name` | 用途 | 备注 |
 |---|---|---|---|
 | `DisabledProvider` | `disabled` | **默认**。没有模型、没有网络、零延迟。`deep_refresh()` / `explain_state()` 都返回 `None`，调用方走确定性模板 | 这是完整的实现，不是一个错误路径 |
-| `LocalCPUProvider` | `local_cpu` | 已经跑着 `llama.cpp`（或任何 OpenAI 兼容端点）的部署**可选**接回本地强语义 | `local_llm.LocalModelClient` 的薄适配器：只读取和复用，不修改客户端。默认 `LocalModelConfig(enabled=True)` |
-| `LocalGPUProvider` | `local_gpu` | 权重跑在 GPU 上，但**线格式与契约完全相同** | 与 `LocalCPUProvider` 是同一份代码，只有上报的名字不同 —— 让 health 和日志一眼看出权重跑在哪 |
-| `RemoteAPIProvider` | `remote_api` | 任意 OpenAI 兼容远端 | key 只从 `CR_SEMANTIC_API_KEY` 读；`available()` 需要 base_url + model + key 三者齐全 |
+| `RemoteAPIProvider` | `remote_api` | 任意 OpenAI 兼容远端，用于可选的低频深层认知刷新 | key 只从 `CR_SEMANTIC_API_KEY` 读；`available()` 需要 base_url + model + key 三者齐全 |
 
-### 7.3 如何启用
+**没有第三种实现。** 本地推理那条路线连同它的两个可选实现一起被删除了，理由与实测数据见 `archive/README.md`。
+
+### 7.3 本地模型路线已放弃（退役名字会显式告警）
+
+本地生成式模型（含它的 CPU / GPU 两个可选 provider）**已经彻底不在本工程里**：
+
+- `local_llm.py` 与 `grammars/` 已删除；`training/` 已移入 `archive/local_model_training/`，本地模型相关脚本已移入 `archive/local_model/scripts/`。`KNOWN_PROVIDER_NAMES` 现在只有 `{"disabled", "remote_api"}`。
+- `RETIRED_PROVIDER_NAMES = {"local_cpu", "local_gpu", "local", "cpu", "gpu", "llama_cpp"}` 仍然被识别，但**只为了让 `build_provider()` 说清"它被移除了"**：遇到这些名字会打一条 WARNING（"the local model route was abandoned"）并返回 `DisabledProvider`。
+- `resolve_provider_name()` 对退役名字**原样返回**（不再折叠成 `disabled`），这样告警才有内容可讲；未识别的名字仍然安静地回落 `disabled`。
+- 原先捆绑的 GBNF 语法约束随本地路线一起删除：`_grammar_for()` 现在恒返回 `None`。这个钩子保留着，自建网关若需要约束解码可以子类化覆写它，`RemoteAPIProvider(grammar=...)` 也仍然接受显式字符串。
+- 环境变量 `CR_LOCAL_MODEL_ENABLED` / `CR_LOCAL_MODEL_BASE_URL` / `CR_LOCAL_MODEL_NAME` / `CR_LOCAL_MODEL_API_KEY` **已不被任何代码读取**，删掉即可。
+
+原因一句话：主 LLM 已经拥有即时理解能力，而实测数据（单次评价在 CPU 上要数秒、常驻约 2 GB）说明它连"低频可用"都算不上。完整的放弃理由、实测表格与退役清单见 `archive/README.md`。
+
+### 7.4 如何启用
 
 选择顺序（`resolve_provider_name()`）：
 
@@ -696,16 +707,8 @@ health() -> dict[str, Any]
 ```
 
 ```powershell
-# 默认：零模型
+# 默认：零模型，什么都不用配
 $env:CR_SEMANTIC_PROVIDER = "disabled"
-
-# 本地 llama.cpp（CPU）—— 需要先自己把端点跑起来
-$env:CR_SEMANTIC_PROVIDER   = "local_cpu"
-$env:CR_SEMANTIC_BASE_URL   = "http://127.0.0.1:8080/v1"
-$env:CR_SEMANTIC_MODEL      = "qboss-2b"
-
-# 本地 GPU
-$env:CR_SEMANTIC_PROVIDER = "local_gpu"
 
 # 远端强语义（key 只放环境变量，绝不写进 config 文件）
 $env:CR_SEMANTIC_PROVIDER = "remote_api"
@@ -714,28 +717,24 @@ $env:CR_SEMANTIC_MODEL    = "some-strong-model"
 $env:CR_SEMANTIC_API_KEY  = "<放在部署环境的密钥管理里，不要提交进仓库>"
 ```
 
-**未知或缺失的名字一律回落 `disabled` 并打一条 warning**：`build_provider()` 被设计为永不抛异常，因此"配置写错了"最坏的结果是"没有强语义"，而不是 Runtime 起不来。
+**未知或缺失的名字一律回落 `disabled` 并打一条 warning；已退役的本地名字（`local_cpu` / `local_gpu` / `local` / `cpu` / `gpu` / `llama_cpp`）回落时还会额外说明"本地路线已被移除"**：`build_provider()` 被设计为永不抛异常，因此"配置写错了"最坏的结果是"没有强语义"，而不是 Runtime 起不来。
 
-### 7.4 环境变量一览
+### 7.5 环境变量一览
 
 | 变量 | 作用 | 默认 / 生效范围 |
 |---|---|---|
-| `CR_SEMANTIC_PROVIDER` | 选择实现：`disabled` / `local_cpu` / `local_gpu` / `remote_api` | `disabled` |
-| `CR_SEMANTIC_BASE_URL` | 覆盖端点 base_url | `local_*` → `LocalModelConfig.base_url`（`http://127.0.0.1:8080/v1`）；`remote_api` → 空（必须显式给） |
-| `CR_SEMANTIC_MODEL` | 覆盖模型名 | `local_*` → `qboss-2b`；`remote_api` → 空（必须显式给） |
-| `CR_SEMANTIC_TIMEOUT_S` | 覆盖超时 | `local_*` → 覆盖 `explain_timeout_s`（默认 6.0 s）；`remote_api` → 覆盖 `timeout_s`（默认 30.0 s） |
-| `CR_SEMANTIC_MAX_TOKENS` | 补全上限 | **仅 `remote_api`**，默认 1024 |
-| `CR_SEMANTIC_API_KEY` | **仅 `remote_api`** 的 bearer token。只从环境读，不落盘、不入库、不进日志、不进 health | 无 |
-| `CR_LOCAL_MODEL_ENABLED` | 显式关掉已被选中的本地 provider | 当 `local_cpu` / `local_gpu` 被显式选中且此变量**未设置**时，视为 `enabled=True`；显式设成 `0/false` 可再关掉 |
-| `CR_LOCAL_MODEL_BASE_URL` | `LocalModelConfig.from_env()` 读取 | `http://127.0.0.1:8080/v1` |
-| `CR_LOCAL_MODEL_NAME` | 同上 | `qboss-2b` |
-| `CR_LOCAL_MODEL_API_KEY` | 同上（受保护的自建端点用） | 无 |
+| `CR_SEMANTIC_PROVIDER` | 选择实现：`disabled` / `remote_api` | `disabled` |
+| `CR_SEMANTIC_BASE_URL` | 覆盖端点 base_url | `remote_api` → 空（必须显式给；缺了就是 `available() == false`） |
+| `CR_SEMANTIC_MODEL` | 覆盖模型名 | `remote_api` → 空（必须显式给） |
+| `CR_SEMANTIC_TIMEOUT_S` | 覆盖单次调用的硬超时 | `remote_api` → 覆盖 `timeout_s`（默认 30.0 s），同时是 `deep_refresh` 的默认截止时间 |
+| `CR_SEMANTIC_MAX_TOKENS` | `remote_api` 的补全上限 | 默认 1024 |
+| `CR_SEMANTIC_API_KEY` | `remote_api` 的 bearer token。只从环境读，不落盘、不入库、不进日志、不进 health | 无（缺了则 `available() == false`） |
 
-本地 provider 复用的其余 `LocalModelConfig` 默认值：`appraise_timeout_s = 1.2`、`explain_timeout_s = 6.0`（同时作为 deep refresh 的超时）、`max_tokens = 256`、`temperature = 0.0`、`cache_ttl_s = 900`、`chat_template_kwargs = {"enable_thinking": false}`（微调模型屏蔽思考分支，否则 JSON 会掉进推理通道）。
+`disabled` 下这些变量**一个都不需要设置**：它不读端点、不读 key、不发请求。
 
 > **安全约定：不要写任何 API key 到 `runtime.toml`。** `RemoteAPIProvider` 会**故意忽略**配置对象里的 key —— Runtime 的配置是可序列化的、会被 `/config` 打印、会进日志，因此它永远不允许携带凭据。
 
-### 7.5 两种调用形态
+### 7.6 两种调用形态
 
 `EmotionExplainer` 通过 `getattr` 兼容两种 provider 接口，所以 v0.1 的 `explain(payload)` 端口和 v0.2 的 `explain_state(payload, state_key=...)` 都能接上：
 
@@ -747,7 +746,7 @@ $env:CR_SEMANTIC_API_KEY  = "<放在部署环境的密钥管理里，不要提�
 
 `state_key` 由 `EmotionExplainer.cache_key_from_payload(payload)` 生成（`v..|a..|i..|r..|p..`），provider 侧缓存 TTL 900 s、上限 128 条；`health()["stats"]` 会报告 `cache_hits` / `explain_ok` / `explain_degraded`。
 
-### 7.6 当前接线状态（诚实标注）
+### 7.7 当前接线状态（诚实标注）
 
 - ✅ **`explain_state()` 已接线**：`context.runtime_explanation()` 与 `POST /explain` 现在会通过 `context._optional_explanation_provider(runtime)` 把 provider 交给 `EmotionExplainer`。这个辅助函数只在该 provider **真的可用**（`available()` 为真且不抛异常）时才返回它 —— 因为 explainer 把"有 provider"理解为"先问它"，把一个挂着但连不上的 provider 交进去只会凭空多一次失败调用。默认 `DisabledProvider` 下它返回 `None`，心理解释照旧走模板。
 - ✅ **`deep_refresh()` 已接线**：`Runtime.deep_refresh()` 会在低频路径上调用 `self.semantic_provider.deep_refresh(request)`，整条链路（触发 → 组装 → provider → grounding → Reducer）已实现并有测试，见第 8 节。
@@ -918,10 +917,10 @@ Reducer 侧还有三条安全规则：
 
 ### 8.7 当前接线状态（诚实标注）
 
-- ✅ **已实现且已接线**：`SemanticProvider` 端口、`DeepRefreshRequest` / `DeepRefreshSuggestions` 契约、`parse_deep_refresh()` 校验、`DEEP_REFRESH_SYSTEM_PROMPT`、四种 provider 的 `deep_refresh()` 实现（含超时降级与统计）、触发判定（`evaluate_triggers`）、请求组装（`build_request`）、grounding（`ground_suggestions`）、编排（`Runtime.deep_refresh`）、落地端（`Reducer._apply_deep_refresh`）、HTTP 与 CLI 入口，以及 `tests/test_deep_refresh.py` 与 `tests/test_cognition_api.py`。
+- ✅ **已实现且已接线**：`SemanticProvider` 端口、`DeepRefreshRequest` / `DeepRefreshSuggestions` 契约、`parse_deep_refresh()` 校验、`DEEP_REFRESH_SYSTEM_PROMPT`、两种 provider 的 `deep_refresh()` 实现（含超时降级与统计）、触发判定（`evaluate_triggers`）、请求组装（`build_request`）、grounding（`ground_suggestions`）、编排（`Runtime.deep_refresh`）、落地端（`Reducer._apply_deep_refresh`）、HTTP 与 CLI 入口，以及 `tests/test_deep_refresh.py` 与 `tests/test_cognition_api.py`。
 - ⚠️ **没有内置自动调度**：`scheduler.py` 不引用深层刷新，也没有任何代码会自动调用 `Runtime.deep_refresh()`。触发**判定**是自动的，触发**调用**目前必须由宿主或运维发起（`POST /cognition/refresh` 或 `companion-runtime refresh`，例如放进宿主的每小时定时任务）。按补丁 §21 的字面要求，"何时触发"的条件表已经实现，但"由谁按定时器去问"这一环留给了宿主。
 - ⚠️ **`semantic.resolve_backlog()` 仍无生产调用方**：刷新路径直接用 `SemanticProjection.list_unresolved()`；`resolve_backlog()` 目前只有 `test_semantic.py` 覆盖，`unresolved_max_age_hours` 也只作为它的参数默认值存在 —— 也就是说"超过 72 小时的 unresolved 不再支撑刷新"这条策略**当前没有被刷新路径执行**。
-- ✅ **两个能力都已接线**：`deep_refresh()`（第 8 节）与 `explain_state()`（第 7.6 节）都有真实生产调用方。默认 `disabled` 时两者都安全地不做事。
+- ✅ **两个能力都已接线**：`deep_refresh()`（第 8 节）与 `explain_state()`（第 7.7 节）都有真实生产调用方。默认 `disabled` 时两者都安全地不做事。
 - ⚠️ **`template_fallback` / `interpretation_max_age_seconds` 无消费者**（见第 3.1 节）。
 
 ---
@@ -1040,7 +1039,7 @@ OpenAPI 文档：`http://127.0.0.1:8787/docs`、`/openapi.json`。
 - `semantics.unresolved` 增长是**正常运行**：模糊事件本来就该先挂着。
 - `by_relevance` 里的 `high` 是"以后更值得回头看一眼"的那些。
 - `semantic_provider.available = false` 配上 `provider = "disabled"` 是默认状态，不是故障。
-- 本地 provider 的 health 里还会多一个 `client` 子块（被包裹的 `LocalModelClient` 自己的快照）。
+- 只有 `remote_api` 会多出 `base_url`、`model`、`api_key`（只报 `configured` / `not configured`）、`stats`、`cache_entries` 这些字段；`disabled` 的快照只有 `provider` / `available` / `enabled` / `reason`。
 
 ### 9.2 宿主接入顺序（推荐）
 
@@ -1245,14 +1244,14 @@ python -m pytest -q -m integration      # 只跑端到端场景
 python -m pytest -q --cov=companion_runtime
 ```
 
-规模：本文撰写时实测 **约 500+ 项**（`python -m pytest -q` 收集 608 项，全部通过）。测试数量随模块演进持续增长（本文撰写过程中就从 559 涨到 608），请以你自己那次运行的输出为准，不要以本文数字为准。
+规模：实测 **603 项**（`python -m pytest -q` 收集 603 项，全部通过）。测试数量随模块演进持续增长（例如本地模型那一批测试随该路线一起被删除，`test_local_llm.py` 已不在 `tests/` 中），请以你自己那次运行的输出为准，不要以本文数字为准。
 
 覆盖范围：
 
 - **基础设施**：数学工具数值性质、配置三层覆盖与脱敏、SQLite 事务/保存点/JSON 列、事件日志 append-only 与过滤
 - **认知模块**：事件评价方向与不确定性、情绪衰减与心境恢复、解释器缓存与 provider 容错、边界检测（含假阳性防护）与生命周期、未尽之事全生命周期、记忆评分/巩固/冲突/去重/检索/激活、用户模型的特征/证据权重/冷启动/学习/漂移/双视图、候选生成与池管理器四种操作、沉默效用、效用分解、危险率（含频率无关性）、softmax 选择、I/R/P 动力学（惯性、饱和、释放）
 - **v0.2 语义结算**（`test_semantic.py`，53 项）：锚点表逐条方向与来源、歧义否决表逐条（含"每个否决标记都必须有负例"）、补丁点名例句必须 unresolved、填充词剥离、强锚点豁免、钝性拒绝 vs 含糊拒绝、强度带与置信度范围、`semantic_label` 恒为 `None`、锚点与否决标记不得冲突、`potential_relevance` 分档、`resolve_backlog` 的 live/stale 切分与排序
-- **v0.2 provider**（`test_providers.py`，73 项）：四种实现的选择与回落、未知名字回落 disabled、构造失败回落 disabled、六个建议字段的类型校验与部分畸形处理、`suggestions` 包装键、超时/连不上/畸形 JSON 全部 fail-open（`None` 或 `degraded`）、本地 client 复用、解释缓存与 `state_key` 契约、provider 统计、**密钥永不出现在 `repr`/`health`/错误信息里**
+- **v0.2 provider**（`test_providers.py`，65 项）：两种实现的选择与回落、退役的本地名字回落 `disabled` 并打 WARNING、未知名字回落 disabled、构造失败回落 disabled、六个建议字段的类型校验与部分畸形处理、`suggestions` 包装键、超时/连不上/畸形 JSON 全部 fail-open（`None` 或 `degraded`）、`extract_json` / `parse_explanation` 的本地实现、`_grammar_for()` 恒为 `None`、解释缓存与 `state_key` 契约、provider 统计、**密钥永不出现在 `repr`/`health`/错误信息里**
 - **v0.2 两层独立性**（`test_acting_layer_independence.py`，11 项）：见第 11 节右表
 - **v0.2 深层认知刷新**（`test_deep_refresh.py`，约 40 项）：八条触发规则各自的优先级与"最紧急者胜出"、阈值来自配置、最小间隔压过所有理由、优先级表与补丁顺序一致；grounding 的六种操作类型可达、编造的来源被拒、缺来源被拒、解释缓存豁免来源、畸形条目被记录而不崩溃、操作数被截断、未知字段被忽略；请求组装的九个段落齐备、**组装请求不写库**、`key_quotes` 来自真实事件；编排层的开关关闭/provider 不可用/无触发/超时抛异常/空建议/全部 grounding 失败/部分坏批次/`force` 只跳过触发不跳过可用性/outcome 可 JSON 序列化；以及"ingest 不触发刷新"与"积压对 health 可见"
 - **v0.2 认知 HTTP 契约**（`test_cognition_api.py`，9 项）：`POST /cognition/refresh` 与 `GET /cognition/backlog` 的响应形状与状态码
@@ -1313,7 +1312,7 @@ v0.2 之后这条边界多了一句更硬的表述：**主 LLM 就是即时演�
 
 ### 15.1 最小常驻集合
 
-移除本地 2B 之后，弱 VPS 上**只需要跑三件东西**：
+不再需要任何本地生成式模型之后，弱 VPS 上**只需要跑三件东西**：
 
 ```text
 1. Runtime sidecar（本工程：Python + fastapi/uvicorn + SQLite）
@@ -1323,60 +1322,28 @@ v0.2 之后这条边界多了一句更硬的表述：**主 LLM 就是即时演�
 可选：轻量词法检索（已内置）、可选轻量 embedding（未实现，见第 16 节）
 ```
 
-**不再需要**常驻：
+Runtime 进程内**没有任何本地推理组件、没有模型权重、没有推理队列** —— 这条路线已被整体放弃（见 7.3 与 `archive/README.md`）。这直接换来了"低成本、长期稳定、可维护"：Runtime 常驻内存以 Python 解释器 + SQLite 页缓存为主，磁盘只有数据库文件、WAL 和备份快照。
 
-```text
-❌ 1GB+ 生成模型权重
-❌ llama.cpp 推理进程
-❌ 本地模型 warmup
-❌ 推理任务队列
-❌ 2B 微调与量化版本维护
-❌ 为模型准备的 swap / 大页配置
-```
+### 15.2 需要更强语义时：用远端，不要在 VPS 上跑模型
 
-这直接换来了"低成本、长期稳定、可维护"：Runtime 常驻内存以 Python 解释器 + SQLite 页缓存为主，磁盘只有数据库文件、WAL 和备份快照。
-
-### 15.2 如果一定要跑本地模型：实测成本量级
-
-以下是实测的量级参考（约 2B 模型，`Q4_K_M` 量化）：
-
-| 配置 | 生成速度 | 备注 |
-|---|---|---|
-| 8 线程（8 个性能核） | **≈ 20 tok/s** | 满打满算的并行度 |
-| 单核 | **≈ 8.9 tok/s** | 只给一个核时的真实速度 |
-| 半核（约半数的核可用） | **≈ 3.7 tok/s** | 与宿主、数据库抢 CPU 时更接近这个数 |
-| 常驻内存 RSS | **≈ 2 GB** | 权重 + KV cache + 运行时 |
-
-补丁 §2 记录的同机型（i7-13700H，8 个性能核，Q4_K_M）更完整的一次评价开销：
-
-```text
-生成速度      ≈ 18 token/s
-单次评价输出  ≈ 67 token      ⇒ 纯生成 ≈ 3.7 s
-输入长度      ≈ 250～600 token，提示处理 ≈ 157 token/s ⇒ ≈ 1.6～3.8 s
-理论总耗时    ≈ 5.3～7.5 s
-实测 p50      ≈ 6.65 s
-```
-
-结论很直接：**光是把 250 token 的提示塞进去（≈ 1.59 s）就已经超过约 1.2 s 的同步前处理预算**，更不用说生成。
-
-### 15.3 因此：本地模型只能是低频异步能力
-
-如果确实需要本地强语义，请把它当成**低频异步能力**而不是实时组件：
+可选的低频强语义只有一条路：`CR_SEMANTIC_PROVIDER = "remote_api"`，把算力放到远端，VPS 上只留 Runtime（第 7 节）。要点：
 
 - ❌ 不要放进关键路径（`process_user_message` 里**不允许**出现模型调用；`test_no_outbound_socket_is_opened_during_ingest` 会直接拦断网络连接）
 - ✅ 只用于低频的深层刷新与心理解释缓存填充（第 7、8 节）
 - ✅ 保持 `semantic.settle_on_ingest = true`：入口处走纯规则结算，零延迟
-- ✅ 半核 3.7 tok/s 意味着一次刷新可能要跑几分钟 —— 这正是 `deep_refresh_min_interval_seconds = 3600`、`deep_refresh_idle_hours = 12` 这类旋钮存在的理由：这类工作**本来就该慢**
-- ✅ 如果本地跑不动，`RemoteAPIProvider` 是更省 VPS 的选择（把算力放到远端，VPS 只留 Runtime）
+- ✅ 深层刷新是低频任务，`deep_refresh_min_interval_seconds = 3600`、`deep_refresh_idle_hours = 12` 这类旋钮的存在就是为了让这类工作**本来就该慢**
+- ✅ 不配 provider（`disabled`）是完全受支持的标准形态，不是降级告警
 
-### 15.4 运维要点
+当初评估过的本地推理方案及其实测开销（生成速度、常驻内存、量化后仍无法上 1 GB VPS）已整体移入 `archive/README.md`，作为"为什么不做"的留档，本工程不再使用这些数据。
+
+### 15.3 运维要点
 
 | 事项 | 建议 |
 |---|---|
 | 数据库目录 | 放在持久化盘；`restore` 会拒绝覆盖运行中的库 |
 | WAL | 保持 `wal = true`，用 `serve --maintenance-interval 3600` 或 cron 定时 checkpoint |
 | 备份 | `backup --keep 7`，快照是自包含单文件，可直接拷走 |
-| 内存 | 零模型部署下 Runtime 内存以 SQLite 页缓存为主；本地模型会额外占 ≈ 2 GB RSS |
+| 内存 | Runtime 内存以 Python 解释器 + SQLite 页缓存为主，没有模型常驻开销 |
 | 启动 | `--host 127.0.0.1`（前面套反代），不要裸奔在公网 |
 | 密钥 | 只放环境变量（`CR_SEMANTIC_API_KEY` 等），**绝不写进 `runtime.toml`**；Runtime 从设计上就拒绝从配置文件读 key |
 | 观测 | `GET /health`（含 `semantics` 与 `semantic_provider`）、`GET /outbox`、`GET /maintenance/verify` 已够用；尚无 Prometheus 导出 |

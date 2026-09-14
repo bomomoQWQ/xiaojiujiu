@@ -87,8 +87,13 @@ class FakeTransport:
         self.heartbeat_error = heartbeat_error
         self.report_error = report_error
         #: Advisory health payload used by the status command. ``None`` means the
-        #: Runtime either predates patch v0.2 or is unreachable.
-        self.health = health
+        #: Runtime either predates patch v0.2 or is unreachable. The default
+        #: mirrors the real Runtime's field names so a stub can never hide a
+        #: protocol mismatch behind a differently-named key.
+        self.health = health if health is not None else {
+            "semantic_provider": {"provider": "disabled", "available": False},
+            "semantics": {"unresolved": 0},
+        }
         self.health_error = health_error
 
         self.event_bodies: list[dict[str, Any]] = []

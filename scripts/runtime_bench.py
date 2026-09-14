@@ -128,7 +128,6 @@ def main() -> int:
     if args.out:
         Path(args.out).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\ncpu budget check: {report['cpu_seconds']}s CPU for {args.rounds} full rounds", file=sys.stderr)
-    print(f"local model enabled: {os.environ.get('CR_LOCAL_MODEL_ENABLED', 'no')}", file=sys.stderr)
     return 0
 
 

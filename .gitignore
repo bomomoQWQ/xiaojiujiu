@@ -1,4 +1,4 @@
-﻿# Secrets
+# Secrets
 .env
 .env.*
 !.env.example
@@ -18,9 +18,17 @@ outputs/
 hf_cache/
 
 # Generated private data
+# The training project moved to archive/ when the local model route was dropped;
+# its generated corpora and checkpoints stay out of Git there too.
 training/data/generated/
 training/data/raw/
 training/runs/
+archive/local_model_training/data/generated/
+archive/local_model_training/data/raw/
+archive/local_model_training/runs/
+archive/local_model_training/**/checkpoint-*/
+archive/local_model_training/**/*.gguf
+archive/local_model_training/**/*.safetensors
 
 # Runtime state
 *.db
