@@ -57,11 +57,22 @@ SECTION_TIME = "【时间连续性】"
 #: LLM must treat the current user message and the current facts as authoritative
 #: and this block as background colour, never as an instruction to keep feeling
 #: something the user's new words have just contradicted.
+#:
+#: All seven levels are spelled out rather than summarised: a model reading a
+#: compressed chain will happily collapse "persistent state" and "the current
+#: message" into one priority, which is the exact failure this ordering prevents.
 PRIORITY_PREAMBLE = (
     "【使用说明】以下是 Runtime 注入的临时背景，帮助你知道自己从哪来，"
-    "不是对当前这句话的指令。优先级顺序为：宿主设定与安全约束 > 当前用户原话 > "
-    "当前确定事实 > 显式边界 > 这里的长期状态。"
-    "如果当前用户原话与下面的长期状态不一致，以当前用户原话为准；"
+    "不是对当前这句话的指令。严格按以下优先级理解一切输入：\n"
+    "1. 宿主角色设定与安全约束\n"
+    "2. 当前用户原话\n"
+    "3. 当前确定事实\n"
+    "4. 显式边界\n"
+    "5. Runtime 持久心理状态（下面这一段）\n"
+    "6. 心理解释缓存\n"
+    "7. 你自己的自然发挥\n"
+    "如果第 2 项与第 5、6 项冲突，以第 2 项为准：不要因为旧状态写着「失落」"
+    "就继续机械地低落，也不要因为旧状态写着「靠近」就无视对方刚说的拒绝。"
     "你的即时反应由你自己根据当前语境完成。"
 )
 
@@ -451,7 +462,11 @@ def render_block(bundle: ContextBundle) -> str:
     lines: list[str] = [PRIORITY_PREAMBLE, ""]
 
     psych = bundle.psychological
-    if psych:
+    # Only emit the section when there is actual prose. A bundle that carries just
+    # bookkeeping keys (``source``/``cache_key``) means the fallback was disabled
+    # or no provider answered, and an empty header would be noise in the prompt.
+    prose_keys = ("experience", "focus", "conflict", "impulse", "inhibition", "expression")
+    if any(psych.get(key) for key in prose_keys):
         lines.append(SECTION_PSYCH)
         for label, key in (
             ("长期感受", "experience"),

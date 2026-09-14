@@ -379,6 +379,12 @@ def build_request(
     projections = runtime.projections
 
     unresolved = projections.semantics.list_unresolved(limit=limit)
+    # Ageing policy from ``semantic.unresolved_max_age_hours``: an event that has
+    # sat unresolved for days stops justifying a refresh spend, but it is never
+    # deleted - it stays in the append-only log and the backlog, exactly as patch
+    # section 25 requires ("不理解可以延迟，但原始事件必须保留").
+    max_age = float(getattr(runtime.config.semantic, "unresolved_max_age_hours", 72.0))
+    unresolved = [item for item in unresolved if _age_hours(item, stamp) <= max_age]
     conversations: dict[str, Any] = {
         item.get("event_id"): item for item in unresolved if item.get("event_id")
     }
@@ -428,6 +434,33 @@ def build_request(
         candidates=[item.to_dict() for item in projections.candidates.list_active(limit=8)],
         key_quotes=key_quotes,
     )
+
+
+def _age_hours(item: Mapping[str, Any], now: datetime) -> float:
+    """Return how long ago an unresolved record was created.
+
+    Args:
+        item: A row from ``SemanticProjection.list_unresolved``.
+        now: Reference time.
+
+    Returns:
+        Age in hours; unparseable or missing timestamps count as fresh, so a
+        record is never dropped from the refresh set because of a bad field.
+    """
+    from .utility import parse_datetime
+
+    raw = item.get("created_at")
+    if not raw:
+        return 0.0
+    try:
+        created = parse_datetime(raw)
+    except (ValueError, TypeError):
+        # A malformed timestamp must never hide evidence from the refresh; treat
+        # it as fresh and let the caller's ordering deal with it.
+        return 0.0
+    if created is None:
+        return 0.0
+    return max(0.0, (now - created).total_seconds() / 3600.0)
 
 
 def _utcnow() -> datetime:

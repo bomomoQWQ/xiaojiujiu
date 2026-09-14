@@ -77,18 +77,22 @@
 
 以下每一条都经过源码核对：**没有任何生产代码路径会执行它**（只有定义、配置、注释或测试）。
 
-| # | 未实现的东西 | 证据 | 影响 |
-|---|---|---|---|
-| 1 | **深层刷新没有内置自动调度**：没有任何代码会自动调用 `Runtime.deep_refresh()` | 全部调用点只有两处：`api.py` 的 `POST /cognition/refresh` 与 `cli.py` 的 `refresh` 命令；`scheduler.py` 对 `deep_refresh` / `refresh` **零命中** | 触发**判定**是自动的，触发**调用**不是。宿主必须自己按节奏调用，否则 unresolved 会一直积压（积压本身无害，只是"后来想明白"不会自己发生） |
-| 2 | **`semantic.resolve_backlog()` 无生产调用方** | 全仓库引用只有 `semantic.py` 的定义与 `tests/test_semantic.py`；刷新路径用的是 `SemanticProjection.list_unresolved()` | `unresolved_max_age_hours`（"太老就不再支撑刷新"）这条策略**没有被执行**；老事件会一直留在刷新候选里（原始事件本来就必须保留，所以这不是数据问题，是费用/优先级问题） |
-| 3 | **`SemanticConfig.template_fallback` 无消费者** | `grep` 该名字，除 `config.py` 的定义与 docstring 外无命中 | 模板兜底当前无条件生效，关不掉 |
-| 4 | **`SemanticConfig.interpretation_max_age_seconds` 无消费者** | 同上 | "一份心理解释多久算 stale"实际由 `task.explain_cache_ttl_seconds`（1800 s）决定 |
-| 5 | **`explain_state()` 未接线**：`context.py::runtime_explanation()` 与 `api.py::POST /explain` 都用 `EmotionExplainer(runtime.projections.emotion, ...)` 构造，未传 provider | 直接读两处构造调用；`Runtime.__init__` 里构造出的 `runtime.semantic_provider` 只被 `/health` 读取 | 即使配了远端或本地 provider，心理解释也**不会**走模型；总是模板/缓存。provider 的 `explain_state` 路径只有单测覆盖 |
-| 5 | **六类触发信号依赖调用方提供**：`major_event` / `matter_due` / `candidate_pool_size` / `wants_proactive` + `proactive_grounded` / `history_suspect` / `user_evidence_overturns` | `evaluate_triggers` 的签名全部是入参；`Runtime.deep_refresh` 只从 `trigger_context` 透传；`api.py` 只透传请求体里出现过的键 | 没人给这些信号时它们一律按"不成立"处理（不会被猜成成立）。Runtime 自己能算的只有 unresolved 数量与"距上次刷新的时长" |
-| 6 | **优先级未逐级进入 prompt**：补丁 §7 的 7 级链在 `PRIORITY_PREAMBLE` 里被压成 5 级 | `context.py::PRIORITY_PREAMBLE` 的字符串内容 | "Runtime 持久心理状态 > 心理解释缓存 > 主 LLM 自然发挥"这三级的相对顺序没有被显式声明 |
-| 7 | **embedding 检索仍是词法降级** | `memory.py::MemoryStore.retrieve()` 是词面重合 + 结构化加权；接口是留给 embedding sidecar 的接缝 | 补丁 §29 提到的"可选轻量 embedding"不存在；语义相近但用词不同的记忆检索不到 |
-| 8 | **无常驻巩固 worker** | 巩固由调用方驱动（`memory.consolidate()`），没有后台线程 | 与 v0.2 无关的既有边界，此处一并记录 |
-| 9 | **无 Prometheus 指标导出** | 只有 `/health`、`/maintenance/verify`、`/outbox`、`/cognition/backlog` 的结构化输出 | 运维需要自己抓 HTTP |
+> **本节已于修复后复核。** 初版审计列出的 9 条中，第 1、2、3、4、5 条**已经修好并加了回归测试**
+> （`tests/test_refresh_scheduling.py`、`tests/test_semantic_config_knobs.py`），
+> 下表保留原条目并标注现状，而不是把它们删掉——"曾经声明了却没接线"这件事本身值得留档。
+
+| # | 条目 | 现状 |
+|---|---|---|
+| 1 | **深层刷新没有内置自动调度** | **已修复。** `Runtime.endogenous_round()` 现在会先跑一次 `deep_refresh`（可经 `deep_refresh=False` 关闭），逐轮上报 `EndogenousOutcome.deep_refresh`；刷新失败只记录、绝不打断主动决策。回归测试：`TestRefreshRunsUnattended` |
+| 2 | **`semantic.resolve_backlog()` 无生产调用方** | **已修复（换了更合适的位置）。** `deep_refresh.build_request()` 现在按 `unresolved_max_age_hours` 过滤刷新候选；`resolve_backlog()` 仍无调用方，但它的策略已经生效。测试：`TestUnresolvedMaxAge` |
+| 3 | **`SemanticConfig.template_fallback` 无消费者** | **已修复。** `EmotionExplainer._render()` 在关闭兜底且无可用 provider 时返回空，`context.render_block()` 只有在真有正文时才输出该段。测试：`TestTemplateFallback` |
+| 4 | **`SemanticConfig.interpretation_max_age_seconds` 无消费者** | **已修复。** `EmotionExplainer._explanation_ttl_seconds()` 优先生效该值，未设时回落 `task.explain_cache_ttl_seconds`。测试：`TestInterpretationMaxAge` |
+| 5 | **`explain_state()` 未接线** | **已修复。** `context.runtime_explanation()` 与 `POST /explain` 都经 `_optional_explanation_provider()` 传入 provider；不可用的 provider 不会被传（避免在上下文路径上白跑一次）。测试：`TestExplainerUsesTheProvider` |
+| 5b | **六类触发信号依赖调用方提供** | **部分修复。** `candidate_pool_size` / `matter_due` / `hours_since_last_refresh` 现在由 `Runtime._refresh_signals()` 自行计算；`major_event` / `history_suspect` / `user_evidence_overturns` 仍须调用方给出——这三项 Runtime 无法自行判断，因此默认按"不成立"处理，而不是猜成成立 |
+| 6 | **优先级未逐级进入 prompt** | **已修复。** `PRIORITY_PREAMBLE` 现在逐条列出补丁 §7 的 7 级链，并写明"第 2 项与第 5、6 项冲突时以第 2 项为准"。测试：`TestPriorityPreambleIsComplete` |
+| 7 | **embedding 检索仍是词法降级** | **未实现（有意）。** `memory.py::MemoryStore.retrieve()` 是词面重合 + 结构化加权，接口是留给 embedding sidecar 的接缝。补丁 §29 提到的"可选轻量 embedding"不存在；语义相近但用词不同的记忆检索不到。这是记录在案的降级，不是缺陷 |
+| 8 | **无常驻巩固 worker** | **未实现（既有边界，与 v0.2 无关）。** 巩固由调用方驱动（`memory.consolidate()`），没有后台线程 |
+| 9 | **无 Prometheus 指标导出** | **未实现（既有边界）。** 只有 `/health`、`/maintenance/verify`、`/outbox`、`/cognition/backlog` 的结构化输出，运维需自己抓 HTTP |
 
 ---
 
@@ -96,10 +100,10 @@
 
 | 补丁章节 | 差在哪 |
 |---|---|
-| §7 / §7.1 | preamble 只声明到"显式边界 > 长期状态"，未逐级区分"持久心理状态 / 解释缓存 / 主 LLM 自然发挥" |
+| §7 / §7.1 | 已补齐 7 级链；§7.1 的示例行为仍只能靠 prompt 约定，没有可断言的代码路径（Runtime 只提供背景，无法强制主 LLM 怎么做） |
 | §10.1 | 输出字段名与补丁 JSON 示例不完全一致（`intensity` band 名 vs `impact`），语义等价 |
-| §15 | 缓存与写入都在位；stale 判据用 TTL 近似，补丁要求的"心境/活跃事件/重大重估"三类事件驱动未被消费（未实现 #4） |
-| §21 | 八条触发规则 + 最小间隔否决都实现了，但**没有调度器**去自动调用它（未实现 #1）；六类信号要由调用方给（未实现 #5） |
+| §15 | 缓存、事件驱动失效（cache key 由当前心境与最高强度算出）、TTL 兜底三者齐备；补丁列举的"重大重估事件"单独作为失效信号尚未实现——重估会改变心境与活跃事件，因此通过 cache key 间接失效 |
+| §21 | 八条规则 + 最小间隔否决齐全，且已由心跳自动调用；"空候选池"与"空闲"两条额外要求**存在待刷新素材**才会成立，避免全新 Runtime 反复空跑 |
 | §12 / §13 / §31 | 主链路已通（含自动重解释与积压结算）；唯一保留条件是"需要有人发起一次刷新"，且 `resolve_backlog` 未被使用 |
 
 ---

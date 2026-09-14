@@ -493,17 +493,51 @@ class EmotionExplainer:
         key = self.cache_key(state, active)
         if not force:
             cached = self._projection.cached_explanation(
-                key, now, self._config.task.explain_cache_ttl_seconds
+                key, now, self._explanation_ttl_seconds()
             )
             if cached is not None:
                 return dict(cached) | {"cache_hit": True, "cache_key": key}
 
         payload = self._build_input(state, active)
         result = self._render(payload, rng or random.Random(0))
-        result["source"] = "semantic" if self._provider is not None else "template"
+        result["source"] = "semantic" if self._semantic_available() else "template"
         result["cache_hit"] = False
         result["cache_key"] = key
         return result
+
+    def _explanation_ttl_seconds(self) -> float:
+        """Return how long a cached interpretation stays valid.
+
+        Patch v0.2 section 15 states the real staleness rule as *event driven*
+        (the mood moved, the dominant active event changed, a major reappraisal
+        landed). The cache key already encodes the first two - it is recomputed
+        from the current mood and top intensity on every turn - so the key
+        changing is what invalidates the entry. This TTL is only the backstop for
+        a state that somehow stops moving.
+        """
+        configured = getattr(
+            getattr(self._config, "semantic", None), "interpretation_max_age_seconds", None
+        )
+        if configured:
+            return float(configured)
+        return float(self._config.task.explain_cache_ttl_seconds)
+
+    def _semantic_available(self) -> bool:
+        """Return whether a provider is present and can actually answer.
+
+        ``semantic.template_fallback = false`` is honoured here: with no usable
+        provider and the fallback disabled, the explainer returns nothing and the
+        caller omits the psychological section instead of inventing prose.
+        """
+        if self._provider is None:
+            return False
+        checker = getattr(self._provider, "available", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:  # noqa: BLE001 - an unavailable provider is absent
+                return False
+        return True
 
     def explain_and_store(
         self,
@@ -565,7 +599,7 @@ class EmotionExplainer:
         A provider is a *cache filler*, never a requirement: patch v0.2 keeps the
         deep interpretation optional and falls back to the deterministic template.
         """
-        if self._provider is not None:
+        if self._provider is not None and self._semantic_available():
             try:
                 provided = self._call_provider(payload)
                 required = {"experience", "impulse", "inhibition"}
@@ -581,6 +615,11 @@ class EmotionExplainer:
                 LOGGER.info("Semantic provider returned no usable payload; using templates")
             except Exception:  # pragma: no cover - defensive boundary around a model
                 LOGGER.exception("Semantic provider failed; falling back to templates")
+
+        if not getattr(getattr(self._config, "semantic", None), "template_fallback", True):
+            # The operator turned the deterministic fallback off, which means they
+            # prefer no psychological section over a generic one.
+            return {}
 
         return self._render_template(payload, rng)
 
