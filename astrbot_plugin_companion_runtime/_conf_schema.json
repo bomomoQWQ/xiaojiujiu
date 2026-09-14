@@ -9,7 +9,7 @@
     "description": "Runtime 基础地址",
     "type": "string",
     "default": "http://127.0.0.1:8720",
-    "hint": "Runtime HTTP API 根地址，必须包含 http:// 或 https://，不要以 / 结尾。"
+    "hint": "Runtime HTTP API 根地址，必须包含 http:// 或 https://，不要以 / 结尾。v0.2 起可在此地址上直接查询 GET /health，查看 semantic_provider（disabled 是标准配置）与 semantics.unresolved（未解释事件数属正常状态）；本插件不调用该端点。"
   },
   "runtime_token": {
     "description": "Runtime 访问令牌（可选）",
@@ -73,13 +73,13 @@
     "description": "启用上下文注入",
     "type": "bool",
     "default": true,
-    "hint": "把 Runtime 当前上下文以临时 TextPart 注入本轮请求；关闭后只上报、不注入。"
+    "hint": "把 Runtime 当前上下文以临时 TextPart 注入本轮请求；关闭后只上报、不注入。注入内容是「角色进入本轮之前的长期状态（背景）」，不是本轮该有的情绪；优先级由 Runtime 在文本内声明，插件原样透传，不改写、不排序。"
   },
   "inject_max_chars": {
     "description": "注入文本长度上限",
     "type": "int",
     "default": 2000,
-    "hint": "超出部分截断。0 表示不限制（不建议）。"
+    "hint": "超出部分截断（截断是插件对注入文本唯一的加工）。0 表示不限制（不建议）。"
   },
   "outbox_enabled": {
     "description": "启用 outbox 消费",

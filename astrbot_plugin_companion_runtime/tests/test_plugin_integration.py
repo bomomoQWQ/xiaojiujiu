@@ -300,7 +300,10 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_context_is_injected_as_a_temporary_part(self) -> None:
         await self._plugin()
         transport = StubRuntimeTransport.instances[-1]
-        transport.snapshot = ContextSnapshot(text="【当前心理状态】\n克制，想联系", version="9")
+        # Patch v0.2: the injected block is the character's long-term state
+        # before the turn (background), never an instruction for this turn.
+        section = "【进入本轮前的长期状态（背景）】"
+        transport.snapshot = ContextSnapshot(text=f"{section}\n克制，想联系", version="9")
 
         from astrbot.api.provider import ProviderRequest
 
@@ -311,7 +314,7 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         part = request.extra_user_content_parts[0]
         self.assertTrue(part._no_save, "hidden context must never be persisted")
         self.assertTrue(part.text.startswith("<companion_runtime_context"))
-        self.assertIn("【当前心理状态】", part.text)
+        self.assertIn(section, part.text)
         self.assertIn('version="9"', part.text)
 
     async def test_injection_times_out_without_touching_the_request(self) -> None:
@@ -430,10 +433,40 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_status_text_reports_counters_without_the_token(self) -> None:
         plugin = await self._plugin(runtime_token="top-secret-token")
-        text = plugin._status_text()
+        text = await plugin._status_text()
         self.assertIn("adapter_id: test-adapter", text)
         self.assertIn("token: configured", text)
         self.assertNotIn("top-secret-token", text)
+
+    async def test_status_text_reports_the_cognition_levels(self) -> None:
+        """Patch v0.2: the report says which level is live and how much is deferred."""
+        plugin = await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+        transport.health = {
+            "semantic_provider": {"name": "disabled", "available": False},
+            "semantics": {"unresolved": 7, "by_status": {"unresolved": 7}},
+        }
+        text = await plugin._status_text()
+        self.assertIn("semantic_provider: disabled (available=False)", text)
+        self.assertIn("7 unresolved", text)
+        # Deferral is normal operation, and the wording must not read as a fault.
+        self.assertIn("normal", text)
+
+    async def test_status_stays_usable_when_the_runtime_is_down(self) -> None:
+        """The probe is advisory: no /health must never break the command."""
+        plugin = await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+        transport.health = None
+        text = await plugin._status_text()
+        self.assertIn("cognition: unavailable", text)
+        self.assertIn("adapter_id: test-adapter", text)
+
+    async def test_status_survives_a_raising_health_probe(self) -> None:
+        plugin = await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+        transport.health_error = RuntimeError("boom")
+        text = await plugin._status_text()
+        self.assertIn("cognition: unavailable", text)
 
     async def test_status_command_returns_a_plain_result(self) -> None:
         await self._plugin()

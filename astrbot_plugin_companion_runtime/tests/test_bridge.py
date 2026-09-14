@@ -41,8 +41,12 @@ class ContextBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_wraps_runtime_text_in_a_labelled_block(self) -> None:
+        # Patch v0.2 renamed the psychological section: the injected text now
+        # states the character's long-term state *before* the turn (background),
+        # not how the current message should feel.
+        section = "【进入本轮前的长期状态（背景）】"
         transport = FakeTransport(
-            snapshot=ContextSnapshot(text="【当前心理状态】\n平静", version="7"),
+            snapshot=ContextSnapshot(text=f"{section}\n平静", version="7"),
         )
         bridge = self._bridge(transport)
         text = await bridge.text_for_llm_request(_request())
@@ -50,7 +54,7 @@ class ContextBridgeTests(unittest.IsolatedAsyncioTestCase):
         assert text is not None
         self.assertIn(f"<{CONTEXT_TAG} version=\"7\">", text)
         self.assertTrue(text.endswith(f"</{CONTEXT_TAG}>"))
-        self.assertIn("【当前心理状态】", text)
+        self.assertIn(section, text)
         self.assertEqual(transport.context_calls, 1)
 
     async def test_second_request_is_served_from_cache(self) -> None:

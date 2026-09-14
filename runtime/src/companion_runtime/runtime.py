@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import random
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -35,6 +36,7 @@ from . import emotion as emotion_module
 from . import memory as memory_module
 from . import motivation as motivation_module
 from . import pool as pool_module
+from . import protocol as protocol_module
 from . import unfinished as unfinished_module
 from .config import RuntimeConfig, StorageConfig
 from .db import Database
@@ -55,6 +57,7 @@ from .typing import (
     RawEvent,
     ReconcileAction,
     RuntimeState,
+    TaskKind,
     UnfinishedStatus,
     new_id,
 )
@@ -143,6 +146,43 @@ class MessageOutcome:
             "semantic_status": self.semantic_status,
             "potential_relevance": self.potential_relevance,
             "narrative": self.narrative,
+        }
+
+
+@dataclass(slots=True)
+class DeepRefreshOutcome:
+    """Result of one low-frequency deep cognition refresh (patch v0.2 §18-§21).
+
+    The refresh is allowed to be skipped for many reasons, and every one of them
+    is reported rather than hidden: an operator must be able to tell "nothing
+    needed doing" apart from "the provider was down" apart from "a model answered
+    but everything it said failed grounding".
+    """
+
+    ran: bool = False
+    reason: str = "not_attempted"
+    trigger: dict[str, Any] = field(default_factory=dict)
+    provider: str = ""
+    degraded: bool = True
+    operations: int = 0
+    applied: dict[str, int] = field(default_factory=dict)
+    violations: list[dict[str, Any]] = field(default_factory=list)
+    settled_events: int = 0
+    latency_ms: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable rendering."""
+        return {
+            "ran": self.ran,
+            "reason": self.reason,
+            "trigger": dict(self.trigger),
+            "provider": self.provider,
+            "degraded": self.degraded,
+            "operations": self.operations,
+            "applied": dict(self.applied),
+            "violations": [dict(item) for item in self.violations],
+            "settled_events": self.settled_events,
+            "latency_ms": self.latency_ms,
         }
 
 
@@ -927,6 +967,175 @@ class Runtime:
         )
         self.projections.runtime.write(state, conn, expect_version=state.version)
         return attempt.attempt_id, item.outbox_id
+
+    # ------------------------------------------------------ deep cognition path
+
+    def deep_refresh(
+        self,
+        *,
+        now: datetime | None = None,
+        force: bool = False,
+        trigger_context: dict[str, Any] | None = None,
+    ) -> DeepRefreshOutcome:
+        """Run one low-frequency deep cognition refresh (patch v0.2 §18-§21).
+
+        This is the *only* place a semantic provider may influence state, and it
+        is deliberately slow, optional and off the ingest path. The pipeline is:
+
+        ``evaluate triggers`` -> ``build request`` -> ``provider`` ->
+        ``grounding`` -> ``one proposal`` -> ``Reducer`` (APPLY / REBASE / DISCARD).
+
+        Every stage can decline. Nothing here raises: a refresh is an attempt to
+        understand old events better, and failing to improve is not an error.
+
+        Args:
+            now: Reference time; defaults to the wall clock.
+            force: Skip the trigger check (diagnostics and tests).
+            trigger_context: Extra trigger signals, e.g. ``matter_due``.
+
+        Returns:
+            A :class:`DeepRefreshOutcome` describing what happened and why.
+        """
+        stamp = ensure_aware(now) or utcnow()
+        config = self.config.semantic
+        outcome = DeepRefreshOutcome()
+
+        if not config.deep_refresh_enabled:
+            outcome.reason = "disabled"
+            return outcome
+        if not self.semantic_provider.available():
+            outcome.reason = "provider_unavailable"
+            outcome.provider = self.semantic_provider.name
+            return outcome
+
+        from .deep_refresh import build_request, evaluate_triggers, ground_suggestions
+
+        signals = dict(trigger_context or {})
+        unresolved = self.projections.semantics.list_unresolved(limit=200)
+        trigger = evaluate_triggers(
+            unresolved_count=len(unresolved),
+            hours_since_last_refresh=signals.get("hours_since_last_refresh", 0.0),
+            config=config,
+            **{
+                key: value
+                for key, value in signals.items()
+                if key != "hours_since_last_refresh"
+            },
+        )
+        outcome.trigger = trigger.to_dict()
+        if not trigger.should_refresh and not force:
+            outcome.reason = trigger.reason
+            return outcome
+
+        request = build_request(runtime=self, now=stamp, limit=config.max_operations_per_refresh)
+        started = time.monotonic()
+        try:
+            suggestions = self.semantic_provider.deep_refresh(request)
+        except Exception:  # noqa: BLE001 - a provider fault is never fatal
+            LOGGER.exception("Deep refresh provider raised; treating as unavailable")
+            outcome.reason = "provider_error"
+            return outcome
+        outcome.provider = getattr(suggestions, "provider", "") or self.semantic_provider.name
+        outcome.latency_ms = int((time.monotonic() - started) * 1000)
+
+        if suggestions is None:
+            outcome.reason = "no_suggestions"
+            return outcome
+        outcome.degraded = bool(getattr(suggestions, "degraded", True))
+        if suggestions.is_empty():
+            outcome.reason = "empty_suggestions"
+            return outcome
+
+        operations, violations = ground_suggestions(
+            suggestions,
+            resolvable=self._is_resolvable,
+            max_candidate_operations=config.max_operations_per_refresh,
+        )
+        outcome.violations = list(violations)
+        outcome.operations = len(operations)
+        if not operations:
+            outcome.reason = "all_suggestions_ungrounded"
+            return outcome
+
+        payload = {
+            "operations": [operation.to_dict() for operation in operations],
+        }
+        interpretation = dict(getattr(suggestions, "psychological_interpretation", {}) or {})
+        if interpretation:
+            # The cached interpretation is carried inside the same proposal so it
+            # passes the same protocol gate as every other suggested change.
+            payload["operations"].append(
+                {
+                    "kind": "psychological_interpretation",
+                    "payload": interpretation,
+                    "sources": [],
+                }
+            )
+
+        source_event_ids = [
+            item["event_id"] for item in unresolved if item.get("event_id")
+        ][: config.max_operations_per_refresh]
+        with self.write_session():
+            state = self.projections.runtime.ensure(stamp)
+            proposal = protocol_module.Proposal(
+                task_id=f"deep_refresh_{new_id('task').split('_')[-1]}",
+                task_type=TaskKind.DEEP_REFRESH.value,
+                based_on_version=state.version,
+                source_event_ids=source_event_ids,
+                payload=payload,
+                created_at=stamp,
+            )
+            result = self.reducer.process_proposal(proposal)
+
+        outcome.ran = True
+        outcome.reason = "applied" if result.applied else result.action
+        outcome.applied = {
+            str(note).split("=")[0].removeprefix("deep_refresh_"): 0
+            for note in result.notes
+            if str(note).startswith("deep_refresh_applied")
+        }
+        for note in result.notes:
+            text = str(note)
+            if text.startswith("settled_events="):
+                outcome.settled_events = int(text.split("=", 1)[1])
+        return outcome
+
+    def _is_resolvable(self, identifier: str) -> bool:
+        """Return whether a grounding identifier names something that exists.
+
+        Grounding is what stops a model from inventing a memory about an event
+        that never happened. Any identifier the Runtime cannot resolve makes the
+        operation carrying it be discarded before it can touch state.
+
+        Args:
+            identifier: An event, memory, unfinished-matter, emotion or candidate id.
+
+        Returns:
+            ``True`` when the identifier resolves to a stored entity.
+        """
+        if not identifier or not isinstance(identifier, str):
+            return False
+        prefix = identifier.split("_", 1)[0]
+        try:
+            if prefix == "evt":
+                return self.events.get(identifier) is not None
+            if prefix == "mem":
+                return self.projections.memory.get_memory(identifier) is not None
+            if prefix == "cnd":
+                return self.projections.candidates.get(identifier) is not None
+        except Exception:  # noqa: BLE001 - a lookup failure is simply "not resolvable"
+            return False
+        # Unfinished matters and emotion events use generated ids that the
+        # projections expose through list calls rather than point lookups.
+        try:
+            if any(item.unfinished_id == identifier for item in self.projections.unfinished.list_all()):
+                return True
+            return any(
+                event.emotion_event_id == identifier
+                for event in self.projections.emotion.list_active()
+            )
+        except Exception:  # noqa: BLE001
+            return False
 
     # ------------------------------------------------------------ feedback path
 

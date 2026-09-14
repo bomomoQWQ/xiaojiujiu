@@ -20,21 +20,54 @@
 
 ---
 
+## 0. v0.2：即时演出层与持久认知层分离
+
+架构补丁 v0.2（`PATCH_v0.2_即时演出与持久认知分离_移除本地2B核心依赖.md`）把 Runtime 明确拆成两个**时间尺度**，而不是两个模型：
+
+```text
+【即时演出层】 当前用户原话 + 对话上下文 + 宿主人格 + 已有 Runtime 状态
+             → 宿主主 LLM → 本轮即时反应
+
+【持久认知层】 本轮交互沉淀
+             → 记忆 / 情绪余波 / 用户模型 / 未尽之事 / 候选意图 / 后验重解释
+             → 影响未来轮次（跨小时、跨天）
+```
+
+两条结论直接改变了部署形态：
+
+1. **当前这一轮的即时理解与情感表现，本来就应该由主 LLM 完成。** 主 LLM 在当前轮已经能看到宿主设定、上下文、用户原话和 Runtime 状态，不需要 Runtime 先同步调用一个 2B 模型把"这句话是失落 0.46"算出来再喂给它。那条路径既昂贵，又重复了主 LLM 已有的能力。
+2. **本地 2B 生成式模型不再是标准依赖。** 它已从标准架构移除，只作为可选 `SemanticProvider` 的一种实现保留（见第 7 节）。弱 VPS 上不再需要常驻权重、不再需要 llama.cpp 进程、不再需要推理队列。
+
+> **Runtime 不依赖任何生成式模型也能完整运行。** 默认配置（`semantic.provider = "disabled"`）下：显式事件由规则表做粗粒度结算，模糊事件记为 `unresolved`，心理解释退化为确定性代码模板，记忆检索是词法重合，用户模型是在线贝叶斯。以上全部无需任何模型，且都有自动测试守着（`tests/test_acting_layer_independence.py` 会在 ingest 路径上直接拦断 `socket.connect`，证明这一轮不会拨出任何网络连接）。
+
+主 LLM 与 Runtime 的分工一句话：
+
+> **主 LLM 管"现在这一刻怎么活"；Runtime 管"活过以后留下什么"。**
+
+章节映射（补丁 §0–§33 → 代码 → 测试 → 状态）另见 `docs/PATCH_V0.2_MAPPING.md`，其中"未实现"条目被逐条诚实标注。
+
+---
+
 ## 1. 目录结构
 
 ```text
 runtime/
 ├── pyproject.toml                 打包与 pytest 配置（src 布局）
 ├── README.md                      本文件
+├── docs/
+│   └── PATCH_V0.2_MAPPING.md      补丁 v0.2 章节 → 代码/测试/状态 映射表
 ├── src/companion_runtime/
 │   ├── __init__.py                版本号与 API 版本
 │   ├── typing.py                  全部枚举与跨模块记录（RawEvent / CandidateIntent / ...）
 │   ├── utility.py                 数学、时间、文本工具（sigmoid / softplus / softmax / decay）
-│   ├── config.py                  分层 dataclass 配置 + TOML/JSON/环境变量 + 脱敏
-│   ├── db.py                      SQLite 连接、事务/保存点、全部表结构、列迁移
+│   ├── config.py                  分层 dataclass 配置 + TOML/JSON/环境变量 + 脱敏（含 SemanticConfig）
+│   ├── db.py                      SQLite 连接、事务/保存点、全部表结构、列迁移（SCHEMA_VERSION = 2）
 │   ├── eventlog.py                append-only 原始事件日志（+ 可选 JSONL 镜像）
-│   ├── projections.py             当前投影读写（runtime_state / 记忆 / 候选 / outbox ...）
-│   ├── emotion.py                 事件评价 → 情绪动力学 → 情绪解释（模板 + 缓存）
+│   ├── projections.py             当前投影读写（runtime_state / 记忆 / 候选 / outbox / event_semantics ...）
+│   ├── semantic.py                【v0.2】粗粒度语义结算：classify_event / 锚点表 / 歧义否决 / unresolved
+│   ├── providers.py               【v0.2】可选 SemanticProvider 端口与四种实现 + 深层刷新契约
+│   ├── local_llm.py               本地小模型客户端（Qwen 系微调 + llama.cpp 端点，**仅被 providers.py 使用**）
+│   ├── emotion.py                 事件评价 → 情绪动力学 → 心理解释（长期底色模板 + 缓存）
 │   ├── boundaries.py              边界状态机（语言检测、生命周期、硬约束裁决）
 │   ├── unfinished.py              未尽之事状态机（检测、生命周期、唤醒锚点）
 │   ├── memory.py                  记忆候选评分、巩固、检索、激活池
@@ -47,13 +80,17 @@ runtime/
 │   ├── reducer.py                 唯一写者（提案应用、投递状态机、outbox 记账）
 │   ├── runtime.py                 核心编排：lazy_tick、前台路径、内源主动路径
 │   ├── scheduler.py               自适应内源唤醒调度
-│   ├── context.py                 临时上下文组装 + 主 LLM prompt 块渲染
+│   ├── context.py                 临时上下文组装 + 主 LLM prompt 块渲染（含 PRIORITY_PREAMBLE）
 │   ├── authorize.py               边界/预算/文本硬门禁
 │   ├── delivery.py                claim → render → send → observe 投递服务
 │   ├── maintenance.py             WAL checkpoint、完整性校验、备份、恢复
 │   ├── api.py                     FastAPI 应用
 │   └── cli.py                     命令行入口
 └── tests/                         单元 / 集成 / 耐久性测试
+    ├── test_semantic.py                       【v0.2】锚点表、歧义否决、相关性、unresolved
+    ├── test_providers.py                      【v0.2】四种 provider、契约校验、降级、密钥卫生
+    ├── test_acting_layer_independence.py      【v0.2】ingest 路径不依赖任何生成式模型（结构性证明）
+    └── ...
 ```
 
 ---
@@ -100,6 +137,8 @@ python -m companion_runtime.cli --base-dir ./data serve --host 127.0.0.1 --port 
 
 全局参数：`--config <file.toml|file.json>`、`--base-dir DIR`、`--log-level LEVEL`。
 
+> v0.2 没有新增 CLI 子命令：即时演出层不在 Runtime 里，持久认知层默认零模型，因此没有需要运维手动跑的"模型预热 / 推理队列"命令。
+
 ---
 
 ## 3. 配置
@@ -130,7 +169,7 @@ log_level = "INFO"
 database_path = "./data/runtime.sqlite3"
 raw_log_path = "./data/raw_events.jsonl"
 mirror_raw_events = true      # 额外写一份 append-only JSONL 便于离线查看
-wal = true                    # 保持 true；见第 6 节
+wal = true                    # 保持 true；见第 10 节
 busy_timeout_ms = 5000
 
 [drive]                       # I / R / P 动力学
@@ -172,6 +211,18 @@ learning_rate = 0.35
 lease_seconds = 45
 max_attempts = 3
 retry_backoff_seconds = 0   # 0 = nack 后立即可再领取（推荐；节流交给宿主重试队列）
+
+[semantic]                    # 【v0.2】两个时间尺度的策略（全部有默认值）
+provider = "disabled"         # disabled | local_cpu | local_gpu | remote_api
+settle_on_ingest = true       # 入口处跑粗粒度规则结算（纯规则，无模型）
+deep_refresh_enabled = true   # 允许低频深层认知刷新
+unresolved_backlog_threshold = 8
+unresolved_max_age_hours = 72.0
+deep_refresh_min_interval_seconds = 3600.0
+deep_refresh_idle_hours = 12.0
+max_operations_per_refresh = 12
+template_fallback = true
+interpretation_max_age_seconds = 21600.0
 ```
 
 环境变量（双下划线表示层级）：
@@ -181,7 +232,28 @@ $env:CR_SERVER__PORT = "9000"
 $env:CR_DRIVE__COOLDOWN_SECONDS = "600"
 $env:CR_STORAGE__DATABASE_PATH = "D:\companion\runtime.sqlite3"
 $env:CR_STORAGE__DATABASE_PATH = ":memory:"     # 内存库（测试/演示）
+
+# 【v0.2】语义端口（默认关闭，不写这两行就是零模型运行）
+$env:CR_SEMANTIC__PROVIDER = "disabled"          # 等价于 CR_SEMANTIC_PROVIDER
+$env:CR_SEMANTIC__SETTLE_ON_INGEST = "true"
 ```
+
+### 3.1 SemanticConfig 参考表（v0.2）
+
+| 字段 | 默认值 | 含义 | 生产消费者 |
+|---|---|---|---|
+| `provider` | `"disabled"` | 要构建的 provider。`disabled` 是标准设置 | `Runtime.__init__` → `build_provider()` |
+| `settle_on_ingest` | `true` | 入口路径上是否跑粗粒度规则结算 | `Runtime.process_user_message`（唯一被消费的开关） |
+| `deep_refresh_enabled` | `true` | 是否允许低频深层刷新 | 目前**无消费者**（见第 8 节与映射表） |
+| `unresolved_backlog_threshold` | `8` | 积压多少条 unresolved 才够触发一次刷新 | 同上，**预留** |
+| `unresolved_max_age_hours` | `72.0` | 超过这个年龄的 unresolved 不再支撑刷新（原始事件仍然保留） | `semantic.resolve_backlog()` 的参数默认值（无生产调用方） |
+| `deep_refresh_min_interval_seconds` | `3600.0` | 两次刷新之间的最小间隔 | **预留** |
+| `deep_refresh_idle_hours` | `12.0` | 系统空闲多久才允许投机性刷新 | **预留** |
+| `max_operations_per_refresh` | `12` | 单次刷新最多应用多少条 grounded 操作 | **预留**（当前上限由调用方自己控制） |
+| `template_fallback` | `true` | 没有缓存解释时退回确定性模板。**不建议关掉** | **预留**（模板兜底逻辑当前无条件生效） |
+| `interpretation_max_age_seconds` | `21600.0` | 一份心理解释多久后算 stale | **预留**（解释缓存 TTL 目前由 `task.explain_cache_ttl_seconds` = 1800 控制） |
+
+> 表中标"预留"的字段已经进入配置层、会被 `/config` 与 `config` CLI 打印、也有明确语义，但**还没有任何生产代码读取它们**：它们是为第 8 节的深层刷新编排准备的。这是刻意的诚实标注，不是遗漏。
 
 全部可用参数见 `config.py` 的 dataclass 定义（每个字段都有说明）。
 
@@ -209,6 +281,8 @@ $env:CR_STORAGE__DATABASE_PATH = ":memory:"     # 内存库（测试/演示）
 
 事实、推断、解释严格分离：事实进 `working_situation_items(kind='fact')`，推断进 `kind='inference'` 并带 `confidence`，解释进 `interpretation_versions`（多版本 + `supersedes_id`），对现在有意义的新理解通过 `reappraisals` 追加，**从不回滚历史**。
 
+v0.2 之后这条约束多了一层意义：**"当时没理解"不会让证据消失**。模糊事件被记为 `unresolved` 时，`raw_events` 里的原文一字不动，因此几小时后出现新证据时可以重新解释它（"追夫火葬场"路径）。
+
 ### 4.2 版本与单写者
 
 `runtime_state.version` 是全局单调计数器。所有写入必须经过 `Reducer`，且每次写入都带乐观并发检查：
@@ -225,7 +299,7 @@ projections.runtime.write(state, conn, expect_version=state.version)   # 不匹�
 | **REBASE** | 语义仍有效，但世界前进了 | 保留语义结果，**基于当前状态重算效应** |
 | **DISCARD** | 源事件消失，或前提被新消息推翻 | 只入历史，不改状态 |
 
-敏感度分级（`protocol.TASK_SENSITIVITY`）：浅层标签 `low`（预算 50 版）→ 事件评价 `medium`（6）→ 候选生成/情绪解释 `high`（2）→ 主动消息成品 `critical`（0，用户开口必须重协调）。
+敏感度分级（`protocol.TASK_SENSITIVITY`）：浅层标签 `low`（预算 50 版）→ 事件评价 `medium`（6）→ 候选生成/情绪解释 `high`（2）→ 主动消息成品 `critical`（0，用户开口必须重协调）。`deep_refresh` 目前**没有**独立条目，会落到默认的 `medium`。
 
 ### 4.3 lazy_tick：唯一时间入口
 
@@ -237,13 +311,21 @@ projections.runtime.write(state, conn, expect_version=state.version)   # 不匹�
 
 ### 4.4 情绪：数值负责动力学，语言负责语义
 
+v0.2 之后，前台路径的入口多了一层**粗粒度结算**（无模型，纯规则）：
+
 ```text
-事件 → appraise_event()            规则化评价：方向/影响/激活/不确定性/关系信号/责任（不产出情绪值）
-     → apply_new_emotion_events()  结合价值观、背景心境、用户模型、既有情绪事件计算数值变化
-     → EmotionExplainer            把结构化状态翻译成第一人称心理语言（模板或本地小模型）
+事件 → classify_event()              显式锚点 → 粗粒度结算（方向 / 强度带 / 置信度 / 来源）
+                                     （无锚点或有歧义否决 → None，记为 unresolved）
+     → settlement_to_evaluation()    强度带 → 数值（uncertainty = 1 − confidence，source = "coarse_rule"）
+     → apply_new_emotion_events()    结合价值观、背景心境、用户模型、既有情绪事件计算数值变化
+     → EmotionExplainer              把结构化状态翻译成"长期底色"（缓存或代码模板）
 ```
 
 背景心境 = `valence / arousal / stability`；情绪影响事件 = 带 `decay_rate` 的衰减事件，`semantic_label = null` 是合法状态（知道"这是中等负向影响"，但暂时不知道叫什么）。
+
+**规则层从不给情绪命名**：`CoarseSettlement.semantic_label` 恒为 `None`。命名（"嫉妒 / 委屈 / 懊恼"）属于低频深层刷新的职责，不属于每轮。
+
+强度带的代表值（中点，不是测量值）：`negligible 0.05` / `low 0.20` / `medium 0.40` / `medium_high 0.62` / `high 0.85`。
 
 情绪解释带缓存：心理状态变化不足时复用旧解释，变化明显才重新解释（`should_re_explain`）。
 
@@ -348,23 +430,444 @@ proposed → committed → rendering → ready_to_send → sent → resolved
 - 中途出现显式边界 → `ABORT`（发送前最后一道门）
 - 同主题但不满足 → `MERGE`（新消息并入原意图）
 
-### 4.13 上下文注入是临时的
+### 4.13 上下文注入是临时的，而且是"背景"不是"指令"
 
-`context.build()` 产出**一次性** bundle：心理状态（自然语言）+ 工作局势 + 最终意图 + 少量激活记忆 + 表达边界 + 时间连续性。`render_block()` 渲染成主 LLM 的 prompt 块，**不包含裸浮点数**（模型对心理文本远比对 `anger = 0.72` 敏感）。
+`context.build()` 产出**一次性** bundle：长期心理状态（自然语言）+ 工作局势 + 最终意图 + 少量激活记忆 + 表达边界 + 时间连续性。`render_block()` 渲染成主 LLM 的 prompt 块，**不包含裸浮点数**（模型对心理文本远比对 `anger = 0.72` 敏感）。
+
+v0.2 改了两件事：
+
+- 心理区块标题从"当前心理状态"改成 **`【进入本轮前的长期状态（背景）】`**（`context.SECTION_PSYCH`）。它的语义是"我从哪来"，不是"这句话该怎么感觉"。
+- 每个 prompt 块开头固定注入 `context.PRIORITY_PREAMBLE`，声明优先级顺序，并明确"如果当前用户原话与下面的长期状态不一致，以当前用户原话为准；你的即时反应由你自己根据当前语境完成"。
 
 本轮结束后全部丢弃。永久对话历史只保存用户可见消息与 assistant 可见消息（`assert_ephemeral` 守住这个不变量）。
 
 当角色在用户开口前几秒已 committed，block 会带上 `lead_seconds_before_user_message`，让主 LLM **可以**自然地说"你居然刚好发来了"，但不强迫。
 
+### 4.14 心理解释：低频缓存 + 代码模板兜底
+
+心理解释（`EmotionExplainer`）在 v0.2 里**不再是实时必需模块**，它是"持久心理状态的低频语义压缩器"：
+
+```text
+已有心理解释缓存？
+├─ 有（且未 stale）→ 直接用
+└─ 无 → 代码模板（确定性，永远可用）
+```
+
+- **情绪解释器可选，情绪状态本身不可选。**
+- 模板只描述**长期底色**，不说当前这句话该怎么反应。例如：
+  - `进入本轮之前，整体底色偏负向，还有没消化完的东西。`
+  - `这段时间情绪基调偏低，表达会比平常收着。`
+  - `长期表达风格偏向克制，不太主动施压。`
+  - `底色是收着的，话不多但留有余地。`
+- 模板按 `mood.valence`（±0.12 阈值）、`approach_impulse` vs `restraint`（+0.15）、`pressure`（0.45）、`restraint`（0.68 / 0.35）分支，每个分支有一组同义说法，随机选一条。
+- 缓存带 key（`EmotionExplainer.cache_key`）：背景心境、冲动、节制、压力取一位小数拼成 `v..|a..|i..|r..|p..`。key 不变就复用，变了才重新算。
+- provider 可用时，`_render()` 会先问 provider 要一段更细腻的语言；拿不到（或字段不全）就退回模板，**永远有输出**。
+
 ---
 
-## 5. HTTP API
+## 5. 两层职责与优先级（v0.2）
+
+### 5.1 即时演出层 = 宿主主 LLM
+
+负责回答：**"用户现在说了这句话，我这一刻怎么反应？"**
+
+输入：
+
+```text
+宿主角色设定（人格、语气、世界设定）
++ 最近对话上下文
++ 当前用户原话
++ 当前确定事实
++ 已有 Runtime 持久状态（prompt 块注入，本轮结束即丢弃）
++ 必要的心理状态缓存（长期底色）
+```
+
+输出：**当前轮可见回复**。
+
+关键点：主 LLM 当场表现出"有点舍不得"，**不等于** Runtime 必须立刻写入 `persistent_sadness = 0.7`。当场表现是演出，Runtime 状态是持续认知，**两者不是同一权限**。
+
+### 5.2 持久认知层 = Runtime
+
+负责回答：**"这件事结束以后，它在我身上留下了什么？"**
+
+处理对象：情绪余波、背景心境、长期记忆、未尽之事、用户交互证据、用户模型、候选意图、主动动力、后验重解释。
+
+Runtime 的任务**不是**"每条消息都准确判断这是失落 0.43 / 焦虑 0.27"，而是：
+
+```text
+这件事是否值得留下？
+是否形成未尽之事？
+是否改变背景心境？
+是否留下用户偏好证据？
+是否需要以后重新解释？
+是否影响未来主动性？
+```
+
+它**不要求**每一轮都实时语义完备。
+
+### 5.3 权威边界
+
+| 谁 | 负责 | 不负责 |
+|---|---|---|
+| **主 LLM**（宿主） | 当前消息即时理解、当前情绪演出、当前语气、当前自然语言反应 | 直接写 Runtime 情绪状态；修改长期记忆事实；修改用户模型数值；绕过边界状态机；直接决定是否内源主动 |
+| **Runtime**（本工程） | 跨轮心理连续性、背景心境、情绪余波、长期记忆、用户交互模型、未尽之事、主动动力、候选意图、动机决策、协议一致性、粗粒度语义结算 | 生成台词；替代主 LLM 理解当前这一句话；把"当场演出"当成状态写入 |
+
+### 5.4 优先级（必须遵守）
+
+```text
+宿主最高层设定 / 安全约束
+> 当前用户原话
+> 当前确定事实
+> 显式边界
+> Runtime 持久心理状态
+> 心理解释缓存
+> 主 LLM 自然发挥
+```
+
+代码落点：`context.PRIORITY_PREAMBLE`，随每个 prompt 块注入。
+
+- 最重要的一条：**当前用户原话与当前事实高于 Runtime 旧心理缓存。**
+- 示例：Runtime 缓存写着"最近整体有些失落，表达偏克制"，用户突然说"其实我就是回来陪你的哈哈" —— 主 LLM 本轮可以立刻惊喜、放松、开心，**不能**因为旧缓存还写着"失落"就继续机械表现低落。这句新话是否让持久背景心境改变，由 Runtime 之后结算。
+- 当前实现把第 5–6 级合并成一句"这里的长期状态"写进 preamble（`宿主设定与安全约束 > 当前用户原话 > 当前确定事实 > 显式边界 > 这里的长期状态`）。**逐级拆分尚未落到 prompt 文本里**，映射表中标注为部分实现。
+
+---
+
+## 6. 语义结算与 unresolved（v0.2）
+
+### 6.1 为什么需要它
+
+补丁 v0.2 取消了"每条用户消息都必须立刻得到准确事件评价"的要求，改成：
+
+```text
+高置信事件   → 粗粒度结算
+低置信事件   → unresolved（保留原始事件）
+重要事件     → 等低频深层刷新
+普通低价值事件 → 可以永远不深挖
+```
+
+理由是**不对称的代价**：一个错误的结算会静默污染角色的长期状态，而一个 `unresolved` 只损失"早点结算"的机会，并且随时可以重来。所以 `semantic.classify_event()` 的契约是**单边的**：证据不明确就回答 `None`。
+
+### 6.2 `classify_event()` 的判定规则
+
+按顺序执行，任何一步不满足就返回 `None`（→ unresolved）：
+
+1. **空文本**：`text.strip()` 为空 → `None`。
+2. **非对话事件**：`event_type` 不在 `{user_message, assistant_message}` → `None`；`actor == "system"` → `None`。
+3. **歧义否决**：在原文里按顺序找第一个命中的 `AMBIGUITY_MARKERS`（见 6.3）。命中即视为"这句话没有把自己承诺给某一种读法"。
+4. **强锚点豁免**：只有当文本含极少数**明确陈述事实或感受**的强锚点时，命中否决标记仍可结算（当前豁免表：`去世 / 过世 / 被辞 / 被裁 / 失业 / 分手 / 离婚 / 确诊 / 手术 / 谢谢你 / 对不起 / 抱歉 / 我喜欢你 / 我很开心 / 我很高兴 / 我很难过 / 我很失望`）。否则**一旦命中否决标记就直接 `None`**。
+5. **锚点表扫描**：按顺序遍历 `ANCHORS`（12 条），先对原文匹配，再对"剥掉中性填充词"后的文本匹配（`FILLER_TOKENS`：我今天/我现在/我刚刚/我刚才/今天/现在/刚刚/刚才/其实/真的/确实/感觉/觉得）。命中即产出 `CoarseSettlement`。
+6. **钝性拒绝**：`BLUNT_REFUSALS`（`不行 / 不可以 / 我拒绝 / 不要这样`）且无否决标记 → 结算为 `explicit_refusal`（负向 / `medium` / 0.70）。
+7. **其余**：`None` → unresolved，reason 记为 `no_explicit_anchor`。
+
+锚点表覆盖的粗粒度类别（对应补丁 §10 的八类方向）：
+
+| `settlement_source` | 方向 | 强度带 | 置信度 | 例 |
+|---|---|---|---|---|
+| `explicit_positive_feedback` | `+` | `medium_high` / `medium_high` | 0.85 / 0.80 | `谢谢你`、`被你安慰到`、`好多了` |
+| `explicit_affection` | `+` | `high` | 0.85 | `我喜欢你`、`想你` |
+| `explicit_good_news` | `+` | `high` | 0.80 / 0.78 | `面试过啦`、`考上了`、`拿到 offer` |
+| `explicit_repair`（和解 / 道歉） | `+` | `medium` | 0.75 | `对不起`、`是我不好` |
+| `explicit_joy` | `+` | `medium_high` | 0.80 | `很开心`、`好开心` |
+| `explicit_need_for_space`（边界 / 需要空间） | `-` | `low` | 0.72 | `想自己待着`、`需要一点空间` |
+| `major_loss`（重大事件） | `-` | `high` | 0.85 | `去世`、`过世`、`葬礼` |
+| `major_setback`（重大事件） | `-` | `high` | 0.85 | `被裁`、`失业`、`分手`、`确诊`、`手术` |
+| `explicit_conflict`（冲突） | `-` | `high` | 0.80 | `你根本不懂`、`我讨厌你` |
+| `explicit_distress`（明确负向） | `-` | `medium_high` | 0.80 | `很难过`、`很失望`、`想哭` |
+| `explicit_refusal`（拒绝） | `-` | `medium` | 0.75 / 0.70 | `我不想聊这个`、`不行` |
+
+两点刻意设计：
+
+- **剥离填充词只允许剥离中性词。** 剥离任何带评价的词（比如"其实"以外的程度词）都会把一句含糊的话变成确定的话 —— 那正是本模块要防止的失效模式。测试 `test_no_anchor_collides_with_an_ambiguity_marker` 守着"锚点不得与否决标记冲突"。
+- **命名情绪不是规则层的事。** `CoarseSettlement.semantic_label` 恒为 `None`；`test_anchor_settles_with_the_expected_reading` 里有一条断言专门钉住这一点。
+
+### 6.3 歧义否决表（`AMBIGUITY_MARKERS`）
+
+| 标记 | 原因 |
+|---|---|
+| `算了` | `hedged_withdrawal` |
+| `也没什么` / `没什么` | `minimising` |
+| `随便` / `都行` / `无所谓` | `indifferent` |
+| `可能` / `也许` / `大概` / `不知道` / `不清楚` | `uncertain` |
+| `还好` / `一般` | `mild` |
+| `再说吧` / `看情况` | `deferred` |
+
+> **「算了，也没什么。」必须保持 unresolved。** 补丁 §11 与 §31 把这个字符串点名为典型例子：Runtime 不能瞎猜，只记录 `semantic_status = unresolved` + `potential_relevance`，原始事件照原样保留。测试 `test_exact_patch_example_is_unresolved` 直接断言 `classify_event("算了，也没什么。") is None`；`test_every_ambiguity_marker_is_covered_by_a_negative_case` 则保证"以后有人往否决表里加标记而不加测试"会立刻失败。
+
+### 6.4 unresolved 的语义：可以晚点懂，但不能丢证据
+
+一条 unresolved 事件会发生什么：
+
+| 层面 | 行为 |
+|---|---|
+| 原始事件 | 照常写入 `raw_events`（append-only，一字不改） |
+| 语义投影 | `event_semantics` 新增一行：`semantic_status='unresolved'`、`potential_relevance`、`unresolved_reason='no_explicit_anchor'` |
+| 情绪 | **本轮不产生任何情绪余波**（`outcome.emotion_event_ids == []`）—— 还没理解的东西不该改变长期心境 |
+| 工作局势 | 仍然写入 `kind='fact'`（"用户说：……"），但**不会**写成 `kind='inference'` 的关系信号 |
+| 接口 | `POST /events` 的 `outcome` 里带 `semantic_status` / `potential_relevance` / `appraisal_source="deferred"` |
+| 运维可见性 | `GET /health` 的 `semantics` 块给出 unresolved 计数（**积压在增长是正常运行，不是错误**） |
+
+配套的 `MessageOutcome` 字段：
+
+| 字段 | 取值 | 含义 |
+|---|---|---|
+| `appraisal_source` | `coarse_rule` | 由 Level 1 规则表结算 |
+| | `deferred` | 记为 unresolved，等以后 |
+| | `rule` | 旧词表路径（仅供仍要求逐轮读数的调用方），默认值 |
+| `semantic_status` | `resolved` / `unresolved` | 这条事件是否已经有了持久的语义读法 |
+| `potential_relevance` | `low` / `medium` / `high` | 刷新队列的优先级，**只影响排序，从不变更状态** |
+
+### 6.5 `potential_relevance()`：便宜的排队优先级
+
+```text
+长度 ≤ 3                    → low
+命中 HIGH_RELEVANCE_HINTS   → high   （关系/喜欢/讨厌/离开/分手/以后/永远/一直/为什么/是不是/你觉得）
+有 live 未尽之事 且 距上次交流 ≥ 6h → medium
+命中 MEDIUM_RELEVANCE_HINTS → medium （今天/明天/面试/工作/考试/答应/约/等/忙）
+长度 ≥ 24                   → medium
+否则                        → low
+```
+
+### 6.6 `settlement_to_evaluation()`：粗粒度 → 数值
+
+```text
+impact       = 强度带代表值（中点）
+activation   = 强度带代表值 × 0.8
+uncertainty  = 1 − 置信度          ← 低置信度的结算会自动阻尼自己在下游的影响
+confidence   = 结算置信度
+source       = "coarse_rule"
+relation_signal = 由 settlement_source 映射（appreciation / closeness / good_news / repair / loss /
+                  bad_news / distance / sorrow / neutral）
+responsibility  = "unclear"
+```
+
+### 6.7 `resolve_backlog()`：把积压分成"还值得刷"与"该老了"
+
+```python
+resolve_backlog(unresolved, now=..., max_age_hours=72.0, limit=20) -> (live, stale)
+```
+
+按 `potential_relevance` 权重（high → medium → low）再按时间新→旧排序，取前 `limit` 条；超过 `max_age_hours` 的进 `stale`（**只是不再支撑一次刷新，原始事件仍然在库里**）。
+
+> 诚实标注：`resolve_backlog()` 目前**只有测试覆盖，没有生产调用方** —— 它是为第 8 节的深层刷新编排准备的接缝。
+
+---
+
+## 7. SemanticProvider：可选强语义端口（v0.2）
+
+### 7.1 它是什么
+
+`providers.SemanticProvider` 是一个 `runtime_checkable` Protocol，只做两件低频的事：
+
+```python
+available() -> bool
+deep_refresh(request, *, timeout_s=None) -> DeepRefreshSuggestions | None
+explain_state(payload, *, state_key="") -> dict[str, str] | None
+health() -> dict[str, Any]
+```
+
+**它不是 Runtime 的必需依赖。** 三条契约对所有实现成立：
+
+1. **只建议，不写状态。** provider 提议，Reducer 决定 `APPLY / REBASE / DISCARD`。
+2. **Fail-open。** 不可用、超时、连不上、JSON 畸形 → 返回 `None` 或 `degraded=True` 的建议集，**从不抛异常**。
+3. **Secret-safe。** 远端 key 只从 `CR_SEMANTIC_API_KEY` 读取，永不落盘、永不进日志、永不出现在 `repr()` 或 `health()` 里（只报 `configured` / `not configured`）。key 只存在于一个闭包单元里，连 `vars()` 都取不到。
+
+### 7.2 四种实现
+
+| 实现 | `name` | 用途 | 备注 |
+|---|---|---|---|
+| `DisabledProvider` | `disabled` | **默认**。没有模型、没有网络、零延迟。`deep_refresh()` / `explain_state()` 都返回 `None`，调用方走确定性模板 | 这是完整的实现，不是一个错误路径 |
+| `LocalCPUProvider` | `local_cpu` | 已经跑着 `llama.cpp`（或任何 OpenAI 兼容端点）的部署**可选**接回本地强语义 | `local_llm.LocalModelClient` 的薄适配器：只读取和复用，不修改客户端。默认 `LocalModelConfig(enabled=True)` |
+| `LocalGPUProvider` | `local_gpu` | 权重跑在 GPU 上，但**线格式与契约完全相同** | 与 `LocalCPUProvider` 是同一份代码，只有上报的名字不同 —— 让 health 和日志一眼看出权重跑在哪 |
+| `RemoteAPIProvider` | `remote_api` | 任意 OpenAI 兼容远端 | key 只从 `CR_SEMANTIC_API_KEY` 读；`available()` 需要 base_url + model + key 三者齐全 |
+
+### 7.3 如何启用
+
+选择顺序（`resolve_provider_name()`）：
+
+```text
+1. config 里的 semantic.provider（或 extras['semantic']['provider']）
+2. 环境变量 CR_SEMANTIC_PROVIDER
+3. disabled
+```
+
+```powershell
+# 默认：零模型
+$env:CR_SEMANTIC_PROVIDER = "disabled"
+
+# 本地 llama.cpp（CPU）—— 需要先自己把端点跑起来
+$env:CR_SEMANTIC_PROVIDER   = "local_cpu"
+$env:CR_SEMANTIC_BASE_URL   = "http://127.0.0.1:8080/v1"
+$env:CR_SEMANTIC_MODEL      = "qboss-2b"
+
+# 本地 GPU
+$env:CR_SEMANTIC_PROVIDER = "local_gpu"
+
+# 远端强语义（key 只放环境变量，绝不写进 config 文件）
+$env:CR_SEMANTIC_PROVIDER = "remote_api"
+$env:CR_SEMANTIC_BASE_URL = "https://api.example.com/v1"
+$env:CR_SEMANTIC_MODEL    = "some-strong-model"
+$env:CR_SEMANTIC_API_KEY  = "<放在部署环境的密钥管理里，不要提交进仓库>"
+```
+
+**未知或缺失的名字一律回落 `disabled` 并打一条 warning**：`build_provider()` 被设计为永不抛异常，因此"配置写错了"最坏的结果是"没有强语义"，而不是 Runtime 起不来。
+
+### 7.4 环境变量一览
+
+| 变量 | 作用 | 默认 / 生效范围 |
+|---|---|---|
+| `CR_SEMANTIC_PROVIDER` | 选择实现：`disabled` / `local_cpu` / `local_gpu` / `remote_api` | `disabled` |
+| `CR_SEMANTIC_BASE_URL` | 覆盖端点 base_url | `local_*` → `LocalModelConfig.base_url`（`http://127.0.0.1:8080/v1`）；`remote_api` → 空（必须显式给） |
+| `CR_SEMANTIC_MODEL` | 覆盖模型名 | `local_*` → `qboss-2b`；`remote_api` → 空（必须显式给） |
+| `CR_SEMANTIC_TIMEOUT_S` | 覆盖超时 | `local_*` → 覆盖 `explain_timeout_s`（默认 6.0 s）；`remote_api` → 覆盖 `timeout_s`（默认 30.0 s） |
+| `CR_SEMANTIC_MAX_TOKENS` | 补全上限 | **仅 `remote_api`**，默认 1024 |
+| `CR_SEMANTIC_API_KEY` | **仅 `remote_api`** 的 bearer token。只从环境读，不落盘、不入库、不进日志、不进 health | 无 |
+| `CR_LOCAL_MODEL_ENABLED` | 显式关掉已被选中的本地 provider | 当 `local_cpu` / `local_gpu` 被显式选中且此变量**未设置**时，视为 `enabled=True`；显式设成 `0/false` 可再关掉 |
+| `CR_LOCAL_MODEL_BASE_URL` | `LocalModelConfig.from_env()` 读取 | `http://127.0.0.1:8080/v1` |
+| `CR_LOCAL_MODEL_NAME` | 同上 | `qboss-2b` |
+| `CR_LOCAL_MODEL_API_KEY` | 同上（受保护的自建端点用） | 无 |
+
+本地 provider 复用的其余 `LocalModelConfig` 默认值：`appraise_timeout_s = 1.2`、`explain_timeout_s = 6.0`（同时作为 deep refresh 的超时）、`max_tokens = 256`、`temperature = 0.0`、`cache_ttl_s = 900`、`chat_template_kwargs = {"enable_thinking": false}`（微调模型屏蔽思考分支，否则 JSON 会掉进推理通道）。
+
+> **安全约定：不要写任何 API key 到 `runtime.toml`。** `RemoteAPIProvider` 会**故意忽略**配置对象里的 key —— Runtime 的配置是可序列化的、会被 `/config` 打印、会进日志，因此它永远不允许携带凭据。
+
+### 7.5 两种调用形态
+
+`EmotionExplainer` 通过 `getattr` 兼容两种 provider 接口，所以 v0.1 的 `explain(payload)` 端口和 v0.2 的 `explain_state(payload, state_key=...)` 都能接上：
+
+```text
+有 explain_state(payload, state_key=...) → 优先用它（provider 侧缓存与 Runtime 侧缓存对齐）
+否则有 explain(payload)                   → 用旧的
+都没有 / 返回 None / 字段不全             → 退回代码模板
+```
+
+`state_key` 由 `EmotionExplainer.cache_key_from_payload(payload)` 生成（`v..|a..|i..|r..|p..`），provider 侧缓存 TTL 900 s、上限 128 条；`health()["stats"]` 会报告 `cache_hits` / `explain_ok` / `explain_degraded`。
+
+### 7.6 当前接线状态（诚实标注）
+
+- `Runtime.__init__` 会构造 `runtime.semantic_provider`（`build_provider(self.config)`），`GET /health` 会报告它的 `health()`。
+- **但 `context.runtime_explanation()` 与 `POST /explain` 构造 `EmotionExplainer` 时没有传入 provider**（`EmotionExplainer(runtime.projections.emotion, runtime.config)`）。也就是说：provider 存在、`explain_state()` 有完整实现和测试，但**生产路径目前不会调用它**，心理解释总是走模板/缓存。
+- `deep_refresh()` 目前也没有生产调用方，详见第 8 节与 `docs/PATCH_V0.2_MAPPING.md`。
+
+这不是"设计如此"，而是 v0.2 的分期落地：端口与实现先到位，编排接通在下一批。文档与映射表都按现状标注。
+
+---
+
+## 8. 深层认知刷新（v0.2）
+
+### 8.1 定位
+
+强语义能力的**唯一**用途是低频的"后来想明白"，而不是每条消息的即时演出：
+
+```text
+✅ 复杂旧事件重解释        复杂未尽之事识别
+✅ 心理状态深层语言化      记忆高级整理
+✅ 候选意图生成            用户模型语义总结
+
+❌ 每条消息的即时演出（那是主 LLM 的事）
+```
+
+### 8.2 输入：`DeepRefreshRequest`
+
+```python
+unresolved_events      # 还没被理解的事件（含原文预览）
+situation              # 当前工作局势
+mood                   # 长期背景心境
+active_emotions        # 活跃情绪影响事件
+memories               # 激活记忆
+unfinished             # 未结清的未尽之事
+user_model_summary     # 用户交互模型的散文摘要
+candidates             # 候选池里已有的意图
+key_quotes             # 必须逐字保留的关键原文
+```
+
+### 8.3 输出：只有建议权的建议集
+
+```json
+{
+  "reinterpretations": [],
+  "psychological_interpretation": {},
+  "candidate_intent_operations": [],
+  "memory_suggestions": [],
+  "unfinished_matter_suggestions": [],
+  "user_model_evidence_suggestions": []
+}
+```
+
+（六个集合也允许嵌在 `{"suggestions": {...}}` 里。）
+
+`parse_deep_refresh()` 把模型回复当作**不可信输入**逐字段校验：
+
+| 情况 | 处理 |
+|---|---|
+| payload 不是对象 | 返回 `None`（调用方按"没有结果"处理） |
+| 某个字段类型不对 | **丢弃该字段**并写进 `reason = "invalid_fields:<字段名>"`，`degraded = True`；不做猜谜式修复 |
+| 某个字段缺失 | 允许 —— **缺失不等于损坏** |
+| 列表里混进非对象元素 | 该字段整个丢弃并记名 |
+| 全部合法 | `degraded = False` |
+
+于是一次"部分畸形"的回复仍然能贡献它写对的那部分，"完全畸形"则表现为 `degraded=True + reason="invalid_json"` 或 `"error:<异常类型>"`，而不会污染状态。
+
+### 8.4 什么时候触发（补丁 §21）
+
+```text
+unresolved 事件积累到一定程度
+出现重大关系事件
+未尽之事进入 due
+候选池不足
+准备主动但语义依据不足
+发现历史解释可能错误
+用户出现新证据推翻旧理解
+长时间没有刷新且系统空闲
+```
+
+配置层已经为这些条件留好旋钮：`deep_refresh_enabled`、`unresolved_backlog_threshold`（8）、`unresolved_max_age_hours`（72）、`deep_refresh_min_interval_seconds`（3600）、`deep_refresh_idle_hours`（12）、`max_operations_per_refresh`（12）。
+
+### 8.5 为什么它仍然只是建议
+
+```text
+provider 产出建议集
+   ↓
+POST /proposals {task_type: "deep_refresh", payload: {operations: [...]}, source_event_ids: [...]}
+   ↓
+Reducer.process_proposal → APPLY / REBASE / DISCARD
+   ↓
+Reducer._apply_deep_refresh：逐条 grounded operation 应用，并记账
+```
+
+Reducer 侧的安全规则：
+
+1. 每条操作必须**已经过 grounding**（引用的实体必须真实存在），因此"凭空的记忆"进不来。
+2. 一批里的坏操作只记进 `result.notes` 并跳过，**不会让整批作废** —— 一次"大部分读懂了"的刷新仍然有价值。
+3. 只有真的应用了**至少一条**操作，对应的 unresolved 事件才会被标记为已结算（`SemanticProjection.settle_from_deep_refresh`）。一次什么都没应用成功的刷新，**不许**把积压静默清空。
+
+操作类型（`kind`）与落地：
+
+| `kind` | 落地 | 效果 |
+|---|---|---|
+| `reinterpretation` | `interpretation_versions` + `reappraisals` | 追加新解释版本（带 `supersedes_id`）与重估事件，**从不回写旧事件** |
+| `psychological_interpretation` | `emotion_explanations` 缓存 | 存入心理解释缓存，`source = "deep_refresh"` |
+| `candidate_intent` | 候选池管理器 | 走 `ADD / UPDATE / RETIRE / REINTERPRET`，非法操作逐条拒绝 |
+| `memory` | 长期记忆 | 建议的记忆写入/修改 |
+| `unfinished_matter` | 未尽之事 | 建议的未尽之事变更 |
+| `user_model_evidence` | 用户模型证据 | 建议的交互证据 |
+
+### 8.6 当前接线状态（诚实标注）
+
+- ✅ **已实现**：`SemanticProvider` 端口、`DeepRefreshRequest` / `DeepRefreshSuggestions` 契约、`parse_deep_refresh()` 校验、`DEEP_REFRESH_SYSTEM_PROMPT`、四种 provider 的 `deep_refresh()` 实现（含超时降级与统计）、Reducer 侧的 `deep_refresh` 提案处理器。
+- ❌ **未实现**：**触发与编排**。目前没有任何生产代码组装 `DeepRefreshRequest`、没有调用 `provider.deep_refresh()`、没有把建议集转换成 grounded `operations` 的 grounding 层（reducer 文档里引用的 `companion_runtime.deep_refresh` 模块**当前不存在**）。第 3.1 节标"预留"的配置项正是这一层的旋钮。
+- ❌ **未实现**：候选意图生成的自动接入。`candidate_intent_operations` 目前只能由外部调用方自己 ground 成 `{"kind": "candidate_intent", "payload": {...}, "sources": [...]}` 后经 `POST /proposals` 提交；从"模型建议"到"可应用操作"的自动转换不存在。
+
+因此 **v0.2 的深层刷新是"端口 + 落地端 + 契约"三件套齐备、中间那条触发链还没接**的状态。这并不影响 Runtime 以零模型完整运行 —— 它只影响"后来想明白"的自动化程度。
+
+---
+
+## 9. HTTP API
 
 所有端点都是薄壳：校验输入 → 委托 Runtime/Reducer → 返回 JSON。**没有任何端点直接写状态。**
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/health` | 存活 + 紧凑活动摘要（版本、边界数、in-flight、outbox 统计） |
+| GET | `/health` | 存活 + 紧凑活动摘要（版本、边界数、in-flight、outbox 统计、**语义结算统计**、**provider 快照**） |
 | POST | `/events` | 追加事件；`user_message` 走完整前台路径，其余原样追加 |
 | GET | `/events` | 读取原始事件（`conversation_id` / `event_type` / `limit` / `newest_first`） |
 | GET | `/events/{id}` | 单条事件 + 其解释版本 |
@@ -374,7 +877,7 @@ proposed → committed → rendering → ready_to_send → sent → resolved
 | GET | `/schedule` | 下一次内源唤醒计划 + 当前是否允许派发 |
 | POST | `/tick` | 显式执行 `lazy_tick` |
 | POST | `/endogenous` | 跑一次内源主动轮，返回完整决策 |
-| POST | `/proposals` | 提交后台模型结果 → APPLY/REBASE/DISCARD |
+| POST | `/proposals` | 提交后台模型结果 → APPLY/REBASE/DISCARD（`task_type="deep_refresh"` 走深层刷新处理器） |
 | POST | `/tasks` | 派发前登记任务快照 |
 | POST | `/reconcile` | 重协调 in-flight attempt |
 | GET | `/outbox` | 列出投递队列 + 各状态统计 |
@@ -406,12 +909,77 @@ proposed → committed → rendering → ready_to_send → sent → resolved
 | GET | `/maintenance/recovery-plan` | **恢复方案** |
 | POST | `/maintenance/tick` | **例行维护**：checkpoint + verify（+ 可选备份与保留策略） |
 
+> v0.2 没有新增端点。unresolved 积压只能通过 `GET /health` 的 `semantics` 块观察（有个数，没有列表）；也没有手动触发深层刷新的端点 —— 触发链尚未实现（第 8.6 节）。
+
 OpenAPI 文档：`http://127.0.0.1:8787/docs`、`/openapi.json`。
 
-### 宿主接入顺序（推荐）
+### 9.1 `GET /health` 响应示例
+
+零模型部署（默认配置）：
+
+```json
+{
+  "status": "ok",
+  "runtime_version": "0.1.0",
+  "state_version": 42,
+  "runtime_id": "companion",
+  "now": "2026-03-01T09:00:00+00:00",
+  "last_tick_at": "2026-03-01T08:59:58+00:00",
+  "allow_proactive": true,
+  "active_boundaries": 1,
+  "open_unfinished": 2,
+  "active_candidates": 3,
+  "in_flight_attempts": 0,
+  "outbox": {"pending": 0, "leased": 0, "sent": 5, "failed": 0},
+  "semantic_provider": {
+    "provider": "disabled",
+    "available": false,
+    "enabled": false,
+    "reason": "disabled"
+  },
+  "semantics": {
+    "by_status": {"resolved": 12, "unresolved": 3},
+    "by_relevance": {"low": 9, "medium": 4, "high": 2},
+    "unresolved": 3
+  },
+  "raw_events": 15
+}
+```
+
+接了远端强语义时，`semantic_provider` 块变成（注意 **key 只报"配没配"，永远不回显**）：
+
+```json
+{
+  "provider": "remote_api",
+  "available": true,
+  "base_url": "https://api.example.com/v1",
+  "model": "some-strong-model",
+  "api_key": "configured",
+  "stats": {
+    "deep_refresh_calls": 0,
+    "deep_refresh_ok": 0,
+    "deep_refresh_degraded": 0,
+    "explain_calls": 4,
+    "explain_ok": 4,
+    "explain_degraded": 0,
+    "cache_hits": 11
+  },
+  "cache_entries": 2
+}
+```
+
+怎么读这两个块：
+
+- `semantics.unresolved` 增长是**正常运行**：模糊事件本来就该先挂着。
+- `by_relevance` 里的 `high` 是"以后更值得回头看一眼"的那些。
+- `semantic_provider.available = false` 配上 `provider = "disabled"` 是默认状态，不是故障。
+- 本地 provider 的 health 里还会多一个 `client` 子块（被包裹的 `LocalModelClient` 自己的快照）。
+
+### 9.2 宿主接入顺序（推荐）
 
 ```text
 1. 收到平台消息      → POST /events {event_type: user_message, content}
+                       响应里的 outcome.semantic_status 告诉你这条是否已结算
 2. 组装本轮 prompt   → GET  /context/render-block   （注入后即丢弃）
 3. 主 LLM 生成回复   → 直接发给用户（Runtime 不阻塞前台）
 4. 投递 worker 循环  → POST /outbox/claim（owner 固定）
@@ -422,13 +990,15 @@ OpenAPI 文档：`http://127.0.0.1:8787/docs`、`/openapi.json`。
 7. 定时维护（每小时）→ POST /maintenance/tick
 ```
 
+第 1 步与第 3 步之间**没有任何模型调用**：Runtime 的入口路径只做 `lazy_tick`、原始事件落库、硬边界规则、机械性工作局势更新、粗粒度结算。这就是补丁 §28 说的"关键路径预算"。
+
 ---
 
-## 6. 持久化、WAL、事务与蓝屏恢复
+## 10. 持久化、WAL、事务与蓝屏恢复
 
 这一节是**硬约定**，不是建议。
 
-### 6.1 运行参数
+### 10.1 运行参数
 
 | 设置 | 值 | 原因 |
 |---|---|---|
@@ -438,7 +1008,7 @@ OpenAPI 文档：`http://127.0.0.1:8787/docs`、`/openapi.json`。
 | 事务 | 每次变更 `BEGIN IMMEDIATE` | 单写者 + 写前取锁，避免升级死锁 |
 | 嵌套 | `SAVEPOINT` | 一个维护操作可以与认知轮处在同一个原子单元里 |
 
-### 6.2 崩溃与断电语义（明确区分）
+### 10.2 崩溃与断电语义（明确区分）
 
 实际只有两种情况，**都不是"数据库损坏"**：
 
@@ -450,7 +1020,7 @@ OpenAPI 文档：`http://127.0.0.1:8787/docs`、`/openapi.json`。
 
 > 想要断电也零丢失，把 `synchronous` 改成 `FULL`（每次提交都 fsync），代价是写入延迟更高。第一版按架构文档选择 `NORMAL`：**可用性 > 推理速度**，且崩溃恢复总是安全的。
 
-### 6.3 自动恢复流程
+### 10.3 自动恢复流程
 
 无需人工干预，下次连接时 SQLite 自动完成：
 
@@ -463,7 +1033,7 @@ OpenAPI 文档：`http://127.0.0.1:8787/docs`、`/openapi.json`。
 
 因为回放只在 WAL 存在时需要，运维风险点是 **WAL 无限增长**，所以需要定期 checkpoint。
 
-### 6.4 checkpoint
+### 10.4 checkpoint
 
 ```powershell
 companion-runtime checkpoint --mode TRUNCATE
@@ -475,7 +1045,7 @@ companion-runtime checkpoint --mode TRUNCATE
 - `serve --maintenance-interval 3600` 会把它作为后台任务自动运行
 - 干净退出时也会自动做一次收尾 checkpoint
 
-### 6.5 备份
+### 10.5 备份
 
 ```powershell
 companion-runtime backup                       # → <数据目录>\backups\runtime-<UTC时间戳>.sqlite3
@@ -489,7 +1059,7 @@ companion-runtime backup D:\snap\a.sqlite3 --keep 7
 - `--keep N` 执行保留策略（`prune_backups()`，按 mtime 保留最新 N 份）
 - 内存库（`:memory:`）无法备份，接口会明确返回 409
 
-### 6.6 恢复演练（可直接照做）
+### 10.6 恢复演练（可直接照做）
 
 ```powershell
 # 0) 先备份（服务运行中也行）
@@ -517,7 +1087,7 @@ companion-runtime health
 1. **拒绝覆盖运行中的数据库**：目标旁边存在 `-wal`/`-shm` 时直接报错（覆盖活动数据库会损坏它）
 2. **先校验快照**：`integrity_check` 不过就拒绝安装
 
-### 6.7 一致性校验
+### 10.7 一致性校验
 
 ```powershell
 companion-runtime verify          # 退出码 0 = 通过，3 = 有问题
@@ -533,13 +1103,38 @@ companion-runtime verify          # 退出码 0 = 通过，3 = 有问题
 6. 不允许存在没有过期时间的 lease（那会让一行永远被占住）
 7. 各表行数统计 + journal mode 断言
 
-### 6.8 schema 迁移
+### 10.8 schema 迁移（v0.2：SCHEMA_VERSION = 2）
 
 `Database.migrate()` 是幂等的：先 `CREATE TABLE IF NOT EXISTS`，再对 `ADDED_COLUMNS` 声明的列用 `ALTER TABLE` 补齐（例如 `runtime_state.epoch_at`、`last_exchange_at`）。**已有数据库可以原地升级，不需要重建。**
 
+v0.2 只新增了一张表：
+
+```sql
+CREATE TABLE IF NOT EXISTS event_semantics (
+    event_id            TEXT PRIMARY KEY,
+    semantic_status     TEXT NOT NULL DEFAULT 'unresolved',   -- resolved | unresolved
+    direction           TEXT,                                 -- + / - / 0 / +-
+    intensity_band      TEXT,                                 -- negligible..high
+    confidence          REAL,
+    settlement_source   TEXT,                                 -- explicit_positive_feedback ...
+    evidence            TEXT,                                 -- 命中的表面形式，留作审计
+    potential_relevance TEXT NOT NULL DEFAULT 'low',
+    unresolved_reason   TEXT,
+    settled_at          TEXT,
+    deep_refresh_id     TEXT,                                 -- 哪次刷新结算了它
+    version             INTEGER NOT NULL DEFAULT 0,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_event_semantics_status
+    ON event_semantics(semantic_status, potential_relevance);
+```
+
+这张表是**派生投影**，不是权威：缺行表示"还没看过"，有行也只是记录"持久层当前相信什么、或者决定暂时什么都不相信"。它可以从 `raw_events` + 规则表重建，所以它自己从不承担权威。**`raw_events` 仍然是唯一不可变的事实来源** —— unresolved 事件永远不会因为"没人理解它"而消失。
+
 ---
 
-## 7. 不变量（都有对应自动测试）
+## 11. 不变量（都有对应自动测试）
 
 | # | 不变量 | 测试 |
 |---|---|---|
@@ -554,9 +1149,22 @@ companion-runtime verify          # 退出码 0 = 通过，3 = 有问题
 | 9 | `committed != sent` | `test_invariant_9_committed_is_not_sent` |
 | 10 | 隐藏心理上下文不进永久历史 | `test_invariant_10_hidden_context_never_enters_history` |
 
+v0.2 新增一组**结构性保证**（不是编号不变量，因为它们是"架构性质"而不是"状态性质"），全部在 `tests/test_acting_layer_independence.py`：
+
+| 保证 | 测试 |
+|---|---|
+| 没有配置 provider 时 ingest 完全可用 | `test_ingest_works_with_no_provider_configured` |
+| ingest 期间**不会拨出任何网络连接**（直接拦 `socket.connect`） | `test_no_outbound_socket_is_opened_during_ingest` |
+| 模糊事件被推迟而不是被猜（且不制造情绪余波） | `test_ambiguous_events_are_deferred_not_guessed` |
+| 被推迟的原始事件一字不丢 | `test_raw_event_survives_being_unresolved` |
+| 「算了，也没什么。」必须保持 unresolved | `test_exact_patch_example_is_unresolved`（`tests/test_semantic.py`） |
+| 规则层从不给情绪命名 | `test_anchor_settles_with_the_expected_reading`（断言 `semantic_label is None`） |
+| 注入的 prompt 块自我声明是"背景"且服从当前轮 | `test_context_block_is_marked_as_background` |
+| unresolved 不会以"已理解的情绪状态"形式泄漏进 prompt 块 | `test_unresolved_events_do_not_leak_into_the_block_as_facts` |
+
 ---
 
-## 8. 测试
+## 12. 测试
 
 ```powershell
 python -m pytest -q                     # 全部
@@ -564,10 +1172,15 @@ python -m pytest -q -m integration      # 只跑端到端场景
 python -m pytest -q --cov=companion_runtime
 ```
 
+规模：本文撰写时实测 **约 500+ 项**（`python -m pytest -q` 收集 559 项，全部通过）。测试数量随模块演进持续增长，请以你自己那次运行的输出为准，不要以本文数字为准。
+
 覆盖范围：
 
 - **基础设施**：数学工具数值性质、配置三层覆盖与脱敏、SQLite 事务/保存点/JSON 列、事件日志 append-only 与过滤
 - **认知模块**：事件评价方向与不确定性、情绪衰减与心境恢复、解释器缓存与 provider 容错、边界检测（含假阳性防护）与生命周期、未尽之事全生命周期、记忆评分/巩固/冲突/去重/检索/激活、用户模型的特征/证据权重/冷启动/学习/漂移/双视图、候选生成与池管理器四种操作、沉默效用、效用分解、危险率（含频率无关性）、softmax 选择、I/R/P 动力学（惯性、饱和、释放）
+- **v0.2 语义结算**（`test_semantic.py`，53 项）：锚点表逐条方向与来源、歧义否决表逐条（含"每个否决标记都必须有负例"）、补丁点名例句必须 unresolved、填充词剥离、强锚点豁免、钝性拒绝 vs 含糊拒绝、强度带与置信度范围、`semantic_label` 恒为 `None`、锚点与否决标记不得冲突、`potential_relevance` 分档、`resolve_backlog` 的 live/stale 切分与排序
+- **v0.2 provider**（`test_providers.py`，73 项）：四种实现的选择与回落、未知名字回落 disabled、构造失败回落 disabled、六个建议字段的类型校验与部分畸形处理、`suggestions` 包装键、超时/连不上/畸形 JSON 全部 fail-open（`None` 或 `degraded`）、本地 client 复用、解释缓存与 `state_key` 契约、provider 统计、**密钥永不出现在 `repr`/`health`/错误信息里**
+- **v0.2 两层独立性**（`test_acting_layer_independence.py`，11 项）：见第 11 节右表
 - **协议与并发**：APPLY/REBASE/DISCARD 全部分支、敏感度表、rebase 辅助、五种重协调结果、outbox claim/lease/ack/nack/租约过期回收/优先级/kinds 过滤、action 状态机合法与非法跃迁
 - **耐久性**（`test_durability.py`）：WAL 生效、认知轮原子性、**进程崩溃后已提交事务保留**、**截断 WAL 尾部后不损坏**、缺 sidecar 无害、四种 checkpoint 模式、verify 各类检查（含故意造坏）、备份一致性、备份包含未 checkpoint 事务、不能覆盖已有快照、停机后可读、**完整恢复演练（备份 → 毁库 → 确认不可读 → restore → verify → 继续可用）**、拒绝覆盖运行中的库、保留策略、CLI 全流程
 - **HTTP**：全部端点契约、状态码（404/409/422）、OpenAPI 覆盖、outbox 全链路、边界/渲染/投递、维护端点
@@ -575,26 +1188,39 @@ python -m pytest -q --cov=companion_runtime
 
 ---
 
-## 9. 降级模式（Level 0）
+## 13. 降级模式（Level 0）
 
-第一版默认就是**零模型可运行**：
+**默认就是零模型可运行**（v0.2 之后这不只是"降级"，而是标准形态）：
 
-- 事件评价：规则 + 双语信号词表
-- 情绪解释：模板（可选接入本地 2B，通过 `EmotionSemanticProvider` 协议）
+- 事件评价（粗粒度结算）：规则 + 双语锚点表 + 歧义否决表（`semantic.py`）
+- 事件评价（旧词表路径）：规则 + 双语信号词表（`emotion.appraise_event`）
+- 情绪解释：确定性代码模板（长期底色）；可选接入 `SemanticProvider.explain_state()`
 - 候选意图：规则生成器
 - 记忆巩固：词面去重 + 结构化摘要
 - 用户模型：先验 + 在线贝叶斯更新
 
 需要更强语义时，通过 `POST /proposals` 把结果交回 Runtime：情绪解释、候选生成、记忆摘要、用户模型总结全部走 APPLY/REBASE/DISCARD。接口保持一致，Runtime 不被单一模型锁死。
 
+三级结构（补丁 §22）在代码里的对应：
+
+```text
+Level 2  低频深层语义      providers.SemanticProvider（可选；编排尚未接通，见 8.6）
+Level 1  廉价认知          规则 / 统计 / 词法检索 / 缓存 / 高置信事件提取
+                          → semantic.py、emotion.py、memory.py、user_model.py
+Level 0  确定性 Runtime    时间 / 状态机 / 情绪余波 / I-R-P / 边界 / 未尽之事 / 协议 / 动机决策
+                          → runtime.py、motivation.py、boundaries.py、unfinished.py、protocol.py
+
+（另一条轴）主 LLM       当前轮即时演出，不属于 Level 0/1/2
+```
+
 ---
 
-## 10. 与宿主框架（AstrBot）的边界
+## 14. 与宿主框架（AstrBot）的边界
 
 | 归属 | 内容 |
 |---|---|
 | **宿主框架（不修改）** | 平台接入、账号/会话、主 LLM 调用、消息发送、角色卡/system prompt、API key 管理 |
-| **本 Runtime sidecar** | 时间连续性、情绪、记忆、用户认识、未尽之事、候选意图、动机决策、边界与许可、投递协议 |
+| **本 Runtime sidecar** | 时间连续性、情绪、记忆、用户认识、未尽之事、候选意图、动机决策、边界与许可、投递协议、语义结算与 unresolved |
 | **通信方式** | HTTP（`api.py`），异步 outbox claim/lease/ack |
 
 Runtime 不 import `AstrBot` 的任何模块，也不修改其代码。宿主只需实现两个端口：
@@ -604,22 +1230,113 @@ Runtime 不 import `AstrBot` 的任何模块，也不修改其代码。宿主只
 
 两者在测试里分别用 `EchoRenderer` 与 `NullTransport` 替代。
 
+v0.2 之后这条边界多了一句更硬的表述：**主 LLM 就是即时演出层**。它不是 Level 0/1/2 里的"深层认知模块"，也不需要 Runtime 先把当前这句话解析成数值再交给它。
+
 ---
 
-## 11. 已知边界与后续工作
+## 15. 弱 VPS 部署建议（v0.2）
 
-第一版刻意简化但**不省略主要模块**：
+### 15.1 最小常驻集合
+
+移除本地 2B 之后，弱 VPS 上**只需要跑三件东西**：
+
+```text
+1. Runtime sidecar（本工程：Python + fastapi/uvicorn + SQLite）
+2. Bot / 宿主框架（平台接入 + 主 LLM 调用，例如 AstrBot）
+3. 数据库（SQLite 单文件即可；要更稳就上 PostgreSQL）
+
+可选：轻量词法检索（已内置）、可选轻量 embedding（未实现，见第 16 节）
+```
+
+**不再需要**常驻：
+
+```text
+❌ 1GB+ 生成模型权重
+❌ llama.cpp 推理进程
+❌ 本地模型 warmup
+❌ 推理任务队列
+❌ 2B 微调与量化版本维护
+❌ 为模型准备的 swap / 大页配置
+```
+
+这直接换来了"低成本、长期稳定、可维护"：Runtime 常驻内存以 Python 解释器 + SQLite 页缓存为主，磁盘只有数据库文件、WAL 和备份快照。
+
+### 15.2 如果一定要跑本地模型：实测成本量级
+
+以下是实测的量级参考（约 2B 模型，`Q4_K_M` 量化）：
+
+| 配置 | 生成速度 | 备注 |
+|---|---|---|
+| 8 线程（8 个性能核） | **≈ 20 tok/s** | 满打满算的并行度 |
+| 单核 | **≈ 8.9 tok/s** | 只给一个核时的真实速度 |
+| 半核（约半数的核可用） | **≈ 3.7 tok/s** | 与宿主、数据库抢 CPU 时更接近这个数 |
+| 常驻内存 RSS | **≈ 2 GB** | 权重 + KV cache + 运行时 |
+
+补丁 §2 记录的同机型（i7-13700H，8 个性能核，Q4_K_M）更完整的一次评价开销：
+
+```text
+生成速度      ≈ 18 token/s
+单次评价输出  ≈ 67 token      ⇒ 纯生成 ≈ 3.7 s
+输入长度      ≈ 250～600 token，提示处理 ≈ 157 token/s ⇒ ≈ 1.6～3.8 s
+理论总耗时    ≈ 5.3～7.5 s
+实测 p50      ≈ 6.65 s
+```
+
+结论很直接：**光是把 250 token 的提示塞进去（≈ 1.59 s）就已经超过约 1.2 s 的同步前处理预算**，更不用说生成。
+
+### 15.3 因此：本地模型只能是低频异步能力
+
+如果确实需要本地强语义，请把它当成**低频异步能力**而不是实时组件：
+
+- ❌ 不要放进关键路径（`process_user_message` 里**不允许**出现模型调用；`test_no_outbound_socket_is_opened_during_ingest` 会直接拦断网络连接）
+- ✅ 只用于低频的深层刷新与心理解释缓存填充（第 7、8 节）
+- ✅ 保持 `semantic.settle_on_ingest = true`：入口处走纯规则结算，零延迟
+- ✅ 半核 3.7 tok/s 意味着一次刷新可能要跑几分钟 —— 这正是 `deep_refresh_min_interval_seconds = 3600`、`deep_refresh_idle_hours = 12` 这类旋钮存在的理由：这类工作**本来就该慢**
+- ✅ 如果本地跑不动，`RemoteAPIProvider` 是更省 VPS 的选择（把算力放到远端，VPS 只留 Runtime）
+
+### 15.4 运维要点
+
+| 事项 | 建议 |
+|---|---|
+| 数据库目录 | 放在持久化盘；`restore` 会拒绝覆盖运行中的库 |
+| WAL | 保持 `wal = true`，用 `serve --maintenance-interval 3600` 或 cron 定时 checkpoint |
+| 备份 | `backup --keep 7`，快照是自包含单文件，可直接拷走 |
+| 内存 | 零模型部署下 Runtime 内存以 SQLite 页缓存为主；本地模型会额外占 ≈ 2 GB RSS |
+| 启动 | `--host 127.0.0.1`（前面套反代），不要裸奔在公网 |
+| 密钥 | 只放环境变量（`CR_SEMANTIC_API_KEY` 等），**绝不写进 `runtime.toml`**；Runtime 从设计上就拒绝从配置文件读 key |
+| 观测 | `GET /health`（含 `semantics` 与 `semantic_provider`）、`GET /outbox`、`GET /maintenance/verify` 已够用；尚无 Prometheus 导出 |
+
+---
+
+## 16. 已知边界与后续工作
+
+v0.2 之后仍然刻意简化但**不省略主要模块**，并且把"还没接上的部分"明确列出：
+
+**v0.2 相关（尚未接通）**
+
+- **深层认知刷新的触发与编排未实现**：没有组装 `DeepRefreshRequest` 的生产代码、没有调用 `provider.deep_refresh()`、没有 grounding 层（reducer 引用的 `companion_runtime.deep_refresh` 模块当前不存在）。Reducer 侧的落地端已就绪，`SemanticConfig` 里的 `deep_refresh_*` 旋钮是为此预留
+- **候选意图的自动生成未接入 reducer**：`candidate_intent_operations` 需要外部先 ground 成可应用操作
+- **`explain_state()` 未接线**：`context.runtime_explanation()` 与 `POST /explain` 构造 `EmotionExplainer` 时未传入 provider，因此心理解释实际总走模板/缓存
+- **`semantic.resolve_backlog()` 无生产调用方**
+- **无 HTTP 端点查看 unresolved 列表或手动触发刷新**：只有 `/health` 的计数
+- **优先级不是逐级落进 prompt 的**：preamble 把"Runtime 持久心理状态 / 心理解释缓存 / 主 LLM 自然发挥"合并成一句"这里的长期状态"
+- **`deep_refresh` 没有独立敏感度条目**，落到 `TASK_SENSITIVITY` 的默认 `medium`
+
+**长期存在的**
 
 - 检索是词面重合而非 embedding（`MemoryStore.retrieve` 是接缝；embedding 未就绪时本方案即为降级路径）
 - 用户模型是"简化分层贝叶斯"：对角精度近似（Laplace），不是完整 MCMC / 变分推断
 - 事件评价与边界检测是规则 + 词表，语义纠错依赖强 API 的 REINTERPRET
+- 粗粒度结算的锚点表是**词法**的：它覆盖明确的表达，不覆盖反讽、隐喻与长距离指代 —— 这些正是要留给深层刷新和主 LLM 的部分
 - `invalidate_when` 的匹配是关键词级，不是语义级
 - 后台巩固目前由调用方驱动（`memory.consolidate()`），未内置常驻 worker 线程
 - 尚无 Prometheus 指标导出（`/health`、`/maintenance/verify`、`/outbox` 已提供足够的数据结构）
 
+`docs/PATCH_V0.2_MAPPING.md` 里给出了逐章节（§0–§33）的代码位置、测试文件与状态标注。
+
 ---
 
-## 12. 快速自检
+## 17. 快速自检
 
 ```powershell
 cd runtime
@@ -627,4 +1344,21 @@ python -m pytest -q                                          # 期望：全部�
 python -m companion_runtime.cli --base-dir ./data health
 python -m companion_runtime.cli --base-dir ./data backup --keep 7
 python -m companion_runtime.cli --base-dir ./data verify
+```
+
+v0.2 补充的两条自检（都是在**零模型**状态下应有正常结果）：
+
+```powershell
+# 1) 确认默认配置就是 disabled，且 Runtime 照常工作
+python -m companion_runtime.cli --base-dir ./data config | Select-String "semantic" -Context 0,12
+
+# 2) 发一句模糊的话，确认它被诚实记为 unresolved 而不是被猜
+curl -s http://127.0.0.1:8787/events -H "content-type: application/json" `
+  -d '{"event_type":"user_message","content":"算了，也没什么。"}'
+#   → outcome.semantic_status = "unresolved"
+#     outcome.appraisal_source = "deferred"
+#     outcome.emotion_event_ids  = []
+
+curl -s http://127.0.0.1:8787/health
+#   → semantics.unresolved 增加 1；semantic_provider.provider = "disabled"
 ```

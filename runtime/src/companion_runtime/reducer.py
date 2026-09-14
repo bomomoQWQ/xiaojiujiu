@@ -38,6 +38,8 @@ from .typing import (
     AttemptState,
     CandidateStatus,
     EventType,
+    MemoryCandidate,
+    MemoryKind,
     OutboxItem,
     OutboxKind,
     OutboxStatus,
@@ -295,6 +297,8 @@ class Reducer:
             self._apply_explanation(conn, payload, state=state)
         elif task_type == TaskKind.SHALLOW_TAG.value:
             self._apply_shallow_tag(conn, proposal, payload, state=state)
+        elif task_type == TaskKind.DEEP_REFRESH.value:
+            self._apply_deep_refresh(conn, proposal, payload, state=state, result=result)
         else:
             LOGGER.debug("No handler for task type %s; proposal recorded only", task_type)
         result.applied = True
@@ -423,8 +427,248 @@ class Reducer:
             source_event_ids=proposal.source_event_ids,
         )
 
-    # ------------------------------------------------------- re-coordination
+    def _apply_deep_refresh(
+        self,
+        conn: sqlite3.Connection,
+        proposal: protocol_module.Proposal,
+        payload: Mapping[str, Any],
+        *,
+        state: RuntimeState,
+        result: ProposalResult,
+    ) -> None:
+        """Apply one grounded deep-refresh bundle (patch v0.2 sections 19-20).
 
+        The bundle is a *set of suggestions*, and this handler is the only place
+        where they can become state. Three rules keep that safe:
+
+        1. Every operation already passed grounding in
+           :mod:`companion_runtime.deep_refresh`, so an operation naming an
+           entity that does not exist never reaches here.
+        2. Nothing is applied that the Runtime cannot attribute to a real source
+           event, so an invented memory cannot enter the archive.
+        3. The handler never raises for a partially valid bundle: one bad
+           operation is recorded in ``result.notes`` and skipped, because a
+           refresh that understood most of the backlog is still valuable.
+
+        Args:
+            conn: Open write transaction.
+            proposal: The proposal carrying the bundle.
+            payload: Grounded operation list plus the optional interpretation.
+            state: Current runtime state.
+            result: Result object used to record what was applied and skipped.
+        """
+        operations = payload.get("operations") or []
+        applied: dict[str, int] = {}
+        skipped: list[str] = []
+
+        for operation in operations:
+            if not isinstance(operation, Mapping):
+                skipped.append("malformed_operation")
+                continue
+            kind = str(operation.get("kind") or "")
+            body = operation.get("payload")
+            if not isinstance(body, Mapping):
+                skipped.append(f"{kind}:missing_payload")
+                continue
+            sources = [str(item) for item in (operation.get("sources") or [])]
+            try:
+                if kind == "reinterpretation":
+                    self._apply_reinterpretation(conn, proposal, body, sources)
+                elif kind == "psychological_interpretation":
+                    self._apply_interpretation_cache(conn, body, state=state)
+                elif kind == "candidate_intent":
+                    self._apply_candidate_operations(
+                        conn,
+                        [candidate_module.CandidateOperation.from_mapping(dict(body))],
+                        state=state,
+                    )
+                elif kind == "memory":
+                    self._apply_memory_suggestion(conn, body, sources)
+                elif kind == "unfinished_matter":
+                    self._apply_unfinished_suggestion(conn, body, sources)
+                elif kind == "user_model_evidence":
+                    self._apply_user_model_evidence(conn, body, sources)
+                else:
+                    skipped.append(f"unknown_kind:{kind}")
+                    continue
+            except Exception as exc:  # noqa: BLE001 - one bad op must not void the bundle
+                LOGGER.warning("Deep refresh operation %s failed: %s", kind, exc)
+                skipped.append(f"{kind}:{type(exc).__name__}")
+                continue
+            applied[kind] = applied.get(kind, 0) + 1
+
+        # An event stops being unresolved only once something was actually said
+        # about it; a skipped operation must not silently close the backlog.
+        refreshed: list[str] = []
+        for event_id in proposal.source_event_ids:
+            if applied and self._p.semantics.settle_from_deep_refresh(
+                conn,
+                event_id=event_id,
+                deep_refresh_id=proposal.task_id,
+                version=state.version,
+            ):
+                refreshed.append(event_id)
+
+        result.notes.append(f"deep_refresh_applied={applied}")
+        if refreshed:
+            result.notes.append(f"settled_events={len(refreshed)}")
+        for note in skipped:
+            result.notes.append(f"skipped:{note}")
+
+    def _apply_reinterpretation(
+        self,
+        conn: sqlite3.Connection,
+        proposal: protocol_module.Proposal,
+        body: Mapping[str, Any],
+        sources: Sequence[str],
+    ) -> None:
+        """Append a new interpretation version and a reappraisal event.
+
+        History is never rewritten: the previous version stays, and the new one
+        explicitly supersedes it. That is what makes "I only understood this
+        later" auditable rather than a silent edit of the past.
+        """
+        target_event = sources[0] if sources else (
+            proposal.source_event_ids[0] if proposal.source_event_ids else None
+        )
+        if target_event is None:
+            raise ValueError("reinterpretation requires a target event")
+        content = str(body.get("content") or body.get("summary") or "").strip()
+        if not content:
+            raise ValueError("reinterpretation requires content")
+        previous = self._p.interpretations.latest("event", target_event)
+        record = self._p.interpretations.add_version(
+            conn,
+            target_kind="event",
+            target_id=target_event,
+            content=content,
+            confidence=clamp(float(body.get("confidence", 0.6))),
+            source_version=proposal.based_on_version,
+            source_event_ids=[target_event, *proposal.source_event_ids],
+            supersedes_id=str(previous["interpretation_id"]) if previous else None,
+        )
+        self._p.interpretations.add_reappraisal(
+            conn,
+            source_event_ids=[target_event, *proposal.source_event_ids],
+            new_interpretation=str(record["content"]),
+            previous_interpretation=str(previous["content"]) if previous else None,
+            delta_summary=str(body.get("realized_text") or content),
+        )
+
+    def _apply_interpretation_cache(
+        self,
+        conn: sqlite3.Connection,
+        body: Mapping[str, Any],
+        *,
+        state: RuntimeState,
+    ) -> None:
+        """Store a deep psychological interpretation in the explanation cache."""
+        fields = ("experience", "focus", "conflict", "impulse", "inhibition", "expression")
+        stored = {name: str(body.get(name) or "") for name in fields}
+        if not any(stored.values()):
+            raise ValueError("psychological_interpretation is empty")
+        cache_key = str(body.get("cache_key") or "").strip()
+        if not cache_key:
+            from .emotion import EmotionExplainer
+
+            cache_key = EmotionExplainer.cache_key(state, self._p.emotion.list_active())
+        stored["source"] = "deep_refresh"
+        self._p.emotion.store_explanation(
+            conn, cache_key=cache_key, payload=stored, source="deep_refresh"
+        )
+
+    def _apply_memory_suggestion(
+        self,
+        conn: sqlite3.Connection,
+        body: Mapping[str, Any],
+        sources: Sequence[str],
+    ) -> None:
+        """Record a suggested long-term memory as a *candidate*.
+
+        A deep refresh may propose a memory, but it may not create one directly:
+        the candidate still has to pass consolidation, which applies the same
+        value and transience criteria as every other memory. Otherwise a single
+        plausible-sounding refresh could fill the archive with things that were
+        never worth keeping.
+        """
+        summary = str(body.get("summary") or "").strip()
+        if not summary:
+            raise ValueError("memory suggestion requires summary")
+        if not sources:
+            raise ValueError("memory suggestion requires at least one source")
+        self._p.memory.upsert_candidate(
+            conn,
+            MemoryCandidate(
+                candidate_id=str(body.get("candidate_id") or new_id("memory")),
+                summary=summary,
+                kind=str(body.get("kind") or body.get("type") or MemoryKind.EPISODIC.value),
+                source_event_ids=list(sources),
+                value=clamp(float(body.get("importance", 0.6))),
+                confidence=clamp(float(body.get("confidence", 0.6))),
+                topics=[str(item) for item in (body.get("topics") or [])],
+                created_at=utcnow(),
+            ),
+        )
+
+    def _apply_unfinished_suggestion(
+        self,
+        conn: sqlite3.Connection,
+        body: Mapping[str, Any],
+        sources: Sequence[str],
+    ) -> None:
+        """Create an unfinished matter proposed by a deep refresh."""
+        title = str(body.get("title") or "").strip()
+        if not title:
+            raise ValueError("unfinished suggestion requires a title")
+        unfinished_module.create(
+            self._p.unfinished,
+            conn,
+            unfinished_module.UnfinishedProposal(
+                title=title,
+                source_event_ids=list(sources),
+                priority=clamp(float(body.get("priority", 0.5))),
+                resolution_conditions=[
+                    str(item) for item in (body.get("resolution_conditions") or [])
+                ],
+                topics=[str(item) for item in (body.get("topics") or [])],
+            ),
+            config=self._config,
+            now=utcnow(),
+        )
+
+    def _apply_user_model_evidence(
+        self,
+        conn: sqlite3.Connection,
+        body: Mapping[str, Any],
+        sources: Sequence[str],
+    ) -> None:
+        """Store semantic user-model evidence as an interpretation version.
+
+        This is deliberately **not** folded into the numeric user model. That model
+        is trained from *observed interactions* - what the user actually did after
+        the character acted - and a language model's inference about the user is
+        not such an observation. Mixing the two would let a plausible narrative
+        silently overwrite measured behaviour.
+
+        So the suggestion is preserved as an auditable interpretation, where later
+        real interactions can corroborate or contradict it.
+        """
+        statement = str(body.get("statement") or body.get("summary") or "").strip()
+        if not statement:
+            raise ValueError("user model evidence requires a statement")
+        if not sources:
+            raise ValueError("user model evidence requires at least one source")
+        self._p.interpretations.add_version(
+            conn,
+            target_kind="user_model_evidence",
+            target_id=",".join(sources),
+            content=statement,
+            confidence=clamp(float(body.get("confidence", 0.5))),
+            source_version=0,
+            source_event_ids=list(sources),
+        )
+
+    # ------------------------------------------------------- re-coordination
     def reconcile_attempt(
         self,
         *,

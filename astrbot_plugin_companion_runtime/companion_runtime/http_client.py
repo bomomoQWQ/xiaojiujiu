@@ -42,6 +42,8 @@ OUTBOX_LEASE_PATH = "/v1/outbox/lease"
 OUTBOX_HEARTBEAT_PATH = "/v1/outbox/{action_id}/heartbeat"
 OUTBOX_RESULT_PATH = "/v1/outbox/{action_id}/result"
 ACTION_AUTHORIZE_PATH = "/v1/actions/{action_id}/authorize"
+#: Advisory liveness and level probe. Read-only, never on the message path.
+HEALTH_PATH = "/health"
 
 #: Response bodies echoed into debug logs are truncated to this length.
 ERROR_BODY_LOG_LIMIT = 200
@@ -155,6 +157,29 @@ class AiohttpRuntimeTransport:
     async def post_events(self, body: dict[str, Any], *, timeout_s: float) -> None:
         """Append an event envelope to the Runtime event log."""
         await self._request("POST", EVENTS_PATH, body=body, timeout_s=timeout_s)
+
+    async def fetch_health(self, *, timeout_s: float) -> dict[str, Any] | None:
+        """Fetch the Runtime health payload, or ``None`` when unavailable.
+
+        Used by the status command to surface which appraisal level is live and
+        how many events the Runtime has deliberately left uninterpreted. A
+        Runtime that predates patch v0.2 simply has no such fields, and a Runtime
+        that is down raises - both are normal, so the caller must treat the
+        result as advisory only and never let it affect message handling.
+
+        Args:
+            timeout_s: Per-request timeout.
+
+        Returns:
+            The decoded health mapping, or ``None`` when it cannot be read.
+        """
+        try:
+            data = await self._request("GET", HEALTH_PATH, body=None, timeout_s=timeout_s)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
 
     async def fetch_context(
         self,

@@ -196,6 +196,10 @@ class TaskKind(str, Enum):
     MEMORY_SUMMARY = "memory_summary"
     USER_MODEL_SUMMARY = "user_model_summary"
     PROACTIVE_DRAFT = "proactive_draft"
+    #: Low-frequency deep cognition refresh (patch v0.2 sections 18-21). It carries
+    #: a grounded bundle of suggestions rather than a single reading, and it is the
+    #: only place where "I only understood this later" is expressed.
+    DEEP_REFRESH = "deep_refresh"
 
 
 class ProtocolAction(str, Enum):

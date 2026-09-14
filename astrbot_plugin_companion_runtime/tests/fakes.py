@@ -74,6 +74,8 @@ class FakeTransport:
         authorize_error: Exception | None = None,
         heartbeat_error: Exception | None = None,
         report_error: Exception | None = None,
+        health: dict[str, Any] | None = None,
+        health_error: Exception | None = None,
     ) -> None:
         self.snapshot = snapshot
         self.actions = list(actions or [])
@@ -84,6 +86,10 @@ class FakeTransport:
         self.authorize_error = authorize_error
         self.heartbeat_error = heartbeat_error
         self.report_error = report_error
+        #: Advisory health payload used by the status command. ``None`` means the
+        #: Runtime either predates patch v0.2 or is unreachable.
+        self.health = health
+        self.health_error = health_error
 
         self.event_bodies: list[dict[str, Any]] = []
         self.context_requests: list[Any] = []
@@ -91,8 +97,16 @@ class FakeTransport:
         self.heartbeat_requests: list[Any] = []
         self.authorize_requests: list[Any] = []
         self.report_bodies: list[dict[str, Any]] = []
+        self.health_calls = 0
         self.context_calls = 0
         self.closed = False
+
+    async def fetch_health(self, *, timeout_s: float) -> dict[str, Any] | None:
+        """Return the configured advisory health payload, or ``None``."""
+        self.health_calls += 1
+        if self.health_error is not None:
+            raise self.health_error
+        return self.health
 
     async def post_events(self, body: dict[str, Any], *, timeout_s: float) -> None:
         self.event_bodies.append(body)

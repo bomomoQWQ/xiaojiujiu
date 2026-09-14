@@ -520,10 +520,17 @@ class CompanionRuntimePlugin(Star):
     @filter.command("companion_runtime")
     async def companion_runtime_status(self, event: AstrMessageEvent):
         """查看陪伴 Runtime 适配器状态。"""
-        yield event.plain_result(self._status_text())
+        yield event.plain_result(await self._status_text())
 
-    def _status_text(self) -> str:
-        """Build the status report shown by the ``/companion_runtime`` command."""
+    async def _status_text(self) -> str:
+        """Build the status report shown by the ``/companion_runtime`` command.
+
+        The Runtime probe is advisory and fail-open: if the sidecar has no
+        ``/health``, is down, or is a version that predates patch v0.2, the report
+        simply says so and every other line is unaffected. Only a whitelist of
+        fields is rendered, so a credential in the payload could never reach the
+        chat even if one were ever added.
+        """
         settings = self._settings
         lines = [
             "companion Runtime adapter",
@@ -538,6 +545,7 @@ class CompanionRuntimePlugin(Star):
             f" every {settings.outbox_poll_interval_s:.1f}s"
             f" batch {settings.outbox_batch}",
         ]
+        lines.extend(await self._semantic_status_lines())
         bridge = self._bridge
         if bridge is not None:
             stats = bridge.stats
@@ -569,3 +577,42 @@ class CompanionRuntimePlugin(Star):
             lines.append("- config issues:")
             lines.extend(f"  · {issue}" for issue in settings.issues)
         return "\n".join(lines)
+
+    async def _semantic_status_lines(self) -> list[str]:
+        """Return advisory lines describing the Runtime's cognition levels.
+
+        Patch v0.2 made the semantic provider optional and made unresolved events
+        a normal state, so the wording here must not read as a fault. Anything
+        unexpected degrades to a single ``unavailable`` line.
+        """
+        transport = self._transport
+        if transport is None:
+            return ["- cognition: unavailable (adapter inactive)"]
+        try:
+            payload = await transport.fetch_health(timeout_s=self._settings.request_timeout_s)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Defence in depth: the transport already swallows its own failures,
+            # but the plugin's whole contract is that an advisory probe can never
+            # break a command, so it does not rely on that.
+            return ["- cognition: unavailable (health probe failed)"]
+        if payload is None:
+            return ["- cognition: unavailable (no /health response)"]
+
+        provider = payload.get("semantic_provider")
+        if isinstance(provider, dict):
+            name = as_str(provider.get("name")) or "unknown"
+            available = bool(provider.get("available"))
+            lines = [f"- semantic_provider: {name} (available={available})"]
+        else:
+            lines = ["- semantic_provider: unknown (Runtime predates patch v0.2)"]
+
+        semantics = payload.get("semantics")
+        if isinstance(semantics, dict):
+            unresolved = semantics.get("unresolved")
+            lines.append(
+                f"- semantics: {unresolved if unresolved is not None else '?'} unresolved "
+                "(normal: the Runtime defers what it cannot settle confidently)"
+            )
+        return lines

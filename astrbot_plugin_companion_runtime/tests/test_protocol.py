@@ -47,9 +47,12 @@ class EventRecordTests(unittest.TestCase):
 
 class ContextSnapshotTests(unittest.TestCase):
     def test_prefers_runtime_authored_text(self) -> None:
-        snapshot = ContextSnapshot.from_wire({"text": "  【当前心理状态】\n平静  "})
+        # Patch v0.2 section naming: the injected block describes the long-term
+        # state carried into the turn, not the emotion the turn should produce.
+        text = "【进入本轮前的长期状态（背景）】\n平静"
+        snapshot = ContextSnapshot.from_wire({"text": f"  {text}  "})
         assert snapshot is not None
-        self.assertEqual(snapshot.render(), "【当前心理状态】\n平静")
+        self.assertEqual(snapshot.render(), text)
 
     def test_assembles_sections_when_no_text(self) -> None:
         snapshot = ContextSnapshot.from_wire(

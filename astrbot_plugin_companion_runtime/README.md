@@ -18,7 +18,7 @@
 >
 > **架构补丁：** `PATCH_v0.2_即时演出与持久认知分离_移除本地2B核心依赖.md`
 > （即时演出层与持久认知层分离；注入块改为「背景」；本地 2B 不再是标准依赖）。
-> 本 README 已与 v0.2 对齐，见 §1.1、§4.2、§4.7。
+> 本 README 已与 v0.2 对齐，见 §0（认知前提）、§4.2（注入块语义）、§4.7（健康字段）。
 
 ---
 
@@ -92,12 +92,17 @@
 | --- | --- |
 | 传递原始事件、会话标识、消息正文 | 事件评价、语义解释、推断与事实分离 |
 | 在超时预算内取回并注入上下文文本 | 决定本轮该注入什么心理状态 |
+| 原样包装注入文本（不解释、不排序、不改写） | 决定注入块在 Prompt 里的优先级语义 |
 | 调用 AstrBot 当前 provider 做一次渲染 | 决定说什么、为什么说 |
 | 在授权通过后发送消息并回报结果 | 决定何时主动、是否沉默、边界判定 |
 | 有界重试与租约心跳 | 状态持久化、单写者 Reducer、版本与 APPLY/REBASE/DISCARD |
 
 插件**不读取、不保存、不转发** AstrBot 的 provider API key：渲染一律通过
-`Context.llm_generate()` 走宿主既有配置。插件自身不含任何凭据（见 §7）。
+`Context.llm_generate()` 走宿主既有配置。插件自身不含任何凭据（见 §8）。
+
+**v0.2 补充：注入是「背景」，不是「本轮该有的情绪」。** 插件对 Runtime 文本只做包装
+（加标签）与长度截断，**绝不改写、绝不重排、绝不为它参与优先级排序**。优先级语义由 Runtime
+在文本内部自带的使用说明声明，由主 LLM 遵守（见 §4.2）。
 
 ---
 
@@ -138,8 +143,8 @@ AstrBot/
 | `context_prefetch` | `true` | 收到消息即后台预热缓存 |
 | `observe_mode` | `wake` | `wake` / `all`，见下 |
 | `report_assistant_messages` | `true` | 上报机器人实际发出的纯文本 |
-| `inject_enabled` | `true` | 关则只上报不注入 |
-| `inject_max_chars` | `2000` | 注入文本长度上限，`0` 为不限 |
+| `inject_enabled` | `true` | 关则只上报不注入（注入内容为「背景」，见 §4.2） |
+| `inject_max_chars` | `2000` | 注入文本长度上限，`0` 为不限（截断是插件**唯一**对注入文本的加工） |
 | `outbox_enabled` | `true` | 关则 Runtime 无法主动联系用户 |
 | `outbox_poll_interval_ms` | `1000` | 轮询间隔，失败指数退避至最长 30s |
 | `outbox_max_actions_per_poll` | `2` | 单轮租约上限 |
@@ -153,6 +158,11 @@ AstrBot/
 | `queue_base_backoff_ms` / `queue_max_backoff_ms` | `500` / `30000` | 退避区间（带随机抖动） |
 | `queue_send_timeout_ms` | `10000` | 队列单次投递超时 |
 | `debug` | `false` | 把超时/失败细节升级为 warning 级日志 |
+
+> **v0.2：配置里没有、也不会有本地生成式模型的开关。** 本地 2B 已不是标准依赖（§0.2），
+> 插件不探测模型进程、不管理权重、不做 warmup，也没有「语义 provider」相关配置项：
+> 这些完全属于 Runtime 侧（`semantic_provider` 见 §4.7）。插件对 `disabled` 与
+> `remote_api` 两种 Runtime 配置的行为**完全一致**。
 
 ### `observe_mode` 请务必确认后再改
 
@@ -229,12 +239,13 @@ AstrBot/
 响应（二选一）：
 
 ```json
-{"context": {"text": "【当前心理状态】\n克制，想联系…", "version": "182", "ttl_ms": 30000}}
+{"context": {"text": "【使用说明】…【进入本轮前的长期状态（背景）】\n克制，想联系…",
+ "version": "182", "ttl_ms": 30000}}
 ```
 
 ```json
-{"context": {"version": "182", "sections": {"当前心理状态": "…", "当前最终意图": "…",
-  "必要记忆": "…", "表达边界": "…"}}}
+{"context": {"version": "182", "sections": {"进入本轮前的长期状态（背景）": "…",
+  "当前工作局势": "…", "当前最终意图": "…", "必要记忆": "…", "表达边界": "…"}}}
 ```
 
 - **时延即体验**：本接口位于 `on_llm_request` 内，硬上限 2s、默认 400ms；超时即放弃注入（不报错、不改写请求）。
@@ -242,6 +253,40 @@ AstrBot/
   不解释语义；`sections` 会被拼成 `【段落】` 形式。
 - 空响应 / 204 / 空对象：视为“本轮无上下文”，不注入。
 - `trigger` 为 `llm_request`（前台请求路径）或 `message`（后台预热）。预热失败无副作用。
+
+#### 注入块的内容是「背景」，不是「本轮该有的情绪」（v0.2）
+
+补丁 v0.2 之前，心理段落试图告诉主 LLM「当前这句话应该产生什么情绪」；**现在不再是**。
+Runtime 注入块描述的是：
+
+> **角色进入本轮之前的长期状态**（长期心境底色、必要记忆、表达边界、当前工作局势等），
+> 以及「你从哪来」，而不是「你现在该怎么反应」。
+
+Runtime 会把这段使用说明和优先级顺序一并写进注入文本内部，插件**原样透传**。优先级顺序是：
+
+```text
+宿主最高层设定 / 安全约束
+  > 当前用户原话
+  > 当前确定事实
+  > 显式边界
+  > Runtime 持久心理状态
+  > 心理解释缓存
+  > 主 LLM 自然发挥
+```
+
+其中最关键的一条：**当前用户原话与当前事实高于 Runtime 的旧心理缓存。**
+如果用户这句话和注入块里写的长期状态冲突，以当前用户原话为准；本轮即时反应由主 LLM
+自己根据当前语境完成。
+
+插件在这件事上的立场（也是不许越界的地方）：
+
+- 插件**始终只把 Runtime 的文本作为临时内容注入**（`TextPart.mark_as_temp()`），
+  它不会进入永久对话历史，也不是系统提示词。
+- 插件**绝不改写**注入文本：不删段落、不调顺序、不加自己的「建议情绪」、不做优先级判断。
+- 插件**绝不参与排序**：优先级由 Runtime 在文本内声明，由主 LLM 遵守；
+  插件既不是排序方，也不懂得排序语义（它只认 `text` / `sections` 两种形状）。
+- 「即时反应 ≠ 持久状态写入」：主 LLM 当场表现出的情绪**不会**被插件回写成 Runtime 状态。
+  持久结算完全由 Runtime 内部完成。
 
 ### 4.3 `POST /v1/outbox/lease` — 租约行动
 
@@ -313,9 +358,144 @@ AstrBot/
 - 回报是幂等的；失败时进入本地有界重试队列，最终由租约到期兜底。
 - 建议 Runtime 对 `rejected` 与 `skipped` 也落一条 `action_attempt` 终态，避免反复派发。
 
+### 4.7 `GET /health` — 健康、语义 provider 与结算积压（v0.2）
+
+补丁 v0.2 之前，「Runtime 是否装了本地 2B 模型」是运维必看项；现在它只是**可选加速器**，
+因此健康检查改为回答两个问题：**有没有可用的语义 provider**、**持久层故意留下多少未解释事件**。
+
+```json
+{
+  "status": "ok",
+  "runtime_version": "0.1.0",
+  "semantic_provider": {
+    "provider": "disabled",
+    "available": false,
+    "enabled": false,
+    "reason": "disabled"
+  },
+  "semantics": {"by_status": {"unresolved": 12, "settled": 87}, "by_relevance": {"medium": 12}, "unresolved": 12}
+}
+```
+
+> 上面是标准部署（`disabled`）的形态。配置了 `remote_api` / `local_cpu` / `local_gpu` 时，
+> `semantic_provider` 会多出 `base_url`、`model`、`api_key`、`stats`、`cache_entries` 字段
+> （`local_*` 还会多一个嵌套的 `client` 块）。`available` 反映「是否真的能用」，
+> 而不是「是否配置过」。
+
+`semantic_provider`（可选语义 provider 的自述，**绝不含密钥**）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `provider` | `disabled`（标准配置）/ `remote_api` / `local_gpu` / `local_cpu` |
+| `available` / `enabled` | 是否真的可用；`disabled` 时两者皆为 `false` |
+| `reason` | 不可用原因（如 `disabled`） |
+| `base_url` / `model` / `api_key` | 仅远程与本地 provider 报告；`api_key` 只报 `configured` / `not configured` |
+| `stats` / `cache_entries` | 调用计数与心理解释缓存条目数（实现相关） |
+
+`semantics`（持久认知层的结算概况）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `by_status` | 各 `semantic_status` 的计数（`settled` / `unresolved` / …） |
+| `by_relevance` | 各 `potential_relevance` 的计数 |
+| `unresolved` | **未解释事件数**（即上面的 `unresolved` 计数） |
+
+**怎么读这两个块（v0.2 的运维认知）：**
+
+- `semantic_provider.provider == "disabled"` 是**完全正常的标准配置**，
+  不是缺件、不是降级告警。此时粗粒度规则结算 + 确定性模板承担全部工作，
+  `unresolved` 会更多，但长期连续性依然成立。
+- `semantics.unresolved` 上升**是设计中的正常状态**（补丁 §11、§12、§31）：
+  模糊事件被有意保留原始证据，等未来证据出现时再由低频深层刷新重新解释。
+  它**不是错误**，不需要重试、不需要告警、不需要在插件侧做补偿。
+- 低频深层认知刷新（粗粒度结算、`unresolved` 积压、后验重解释）**全部发生在 Runtime
+  sidecar 内部**，可能由积压量、重大关系事件、未尽之事到期或系统空闲触发。
+  宿主侧**不需要新增钩子**，也不应该尝试驱动它。
+- 本插件**目前不调用 `/health`**（见 §4.8），也不解析以上字段。
+
+### 4.8 适配器侧现状：`/health` 与 `/companion_runtime` 的差距（v0.2 已知差距）
+
+**`/companion_runtime` 状态命令的输出与「本地模型可选」并不矛盾** —— 它从头到尾**没有提到任何模型**，
+既不假设本地 2B 存在，也不报它的健康度。它当前输出的全部内容都是宿主侧接缝的机械统计：
+
+```text
+companion Runtime adapter
+- state / adapter_id / runtime / token
+- observe_mode
+- context deadline / ttl
+- outbox: …
+- context: N requests, N cache hits, N fetches, N timeouts, N errors, N stale fallbacks
+- actions: N leased, N rendered, N sent, N rejected, N failed, N skipped, N replayed
+- queue: N pending, N delivered, N retried, N dropped (full …/failed …/expired …)
+- config issues: …
+```
+
+**已知差距（现状说明，非缺陷）：** 上述输出**不包含** `semantic_provider` 与 `semantics` 两块，
+也没有任何字段能告诉运维「Runtime 当前用的是 `disabled` 还是别的 provider」、
+「有多少事件处于 `unresolved`」。原因是本插件**从不调用 `/health`**：它的职责是报告宿主侧接缝的
+统计，而不是 Runtime 的内部认知状况。v0.2 之后这两个字段成了运维关注点，
+但**插件侧代码尚未同步**（本文档只同步了认知，未改实现）。
+
+因此现在要判断 Runtime 的语义结算状况，请直接查询 Runtime：
+
+```bash
+curl -s http://127.0.0.1:8720/health | python -m json.tool
+```
+
+插件**不会**因为缺少这些信息而改变行为：注入、上报、outbox 消费三条路径都与语义 provider 无关，
+`disabled` 与 `remote_api` 下插件行为完全一致。若要消除这个差距，最小改动见 §12「建议但未执行的改动」。
+
 ---
 
-## 5. 失败策略与并发行为
+## 5. Runtime 侧契约（v0.2）
+
+本章说明 v0.2 之后**宿主侧应该对 Runtime 抱有什么期待**，以及**哪些事不该由宿主侧操心**。
+协议本身（§4）没有变化；变化的是持久认知层的内部能力。
+
+### 5.1 v0.2 新增的三项 Runtime 内部能力
+
+这三项**全部发生在 Runtime sidecar 内部**，对宿主侧不暴露新端点、不要求新钩子：
+
+| 能力 | 做什么 | 宿主侧需要做什么 |
+| --- | --- | --- |
+| 粗粒度语义结算 | 只对高置信事件给出「方向 + 粗粒度强度 + 时间 + 来源」，不要求命名具体情绪 | 无。插件继续逐条上报原始事件即可 |
+| `unresolved` 事件积压 | 低置信事件保留原始证据并标记未解释，不硬猜 | 无。**不要**因为计数上升而重试、补报或告警 |
+| 低频深层认知刷新 | 必要时（积压、重大事件、未尽之事到期、系统空闲等）重新解释旧事件，生成 `reappraisal_event` 与建议集 | 无。宿主侧不驱动、不轮询、不代理它 |
+
+Runtime 的 Reducer 仍是唯一写者：深层刷新只产出**建议**，最终经
+`APPLY / REBASE / DISCARD` 落地。插件在这条链路上没有任何写入权限，也不该有。
+
+### 5.2 未解释的事件是正常状态，不是错误
+
+这是 v0.2 最容易误读的一点，请务必按运维口径理解：
+
+- **`unresolved` 不是失败、不是降级、不是待处理告警。** 它表示持久认知层**有意**推迟结算：
+  当前证据不足以高置信判断，于是只保存原始事件与 `potential_relevance`。
+- 设计意图是「**允许错过当下，但不能丢失原始证据**」：主 LLM 当前轮已经有机会自然理解这句话，
+  Runtime 不必马上硬猜；以后出现新证据时再回头重新解释，正是长期关系里很自然的叙事连续性。
+- 因此下列做法都是**错的**：把 `unresolved` 当成上报失败而重发事件；为降低计数而放宽置信门槛；
+  在插件侧加「未解释事件补偿」逻辑。原始事件已经落库，重复上报只会被 `event_id` 幂等忽略。
+- `semantic_provider.provider == "disabled"`（标准配置）下 `unresolved` 会更多，这同样是正常的：
+  确定性模板 + 粗粒度规则足以维持长期连续性，只是「后来想明白」的能力更弱。
+
+### 5.3 双层时间模型下双方的义务
+
+```text
+宿主主 LLM：本轮即时理解与演出 —— 只看当前原话 + 上下文 + 注入的背景
+Runtime   ：跨轮持久连续性     —— 上看长期状态、下结算长期影响
+本插件    ：机械搬运           —— 上报 / 临时注入 / 租约消费，不含语义判断
+```
+
+- 插件**不要求** Runtime 在关键路径上语义完备：注入超时即放弃，Runtime 慢一点不会阻塞回复
+  （§6 fail-open）。
+- 插件**不假设** Runtime 有任何生成式模型可用：`disabled` 时全部接口照常工作。
+- 插件**不解释**注入文本、**不排序**、**不改写**（§4.2）。
+- Runtime **不要求**插件替它维持任何状态：进程重启后丢失的去重缓存与本地队列，
+  靠租约到期与 `(action_id, attempt_id)` 语义兜底（§11）。
+
+---
+
+## 6. 失败策略与并发行为
 
 **fail-open（不影响宿主）**
 - 事件上报、上下文获取、结果回报：任何异常都被吞掉（仅 debug 日志），AstrBot 照常回复用户。
@@ -325,6 +505,13 @@ AstrBot/
 **fail-closed（不替 Runtime 说话）**
 - 只在 `send` 路径：无有效租约、授权请求失败、授权被拒 → 不发送。
 
+**v0.2：Runtime 的语义结算状态永远不触发上面任何一条**
+- `semantic_provider` 是 `disabled`、或 `semantics.unresolved` 很高，都**不是失败信号**：
+  插件不因此重试、不因此降级、也不因此关闭注入。这些状态只影响 Runtime 内部「想得多深」，
+  不影响宿主侧接缝的成败判定。
+- 唯一与「语义能力」有关的失败面仍然只有注入超时（fail-open）与发送授权（fail-closed），
+  两者都不看 provider 字段。
+
 **有界与去重**
 - 本地重试队列有界（默认 256），写满丢弃**最旧**条目；单条最多 6 次、最长 10 分钟，之后丢弃并计数。
 - 同一 `(action_id, attempt_id)` 重复租约：重放已存结果，不二次渲染/发送（进程内最多记忆 256 条）。
@@ -333,7 +520,7 @@ AstrBot/
 
 ---
 
-## 6. 生命周期
+## 7. 生命周期
 
 - `__init__`：只解析配置，**不做任何 I/O、不创建任务**。
 - `initialize()`：构建 transport / 队列 / bridge / outbox，随即启动队列 worker 与 outbox 消费者。
@@ -346,17 +533,21 @@ AstrBot/
 
 ---
 
-## 7. 安全与凭据
+## 8. 安全与凭据
 
 - 仓库内**没有任何 API key 或令牌**；`runtime_token` 默认空串，且可用环境变量
   `COMPANION_RUNTIME_TOKEN` 提供，配置文件里可以不出现密钥。
 - 令牌只出现在请求头，日志里只显示 `configured / not configured`；`tests/test_packaging.py`
   会扫描全部文件，命中 `sk-…`、`Bearer <长串>`、`AIza…` 等模式即失败。
+- **v0.2：Runtime 侧同样遵守这条规则。** `/health` 的 `semantic_provider` 块只报告
+  `api_key: configured` / `not configured`，不回显密钥；插件不调用 `/health`（§4.8），
+  因此这一层信息不会经过宿主侧。若将来按 §12 第 1 条实现状态查询，必须原样打印该字段，
+  **不得打印整个响应体**，以免把运维信息变成潜在凭据泄漏面。
 - 仅供本机/内网使用；对外暴露 Runtime 时请自行加 TLS 反向代理（本插件支持 `https://`）。
 
 ---
 
-## 8. 目录结构
+## 9. 目录结构
 
 ```text
 astrbot_plugin_companion_runtime/
@@ -379,7 +570,7 @@ astrbot_plugin_companion_runtime/
 
 ---
 
-## 9. 测试
+## 10. 测试
 
 ```bash
 cd data/plugins/astrbot_plugin_companion_runtime
@@ -404,7 +595,7 @@ python -m pytest tests -q          # 或：python -m unittest discover -s tests 
 
 ---
 
-## 10. 兼容性与已知限制
+## 11. 兼容性与已知限制
 
 - 目标版本：**AstrBot >= 4.28, < 5**（`metadata.yaml` 强制）。仅使用公开/文档化接口：
   `astrbot.api.*`、`astrbot.core.agent.message.TextPart`（文档给出的注入写法）、
@@ -415,10 +606,38 @@ python -m pytest tests -q          # 或：python -m unittest discover -s tests 
 - 事件上报逐条入队（不批量），以保证弱网下的顺序与幂等语义简单可验证。
 - 进程重启后 `_completed` 去重缓存与本地队列会丢失；此时依赖 Runtime 的租约到期与
   `(action_id, attempt_id)` 语义避免重复发送。
+- **v0.2 已知差距**：`/companion_runtime` 状态命令不查询 `/health`，因此不显示
+  `semantic_provider` 与 `semantics.unresolved`（§4.8）；插件也没有任何与本地生成式模型
+  相关的配置项或探测逻辑——这是设计选择，不是遗漏。
 
 ---
 
-## 11. 版本
+## 12. 建议但未执行的改动（v0.2）
+
+以下改动**本仓库尚未执行**（本次只同步了文档与测试文案）。它们都涉及实现代码，需要人工确认后再做：
+
+1. **`main.py`：在 `/companion_runtime` 输出中加入可选的两行 Runtime 语义状况。**
+   现状（§4.8）只报宿主侧统计。最小改动是：在 `_status_text()` 里追加一次
+   `GET /health` 的**可选**查询，复用既有 `transport` 与 `request_timeout_ms`，
+   失败时只打印 `semantic: unavailable`（保持 fail-open，不影响其它输出）；成功时输出
+   例如 `- semantic_provider: disabled (available=False)` 与 `- semantics: 12 unresolved`。
+   注意：必须沿用「不回显密钥」的既有约束——`/health` 的 `api_key` 字段只报
+   `configured` / `not configured`，插件只需原样打印，不要打印整个响应体。
+2. **`tests/test_plugin_integration.py`：为上面这条新增一个断言**，
+   覆盖「Runtime 不提供 `/health` 时状态命令仍然可用」这一 fail-open 行为。
+3. **（可选）README §4.8 的「已知差距」段落在 1、2 完成后即可删除**，只保留状态命令的新输出示例。
+
+> 说明：第 1 条**不建议**在没想清楚前就做——它会让状态命令依赖一个新的 Runtime 端点，
+> 与「本地模型可选」的初衷略有张力（运维会开始把 provider 字段当作必看项）。
+> 若只想要「看一眼」的能力，直接 `curl /health` 更简单，也是本 README 当前推荐的路径。
+
+---
+
+## 13. 版本
 
 - `0.1.0`：首个可用版本。协议 v1；render/send 两种行动；严格短超时注入；有界重试队列；
   租约心跳；`wake`/`all` 两种监听范围；离线测试 121 项。
+- `0.1.0`（文档同步，未发版）：README / `metadata.yaml` / `_conf_schema.json` 文案与
+  **架构补丁 v0.2** 对齐（两层时间模型、注入块背景语义与优先级、`semantic_provider` 与
+  `semantics` 健康字段、本地模型可选、`unresolved` 属正常状态）。
+  **协议、配置键、插件行为与测试数量均未变化**（仍为 121 项）。
