@@ -406,6 +406,38 @@ class TestRefreshOrchestration:
         finally:
             runtime.close()
 
+    def test_only_referenced_events_leave_the_backlog(self) -> None:
+        """Regression: a refresh must not close events it never mentioned.
+
+        An early version settled every event handed to the proposal, so one
+        reinterpretation silently marked the entire backlog as understood. The
+        live end-to-end check caught it; this test keeps it caught.
+        """
+        runtime = _runtime()
+        try:
+            first = runtime.process_user_message(content="算了，也没什么。", timestamp=BASE_TIME)
+            unrelated = runtime.process_user_message(
+                content="随便吧，都行。", timestamp=BASE_TIME + timedelta(minutes=1)
+            )
+            assert runtime.projections.semantics.unresolved_count() == 2
+            runtime.semantic_provider = _StubProvider(
+                DeepRefreshSuggestions(
+                    degraded=False,
+                    reinterpretations=[
+                        {"content": "那是失望。", "sources": [first.event.event_id]}
+                    ],
+                )
+            )
+            runtime.deep_refresh(now=BASE_TIME + timedelta(minutes=5), force=True)
+            remaining = {
+                item["event_id"] for item in runtime.projections.semantics.list_unresolved()
+            }
+            assert first.event.event_id not in remaining
+            assert unrelated.event.event_id in remaining, "an unrelated event was wrongly closed"
+            assert runtime.projections.semantics.unresolved_count() == 1
+        finally:
+            runtime.close()
+
     def test_a_partially_bad_bundle_still_applies_the_good_part(self) -> None:
         """One malformed operation must not void a useful refresh."""
         runtime = _runtime()

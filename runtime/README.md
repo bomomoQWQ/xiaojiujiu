@@ -653,7 +653,7 @@ resolve_backlog(unresolved, now=..., max_age_hours=72.0, limit=20) -> (live, sta
 
 按 `potential_relevance` 权重（high → medium → low）再按时间新→旧排序，取前 `limit` 条；超过 `max_age_hours` 的进 `stale`（**只是不再支撑一次刷新，原始事件仍然在库里**）。
 
-> 诚实标注：`resolve_backlog()` 目前**只有测试覆盖，没有生产调用方** —— 它是为第 8 节的深层刷新编排准备的接缝。
+> 诚实标注：`resolve_backlog()` 目前**只有测试覆盖，没有生产调用方**。第 8 节的深层刷新链已经落地，但它读积压用的是 `SemanticProjection.list_unresolved()`，没有走这个函数 —— 因此 `unresolved_max_age_hours`（"太老就不再支撑刷新"）这条策略**当前没有被执行**。
 
 ---
 
@@ -812,57 +812,117 @@ key_quotes             # 必须逐字保留的关键原文
 
 于是一次"部分畸形"的回复仍然能贡献它写对的那部分，"完全畸形"则表现为 `degraded=True + reason="invalid_json"` 或 `"error:<异常类型>"`，而不会污染状态。
 
-### 8.4 什么时候触发（补丁 §21）
+### 8.4 什么时候触发：`deep_refresh.evaluate_triggers()`
+
+补丁 §21 的八个条件在 `deep_refresh.evaluate_triggers()` 里按**优先级顺序**实现，第一个命中的胜出（同时满足多个时，`reason` 只报告最有分量的那一个）：
+
+| 优先级 | `reason` | 判定 | 对应配置 |
+|---|---|---|---|
+| — | `min_interval_not_elapsed` | **前置否决**：距上次刷新不足 `deep_refresh_min_interval_seconds` 就直接拒绝，任何理由都不例外 | `deep_refresh_min_interval_seconds` |
+| 1 | `unresolved_backlog` | unresolved 数量 ≥ 阈值 | `unresolved_backlog_threshold` |
+| 2 | `major_event` | 刚发生重大关系事件 | 调用方传 `major_event` |
+| 3 | `matter_due` | 未尽之事到期 | 调用方传 `matter_due` |
+| 4 | `candidate_pool_empty` | 候选池为空（`candidate_pool_size <= 0`） | 调用方传 `candidate_pool_size` |
+| 5 | `proactive_without_grounding` | 想主动但语义依据不足（`wants_proactive and not proactive_grounded`） | 调用方传两个标志 |
+| 6 | `history_may_be_wrong` | 历史解释可能错误 | 调用方传 `history_suspect` |
+| 7 | `user_evidence_overturns` | 用户新证据推翻旧理解 | 调用方传 `user_evidence_overturns` |
+| 8 | `idle_refresh` | 长时间没刷新（`hours_since_last_refresh >= deep_refresh_idle_hours`） | `deep_refresh_idle_hours` |
+| — | `not_needed` | 一条都不命中 —— **这是最常见的结果** | — |
+
+也就是说：阈值与空闲时间这两类信号 Runtime 自己算得出来，其余六类（重大事件、到期、候选池、主动意图、历史可疑、用户反证）需要调用方在 `trigger_context` 里给出。没有给出就当作"不成立"，**不会**被猜成"成立"。
+
+### 8.5 完整管线：五个阶段，每个阶段都可以拒绝
 
 ```text
-unresolved 事件积累到一定程度
-出现重大关系事件
-未尽之事进入 due
-候选池不足
-准备主动但语义依据不足
-发现历史解释可能错误
-用户出现新证据推翻旧理解
-长时间没有刷新且系统空闲
+① 开关          deep_refresh_enabled?          否 → reason="disabled"
+② provider      provider.available()?          否 → reason="provider_unavailable"
+③ 触发          evaluate_triggers(...)         否 → reason=<未命中的原因>（force=True 可跳过）
+④ 组装          build_request(runtime, ...)    只读，不写任何状态
+⑤ 调用          provider.deep_refresh(request) 异常/None/空 → 降级返回，绝不抛出
+⑥ grounding     ground_suggestions(...)        全部不合法 → reason="all_suggestions_ungrounded"
+⑦ 落地          一条 Proposal → Reducer        APPLY / REBASE / DISCARD
 ```
 
-配置层已经为这些条件留好旋钮：`deep_refresh_enabled`、`unresolved_backlog_threshold`（8）、`unresolved_max_age_hours`（72）、`deep_refresh_min_interval_seconds`（3600）、`deep_refresh_idle_hours`（12）、`max_operations_per_refresh`（12）。
+运维入口（两者都是幂等且安全的，`ran=false` 是正常结果而非错误）：
 
-### 8.5 为什么它仍然只是建议
+```powershell
+# CLI
+companion-runtime refresh --now 2026-03-01T09:00:00Z
+companion-runtime refresh --force          # 跳过触发检查，仅用于诊断
+companion-runtime backlog --limit 50       # 看看积压里到底是哪几条
+
+# HTTP
+POST /cognition/refresh                    # body 可带 now / force / trigger_context 的八个信号
+GET  /cognition/backlog?limit=50
+```
+
+返回的 `DeepRefreshOutcome` 会如实报告每一步的结果，便于把"没什么可做的"和"provider 挂了"和"模型答了一堆但全部 grounding 失败"区分开：
+
+```json
+{
+  "ran": true,
+  "reason": "applied",
+  "trigger": {"should_refresh": true, "reason": "unresolved_backlog", "priority": 1, "unresolved_count": 9},
+  "provider": "remote_api",
+  "degraded": false,
+  "operations": 3,
+  "applied": {"reinterpretation": 1, "memory": 2},
+  "violations": [{"kind": "memory", "reason": "ungrounded_sources", "sources": ["evt_deadbeef"]}],
+  "settled_events": 2,
+  "latency_ms": 8421
+}
+```
+
+### 8.6 为什么它仍然只是建议：grounding + Reducer
 
 ```text
 provider 产出建议集
    ↓
-POST /proposals {task_type: "deep_refresh", payload: {operations: [...]}, source_event_ids: [...]}
+deep_refresh.ground_suggestions(suggestions, resolvable=runtime._is_resolvable, ...)
+   ↓ 只留下"引用得到真实实体"的操作
+Runtime.deep_refresh 把它装成一条 Proposal
    ↓
-Reducer.process_proposal → APPLY / REBASE / DISCARD
+POST /proposals 等价路径：Reducer.process_proposal → APPLY / REBASE / DISCARD
    ↓
-Reducer._apply_deep_refresh：逐条 grounded operation 应用，并记账
+Reducer._apply_deep_refresh：逐条应用，并记账
 ```
 
-Reducer 侧的安全规则：
+**grounding 是这条链路的承重墙**（`ground_suggestions`）：
 
-1. 每条操作必须**已经过 grounding**（引用的实体必须真实存在），因此"凭空的记忆"进不来。
-2. 一批里的坏操作只记进 `result.notes` 并跳过，**不会让整批作废** —— 一次"大部分读懂了"的刷新仍然有价值。
+| 规则 | 行为 |
+|---|---|
+| 未知 `kind` | 只接受六种已知操作类型（`OPERATION_KINDS`），其余一律丢弃，不做"先留着"的处理 |
+| 必须有来源的 `kind` | `reinterpretation` / `candidate_intent` / `memory` / `user_model_evidence` 必须给出 `sources`，且**每一个**都能被解析到真实实体（`_is_resolvable` 认 `evt_*` / `mem_*` / `cnd_*` 前缀与未尽之事、情绪事件 id） |
+| 允许无来源的 `kind` | 只有 `psychological_interpretation` 豁免 —— 它概括的是整体状态，不是某一条事件 |
+| 缺来源 / 来源解析不到 | 丢弃该操作，并记一条结构化 `violation`（`missing_sources` / `ungrounded_sources` / `not_a_mapping` / `empty_payload`），可在 outcome 与测试里统计 |
+| 操作数量超限 | 截断到 `max_operations_per_refresh`，并记一条 `exceeded_max_operations` |
+
+于是"模型编造了一段从未发生过的对话"的表现是**一条 violation**，而不是一条假记忆。
+
+Reducer 侧还有三条安全规则：
+
+1. 每条操作必须**已经过 grounding**，因此"凭空的记忆"进不来。
+2. 一批里的坏操作只记进 `result.notes` 并跳过，**不会让整批作废** —— 一次"大部分读懂了"的刷新仍然有价值（`test_a_partially_bad_bundle_still_applies_the_good_part`）。
 3. 只有真的应用了**至少一条**操作，对应的 unresolved 事件才会被标记为已结算（`SemanticProjection.settle_from_deep_refresh`）。一次什么都没应用成功的刷新，**不许**把积压静默清空。
 
 操作类型（`kind`）与落地：
 
 | `kind` | 落地 | 效果 |
 |---|---|---|
-| `reinterpretation` | `interpretation_versions` + `reappraisals` | 追加新解释版本（带 `supersedes_id`）与重估事件，**从不回写旧事件** |
-| `psychological_interpretation` | `emotion_explanations` 缓存 | 存入心理解释缓存，`source = "deep_refresh"` |
+| `reinterpretation` | `interpretation_versions` + `reappraisals` | 追加新解释版本（带 `supersedes_id`）与重估事件，**从不回写旧事件**（`test_history_is_not_rewritten_by_a_reinterpretation`） |
+| `psychological_interpretation` | `emotion_explanations` 缓存 | 存入心理解释缓存，`source = "deep_refresh"`，下一轮可直接复用（`test_the_interpretation_cache_is_updated_and_reused`） |
 | `candidate_intent` | 候选池管理器 | 走 `ADD / UPDATE / RETIRE / REINTERPRET`，非法操作逐条拒绝 |
 | `memory` | 长期记忆 | 建议的记忆写入/修改 |
 | `unfinished_matter` | 未尽之事 | 建议的未尽之事变更 |
 | `user_model_evidence` | 用户模型证据 | 建议的交互证据 |
 
-### 8.6 当前接线状态（诚实标注）
+### 8.7 当前接线状态（诚实标注）
 
-- ✅ **已实现**：`SemanticProvider` 端口、`DeepRefreshRequest` / `DeepRefreshSuggestions` 契约、`parse_deep_refresh()` 校验、`DEEP_REFRESH_SYSTEM_PROMPT`、四种 provider 的 `deep_refresh()` 实现（含超时降级与统计）、Reducer 侧的 `deep_refresh` 提案处理器。
-- ❌ **未实现**：**触发与编排**。目前没有任何生产代码组装 `DeepRefreshRequest`、没有调用 `provider.deep_refresh()`、没有把建议集转换成 grounded `operations` 的 grounding 层（reducer 文档里引用的 `companion_runtime.deep_refresh` 模块**当前不存在**）。第 3.1 节标"预留"的配置项正是这一层的旋钮。
-- ❌ **未实现**：候选意图生成的自动接入。`candidate_intent_operations` 目前只能由外部调用方自己 ground 成 `{"kind": "candidate_intent", "payload": {...}, "sources": [...]}` 后经 `POST /proposals` 提交；从"模型建议"到"可应用操作"的自动转换不存在。
-
-因此 **v0.2 的深层刷新是"端口 + 落地端 + 契约"三件套齐备、中间那条触发链还没接**的状态。这并不影响 Runtime 以零模型完整运行 —— 它只影响"后来想明白"的自动化程度。
+- ✅ **已实现且已接线**：`SemanticProvider` 端口、`DeepRefreshRequest` / `DeepRefreshSuggestions` 契约、`parse_deep_refresh()` 校验、`DEEP_REFRESH_SYSTEM_PROMPT`、四种 provider 的 `deep_refresh()` 实现（含超时降级与统计）、触发判定（`evaluate_triggers`）、请求组装（`build_request`）、grounding（`ground_suggestions`）、编排（`Runtime.deep_refresh`）、落地端（`Reducer._apply_deep_refresh`）、HTTP 与 CLI 入口，以及 `tests/test_deep_refresh.py` 与 `tests/test_cognition_api.py`。
+- ⚠️ **没有内置自动调度**：`scheduler.py` 不引用深层刷新，也没有任何代码会自动调用 `Runtime.deep_refresh()`。触发**判定**是自动的，触发**调用**目前必须由宿主或运维发起（`POST /cognition/refresh` 或 `companion-runtime refresh`，例如放进宿主的每小时定时任务）。按补丁 §21 的字面要求，"何时触发"的条件表已经实现，但"由谁按定时器去问"这一环留给了宿主。
+- ⚠️ **`semantic.resolve_backlog()` 仍无生产调用方**：刷新路径直接用 `SemanticProjection.list_unresolved()`；`resolve_backlog()` 目前只有 `test_semantic.py` 覆盖，`unresolved_max_age_hours` 也只作为它的参数默认值存在 —— 也就是说"超过 72 小时的 unresolved 不再支撑刷新"这条策略**当前没有被刷新路径执行**。
+- ⚠️ **`explain_state()` 仍未接线**（见第 7.6 节）。
+- ⚠️ **`template_fallback` / `interpretation_max_age_seconds` 无消费者**（见第 3.1 节）。
 
 ---
 
@@ -879,6 +939,8 @@ Reducer 侧的安全规则：
 | GET | `/context` | 组装临时上下文 bundle |
 | POST | `/context/render-block` | 只渲染 prompt 块 |
 | POST | `/explain` | 当前第一人称心理状态 |
+| POST | `/cognition/refresh` | **【v0.2】** 跑一次低频深层认知刷新。可带 `now` / `force` / 八个触发信号；返回 `DeepRefreshOutcome`（`ran=false` 是正常结果） |
+| GET | `/cognition/backlog` | **【v0.2】** 列出被有意留在 unresolved 的事件 + 统计（`limit`） |
 | GET | `/schedule` | 下一次内源唤醒计划 + 当前是否允许派发 |
 | POST | `/tick` | 显式执行 `lazy_tick` |
 | POST | `/endogenous` | 跑一次内源主动轮，返回完整决策 |
@@ -914,7 +976,7 @@ Reducer 侧的安全规则：
 | GET | `/maintenance/recovery-plan` | **恢复方案** |
 | POST | `/maintenance/tick` | **例行维护**：checkpoint + verify（+ 可选备份与保留策略） |
 
-> v0.2 没有新增端点。unresolved 积压只能通过 `GET /health` 的 `semantics` 块观察（有个数，没有列表）；也没有手动触发深层刷新的端点 —— 触发链尚未实现（第 8.6 节）。
+> v0.2 新增两个端点：`POST /cognition/refresh`（触发一次深层刷新）与 `GET /cognition/backlog`（查看积压）。此外 `GET /health` 的 `semantics` 块给出计数。
 
 OpenAPI 文档：`http://127.0.0.1:8787/docs`、`/openapi.json`。
 
@@ -1166,6 +1228,11 @@ v0.2 新增一组**结构性保证**（不是编号不变量，因为它们是"�
 | 规则层从不给情绪命名 | `test_anchor_settles_with_the_expected_reading`（断言 `semantic_label is None`） |
 | 注入的 prompt 块自我声明是"背景"且服从当前轮 | `test_context_block_is_marked_as_background` |
 | unresolved 不会以"已理解的情绪状态"形式泄漏进 prompt 块 | `test_unresolved_events_do_not_leak_into_the_block_as_facts` |
+| ingest 自己**不会**触发一次深层刷新（低频就是低频） | `test_deep_refresh.py::test_ingest_does_not_trigger_a_refresh` |
+| provider 抛异常不会让刷新失败 | `test_a_raising_provider_is_not_fatal` |
+| 一条 grounding 不过的操作都不许改状态 | `test_all_ungrounded_suggestions_apply_nothing` |
+| 重解释**从不**重写历史事件 | `test_history_is_not_rewritten_by_a_reinterpretation` |
+| 只有真的应用了操作才把事件标为已结算 | `test_a_grounded_reinterpretation_settles_the_backlog` |
 
 ---
 
@@ -1177,7 +1244,7 @@ python -m pytest -q -m integration      # 只跑端到端场景
 python -m pytest -q --cov=companion_runtime
 ```
 
-规模：本文撰写时实测 **约 500+ 项**（`python -m pytest -q` 收集 559 项，全部通过）。测试数量随模块演进持续增长，请以你自己那次运行的输出为准，不要以本文数字为准。
+规模：本文撰写时实测 **约 500+ 项**（`python -m pytest -q` 收集 607 项，全部通过）。测试数量随模块演进持续增长（本文撰写过程中就从 559 涨到 607），请以你自己那次运行的输出为准，不要以本文数字为准。
 
 覆盖范围：
 
@@ -1186,6 +1253,8 @@ python -m pytest -q --cov=companion_runtime
 - **v0.2 语义结算**（`test_semantic.py`，53 项）：锚点表逐条方向与来源、歧义否决表逐条（含"每个否决标记都必须有负例"）、补丁点名例句必须 unresolved、填充词剥离、强锚点豁免、钝性拒绝 vs 含糊拒绝、强度带与置信度范围、`semantic_label` 恒为 `None`、锚点与否决标记不得冲突、`potential_relevance` 分档、`resolve_backlog` 的 live/stale 切分与排序
 - **v0.2 provider**（`test_providers.py`，73 项）：四种实现的选择与回落、未知名字回落 disabled、构造失败回落 disabled、六个建议字段的类型校验与部分畸形处理、`suggestions` 包装键、超时/连不上/畸形 JSON 全部 fail-open（`None` 或 `degraded`）、本地 client 复用、解释缓存与 `state_key` 契约、provider 统计、**密钥永不出现在 `repr`/`health`/错误信息里**
 - **v0.2 两层独立性**（`test_acting_layer_independence.py`，11 项）：见第 11 节右表
+- **v0.2 深层认知刷新**（`test_deep_refresh.py`，39 项）：八条触发规则各自的优先级与"最紧急者胜出"、阈值来自配置、最小间隔压过所有理由、优先级表与补丁顺序一致；grounding 的六种操作类型可达、编造的来源被拒、缺来源被拒、解释缓存豁免来源、畸形条目被记录而不崩溃、操作数被截断、未知字段被忽略；请求组装的九个段落齐备、**组装请求不写库**、`key_quotes` 来自真实事件；编排层的开关关闭/provider 不可用/无触发/超时抛异常/空建议/全部 grounding 失败/部分坏批次/`force` 只跳过触发不跳过可用性/outcome 可 JSON 序列化；以及"ingest 不触发刷新"与"积压对 health 可见"
+- **v0.2 认知 HTTP 契约**（`test_cognition_api.py`，9 项）：`POST /cognition/refresh` 与 `GET /cognition/backlog` 的响应形状与状态码
 - **协议与并发**：APPLY/REBASE/DISCARD 全部分支、敏感度表、rebase 辅助、五种重协调结果、outbox claim/lease/ack/nack/租约过期回收/优先级/kinds 过滤、action 状态机合法与非法跃迁
 - **耐久性**（`test_durability.py`）：WAL 生效、认知轮原子性、**进程崩溃后已提交事务保留**、**截断 WAL 尾部后不损坏**、缺 sidecar 无害、四种 checkpoint 模式、verify 各类检查（含故意造坏）、备份一致性、备份包含未 checkpoint 事务、不能覆盖已有快照、停机后可读、**完整恢复演练（备份 → 毁库 → 确认不可读 → restore → verify → 继续可用）**、拒绝覆盖运行中的库、保留策略、CLI 全流程
 - **HTTP**：全部端点契约、状态码（404/409/422）、OpenAPI 覆盖、outbox 全链路、边界/渲染/投递、维护端点
@@ -1209,7 +1278,7 @@ python -m pytest -q --cov=companion_runtime
 三级结构（补丁 §22）在代码里的对应：
 
 ```text
-Level 2  低频深层语义      providers.SemanticProvider（可选；编排尚未接通，见 8.6）
+Level 2  低频深层语义      providers.SemanticProvider + deep_refresh 编排（可选；默认 disabled，未配 provider 时整条链安全跳过）
 Level 1  廉价认知          规则 / 统计 / 词法检索 / 缓存 / 高置信事件提取
                           → semantic.py、emotion.py、memory.py、user_model.py
 Level 0  确定性 Runtime    时间 / 状态机 / 情绪余波 / I-R-P / 边界 / 未尽之事 / 协议 / 动机决策
@@ -1317,15 +1386,15 @@ v0.2 之后这条边界多了一句更硬的表述：**主 LLM 就是即时演�
 
 v0.2 之后仍然刻意简化但**不省略主要模块**，并且把"还没接上的部分"明确列出：
 
-**v0.2 相关（尚未接通）**
+**v0.2 相关（仍未接通）**
 
-- **深层认知刷新的触发与编排未实现**：没有组装 `DeepRefreshRequest` 的生产代码、没有调用 `provider.deep_refresh()`、没有 grounding 层（reducer 引用的 `companion_runtime.deep_refresh` 模块当前不存在）。Reducer 侧的落地端已就绪，`SemanticConfig` 里的 `deep_refresh_*` 旋钮是为此预留
-- **候选意图的自动生成未接入 reducer**：`candidate_intent_operations` 需要外部先 ground 成可应用操作
-- **`explain_state()` 未接线**：`context.runtime_explanation()` 与 `POST /explain` 构造 `EmotionExplainer` 时未传入 provider，因此心理解释实际总走模板/缓存
-- **`semantic.resolve_backlog()` 无生产调用方**
-- **无 HTTP 端点查看 unresolved 列表或手动触发刷新**：只有 `/health` 的计数
+- **深层刷新没有内置自动调度**：触发**判定**已实现（`deep_refresh.evaluate_triggers`，含补丁 §21 的八条规则与最小间隔否决），但没有定时器会自动调用它 —— `scheduler.py` 不引用深层刷新，`Runtime.deep_refresh()` 目前只被 `POST /cognition/refresh` 与 `companion-runtime refresh` 调用。**"由谁按节奏去问"这一环留给宿主**（例如放进宿主的每小时任务）
+- **`semantic.resolve_backlog()` 无生产调用方**：刷新路径直接读 `SemanticProjection.list_unresolved()`，因此"超过 `unresolved_max_age_hours` 的 unresolved 不再支撑刷新"这条策略当前**没有被执行**（原始事件当然仍然保留）
+- **`explain_state()` 未接线**：`context.runtime_explanation()` 与 `POST /explain` 构造 `EmotionExplainer` 时未传入 provider，因此心理解释实际总走模板/缓存，配了远端 provider 也不会用于这一步
+- **`template_fallback` 与 `interpretation_max_age_seconds` 无消费者**：模板兜底当前无条件生效；解释缓存陈旧判定实际由 `task.explain_cache_ttl_seconds` 承担
 - **优先级不是逐级落进 prompt 的**：preamble 把"Runtime 持久心理状态 / 心理解释缓存 / 主 LLM 自然发挥"合并成一句"这里的长期状态"
-- **`deep_refresh` 没有独立敏感度条目**，落到 `TASK_SENSITIVITY` 的默认 `medium`
+- **`deep_refresh` 没有独立敏感度条目**，落到 `TASK_SENSITIVITY` 的默认 `medium`（预算 6 版）
+- **六类触发信号依赖调用方提供**：`major_event` / `matter_due` / `candidate_pool_size` / `wants_proactive` + `proactive_grounded` / `history_suspect` / `user_evidence_overturns` 需要宿主在调用时给出；没给出就按"不成立"处理（不会被猜成成立）
 
 **长期存在的**
 
@@ -1351,7 +1420,7 @@ python -m companion_runtime.cli --base-dir ./data backup --keep 7
 python -m companion_runtime.cli --base-dir ./data verify
 ```
 
-v0.2 补充的两条自检（都是在**零模型**状态下应有正常结果）：
+v0.2 补充的自检（全部应在**零模型**状态下给出正常结果）：
 
 ```powershell
 # 1) 确认默认配置就是 disabled，且 Runtime 照常工作
@@ -1363,6 +1432,13 @@ curl -s http://127.0.0.1:8787/events -H "content-type: application/json" `
 #   → outcome.semantic_status = "unresolved"
 #     outcome.appraisal_source = "deferred"
 #     outcome.emotion_event_ids  = []
+
+# 3) 看看积压里到底是哪几条
+python -m companion_runtime.cli --base-dir ./data backlog --limit 20
+
+# 4) 试着刷新一次 —— 没配 provider 时应当礼貌地拒绝，而不是报错
+python -m companion_runtime.cli --base-dir ./data refresh
+#   → {"ran": false, "reason": "provider_unavailable", "provider": "disabled", ...}
 
 curl -s http://127.0.0.1:8787/health
 #   → semantics.unresolved 增加 1；semantic_provider.provider = "disabled"

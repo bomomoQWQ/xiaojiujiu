@@ -460,6 +460,11 @@ class Reducer:
         operations = payload.get("operations") or []
         applied: dict[str, int] = {}
         skipped: list[str] = []
+        #: Only events an applied operation actually referred to may be closed.
+        #: Passing the whole backlog as the proposal's sources would let one
+        #: reinterpretation silently mark unrelated events as understood, which is
+        #: precisely the failure the unresolved state exists to prevent.
+        touched: set[str] = set()
 
         for operation in operations:
             if not isinstance(operation, Mapping):
@@ -496,12 +501,16 @@ class Reducer:
                 skipped.append(f"{kind}:{type(exc).__name__}")
                 continue
             applied[kind] = applied.get(kind, 0) + 1
+            touched.update(sources)
 
         # An event stops being unresolved only once something was actually said
-        # about it; a skipped operation must not silently close the backlog.
+        # about it; a skipped operation, or an operation about a different event,
+        # must not close it.
         refreshed: list[str] = []
-        for event_id in proposal.source_event_ids:
-            if applied and self._p.semantics.settle_from_deep_refresh(
+        for event_id in sorted(touched):
+            if not self._p.semantics.get(event_id):
+                continue
+            if self._p.semantics.settle_from_deep_refresh(
                 conn,
                 event_id=event_id,
                 deep_refresh_id=proposal.task_id,
