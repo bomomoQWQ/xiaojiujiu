@@ -113,9 +113,32 @@ def build_parser() -> argparse.ArgumentParser:
     state.add_argument(
         "--include",
         default="state",
-        choices=["state", "candidates", "memories", "unfinished", "boundaries", "attempts", "all"],
+        choices=[
+            "state",
+            "candidates",
+            "memories",
+            "unfinished",
+            "boundaries",
+            "attempts",
+            "semantics",
+            "all",
+        ],
         help="which section to print",
     )
+
+    refresh = subparsers.add_parser(
+        "refresh",
+        help="run one deep cognition refresh (patch v0.2; optional semantic provider)",
+    )
+    refresh.add_argument("--now", default=None, help="ISO-8601 reference time (default: now)")
+    refresh.add_argument(
+        "--force", action="store_true", help="ignore the trigger check (diagnostics)"
+    )
+
+    backlog = subparsers.add_parser(
+        "backlog", help="list events the Runtime has deliberately left uninterpreted"
+    )
+    backlog.add_argument("--limit", type=int, default=50, help="maximum items to list")
 
     check = subparsers.add_parser("verify", help="integrity and consistency check")
     check.add_argument("--json", action="store_true", help="print compact JSON")
@@ -297,6 +320,41 @@ def cmd_endogenous(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_refresh(args: argparse.Namespace) -> int:
+    """Run one deep cognition refresh and print what happened.
+
+    A refresh that declines is a normal result, not a failure, so this exits 0
+    either way and reports the reason. Only a database problem is an error.
+    """
+    config = _resolve_config(args)
+    configure_logging(config.server.log_level)
+    runtime = Runtime(config)
+    try:
+        outcome = runtime.deep_refresh(now=_parse_now(args.now), force=args.force)
+        _emit(outcome.to_dict(), as_json=True)
+    finally:
+        runtime.close()
+    return EXIT_OK
+
+
+def cmd_backlog(args: argparse.Namespace) -> int:
+    """Print the unresolved-event backlog and its relevance breakdown."""
+    config = _resolve_config(args)
+    configure_logging(config.server.log_level)
+    runtime = Runtime(config)
+    try:
+        _emit(
+            {
+                "stats": runtime.projections.semantics.stats(),
+                "items": runtime.projections.semantics.list_unresolved(limit=args.limit),
+            },
+            as_json=True,
+        )
+    finally:
+        runtime.close()
+    return EXIT_OK
+
+
 def cmd_state(args: argparse.Namespace) -> int:
     """Print a read-only view of the Runtime."""
     config = _resolve_config(args)
@@ -456,6 +514,8 @@ COMMANDS = {
     "serve": cmd_serve,
     "tick": cmd_tick,
     "endogenous": cmd_endogenous,
+    "refresh": cmd_refresh,
+    "backlog": cmd_backlog,
     "state": cmd_state,
     "verify": cmd_verify,
     "checkpoint": cmd_checkpoint,

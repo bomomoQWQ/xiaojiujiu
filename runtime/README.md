@@ -66,6 +66,7 @@ runtime/
 │   ├── projections.py             当前投影读写（runtime_state / 记忆 / 候选 / outbox / event_semantics ...）
 │   ├── semantic.py                【v0.2】粗粒度语义结算：classify_event / 锚点表 / 歧义否决 / unresolved
 │   ├── providers.py               【v0.2】可选 SemanticProvider 端口与四种实现 + 深层刷新契约
+│   ├── deep_refresh.py            【v0.2】深层认知刷新：触发判定 / 请求组装 / 建议 grounding
 │   ├── local_llm.py               本地小模型客户端（Qwen 系微调 + llama.cpp 端点，**仅被 providers.py 使用**）
 │   ├── emotion.py                 事件评价 → 情绪动力学 → 心理解释（长期底色模板 + 缓存）
 │   ├── boundaries.py              边界状态机（语言检测、生命周期、硬约束裁决）
@@ -89,6 +90,8 @@ runtime/
 └── tests/                         单元 / 集成 / 耐久性测试
     ├── test_semantic.py                       【v0.2】锚点表、歧义否决、相关性、unresolved
     ├── test_providers.py                      【v0.2】四种 provider、契约校验、降级、密钥卫生
+    ├── test_deep_refresh.py                   【v0.2】触发优先级、grounding、刷新编排、历史不被重写
+    ├── test_cognition_api.py                  【v0.2】/cognition/refresh 与 /cognition/backlog 契约
     ├── test_acting_layer_independence.py      【v0.2】ingest 路径不依赖任何生成式模型（结构性证明）
     └── ...
 ```
@@ -127,6 +130,8 @@ python -m companion_runtime.cli --base-dir ./data serve --host 127.0.0.1 --port 
 | `tick --now <ISO>` | 执行 `lazy_tick`，把 Runtime 推进到某时刻 |
 | `endogenous --now <ISO> [--force] [--dry-run]` | 跑一次内源主动轮，打印完整决策 |
 | `state --include all\|state\|candidates\|memories\|unfinished\|boundaries\|attempts` | 只读查看当前投影 |
+| `refresh [--now ISO] [--force]` | **【v0.2】** 跑一次低频深层认知刷新，打印触发原因、grounding 违规与落地计数 |
+| `backlog [--limit N]` | **【v0.2】** 列出 Runtime 有意没有解释的 unresolved 事件 |
 | `verify [--json]` | 完整性 + 结构一致性检查（失败退出码 3） |
 | `checkpoint --mode PASSIVE\|FULL\|RESTART\|TRUNCATE` | 把 WAL 合并回主库文件 |
 | `backup [目标] [--keep N]` | 写一份一致快照（`VACUUM INTO`） |
@@ -137,7 +142,7 @@ python -m companion_runtime.cli --base-dir ./data serve --host 127.0.0.1 --port 
 
 全局参数：`--config <file.toml|file.json>`、`--base-dir DIR`、`--log-level LEVEL`。
 
-> v0.2 没有新增 CLI 子命令：即时演出层不在 Runtime 里，持久认知层默认零模型，因此没有需要运维手动跑的"模型预热 / 推理队列"命令。
+> v0.2 新增两个命令：`refresh`（跑一次深层认知刷新）与 `backlog`（列出未解释的事件）。两者都不需要模型：没有配 provider 时 `refresh` 会以 `provider_unavailable` 正常退出。
 
 ---
 
@@ -243,17 +248,17 @@ $env:CR_SEMANTIC__SETTLE_ON_INGEST = "true"
 | 字段 | 默认值 | 含义 | 生产消费者 |
 |---|---|---|---|
 | `provider` | `"disabled"` | 要构建的 provider。`disabled` 是标准设置 | `Runtime.__init__` → `build_provider()` |
-| `settle_on_ingest` | `true` | 入口路径上是否跑粗粒度规则结算 | `Runtime.process_user_message`（唯一被消费的开关） |
-| `deep_refresh_enabled` | `true` | 是否允许低频深层刷新 | 目前**无消费者**（见第 8 节与映射表） |
-| `unresolved_backlog_threshold` | `8` | 积压多少条 unresolved 才够触发一次刷新 | 同上，**预留** |
-| `unresolved_max_age_hours` | `72.0` | 超过这个年龄的 unresolved 不再支撑刷新（原始事件仍然保留） | `semantic.resolve_backlog()` 的参数默认值（无生产调用方） |
-| `deep_refresh_min_interval_seconds` | `3600.0` | 两次刷新之间的最小间隔 | **预留** |
-| `deep_refresh_idle_hours` | `12.0` | 系统空闲多久才允许投机性刷新 | **预留** |
-| `max_operations_per_refresh` | `12` | 单次刷新最多应用多少条 grounded 操作 | **预留**（当前上限由调用方自己控制） |
-| `template_fallback` | `true` | 没有缓存解释时退回确定性模板。**不建议关掉** | **预留**（模板兜底逻辑当前无条件生效） |
-| `interpretation_max_age_seconds` | `21600.0` | 一份心理解释多久后算 stale | **预留**（解释缓存 TTL 目前由 `task.explain_cache_ttl_seconds` = 1800 控制） |
+| `settle_on_ingest` | `true` | 入口路径上是否跑粗粒度规则结算 | `Runtime.process_user_message` |
+| `deep_refresh_enabled` | `true` | 是否允许低频深层刷新 | `Runtime.deep_refresh`（总开关，关掉就立刻返回 `disabled`） |
+| `unresolved_backlog_threshold` | `8` | 积压多少条 unresolved 才够触发一次刷新 | `deep_refresh.evaluate_triggers`（触发规则 `unresolved_backlog`） |
+| `unresolved_max_age_hours` | `72.0` | 超过这个年龄的 unresolved 不再支撑刷新（原始事件仍然保留） | **预留**：只作为 `semantic.resolve_backlog()` 的参数默认值，而该函数目前无生产调用方 |
+| `deep_refresh_min_interval_seconds` | `3600.0` | 两次刷新之间的最小间隔 | `deep_refresh.evaluate_triggers`（**优先级最高**：不满足就直接 `min_interval_not_elapsed`） |
+| `deep_refresh_idle_hours` | `12.0` | 系统空闲多久才允许投机性刷新 | `deep_refresh.evaluate_triggers`（触发规则 `idle_refresh`） |
+| `max_operations_per_refresh` | `12` | 单次刷新最多应用多少条 grounded 操作 | `Runtime.deep_refresh`：同时用作请求里 unresolved 的条数上限、`source_event_ids` 上限与 `ground_suggestions` 的操作上限 |
+| `template_fallback` | `true` | 没有缓存解释时退回确定性模板。**不建议关掉** | **预留**：模板兜底当前无条件生效（不可关） |
+| `interpretation_max_age_seconds` | `21600.0` | 一份心理解释多久后算 stale | **预留**：解释缓存的陈旧判定实际由 `task.explain_cache_ttl_seconds`（1800）承担 |
 
-> 表中标"预留"的字段已经进入配置层、会被 `/config` 与 `config` CLI 打印、也有明确语义，但**还没有任何生产代码读取它们**：它们是为第 8 节的深层刷新编排准备的。这是刻意的诚实标注，不是遗漏。
+> 只有 `unresolved_max_age_hours`、`template_fallback`、`interpretation_max_age_seconds` 三项还处于"已进配置层、语义明确、但尚无生产代码读取"的状态；其余七项都在运行时真实生效。
 
 全部可用参数见 `config.py` 的 dataclass 定义（每个字段都有说明）。
 
@@ -744,11 +749,11 @@ $env:CR_SEMANTIC_API_KEY  = "<放在部署环境的密钥管理里，不要提�
 
 ### 7.6 当前接线状态（诚实标注）
 
-- `Runtime.__init__` 会构造 `runtime.semantic_provider`（`build_provider(self.config)`），`GET /health` 会报告它的 `health()`。
-- **但 `context.runtime_explanation()` 与 `POST /explain` 构造 `EmotionExplainer` 时没有传入 provider**（`EmotionExplainer(runtime.projections.emotion, runtime.config)`）。也就是说：provider 存在、`explain_state()` 有完整实现和测试，但**生产路径目前不会调用它**，心理解释总是走模板/缓存。
-- `deep_refresh()` 目前也没有生产调用方，详见第 8 节与 `docs/PATCH_V0.2_MAPPING.md`。
+- ✅ `Runtime.__init__` 构造 `runtime.semantic_provider`（`build_provider(self.config)`），`GET /health` 报告它的 `health()`。
+- ✅ **`deep_refresh()` 已接线**：`Runtime.deep_refresh()` 会在低频路径上调用 `self.semantic_provider.deep_refresh(request)`，整条链路（触发 → 组装 → provider → grounding → Reducer）已实现并有测试，见第 8 节。
+- ❌ **`explain_state()` 仍未接线**：`context.runtime_explanation()` 与 `POST /explain` 构造 `EmotionExplainer` 时没有传入 provider（`EmotionExplainer(runtime.projections.emotion, runtime.config)`）。也就是说：`explain_state()` 有完整实现、有缓存契约测试，但**生产路径目前不会调用它**，心理解释总是走模板/缓存。
 
-这不是"设计如此"，而是 v0.2 的分期落地：端口与实现先到位，编排接通在下一批。文档与映射表都按现状标注。
+这最后一条不是"设计如此"，而是 v0.2 的分期落地：深层刷新那条链已经接通，心理解释缓存填充这一条还差一次接线。
 
 ---
 
