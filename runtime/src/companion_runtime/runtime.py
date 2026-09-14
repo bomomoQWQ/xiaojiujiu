@@ -20,6 +20,7 @@ proposals.
 
 from __future__ import annotations
 
+import ast
 import logging
 import random
 import threading
@@ -147,6 +148,25 @@ class MessageOutcome:
             "potential_relevance": self.potential_relevance,
             "narrative": self.narrative,
         }
+
+
+def _parse_counts(text: str) -> dict[str, int]:
+    """Parse the reducer's ``{'kind': count}`` note without trusting its format.
+
+    Args:
+        text: The mapping literal produced by the deep-refresh handler.
+
+    Returns:
+        A counts mapping; an unparseable note yields an empty mapping rather than
+        an exception, because reporting is never worth failing a refresh over.
+    """
+    try:
+        parsed = ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(key): int(value) for key, value in parsed.items() if isinstance(value, int)}
 
 
 @dataclass(slots=True)
@@ -1089,15 +1109,15 @@ class Runtime:
 
         outcome.ran = True
         outcome.reason = "applied" if result.applied else result.action
-        outcome.applied = {
-            str(note).split("=")[0].removeprefix("deep_refresh_"): 0
-            for note in result.notes
-            if str(note).startswith("deep_refresh_applied")
-        }
         for note in result.notes:
             text = str(note)
-            if text.startswith("settled_events="):
-                outcome.settled_events = int(text.split("=", 1)[1])
+            if text.startswith("deep_refresh_applied="):
+                outcome.applied = _parse_counts(text.split("=", 1)[1])
+            elif text.startswith("settled_events="):
+                try:
+                    outcome.settled_events = int(text.split("=", 1)[1])
+                except ValueError:
+                    outcome.settled_events = 0
         return outcome
 
     def _is_resolvable(self, identifier: str) -> bool:

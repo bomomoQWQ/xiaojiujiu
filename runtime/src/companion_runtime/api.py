@@ -237,6 +237,48 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
             "note": "inject for one turn only; never persist into conversation history",
         }
 
+    # ------------------------------------------------- deep cognition refresh
+
+    @router.post("/cognition/refresh", tags=["cognition"])
+    def cognition_refresh(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        """Run one low-frequency deep cognition refresh (patch v0.2 §18-§21).
+
+        The refresh is always optional and always safe to call: it declines with a
+        reason when nothing needs doing, when no provider is configured, or when
+        the provider answered with nothing usable. Callers should treat a
+        ``ran=false`` response as normal operation, not as an error.
+        """
+        return runtime.deep_refresh(
+            now=_optional_datetime(payload.get("now")),
+            force=bool(payload.get("force", False)),
+            trigger_context={
+                key: payload[key]
+                for key in (
+                    "major_event",
+                    "matter_due",
+                    "candidate_pool_size",
+                    "wants_proactive",
+                    "proactive_grounded",
+                    "history_suspect",
+                    "user_evidence_overturns",
+                    "hours_since_last_refresh",
+                )
+                if key in payload
+            },
+        ).to_dict()
+
+    @router.get("/cognition/backlog", tags=["cognition"])
+    def cognition_backlog(limit: int = 50) -> dict[str, Any]:
+        """Return the unresolved events waiting for a later interpretation.
+
+        This is the honest view of what the Runtime has declined to guess about.
+        A non-empty backlog is the designed steady state, not a fault.
+        """
+        return {
+            "stats": runtime.projections.semantics.stats(),
+            "items": runtime.projections.semantics.list_unresolved(limit=limit),
+        }
+
     # ------------------------------------------------------------------ render
 
     @router.post("/render", tags=["render"])
