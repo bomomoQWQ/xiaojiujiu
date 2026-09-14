@@ -1,17 +1,19 @@
 """Optional Semantic Provider port (architecture patch v0.2, sections 16-21).
 
-Patch v0.2 removes the local 2B model from the standard dependency set: the main
-LLM already understands the current turn, so the Runtime only needs *strong
+Patch v0.2 removes the local generative model from the standard dependency set: the
+main LLM already understands the current turn, so the Runtime only needs *strong
 semantics* for **low-frequency deep cognition**, never for the acting layer.
 
-This module defines that optional port and its implementations:
+**The local route has been abandoned entirely.** There is no ``local_cpu`` or
+``local_gpu`` provider: shipping a multi-gigabyte model beside a chat bot costs
+more than it returns (measured: seconds per appraisal on CPU, ~2 GB resident),
+and the acting layer never needed it in the first place. What remains is:
 
 * :class:`SemanticProvider` - the frozen protocol the Runtime integrates against;
 * :class:`DisabledProvider` - the default, model-free implementation, so the
   Runtime runs completely with no model at all;
-* :class:`LocalCPUProvider` / :class:`LocalGPUProvider` - thin wrappers around the
-  existing :class:`companion_runtime.local_llm.LocalModelClient`;
-* :class:`RemoteAPIProvider` - any OpenAI-compatible remote endpoint;
+* :class:`RemoteAPIProvider` - any OpenAI-compatible remote endpoint, for the
+  optional low-frequency deep cognition;
 * :func:`build_provider` - environment-driven selection that never raises and
   always falls back to :class:`DisabledProvider`.
 
@@ -39,28 +41,24 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
-from .local_llm import LocalModelClient, LocalModelConfig, _extract_json, parse_explanation
-
 LOGGER = logging.getLogger("companion_runtime.providers")
 
 __all__ = [
     "DEEP_REFRESH_FIELDS",
     "DISABLED_NAME",
-    "LOCAL_CPU_NAME",
-    "LOCAL_GPU_NAME",
     "PROVIDER_ENV_VAR",
     "REMOTE_API_NAME",
     "DEEP_REFRESH_SYSTEM_PROMPT",
     "DeepRefreshRequest",
     "DeepRefreshSuggestions",
     "DisabledProvider",
-    "LocalCPUProvider",
-    "LocalGPUProvider",
     "RemoteAPIProvider",
     "SemanticProvider",
     "Transport",
     "build_provider",
+    "extract_json",
     "parse_deep_refresh",
+    "parse_explanation",
     "resolve_provider_name",
 ]
 
@@ -72,12 +70,17 @@ PROVIDER_ENV_VAR = "CR_SEMANTIC_PROVIDER"
 API_KEY_ENV_VAR = "CR_SEMANTIC_API_KEY"
 
 DISABLED_NAME = "disabled"
-LOCAL_CPU_NAME = "local_cpu"
-LOCAL_GPU_NAME = "local_gpu"
 REMOTE_API_NAME = "remote_api"
 
-#: Every provider name :func:`build_provider` accepts.
-KNOWN_PROVIDER_NAMES = frozenset({DISABLED_NAME, LOCAL_CPU_NAME, LOCAL_GPU_NAME, REMOTE_API_NAME})
+#: Every provider name :func:`build_provider` accepts. Retired names such as
+#: ``local_cpu`` / ``local_gpu`` are deliberately absent: an operator still
+#: exporting one gets ``DisabledProvider`` plus a warning, never a half-working
+#: local path that no longer exists.
+KNOWN_PROVIDER_NAMES = frozenset({DISABLED_NAME, REMOTE_API_NAME})
+
+#: Provider names that used to exist and are now removed. Kept so the factory can
+#: say *why* a stale setting was ignored instead of silently degrading.
+RETIRED_PROVIDER_NAMES = frozenset({"local_cpu", "local_gpu", "local", "cpu", "gpu", "llama_cpp"})
 
 #: Deep-refresh suggestion field -> the Python type it must decode to.
 DEEP_REFRESH_FIELDS: Mapping[str, type] = {
@@ -112,8 +115,8 @@ EXPLAIN_STATE_SYSTEM_PROMPT = (
 class Transport(Protocol):
     """Minimal HTTP transport seam used to keep tests offline.
 
-    It mirrors :class:`companion_runtime.local_llm.LocalModelClient`'s injectable
-    transport so both client families are faked the same way.
+    Injected into every provider so the whole suite runs with no network and no
+    endpoint of any kind.
     """
 
     def __call__(
@@ -327,7 +330,12 @@ def parse_deep_refresh(
 
 
 def resolve_provider_name(config: Any = None, env: Mapping[str, str] | None = None) -> str:
-    """Return the requested provider name, or the default when unrecognised.
+    """Return the requested provider name, normalised.
+
+    This answers "what did the operator ask for", not "can we honour it". Retired
+    names are therefore returned verbatim rather than collapsed to ``disabled``,
+    so :func:`build_provider` can explain the removal instead of the operator
+    silently getting no provider and no reason.
 
     Args:
         config: Optional Runtime configuration or mapping; a
@@ -336,8 +344,9 @@ def resolve_provider_name(config: Any = None, env: Mapping[str, str] | None = No
         env: Environment mapping, defaults to :data:`os.environ`.
 
     Returns:
-        One of :data:`KNOWN_PROVIDER_NAMES`. Any unknown or missing value
-        resolves to :data:`DISABLED_NAME`; this function never raises.
+        A member of :data:`KNOWN_PROVIDER_NAMES`, a member of
+        :data:`RETIRED_PROVIDER_NAMES`, or :data:`DISABLED_NAME` for anything
+        unrecognised. This function never raises.
     """
     source = os.environ if env is None else env
     requested = _first_str(
@@ -345,7 +354,7 @@ def resolve_provider_name(config: Any = None, env: Mapping[str, str] | None = No
         source.get(PROVIDER_ENV_VAR),
     )
     name = requested.strip().lower()
-    if name in KNOWN_PROVIDER_NAMES:
+    if name in KNOWN_PROVIDER_NAMES or name in RETIRED_PROVIDER_NAMES:
         return name
     if name:
         LOGGER.warning(
@@ -564,7 +573,7 @@ class _OpenAICompatibleProvider:
         Raises:
             ValueError: When the reply is not decodable JSON.
         """
-        return _extract_json(raw)
+        return extract_json(raw)
 
     # ------------------------------------------------------------- deep refresh
 
@@ -732,13 +741,17 @@ class _OpenAICompatibleProvider:
     def _grammar_for(self, name: str) -> str | None:
         """Return inline GBNF text for constrained decoding, or ``None``.
 
+        The Runtime no longer bundles grammars, because the local route they
+        existed for is gone. The hook stays so a self-hosted gateway that wants
+        constrained decoding can be wrapped by subclassing and returning text here.
+
         Args:
-            name: Grammar base name, resolved against the bundled directory.
+            name: Grammar base name, e.g. ``deep_refresh``.
 
         Returns:
-            The grammar text, or ``None`` when unconstrained decoding is used.
+            ``None``, meaning unconstrained decoding.
         """
-        return _grammar_text(name)
+        return None
 
     def __repr__(self) -> str:
         """Return a stable, secret-free repr."""
@@ -747,117 +760,6 @@ class _OpenAICompatibleProvider:
             f"model={self.model!r}, api_key="
             f"{'configured' if self._api_key_configured() else 'not configured'})"
         )
-
-
-class LocalCPUProvider(_OpenAICompatibleProvider):
-    """Semantic provider backed by the existing local model client.
-
-    This is a thin adapter over :class:`companion_runtime.local_llm.LocalModelClient`
-    - the client is read and reused, never modified. It exists so a deployment
-    that already runs a ``llama.cpp`` server can opt back into local strong
-    semantics, with the same strict degradation the client already guarantees.
-
-    Args:
-        config: Local model configuration. When omitted, a configuration with
-            ``enabled=True`` is built so that explicitly selecting this provider
-            is enough to activate the local endpoint.
-        transport: Inject the underlying client's transport, used by tests.
-        grammar: Inline GBNF grammar for constrained deep-refresh decoding.
-        name: Provider name; overridden by :class:`LocalGPUProvider`.
-    """
-
-    def __init__(
-        self,
-        config: LocalModelConfig | None = None,
-        *,
-        transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]]
-        | None = None,
-        grammar: str | None = None,
-        name: str = LOCAL_CPU_NAME,
-    ) -> None:
-        """Build the wrapped client and expose its settings."""
-        resolved = config if config is not None else LocalModelConfig(enabled=True)
-        self._client = LocalModelClient(resolved, transport=transport)
-        self._config = resolved
-        self._grammar = grammar
-        super().__init__(
-            name=name,
-            base_url=resolved.base_url,
-            model=resolved.model,
-            # The token is forwarded into the base class's closure-only key slot so
-            # a protected endpoint stays protected, while ``repr``/``health`` report
-            # nothing but "configured".
-            api_key=resolved.api_key,
-            timeout_s=resolved.explain_timeout_s,
-            deep_timeout_s=resolved.explain_timeout_s,
-            max_tokens=resolved.max_tokens,
-            temperature=resolved.temperature,
-            headers=resolved.headers,
-            transport=self._client_transport,
-        )
-
-    # --------------------------------------------------------------- delegation
-
-    @property
-    def client(self) -> LocalModelClient:
-        """Return the wrapped local model client."""
-        return self._client
-
-    def _client_transport(
-        self, url: str, body: dict[str, Any], timeout: float, headers: dict[str, str]
-    ) -> Mapping[str, Any]:
-        """Delegate to the wrapped client's transport seam."""
-        return self._client._transport(url, body, timeout, headers)  # noqa: SLF001
-
-    def configured(self) -> bool:
-        """Return whether the wrapped client is enabled and reachable-looking."""
-        return bool(self._config.enabled and self.base_url and self.model)
-
-    def available(self) -> bool:
-        """Return whether the wrapped local client is enabled."""
-        return bool(self._config.enabled)
-
-    def _extra_body(self) -> dict[str, Any] | None:
-        """Reuse the client's ``chat_template_kwargs`` request fields."""
-        kwargs = dict(self._config.chat_template_kwargs or {})
-        return {"chat_template_kwargs": kwargs} if kwargs else None
-
-    def _grammar_for(self, name: str) -> str | None:
-        """Return the explicit grammar override, else the bundled grammar."""
-        return self._grammar if self._grammar else super()._grammar_for(name)
-
-    def health(self) -> dict[str, Any]:
-        """Return the provider snapshot plus the wrapped client's own snapshot."""
-        snapshot = super().health()
-        snapshot["client"] = self._client.health()
-        return snapshot
-
-
-class LocalGPUProvider(LocalCPUProvider):
-    """Identical transport to :class:`LocalCPUProvider`, named for a GPU deployment.
-
-    Patch v0.2 section 17 lists this as a separate option only because operators
-    think in terms of where the weights run. The wire format is unchanged: it is
-    the **same OpenAI-compatible endpoint**, served from a GPU instead of the CPU.
-    No code path, prompt or contract differs - only the reported name, so health
-    output and logs make the deployment obvious.
-
-    Args:
-        config: Local model configuration, as for :class:`LocalCPUProvider`.
-        transport: Inject the underlying client's transport, used by tests.
-        grammar: Inline GBNF grammar for constrained deep-refresh decoding.
-    """
-
-    def __init__(
-        self,
-        config: LocalModelConfig | None = None,
-        *,
-        transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]]
-        | None = None,
-        grammar: str | None = None,
-    ) -> None:
-        """Build the provider with the ``local_gpu`` name."""
-        super().__init__(config, transport=transport, grammar=grammar, name=LOCAL_GPU_NAME)
 
 
 class RemoteAPIProvider(_OpenAICompatibleProvider):
@@ -945,7 +847,10 @@ def build_provider(
     3. :data:`DISABLED_NAME`.
 
     Any unknown name and any construction failure falls back to
-    :class:`DisabledProvider`, so the Runtime always has a working port.
+    :class:`DisabledProvider`, so the Runtime always has a working port. Retired
+    local names are reported explicitly rather than degraded silently, so an
+    operator who still exports ``CR_SEMANTIC_PROVIDER=local_cpu`` learns that the
+    local route is gone instead of wondering why nothing happens.
 
     Args:
         config: Optional Runtime configuration (``RuntimeConfig`` or any object or
@@ -959,45 +864,22 @@ def build_provider(
     source = os.environ if env is None else env
     try:
         name = resolve_provider_name(config, source)
+        if name in RETIRED_PROVIDER_NAMES:
+            LOGGER.warning(
+                "Semantic provider %r was removed when the local model route was abandoned; "
+                "using the disabled provider. Use %r for remote strong semantics.",
+                name,
+                REMOTE_API_NAME,
+            )
+            return DisabledProvider()
         if name == DISABLED_NAME:
             return DisabledProvider()
-        if name in {LOCAL_CPU_NAME, LOCAL_GPU_NAME}:
-            return _build_local(name, config, source, transport)
         if name == REMOTE_API_NAME:
             return _build_remote(config, source, transport)
     except Exception as exc:  # noqa: BLE001 - the factory must never raise
         LOGGER.warning("Semantic provider construction failed (%s); using disabled", exc)
         return DisabledProvider()
     return DisabledProvider()
-
-
-def _build_local(
-    name: str,
-    config: Any,
-    env: Mapping[str, str],
-    transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]] | None,
-) -> SemanticProvider:
-    """Build a local CPU/GPU provider from config and environment settings."""
-    base_url = _first_str(
-        _config_value(config, "semantic_base_url", "base_url"), env.get("CR_SEMANTIC_BASE_URL")
-    )
-    model = _first_str(
-        _config_value(config, "semantic_model", "model"), env.get("CR_SEMANTIC_MODEL")
-    )
-    local_config = LocalModelConfig.from_env(env)
-    if base_url:
-        local_config.base_url = base_url.rstrip("/")
-    if model:
-        local_config.model = model
-    # An explicitly selected local provider is an opt-in: the pre-existing
-    # ``CR_LOCAL_MODEL_ENABLED`` flag stays available to turn it back off.
-    if not local_config.enabled and "CR_LOCAL_MODEL_ENABLED" not in env:
-        local_config.enabled = True
-    timeout = _first_float(env.get("CR_SEMANTIC_TIMEOUT_S"))
-    if timeout is not None:
-        local_config.explain_timeout_s = timeout
-    factory = LocalGPUProvider if name == LOCAL_GPU_NAME else LocalCPUProvider
-    return factory(local_config, transport=transport)
 
 
 def _build_remote(
@@ -1108,22 +990,68 @@ def _first_message_text(response: Any) -> str:
     return content
 
 
-def _grammar_text(name: str) -> str | None:
-    """Load a bundled GBNF grammar for constrained decoding.
+def extract_json(text: str) -> Any:
+    """Extract the first JSON object from a completion reply.
+
+    Remote endpoints fence their output, prefix it with prose, or wrap it in a
+    ``suggestions`` envelope, so the reply must be located rather than assumed.
 
     Args:
-        name: Grammar base name, e.g. ``deep_refresh``.
+        text: Raw completion text.
 
     Returns:
-        The grammar text, or ``None`` when no grammar file is bundled. A missing
-        grammar only removes constrained decoding; it never breaks the Runtime.
-    """
-    try:
-        from .local_llm import load_grammar
+        The decoded object.
 
-        return load_grammar(name)
-    except Exception:  # noqa: BLE001 - a missing grammar is never fatal
+    Raises:
+        ValueError: When no decodable JSON object is present.
+    """
+    stripped = (text or "").strip()
+    if stripped.startswith("```"):
+        stripped = stripped.split("```")[1] if "```" in stripped[3:] else stripped[3:]
+        if stripped.startswith("json"):
+            stripped = stripped[4:]
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start >= 0 and end > start:
+        return json.loads(stripped[start : end + 1])
+    raise ValueError("no JSON object in model reply")
+
+
+#: Explanation fields a provider must return to be considered usable.
+EXPLANATION_FIELDS = ("experience", "focus", "conflict", "impulse", "inhibition", "expression")
+
+
+def parse_explanation(payload: Any) -> dict[str, str] | None:
+    """Validate a decoded emotion-explanation payload.
+
+    Args:
+        payload: Decoded JSON object from the model.
+
+    Returns:
+        A mapping of the six explanation fields, or ``None`` when malformed. A
+        long field is rejected rather than truncated: a truncated psychological
+        sentence is worse than none.
+    """
+    if not isinstance(payload, Mapping):
         return None
+    result: dict[str, str] = {}
+    for field_name in EXPLANATION_FIELDS:
+        value = payload.get(field_name)
+        if value is None:
+            value = ""
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if len(text) > 120:
+            return None
+        result[field_name] = text
+    if not any(result.values()):
+        return None
+    return result
 
 
 def _ms(started: float) -> int:

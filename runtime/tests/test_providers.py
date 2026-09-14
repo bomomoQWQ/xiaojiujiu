@@ -21,15 +21,14 @@ from typing import Any, Mapping
 
 import pytest
 
-from companion_runtime.local_llm import LocalModelConfig
 from companion_runtime.providers import (
     API_KEY_ENV_VAR,
     DEEP_REFRESH_FIELDS,
+    KNOWN_PROVIDER_NAMES,
+    RETIRED_PROVIDER_NAMES,
     DeepRefreshRequest,
     DeepRefreshSuggestions,
     DisabledProvider,
-    LocalCPUProvider,
-    LocalGPUProvider,
     RemoteAPIProvider,
     build_provider,
     parse_deep_refresh,
@@ -97,12 +96,6 @@ def _remote(handler, **overrides: Any) -> RemoteAPIProvider:
     }
     settings.update(overrides)
     return RemoteAPIProvider(transport=FakeTransport(handler), **settings)
-
-
-def _local(handler, **overrides: Any) -> LocalCPUProvider:
-    """Build a local CPU provider wired to a fake transport."""
-    config = LocalModelConfig(enabled=True, **overrides)
-    return LocalCPUProvider(config, transport=FakeTransport(handler))
 
 
 def _suggestions_payload(**overrides: Any) -> DeepRefreshSuggestions:
@@ -253,22 +246,25 @@ class TestBuildProvider:
         provider = build_provider(env={"CR_SEMANTIC_PROVIDER": "  Remote_API  "})
         assert isinstance(provider, RemoteAPIProvider)
 
-    def test_local_cpu_selection(self) -> None:
-        provider = build_provider(env={"CR_SEMANTIC_PROVIDER": "local_cpu"})
-        assert isinstance(provider, LocalCPUProvider)
-        assert not isinstance(provider, LocalGPUProvider)
-        assert provider.name == "local_cpu"
-        assert provider.available() is True
+    def test_the_local_route_is_gone(self) -> None:
+        """Abandoning the local model must be an explicit, reported outcome.
 
-    def test_local_gpu_selection_shares_the_local_wire(self) -> None:
-        cpu = build_provider(env={"CR_SEMANTIC_PROVIDER": "local_cpu"})
-        gpu = build_provider(env={"CR_SEMANTIC_PROVIDER": "local_gpu"})
-        assert isinstance(gpu, LocalGPUProvider)
-        assert gpu.name == "local_gpu"
-        assert type(gpu).__mro__[1] is LocalCPUProvider
-        # Identical wiring: only the reported name differs.
-        assert gpu.base_url == cpu.base_url
-        assert gpu.model == cpu.model
+        An operator still exporting a retired name must get the disabled provider
+        and a warning - never a half-working local path or a silent success.
+        """
+        for name in sorted(RETIRED_PROVIDER_NAMES):
+            provider = build_provider(env={"CR_SEMANTIC_PROVIDER": name})
+            assert isinstance(provider, DisabledProvider), name
+            assert provider.available() is False
+
+    def test_only_disabled_and_remote_are_known(self) -> None:
+        assert KNOWN_PROVIDER_NAMES == {"disabled", "remote_api"}
+        assert not (KNOWN_PROVIDER_NAMES & RETIRED_PROVIDER_NAMES)
+
+    def test_a_retired_name_is_reported_in_the_log(self, caplog: Any) -> None:
+        with caplog.at_level(logging.WARNING):
+            build_provider(env={"CR_SEMANTIC_PROVIDER": "local_cpu"})
+        assert any("abandoned" in record.getMessage() for record in caplog.records)
 
     def test_remote_selection_uses_environment_key(self) -> None:
         provider = build_provider(
@@ -305,13 +301,20 @@ class TestBuildProvider:
         assert isinstance(provider, DisabledProvider)
 
     def test_mapping_config_is_supported(self) -> None:
+        provider = build_provider({"semantic_provider": "remote_api"}, env={})
+        assert isinstance(provider, RemoteAPIProvider)
+
+    def test_a_retired_name_in_config_is_also_reported(self) -> None:
+        """The removal must be visible wherever the name is set, not just in env."""
         provider = build_provider({"semantic_provider": "local_gpu"}, env={})
-        assert isinstance(provider, LocalGPUProvider)
+        assert isinstance(provider, DisabledProvider)
 
     def test_config_extras_semantic_section_is_honoured(self) -> None:
-        config = type("Cfg", (), {"extras": {"semantic": {"provider": "local_cpu"}}})()
+        config = type(
+            "Cfg", (), {"extras": {"semantic": {"provider": "remote_api"}}}
+        )()
         provider = build_provider(config, env={})
-        assert isinstance(provider, LocalCPUProvider)
+        assert isinstance(provider, RemoteAPIProvider)
 
     def test_api_key_in_config_is_ignored(self) -> None:
         provider = build_provider(
@@ -348,7 +351,7 @@ class TestBuildProvider:
 
             @property
             def semantic_provider(self) -> str:
-                return "local_cpu"
+                return "remote_api"
 
             @property
             def semantic_base_url(self) -> str:
@@ -360,7 +363,7 @@ class TestBuildProvider:
     def test_resolve_provider_name_never_raises(self) -> None:
         assert resolve_provider_name(None, {}) == "disabled"
         assert resolve_provider_name(None, {"CR_SEMANTIC_PROVIDER": "???"}) == "disabled"
-        assert resolve_provider_name(None, {"CR_SEMANTIC_PROVIDER": "local_gpu"}) == "local_gpu"
+        assert resolve_provider_name(None, {"CR_SEMANTIC_PROVIDER": "remote_api"}) == "remote_api"
 
 
 # --------------------------------------------------------------------------------------
@@ -384,76 +387,6 @@ class TestDisabledProvider:
 
     def test_repr_is_stable_and_secret_free(self) -> None:
         assert repr(DisabledProvider()) == "DisabledProvider(name='disabled')"
-
-
-# --------------------------------------------------------------------------------------
-# Local CPU / GPU provider
-# --------------------------------------------------------------------------------------
-
-
-class TestLocalCPUProvider:
-    """The local route wraps the existing client and keeps its degradation."""
-
-    def test_name_and_availability(self) -> None:
-        provider = _local(lambda *_: _reply(GOOD_SUGGESTIONS))
-        assert provider.name == "local_cpu"
-        assert provider.available() is True
-
-    def test_disabled_config_is_unavailable(self) -> None:
-        provider = LocalCPUProvider(LocalModelConfig(enabled=False))
-        assert provider.available() is False
-        assert provider.deep_refresh(DeepRefreshRequest()) is None
-        assert provider.explain_state({"x": 1}) is None
-
-    def test_deep_refresh_success_uses_the_wrapped_client_transport(self) -> None:
-        transport = FakeTransport(lambda *_: _reply(GOOD_SUGGESTIONS))
-        provider = LocalCPUProvider(LocalModelConfig(enabled=True), transport=transport)
-        result = provider.deep_refresh(DeepRefreshRequest(unresolved_events=[{"event_id": "e1"}]))
-        assert result is not None
-        assert result.degraded is False
-        assert result.provider == "local_cpu"
-        assert result.reinterpretations[0]["event_id"] == "e1"
-        assert transport.call_count == 1
-        assert transport.calls[0]["url"].endswith("/chat/completions")
-        # The wrapped client's own request shape is preserved.
-        assert transport.calls[0]["body"]["chat_template_kwargs"] == {"enable_thinking": False}
-        assert transport.calls[0]["body"]["stream"] is False
-
-    def test_deep_refresh_timeout_degrades(self) -> None:
-        def boom(*_: Any) -> Mapping[str, Any]:
-            raise socket.timeout("timed out")
-
-        provider = _local(boom)
-        result = provider.deep_refresh(DeepRefreshRequest(), timeout_s=0.01)
-        assert result is not None
-        assert result.degraded is True
-        assert result.provider == "local_cpu"
-        assert result.reason.startswith("error:")
-
-    def test_explain_state_success_and_template_fallback(self) -> None:
-        provider = _local(lambda *_: _reply(GOOD_EXPLANATION))
-        assert provider.explain_state({"mood_valence": -0.2}) == GOOD_EXPLANATION
-
-        failing = _local(lambda *_: {"choices": [{"message": {"content": "不是 JSON"}}]})
-        assert failing.explain_state({"mood_valence": -0.2}) is None
-
-    def test_local_token_is_forwarded_and_never_echoed(self) -> None:
-        transport = FakeTransport(lambda *_: _reply(GOOD_SUGGESTIONS))
-        provider = LocalCPUProvider(
-            LocalModelConfig(enabled=True, api_key=SECRET), transport=transport
-        )
-        provider.deep_refresh(DeepRefreshRequest())
-        assert transport.calls[0]["headers"]["Authorization"] == f"Bearer {SECRET}"
-        assert SECRET not in repr(provider)
-        assert SECRET not in json.dumps(provider.health())
-
-    def test_gpu_provider_only_differs_by_name(self) -> None:
-        transport = FakeTransport(lambda *_: _reply(GOOD_SUGGESTIONS))
-        provider = LocalGPUProvider(LocalModelConfig(enabled=True), transport=transport)
-        assert provider.name == "local_gpu"
-        result = provider.deep_refresh(DeepRefreshRequest())
-        assert result is not None
-        assert result.provider == "local_gpu"
 
 
 # --------------------------------------------------------------------------------------
@@ -714,14 +647,6 @@ class TestExplainStateCache:
         provider.explain_state({"x": 1}, state_key="k")
         assert transport.call_count == 2
 
-    def test_local_provider_honours_the_same_cache_contract(self) -> None:
-        transport = FakeTransport(lambda *_: _reply(GOOD_EXPLANATION))
-        provider = LocalCPUProvider(LocalModelConfig(enabled=True), transport=transport)
-        provider.explain_state({"mood_valence": -0.3}, state_key="same")
-        provider.explain_state({"mood_valence": +0.3}, state_key="same")
-        assert transport.call_count == 1
-        assert provider.stats["cache_hits"] == 1
-
     def test_cache_key_is_not_derived_from_the_payload_alone(self) -> None:
         """Two payloads sharing a key share the entry - the key is authoritative."""
         transport = FakeTransport(lambda *_: _reply(GOOD_EXPLANATION))
@@ -748,12 +673,6 @@ class TestProtocolConformance:
         "provider",
         [
             DisabledProvider(),
-            LocalCPUProvider(
-                LocalModelConfig(enabled=True), transport=FakeTransport(lambda *_: {})
-            ),
-            LocalGPUProvider(
-                LocalModelConfig(enabled=True), transport=FakeTransport(lambda *_: {})
-            ),
             RemoteAPIProvider(
                 "https://semantic.example.com/v1",
                 model="strong-model",
@@ -761,7 +680,7 @@ class TestProtocolConformance:
                 transport=FakeTransport(lambda *_: {}),
             ),
         ],
-        ids=["disabled", "local_cpu", "local_gpu", "remote_api"],
+        ids=["disabled", "remote_api"],
     )
     def test_members_and_fail_open_behaviour(self, provider: Any) -> None:
         assert isinstance(provider.name, str) and provider.name
