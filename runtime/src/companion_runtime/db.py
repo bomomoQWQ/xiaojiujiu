@@ -30,7 +30,7 @@ from .utility import ensure_aware, isoformat, parse_datetime
 
 LOGGER = logging.getLogger("companion_runtime.db")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     # ------------------------------------------------------------------ version
@@ -86,6 +86,32 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_raw_events_ts ON raw_events(timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_raw_events_type ON raw_events(event_type)",
     "CREATE INDEX IF NOT EXISTS idx_raw_events_conv ON raw_events(conversation_id, timestamp)",
+    # --------------------------------------------------- semantic settlement
+    # Architecture patch v0.2 separates the acting layer from persistent
+    # cognition, which means an event no longer has to be interpreted the moment
+    # it arrives. This table is the *derived* reading of a raw event: it is
+    # rebuildable, and a missing row means "not looked at yet". ``raw_events``
+    # stays untouched, so an unresolved event is never lost.
+    """
+    CREATE TABLE IF NOT EXISTS event_semantics (
+        event_id            TEXT PRIMARY KEY,
+        semantic_status     TEXT NOT NULL DEFAULT 'unresolved',
+        direction           TEXT,
+        intensity_band      TEXT,
+        confidence          REAL,
+        settlement_source   TEXT,
+        evidence            TEXT,
+        potential_relevance TEXT NOT NULL DEFAULT 'low',
+        unresolved_reason   TEXT,
+        settled_at          TEXT,
+        deep_refresh_id     TEXT,
+        version             INTEGER NOT NULL DEFAULT 0,
+        created_at          TEXT NOT NULL,
+        updated_at          TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_event_semantics_status "
+    "ON event_semantics(semantic_status, potential_relevance)",
     """
     CREATE TABLE IF NOT EXISTS interpretation_versions (
         interpretation_id TEXT PRIMARY KEY,

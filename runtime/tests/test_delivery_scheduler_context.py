@@ -386,14 +386,22 @@ def test_context_separates_facts_from_inferences(runtime: Runtime) -> None:
 
 
 def test_render_block_contains_the_documented_sections(runtime: Runtime) -> None:
-    """The prompt block has the five documented sections and a discard note."""
+    """The block has the documented sections, a priority note and a discard note.
+
+    Patch v0.2 reframed the psychological section from "how this turn should feel"
+    to "the long-term weather you carry in", so the block must also state its own
+    subordination to the current user message.
+    """
     runtime.process_user_message(content="明天下午面试，结束告诉你结果。", timestamp=BASE_TIME)
     bundle = context_module.build(runtime=runtime, now=BASE_TIME)
     block = context_module.render_block(bundle)
     assert context_module.SECTION_PSYCH in block
     assert context_module.SECTION_SITUATION in block
     assert context_module.SECTION_TIME in block
-    assert "临时内部状态" in block
+    assert context_module.PRIORITY_PREAMBLE in block
+    assert "当前用户原话" in block
+    assert "长期状态" in block
+    assert "临时背景" in block
 
 
 def test_render_block_never_contains_raw_numbers_for_emotion(runtime: Runtime) -> None:

@@ -383,7 +383,12 @@ def mood_relax(state: RuntimeState, config: EmotionConfig, dt_seconds: float) ->
 
 
 class EmotionSemanticProvider(Protocol):
-    """Optional port for a local small model that writes the心理 explanation."""
+    """Optional port for a semantic provider that renders the psychological cache.
+
+    Two call shapes are accepted so that both the legacy explanation port and the
+    patch-v0.2 :class:`~companion_runtime.providers.SemanticProvider` work here:
+    ``explain(payload)`` or ``explain_state(payload, state_key=...)``.
+    """
 
     def explain(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Return first-person psychological language for ``payload``."""
@@ -391,18 +396,19 @@ class EmotionSemanticProvider(Protocol):
 
 
 TEMPLATES_POSITIVE = (
-    "心里是松的，也有点高兴。",
-    "有一点被回应到的感觉，情绪往上走。",
-    "有些轻快，愿意多说几句。",
+    "进入本轮之前，整体是偏暖的，情绪基调往上走。",
+    "这一段时间心里比较松，愿意多待一会儿。",
+    "最近的底色是轻快的，不太设防。",
 )
 TEMPLATES_NEGATIVE = (
-    "有些失落，也有一点不确定。",
-    "情绪往下沉了一点，还压着没说。",
-    "有点不是滋味，但还不至于表现出来。",
+    "进入本轮之前，整体底色偏负向，还有没消化完的东西。",
+    "这段时间情绪基调偏低，表达会比平常收着。",
+    "近期一直有一点沉，还没有完全过去。",
 )
 TEMPLATES_NEUTRAL = (
-    "还算平静，只是在留意接下来的走向。",
-    "没什么起伏，保持着观察。",
+    "进入本轮之前，整体比较平，没有强烈倾向。",
+    "这段时间基调平稳，处于观察状态。",
+    "最近没有大起大落，底色是中性的。",
 )
 
 
@@ -554,12 +560,16 @@ class EmotionExplainer:
         }
 
     def _render(self, payload: dict[str, Any], rng: random.Random) -> dict[str, Any]:
-        """Render the explanation, delegating to the provider when available."""
+        """Render the explanation, delegating to the provider when available.
+
+        A provider is a *cache filler*, never a requirement: patch v0.2 keeps the
+        deep interpretation optional and falls back to the deterministic template.
+        """
         if self._provider is not None:
             try:
-                provided = self._provider.explain(payload)
+                provided = self._call_provider(payload)
                 required = {"experience", "impulse", "inhibition"}
-                if required.issubset(provided.keys()):
+                if isinstance(provided, Mapping) and required.issubset(provided.keys()):
                     return {
                         "experience": str(provided.get("experience", "")),
                         "focus": str(provided.get("focus", "")),
@@ -568,14 +578,50 @@ class EmotionExplainer:
                         "inhibition": str(provided.get("inhibition", "")),
                         "expression": str(provided.get("expression", "")),
                     }
-                LOGGER.warning("Emotion provider returned an incomplete payload; using templates")
+                LOGGER.info("Semantic provider returned no usable payload; using templates")
             except Exception:  # pragma: no cover - defensive boundary around a model
-                LOGGER.exception("Emotion provider failed; falling back to templates")
+                LOGGER.exception("Semantic provider failed; falling back to templates")
 
         return self._render_template(payload, rng)
 
+    def _call_provider(self, payload: dict[str, Any]) -> Any:
+        """Call the provider through whichever explanation interface it offers."""
+        explain_state = getattr(self._provider, "explain_state", None)
+        if callable(explain_state):
+            return explain_state(payload, state_key=EmotionExplainer.cache_key_from_payload(payload))
+        explain = getattr(self._provider, "explain", None)
+        if callable(explain):
+            return explain(payload)
+        return None
+
+    @staticmethod
+    def cache_key_from_payload(payload: Mapping[str, Any]) -> str:
+        """Return a cache key for a raw explainer payload.
+
+        Used when the provider is invoked directly with the payload rather than
+        through :meth:`explain`, so the provider-side cache stays aligned with the
+        Runtime-side one.
+        """
+        mood = payload.get("background_mood") or {}
+        return "|".join(
+            [
+                f"v{round(float(mood.get('valence', 0.0)), 1)}",
+                f"a{round(float(mood.get('arousal', 0.0)), 1)}",
+                f"i{round(float(payload.get('approach_impulse', 0.0)), 1)}",
+                f"r{round(float(payload.get('restraint', 0.0)), 1)}",
+                f"p{round(float(payload.get('pressure', 0.0)), 1)}",
+            ]
+        )
+
     def _render_template(self, payload: dict[str, Any], rng: random.Random) -> dict[str, Any]:
-        """Compose the explanation from deterministic templates."""
+        """Compose the long-term background from deterministic templates.
+
+        Patch v0.2 redefined this function's job. It must **not** describe how the
+        current message should be received - the main LLM decides that from the
+        user's actual words. It only answers "roughly what state am I carrying
+        into this turn", so every phrase below is about the standing weather
+        rather than the present moment.
+        """
         mood = payload["background_mood"]
         valence = float(mood["valence"])
         impulse = float(payload["approach_impulse"])
@@ -593,33 +639,33 @@ class EmotionExplainer:
         if dominant is not None:
             label = dominant.get("label")
             if label:
-                focus = f"现在最占位置的是「{label}」这种感受。"
+                focus = f"近期最占位置的，是「{label}」这一类还没散掉的东西。"
             elif dominant["direction"] == EmotionDirection.NEGATIVE.value:
-                focus = "有一件事压着，具体叫什么还说不上来。"
+                focus = "有一件事还压着，具体叫什么暂时说不上来。"
             else:
-                focus = "有一件事让人心里是暖的。"
+                focus = "有一件让人心里偏暖的事，还在余波里。"
         else:
-            focus = "没有特别占位置的事，注意力是散的。"
+            focus = "没有特别占位置的旧事，注意力比较散。"
 
         if impulse > restraint + 0.15:
-            conflict = "很想靠近，但知道现在未必合适。"
-            impulse_text = "想主动说点什么。"
+            conflict = "长期下来一直有靠近的倾向，同时又习惯性地收着。"
+            impulse_text = "总体上是想靠近的，只是未必马上行动。"
         elif pressure > 0.45:
-            conflict = "压着不说已经有点难受了。"
-            impulse_text = "想确认一下对方还在不在。"
+            conflict = "压着不说的东西积累了一阵子，已经有点沉。"
+            impulse_text = "总体上有确认对方状态的倾向，但不急。"
         else:
-            conflict = "暂时没有明显的拉扯。"
-            impulse_text = "没有非做不可的冲动。"
+            conflict = "长期来看没有明显的内部拉扯。"
+            impulse_text = "总体没有非做不可的倾向。"
 
         if restraint > 0.68:
-            inhibition = "不希望给对方增加压力，所以会克制。"
-            expression = "表达上会偏收着，话不多但留有余地。"
+            inhibition = "长期表达风格偏向克制，不太主动施压。"
+            expression = "底色是收着的，话不多但留有余地。"
         elif restraint < 0.35:
-            inhibition = "顾虑不多，愿意直接说出来。"
-            expression = "表达上会更直接一点。"
+            inhibition = "长期表达风格顾虑不多，倾向于直说。"
+            expression = "底色是直接的，想到什么就说什么。"
         else:
-            inhibition = "会看情况决定表达多少。"
-            expression = "表达上保持平常的分寸。"
+            inhibition = "长期表达风格会看情况决定说多少。"
+            expression = "底色是平常的分寸，不高不低。"
 
         return {
             "experience": experience,

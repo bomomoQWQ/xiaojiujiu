@@ -41,13 +41,29 @@ __all__ = [
 ]
 
 #: Section headers used in the rendered prompt block.
-SECTION_PSYCH = "【当前心理状态】"
+#
+# Patch v0.2 renamed the psychological section: it no longer tells the main LLM
+# how the current message should feel, it only describes the long-term weather
+# the character carries into the turn.
+SECTION_PSYCH = "【进入本轮前的长期状态（背景）】"
 SECTION_SITUATION = "【当前工作局势】"
 SECTION_INTENT = "【当前最终意图】"
 SECTION_SITUATION_INTENT = "【刚刚差点要说的话】"
 SECTION_MEMORY = "【必要记忆】"
 SECTION_BOUNDARY = "【表达边界】"
 SECTION_TIME = "【时间连续性】"
+
+#: Preamble that fixes the precedence order from patch v0.2 section 7. The main
+#: LLM must treat the current user message and the current facts as authoritative
+#: and this block as background colour, never as an instruction to keep feeling
+#: something the user's new words have just contradicted.
+PRIORITY_PREAMBLE = (
+    "【使用说明】以下是 Runtime 注入的临时背景，帮助你知道自己从哪来，"
+    "不是对当前这句话的指令。优先级顺序为：宿主设定与安全约束 > 当前用户原话 > "
+    "当前确定事实 > 显式边界 > 这里的长期状态。"
+    "如果当前用户原话与下面的长期状态不一致，以当前用户原话为准；"
+    "你的即时反应由你自己根据当前语境完成。"
+)
 
 #: How long a *closed* attempt stays worth recalling. A committed intention that
 #: the user pre-empted is only interesting while it is still "just now"; after this
@@ -404,18 +420,18 @@ def render_block(bundle: ContextBundle) -> str:
     """
     if not bundle.psychological and not bundle.situation.get("facts"):
         return ""
-    lines: list[str] = []
+    lines: list[str] = [PRIORITY_PREAMBLE, ""]
 
     psych = bundle.psychological
     if psych:
         lines.append(SECTION_PSYCH)
         for label, key in (
-            ("感受", "experience"),
+            ("长期感受", "experience"),
             ("在意", "focus"),
             ("拉扯", "conflict"),
-            ("冲动", "impulse"),
+            ("倾向", "impulse"),
             ("克制", "inhibition"),
-            ("表达", "expression"),
+            ("表达底色", "expression"),
         ):
             value = psych.get(key)
             if value:
@@ -480,7 +496,10 @@ def render_block(bundle: ContextBundle) -> str:
         lines.append(f"- 距离上次主动联系：{time_context['hours_since_last_contact']} 小时")
     lines.append(f"- 当前本地时间：{time_context.get('local_now')}")
     lines.append("")
-    lines.append("以上是仅本轮注入的临时内部状态，不要直接复述，也不要写进长期对话历史。")
+    lines.append(
+        "以上是仅本轮注入的临时背景，不要直接复述，也不要写进长期对话历史；"
+        "它描述的是你进入本轮之前的长期状态，不是本轮该怎么反应。"
+    )
     return "\n".join(lines)
 
 

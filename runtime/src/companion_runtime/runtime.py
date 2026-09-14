@@ -114,9 +114,16 @@ class MessageOutcome:
     observation_id: str | None = None
     reply_blocked: bool = False
     proactive_paused_until: datetime | None = None
-    #: Which appraiser produced the emotional reading: ``rule`` (degradation
-    #: Level 0) or ``local_model`` (Level 2). Both satisfy the same contract.
+    #: Which appraiser produced the emotional reading: ``coarse_rule`` (an explicit
+    #: event settled by the Level 1 rule table), ``deferred`` (recorded as
+    #: unresolved for a later deep refresh) or ``rule`` (the legacy lexicon path
+    #: used by callers that still ask for a per-turn reading).
     appraisal_source: str = "rule"
+    #: Whether this event has a durable semantic reading yet (patch v0.2).
+    semantic_status: str = "resolved"
+    #: Cheap priority for the deep-refresh queue when ``semantic_status`` is
+    #: ``unresolved``.
+    potential_relevance: str = "low"
     narrative: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -133,6 +140,8 @@ class MessageOutcome:
             "reply_blocked": self.reply_blocked,
             "proactive_paused_until": isoformat(self.proactive_paused_until),
             "appraisal_source": self.appraisal_source,
+            "semantic_status": self.semantic_status,
+            "potential_relevance": self.potential_relevance,
             "narrative": self.narrative,
         }
 
@@ -212,12 +221,16 @@ class Runtime:
         self.rng = random.Random(seed)
         self._write_lock = threading.RLock()
         self._worker_id = f"runtime-{new_id('task').split('_')[-1]}"
-        #: Optional Level 2 accelerator (the fine-tuned 2B model on the CPU).
-        #: Disabled unless ``CR_LOCAL_MODEL_ENABLED`` is set, so the Runtime stays
-        #: dependency-free and deterministic by default.
-        from .local_llm import LocalModelClient, LocalModelConfig
+        #: Optional semantic provider (architecture patch v0.2).
+        #:
+        #: This is *not* on the ingest path and never will be: the host main LLM
+        #: performs the current turn, and the Runtime only needs a model when it
+        #: wants to reinterpret old events or compress long-term state into
+        #: language. ``build_provider`` defaults to ``DisabledProvider`` and never
+        #: raises, so the Runtime is fully functional with no model at all.
+        from .providers import build_provider
 
-        self.local_model = LocalModelClient(LocalModelConfig.from_env())
+        self.semantic_provider = build_provider(self.config)
         self.reducer = Reducer(
             db=self._db,
             events=self.events,
@@ -525,48 +538,87 @@ class Runtime:
                 if resolved_ids:
                     self._retire_candidates_for(resolved_ids, conn, now=stamp)
 
-                # --- emotion appraisal and mood
+                # --- coarse persistent settlement (architecture patch v0.2)
+                #
+                # The acting layer already understands this turn: the host main LLM
+                # sees the user's words directly. What the Runtime owes the future
+                # is not a second opinion about "how does this feel right now", but
+                # a decision about "what does this leave behind".
+                #
+                # So the per-turn path is deliberately cheap and allowed to fail:
+                # an explicit event is settled coarsely, and anything ambiguous is
+                # recorded as ``unresolved`` and revisited later. Guessing here
+                # would silently corrupt long-term state, while deferring costs only
+                # the chance to settle early.
                 busy = self.user_model.busy_probability(
                     hours_since_contact=delta_seconds(stamp, state.last_user_message_at) / 3600.0,
                     replied_recently=False,
                     context={"stated_busy": any(marker in content for marker in BUSY_MARKERS)},
                 )
-                from .emotion import appraise_event, apply_new_emotion_events
-                from .local_llm import LocalModelClient, LocalModelConfig
-
-                # Level 2 first: the fine-tuned 2B model, when it is running and
-                # answers inside its deadline with a payload that satisfies the
-                # frozen contract. Anything else degrades to the rule-based
-                # Level 0 appraiser, so a model outage is invisible upstream.
-                evaluation = None
-                if self.local_model.config.enabled:
-                    summary = "；".join(
-                        str(item.get("content", ""))
-                        for item in self.projections.situation.list_active(limit=5)
-                    )
-                    semantic = self.local_model.appraise(
-                        content,
-                        context_summary=summary,
-                        boundary_state=proactive_verdict.reason or "none",
-                    )
-                    if not semantic.degraded:
-                        evaluation = semantic.evaluation
-                        outcome.appraisal_source = "local_model"
-                if evaluation is None:
-                    evaluation = appraise_event(
-                        event, state=state, config=self.config.emotion, user_busy_probability=busy
-                    )
-                    outcome.appraisal_source = "rule"
-                existing_emotions = self.projections.emotion.list_active()
-                _, created = apply_new_emotion_events(
-                    evaluations=[(event, evaluation)],
-                    active=existing_emotions,
-                    state=state,
-                    config=self.config.emotion,
+                from .emotion import apply_new_emotion_events
+                from .semantic import (
+                    SemanticStatus,
+                    classify_event,
+                    potential_relevance,
+                    settlement_to_evaluation,
                 )
-                for emotion_event in created:
-                    self.projections.emotion.upsert(conn, emotion_event)
-                    outcome.emotion_event_ids.append(emotion_event.emotion_event_id)
+
+                settlement = None
+                if self.config.semantic.settle_on_ingest:
+                    settlement = classify_event(
+                        content, event_type=event.event_type, actor=event.actor
+                    )
+
+                evaluation = None
+                created: list[Any] = []
+                if settlement is not None:
+                    evaluation = settlement_to_evaluation(settlement)
+                    self.projections.semantics.record_settlement(
+                        conn,
+                        event_id=event.event_id,
+                        direction=settlement.direction,
+                        intensity_band=settlement.intensity,
+                        confidence=settlement.confidence,
+                        settlement_source=settlement.source,
+                        evidence=settlement.evidence,
+                        version=state.version,
+                        now=stamp,
+                    )
+                    outcome.appraisal_source = "coarse_rule"
+                    outcome.semantic_status = SemanticStatus.RESOLVED.value
+                else:
+                    relevance = potential_relevance(
+                        content,
+                        hours_since_contact=delta_seconds(stamp, state.last_user_message_at)
+                        / 3600.0,
+                        has_open_matters=bool(self.projections.unfinished.list_open()),
+                    )
+                    self.projections.semantics.record_unresolved(
+                        conn,
+                        event_id=event.event_id,
+                        potential_relevance=relevance,
+                        reason="no_explicit_anchor",
+                        version=state.version,
+                        now=stamp,
+                    )
+                    outcome.appraisal_source = "deferred"
+                    outcome.semantic_status = SemanticStatus.UNRESOLVED.value
+                    outcome.potential_relevance = relevance
+                    # An unresolved event yields no emotional after-effect yet.
+                    # The raw event is preserved, so a later deep refresh can
+                    # reinterpret it - that is the "追夫火葬场" path in patch v0.2.
+
+                if evaluation is not None:
+                    existing_emotions = self.projections.emotion.list_active()
+                    _, created = apply_new_emotion_events(
+                        evaluations=[(event, evaluation)],
+                        active=existing_emotions,
+                        state=state,
+                        config=self.config.emotion,
+                    )
+                    for emotion_event in created:
+                        self.projections.emotion.upsert(conn, emotion_event)
+                        outcome.emotion_event_ids.append(emotion_event.emotion_event_id)
 
                 # --- working situation: facts and inferences stay separate
                 self.projections.situation.upsert(
@@ -579,7 +631,7 @@ class Runtime:
                     source_id=event.event_id,
                     expires_at=stamp + timedelta(hours=24),
                 )
-                if evaluation.confidence >= 0.5 and evaluation.relation_signal != "neutral":
+                if evaluation is not None and evaluation.confidence >= 0.5 and evaluation.relation_signal != "neutral":
                     self.projections.situation.upsert(
                         conn,
                         kind="inference",
@@ -629,6 +681,9 @@ class Runtime:
                 self.projections.situation.prune(conn)
 
                 # --- memory candidate
+                # ``created`` only exists when the event was settled; an
+                # unresolved event has no emotional salience yet by definition,
+                # so it contributes none rather than guessing one.
                 salience = max((e.intensity for e in created), default=0.0)
                 proposal_memory = memory_module.propose_from_event(
                     event,

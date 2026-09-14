@@ -1724,6 +1724,162 @@ class InterpretationProjection:
 
 
 # --------------------------------------------------------------------------------------
+# semantic settlement
+# --------------------------------------------------------------------------------------
+
+
+class SemanticProjection:
+    """Derived semantic status of raw events (architecture patch v0.2).
+
+    A missing row means "not looked at yet". Rows are rebuildable from
+    ``raw_events`` plus the rule table, so this projection never carries
+    authority of its own - it only records what the persistent layer currently
+    believes, and whether it has decided to believe anything at all.
+    """
+
+    def __init__(self, db: Database) -> None:
+        """Bind the projection to a database."""
+        self._db = db
+
+    def get(self, event_id: str) -> dict[str, Any] | None:
+        """Return the semantic record for one event, or ``None``."""
+        row = self._db.query_one("SELECT * FROM event_semantics WHERE event_id = ?", (event_id,))
+        return row_to_dict(row, "event_semantics") if row is not None else None
+
+    def record_unresolved(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        event_id: str,
+        potential_relevance: str,
+        reason: str = "",
+        version: int = 0,
+        now: datetime | None = None,
+    ) -> None:
+        """Mark an event as deliberately not interpreted yet.
+
+        Args:
+            connection: Open write transaction.
+            event_id: Raw event identifier.
+            potential_relevance: ``low`` / ``medium`` / ``high``.
+            reason: Why the settlement was deferred.
+            version: Runtime version at the time of recording.
+            now: Reference timestamp.
+        """
+        stamp = isoformat(now or utcnow())
+        connection.execute(
+            "INSERT INTO event_semantics(event_id, semantic_status, potential_relevance, "
+            "unresolved_reason, version, created_at, updated_at) "
+            "VALUES(?, 'unresolved', ?, ?, ?, ?, ?) "
+            "ON CONFLICT(event_id) DO NOTHING",
+            (event_id, potential_relevance, reason, int(version), stamp, stamp),
+        )
+
+    def record_settlement(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        event_id: str,
+        direction: str,
+        intensity_band: str,
+        confidence: float,
+        settlement_source: str,
+        evidence: str = "",
+        version: int = 0,
+        now: datetime | None = None,
+    ) -> None:
+        """Record a confident coarse settlement for an event."""
+        from .semantic import SemanticStatus
+
+        stamp = isoformat(now or utcnow())
+        connection.execute(
+            "INSERT INTO event_semantics(event_id, semantic_status, direction, intensity_band, "
+            "confidence, settlement_source, evidence, potential_relevance, settled_at, version, "
+            "created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, 'low', ?, ?, ?, ?) "
+            "ON CONFLICT(event_id) DO UPDATE SET semantic_status=excluded.semantic_status, "
+            "direction=excluded.direction, intensity_band=excluded.intensity_band, "
+            "confidence=excluded.confidence, settlement_source=excluded.settlement_source, "
+            "evidence=excluded.evidence, settled_at=excluded.settled_at, "
+            "version=excluded.version, updated_at=excluded.updated_at",
+            (
+                event_id,
+                SemanticStatus.RESOLVED.value,
+                direction,
+                intensity_band,
+                float(confidence),
+                settlement_source,
+                evidence,
+                stamp,
+                int(version),
+                stamp,
+                stamp,
+            ),
+        )
+
+    def settle_from_deep_refresh(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        event_id: str,
+        deep_refresh_id: str,
+        version: int = 0,
+        now: datetime | None = None,
+    ) -> bool:
+        """Mark an unresolved event as later understood.
+
+        Returns:
+            ``True`` when a row was updated.
+        """
+        from .semantic import SemanticStatus
+
+        stamp = isoformat(now or utcnow())
+        cursor = connection.execute(
+            "UPDATE event_semantics SET semantic_status = ?, deep_refresh_id = ?, "
+            "settled_at = COALESCE(settled_at, ?), version = ?, updated_at = ? WHERE event_id = ?",
+            (SemanticStatus.RESOLVED.value, deep_refresh_id, stamp, int(version), stamp, event_id),
+        )
+        return bool(cursor.rowcount)
+
+    def list_unresolved(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Return unresolved events ordered by relevance then recency."""
+        rows = self._db.query(
+            "SELECT s.*, e.content, e.timestamp, e.actor, e.event_type, e.conversation_id "
+            "FROM event_semantics s JOIN raw_events e ON e.event_id = s.event_id "
+            "WHERE s.semantic_status = 'unresolved' "
+            "ORDER BY CASE s.potential_relevance "
+            "WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, e.timestamp DESC LIMIT ?",
+            (int(limit),),
+        )
+        return [row_to_dict(row, "event_semantics") or {} for row in rows]
+
+    def unresolved_count(self) -> int:
+        """Return how many events are waiting to be understood."""
+        row = self._db.query_one(
+            "SELECT COUNT(*) AS n FROM event_semantics WHERE semantic_status = 'unresolved'"
+        )
+        return int(row["n"]) if row is not None else 0
+
+    def stats(self) -> dict[str, Any]:
+        """Return counts by status and relevance for health endpoints."""
+        rows = self._db.query(
+            "SELECT semantic_status, potential_relevance, COUNT(*) AS n FROM event_semantics "
+            "GROUP BY semantic_status, potential_relevance"
+        )
+        by_status: dict[str, int] = {}
+        by_relevance: dict[str, int] = {}
+        for row in rows:
+            by_status[row["semantic_status"]] = by_status.get(row["semantic_status"], 0) + int(row["n"])
+            by_relevance[row["potential_relevance"]] = by_relevance.get(
+                row["potential_relevance"], 0
+            ) + int(row["n"])
+        return {
+            "by_status": by_status,
+            "by_relevance": by_relevance,
+            "unresolved": by_status.get("unresolved", 0),
+        }
+
+
+# --------------------------------------------------------------------------------------
 # aggregator
 # --------------------------------------------------------------------------------------
 
@@ -1746,6 +1902,10 @@ class Projections:
         self.tasks = TaskProjection(db)
         self.user_model = UserModelProjection(db)
         self.interpretations = InterpretationProjection(db)
+        #: Derived semantic status of raw events (patch v0.2). Ambiguity is a
+        #: first-class outcome here, so this projection is what tells the Runtime
+        #: how much it has deliberately left uninterpreted.
+        self.semantics = SemanticProjection(db)
 
     def ensure_defaults(
         self, now: datetime | None = None, values: ValueProfile | None = None

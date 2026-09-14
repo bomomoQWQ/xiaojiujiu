@@ -140,6 +140,13 @@ class LocalModelConfig:
     grammar_appraisal: str = "appraisal"
     grammar_explanation: str = "explanation"
     cache_ttl_s: float = 900.0
+    #: Passed through to llama.cpp's ``chat_template_kwargs``. The fine-tuned
+    #: model was trained with thinking masked out, so the endpoint must render the
+    #: template's non-thinking branch; otherwise the model re-opens a ``<think>``
+    #: block and the JSON lands inside the reasoning channel.
+    chat_template_kwargs: dict[str, Any] = field(
+        default_factory=lambda: {"enable_thinking": False}
+    )
     #: Extra request headers, e.g. a reverse-proxy token.
     headers: dict[str, str] = field(default_factory=dict)
 
@@ -396,6 +403,8 @@ class LocalModelClient:
             "max_tokens": self.config.max_tokens,
             "stream": False,
         }
+        if self.config.chat_template_kwargs:
+            body["chat_template_kwargs"] = dict(self.config.chat_template_kwargs)
         if grammar:
             # llama.cpp accepts either an inline GBNF string or a server-side
             # grammar name. A value containing ``::=`` is treated as inline GBNF;

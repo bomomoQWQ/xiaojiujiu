@@ -318,6 +318,45 @@ class TaskConfig:
 
 
 @dataclass(slots=True)
+class SemanticConfig:
+    """Two-time-scale policy: acting layer vs persistent cognition (patch v0.2).
+
+    The default configuration assumes **no generative model at all**: explicit
+    events are settled by the coarse rule table, ambiguous ones are recorded as
+    ``unresolved``, and the psychological context falls back to a deterministic
+    template. A semantic provider is an optional accelerator, never a dependency.
+
+    Attributes:
+        provider: Which provider to build. ``disabled`` is the standard setting.
+        settle_on_ingest: Run the coarse rule settlement on the ingest path.
+        deep_refresh_enabled: Whether the low-frequency deep refresh may run.
+        unresolved_backlog_threshold: Unresolved events needed to trigger a refresh.
+        unresolved_max_age_hours: Age after which an unresolved event stops
+            justifying a refresh but is still kept as raw history.
+        deep_refresh_min_interval_seconds: Floor between two deep refreshes.
+        deep_refresh_idle_hours: How long the system must be idle before a
+            speculative refresh is allowed.
+        max_operations_per_refresh: Upper bound on grounded operations applied from
+            one refresh, so a single bad response cannot rewrite everything.
+        template_fallback: Use the deterministic template when no cached
+            interpretation exists. Disabling it is not recommended.
+        interpretation_max_age_seconds: How long a psychological interpretation
+            stays valid before it is considered stale.
+    """
+
+    provider: str = "disabled"
+    settle_on_ingest: bool = True
+    deep_refresh_enabled: bool = True
+    unresolved_backlog_threshold: int = 8
+    unresolved_max_age_hours: float = 72.0
+    deep_refresh_min_interval_seconds: float = 3600.0
+    deep_refresh_idle_hours: float = 12.0
+    max_operations_per_refresh: int = 12
+    template_fallback: bool = True
+    interpretation_max_age_seconds: float = 21600.0
+
+
+@dataclass(slots=True)
 class RuntimeConfig:
     """Aggregate configuration for the whole Runtime."""
 
@@ -338,6 +377,10 @@ class RuntimeConfig:
     outbox: OutboxConfig = field(default_factory=OutboxConfig)
     action: ActionConfig = field(default_factory=ActionConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    #: Two-time-scale policy (patch v0.2): the acting layer is the host main LLM,
+    #: the persistent layer is the Runtime. Nothing here is allowed to make a
+    #: generative model mandatory.
+    semantic: SemanticConfig = field(default_factory=SemanticConfig)
     task: TaskConfig = field(default_factory=TaskConfig)
     #: Free-form extras; useful for experiments without touching the schema.
     extras: dict[str, Any] = field(default_factory=dict)

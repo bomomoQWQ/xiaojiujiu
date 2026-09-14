@@ -128,9 +128,12 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
             "active_candidates": len(runtime.projections.candidates.list_active(limit=100)),
             "in_flight_attempts": runtime.projections.attempts.count_in_flight(),
             "outbox": outbox_stats,
-            # Operators need to see which appraisal level is actually live, and
-            # whether the local model has been answered or bypassed.
-            "local_model": runtime.local_model.health(),
+            # Patch v0.2: the semantic provider is an optional accelerator, so
+            # operators need to see whether one is live and how much the
+            # persistent layer has deliberately left uninterpreted. A growing
+            # unresolved backlog is normal operation, not an error.
+            "semantic_provider": runtime.semantic_provider.health(),
+            "semantics": runtime.projections.semantics.stats(),
             "raw_events": runtime.events.count(),
         }
 

@@ -1,0 +1,1131 @@
+"""Optional Semantic Provider port (architecture patch v0.2, sections 16-21).
+
+Patch v0.2 removes the local 2B model from the standard dependency set: the main
+LLM already understands the current turn, so the Runtime only needs *strong
+semantics* for **low-frequency deep cognition**, never for the acting layer.
+
+This module defines that optional port and its implementations:
+
+* :class:`SemanticProvider` - the frozen protocol the Runtime integrates against;
+* :class:`DisabledProvider` - the default, model-free implementation, so the
+  Runtime runs completely with no model at all;
+* :class:`LocalCPUProvider` / :class:`LocalGPUProvider` - thin wrappers around the
+  existing :class:`companion_runtime.local_llm.LocalModelClient`;
+* :class:`RemoteAPIProvider` - any OpenAI-compatible remote endpoint;
+* :func:`build_provider` - environment-driven selection that never raises and
+  always falls back to :class:`DisabledProvider`.
+
+Three contracts hold for every provider:
+
+1. **Advisory only.** A provider proposes; the Reducer decides
+   ``APPLY`` / ``REBASE`` / ``DISCARD``. Nothing here writes Runtime state.
+2. **Fail-open.** Unavailable, timed out, unreachable or malformed-JSON calls
+   return ``None`` or a ``degraded`` suggestion set - never an exception.
+3. **Secret-safe.** An API key is read from ``CR_SEMANTIC_API_KEY`` only, is
+   never persisted, and never appears in ``repr()``, logs or :meth:`health`.
+
+Only the standard library is used, matching the sidecar's tiny dependency set.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Protocol, runtime_checkable
+
+from .local_llm import LocalModelClient, LocalModelConfig, _extract_json, parse_explanation
+
+LOGGER = logging.getLogger("companion_runtime.providers")
+
+__all__ = [
+    "DEEP_REFRESH_FIELDS",
+    "DISABLED_NAME",
+    "LOCAL_CPU_NAME",
+    "LOCAL_GPU_NAME",
+    "PROVIDER_ENV_VAR",
+    "REMOTE_API_NAME",
+    "DEEP_REFRESH_SYSTEM_PROMPT",
+    "DeepRefreshRequest",
+    "DeepRefreshSuggestions",
+    "DisabledProvider",
+    "LocalCPUProvider",
+    "LocalGPUProvider",
+    "RemoteAPIProvider",
+    "SemanticProvider",
+    "Transport",
+    "build_provider",
+    "parse_deep_refresh",
+    "resolve_provider_name",
+]
+
+#: Environment variable selecting the implementation.
+PROVIDER_ENV_VAR = "CR_SEMANTIC_PROVIDER"
+
+#: Environment variable holding the remote API key. Read from the environment
+#: only; the Runtime never writes it back to disk or into a log.
+API_KEY_ENV_VAR = "CR_SEMANTIC_API_KEY"
+
+DISABLED_NAME = "disabled"
+LOCAL_CPU_NAME = "local_cpu"
+LOCAL_GPU_NAME = "local_gpu"
+REMOTE_API_NAME = "remote_api"
+
+#: Every provider name :func:`build_provider` accepts.
+KNOWN_PROVIDER_NAMES = frozenset({DISABLED_NAME, LOCAL_CPU_NAME, LOCAL_GPU_NAME, REMOTE_API_NAME})
+
+#: Deep-refresh suggestion field -> the Python type it must decode to.
+DEEP_REFRESH_FIELDS: Mapping[str, type] = {
+    "reinterpretations": list,
+    "psychological_interpretation": dict,
+    "candidate_intent_operations": list,
+    "memory_suggestions": list,
+    "unfinished_matter_suggestions": list,
+    "user_model_evidence_suggestions": list,
+}
+
+#: Optional key a model may wrap the six collections under.
+DEEP_REFRESH_WRAPPER_KEY = "suggestions"
+
+DEEP_REFRESH_SYSTEM_PROMPT = (
+    "你是长期陪伴角色的深层认知整理器，只在低频的后台刷新中被调用。"
+    "只输出一个 JSON 对象，字段固定为 reinterpretations, psychological_interpretation, "
+    "candidate_intent_operations, memory_suggestions, unfinished_matter_suggestions, "
+    "user_model_evidence_suggestions。"
+    "前五个中除 psychological_interpretation 是对象外，其余都是数组。"
+    "你只提供建议，不决定任何状态变更，不生成台词，不创造输入中不存在的事件；"
+    "证据不足时返回空数组或空对象，不要猜测。"
+)
+
+EXPLAIN_STATE_SYSTEM_PROMPT = (
+    "你是长期陪伴角色的情绪解释器：把已有的结构化心理状态翻译成第一人称心理语言。"
+    "只输出一个 JSON 对象，字段固定为 experience, focus, conflict, impulse, inhibition, expression。"
+    "每个字段一句话，20 到 40 字，不出现数字，不生成台词，不创造输入中不存在的事件。"
+)
+
+
+class Transport(Protocol):
+    """Minimal HTTP transport seam used to keep tests offline.
+
+    It mirrors :class:`companion_runtime.local_llm.LocalModelClient`'s injectable
+    transport so both client families are faked the same way.
+    """
+
+    def __call__(
+        self, url: str, body: dict[str, Any], timeout: float, headers: dict[str, str]
+    ) -> Mapping[str, Any]:
+        """Perform one POST and return the decoded JSON response."""
+        ...
+
+
+# --------------------------------------------------------------------------------------
+# Wire contracts
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class DeepRefreshRequest:
+    """Everything a deep refresh is allowed to see (patch v0.2, section 19).
+
+    Attributes:
+        unresolved_events: Events the Runtime declined to interpret yet.
+        situation: Current working situation.
+        mood: Long-horizon background mood.
+        active_emotions: Active emotion impact events.
+        memories: Activated memories.
+        unfinished: Open unfinished matters.
+        user_model_summary: Prose summary of the user interaction model.
+        candidates: Candidate intents already in the pool.
+        key_quotes: Raw quotes that must survive verbatim.
+    """
+
+    unresolved_events: list[dict[str, Any]] = field(default_factory=list)
+    situation: dict[str, Any] = field(default_factory=dict)
+    mood: dict[str, Any] = field(default_factory=dict)
+    active_emotions: list[dict[str, Any]] = field(default_factory=list)
+    memories: list[dict[str, Any]] = field(default_factory=list)
+    unfinished: list[dict[str, Any]] = field(default_factory=list)
+    user_model_summary: str = ""
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+    key_quotes: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable rendering of the request."""
+        return {
+            "unresolved_events": [dict(item) for item in self.unresolved_events],
+            "situation": dict(self.situation),
+            "mood": dict(self.mood),
+            "active_emotions": [dict(item) for item in self.active_emotions],
+            "memories": [dict(item) for item in self.memories],
+            "unfinished": [dict(item) for item in self.unfinished],
+            "user_model_summary": self.user_model_summary,
+            "candidates": [dict(item) for item in self.candidates],
+            "key_quotes": [dict(item) for item in self.key_quotes],
+        }
+
+
+@dataclass(slots=True)
+class DeepRefreshSuggestions:
+    """Advisory output of one deep refresh (patch v0.2, section 20).
+
+    The Runtime still owns the decision: every entry here is a *suggestion* that
+    goes through ``APPLY`` / ``REBASE`` / ``DISCARD`` in the Reducer.
+
+    Attributes:
+        reinterpretations: Suggested re-readings of old events.
+        psychological_interpretation: Deeper first-person psychological language.
+        candidate_intent_operations: Suggested candidate-intent operations.
+        memory_suggestions: Suggested memory writes or edits.
+        unfinished_matter_suggestions: Suggested unfinished-matter changes.
+        user_model_evidence_suggestions: Suggested user-model evidence.
+        provider: Name of the provider that produced (or failed to produce) this.
+        degraded: ``True`` whenever the caller must not rely on the content.
+        reason: Machine-readable degradation reason, empty on full success.
+        latency_ms: Wall-clock cost of the attempt, in milliseconds.
+    """
+
+    reinterpretations: list[dict[str, Any]] = field(default_factory=list)
+    psychological_interpretation: dict[str, Any] = field(default_factory=dict)
+    candidate_intent_operations: list[dict[str, Any]] = field(default_factory=list)
+    memory_suggestions: list[dict[str, Any]] = field(default_factory=list)
+    unfinished_matter_suggestions: list[dict[str, Any]] = field(default_factory=list)
+    user_model_evidence_suggestions: list[dict[str, Any]] = field(default_factory=list)
+    provider: str = ""
+    degraded: bool = True
+    reason: str = ""
+    latency_ms: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable rendering of the suggestions."""
+        return {
+            "reinterpretations": [dict(item) for item in self.reinterpretations],
+            "psychological_interpretation": dict(self.psychological_interpretation),
+            "candidate_intent_operations": [
+                dict(item) for item in self.candidate_intent_operations
+            ],
+            "memory_suggestions": [dict(item) for item in self.memory_suggestions],
+            "unfinished_matter_suggestions": [
+                dict(item) for item in self.unfinished_matter_suggestions
+            ],
+            "user_model_evidence_suggestions": [
+                dict(item) for item in self.user_model_evidence_suggestions
+            ],
+            "provider": self.provider,
+            "degraded": self.degraded,
+            "reason": self.reason,
+            "latency_ms": self.latency_ms,
+        }
+
+    def is_empty(self) -> bool:
+        """Return ``True`` when no suggestion of any kind was produced."""
+        return not any(
+            (
+                self.reinterpretations,
+                self.psychological_interpretation,
+                self.candidate_intent_operations,
+                self.memory_suggestions,
+                self.unfinished_matter_suggestions,
+                self.user_model_evidence_suggestions,
+            )
+        )
+
+
+@runtime_checkable
+class SemanticProvider(Protocol):
+    """Optional port for low-frequency strong semantics.
+
+    The Runtime must remain fully functional when the only implementation is
+    :class:`DisabledProvider`, so every method is allowed to answer "nothing".
+    """
+
+    name: str
+
+    def available(self) -> bool:
+        """Return whether the provider is configured and usable right now."""
+        ...
+
+    def deep_refresh(
+        self, request: DeepRefreshRequest, *, timeout_s: float | None = None
+    ) -> DeepRefreshSuggestions | None:
+        """Return advisory suggestions, or ``None`` when unavailable."""
+        ...
+
+    def explain_state(
+        self, payload: Mapping[str, Any], *, state_key: str = ""
+    ) -> dict[str, str] | None:
+        """Return first-person psychological language, or ``None``."""
+        ...
+
+    def health(self) -> dict[str, Any]:
+        """Return a JSON-serialisable, secret-free health snapshot."""
+        ...
+
+
+# --------------------------------------------------------------------------------------
+# Parsing
+# --------------------------------------------------------------------------------------
+
+
+def parse_deep_refresh(
+    payload: Any, *, provider: str = "", latency_ms: int = 0
+) -> DeepRefreshSuggestions | None:
+    """Validate a decoded deep-refresh payload against the frozen contract.
+
+    A model reply is untrusted input: each of the six suggestion fields is
+    type-checked on its own. A field of the wrong type is **dropped** and named
+    in ``reason`` rather than triggering a guess-repair, so a partially malformed
+    reply still yields the suggestions that were well formed.
+
+    Args:
+        payload: Decoded JSON object from the model. The six collections may also
+            be nested under a ``suggestions`` key.
+        provider: Provider name to record on the result.
+        latency_ms: Measured latency to record on the result.
+
+    Returns:
+        A :class:`DeepRefreshSuggestions`, or ``None`` when ``payload`` is not a
+        mapping at all. A non-``None`` result with ``degraded`` set means the
+        caller must not rely on the affected fields.
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    body: Mapping[str, Any] = payload
+    nested = payload.get(DEEP_REFRESH_WRAPPER_KEY)
+    if isinstance(nested, Mapping) and any(key in nested for key in DEEP_REFRESH_FIELDS):
+        body = nested
+
+    suggestions = DeepRefreshSuggestions(provider=provider, latency_ms=latency_ms)
+    invalid: list[str] = []
+    for field_name, expected in DEEP_REFRESH_FIELDS.items():
+        if field_name not in body:
+            # An omitted field is allowed: absence is not corruption.
+            continue
+        value = body[field_name]
+        if not isinstance(value, expected):
+            invalid.append(field_name)
+            continue
+        if expected is list:
+            if not all(isinstance(item, Mapping) for item in value):
+                invalid.append(field_name)
+                continue
+            setattr(suggestions, field_name, [dict(item) for item in value])
+        else:
+            setattr(suggestions, field_name, dict(value))
+
+    if invalid:
+        suggestions.degraded = True
+        suggestions.reason = "invalid_fields:" + ",".join(invalid)
+    else:
+        suggestions.degraded = False
+        suggestions.reason = ""
+    return suggestions
+
+
+def resolve_provider_name(config: Any = None, env: Mapping[str, str] | None = None) -> str:
+    """Return the requested provider name, or the default when unrecognised.
+
+    Args:
+        config: Optional Runtime configuration or mapping; a
+            ``semantic_provider`` entry (or ``extras['semantic']['provider']``)
+            takes precedence over the environment.
+        env: Environment mapping, defaults to :data:`os.environ`.
+
+    Returns:
+        One of :data:`KNOWN_PROVIDER_NAMES`. Any unknown or missing value
+        resolves to :data:`DISABLED_NAME`; this function never raises.
+    """
+    source = os.environ if env is None else env
+    requested = _first_str(
+        _config_value(config, "semantic_provider", "provider"),
+        source.get(PROVIDER_ENV_VAR),
+    )
+    name = requested.strip().lower()
+    if name in KNOWN_PROVIDER_NAMES:
+        return name
+    if name:
+        LOGGER.warning(
+            "Unknown semantic provider %r; falling back to %s", requested, DISABLED_NAME
+        )
+    return DISABLED_NAME
+
+
+# --------------------------------------------------------------------------------------
+# Implementations
+# --------------------------------------------------------------------------------------
+
+
+class DisabledProvider:
+    """The default provider: no model, no network, no latency.
+
+    Patch v0.2 makes "no strong semantics" a first-class configuration rather
+    than an error path, so this provider is a complete, honest implementation:
+    the Runtime keeps running on rules, statistics and the main LLM alone.
+    """
+
+    name = DISABLED_NAME
+
+    def available(self) -> bool:
+        """Return ``False``: there is deliberately no model behind this port."""
+        return False
+
+    def deep_refresh(
+        self, request: DeepRefreshRequest, *, timeout_s: float | None = None
+    ) -> DeepRefreshSuggestions | None:
+        """Return ``None`` without touching the network."""
+        return None
+
+    def explain_state(
+        self, payload: Mapping[str, Any], *, state_key: str = ""
+    ) -> dict[str, str] | None:
+        """Return ``None``; the caller uses its deterministic templates."""
+        return None
+
+    def health(self) -> dict[str, Any]:
+        """Return a snapshot naming the disabled implementation."""
+        return {
+            "provider": self.name,
+            "available": False,
+            "enabled": False,
+            "reason": "disabled",
+        }
+
+    def __repr__(self) -> str:
+        """Return a stable, secret-free repr."""
+        return "DisabledProvider(name='disabled')"
+
+
+class _OpenAICompatibleProvider:
+    """Shared OpenAI-compatible chat plumbing for the concrete providers.
+
+    Args:
+        name: Provider name reported through :meth:`health`.
+        base_url: Base URL of the OpenAI-compatible endpoint.
+        model: Model name sent to the endpoint.
+        api_key: Bearer token, or an empty string for an unprotected endpoint.
+        timeout_s: Default hard deadline for one call.
+        deep_timeout_s: Hard deadline for a deep refresh. Deep cognition is
+            low-frequency by design, so it may wait far longer than an
+            interactive call; it defaults to ``timeout_s``.
+        max_tokens: Completion cap.
+        temperature: Sampling temperature; ``0`` keeps structured output stable.
+        headers: Extra request headers.
+        transport: Injectable transport used by tests.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        base_url: str,
+        model: str,
+        api_key: str = "",
+        timeout_s: float = 30.0,
+        deep_timeout_s: float | None = None,
+        max_tokens: int = 1024,
+        temperature: float = 0.0,
+        headers: Mapping[str, str] | None = None,
+        transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]]
+        | None = None,
+    ) -> None:
+        """Store the endpoint settings and the transport seam."""
+        self.name = name
+        self.base_url = (base_url or "").rstrip("/")
+        self.model = model
+        self.timeout_s = float(timeout_s)
+        self.deep_timeout_s = float(deep_timeout_s if deep_timeout_s is not None else timeout_s)
+        self.max_tokens = int(max_tokens)
+        self.temperature = float(temperature)
+        self.headers: dict[str, str] = dict(headers or {})
+        self._transport = transport or self._http_transport
+        # Secret hygiene: the token is deliberately NOT an instance attribute. It
+        # lives only inside this closure's cell, so no ``vars()``/``__dict__`` dump,
+        # ``repr`` or log record can reach it. Only ``_api_key_present`` (a bool) is
+        # observable, which is exactly what ``health()`` is allowed to report.
+        base_headers = dict(self.headers)
+        if api_key:
+            base_headers["Authorization"] = f"Bearer {api_key}"
+        self._api_key_present = bool(api_key)
+
+        def _headers() -> dict[str, str]:
+            """Return the outgoing headers, including the bearer token if set."""
+            return dict(base_headers)
+
+        self._headers = _headers
+        self._lock = threading.Lock()
+        self.stats: dict[str, int] = {
+            "deep_refresh_calls": 0,
+            "deep_refresh_ok": 0,
+            "deep_refresh_degraded": 0,
+            "explain_calls": 0,
+            "explain_ok": 0,
+            "explain_degraded": 0,
+            "cache_hits": 0,
+        }
+        self._cache: dict[str, tuple[float, dict[str, str]]] = {}
+        self._cache_ttl_s = 900.0
+
+    # ------------------------------------------------------------------ transport
+
+    def _http_transport(
+        self, url: str, body: dict[str, Any], timeout: float, headers: dict[str, str]
+    ) -> Mapping[str, Any]:
+        """Perform the HTTP call with the standard library only.
+
+        Args:
+            url: Fully qualified request URL.
+            body: JSON request body.
+            timeout: Deadline in seconds.
+            headers: Request headers, including the bearer token when configured.
+
+        Returns:
+            The decoded JSON response.
+
+        Raises:
+            urllib.error.URLError: On any network failure. Callers degrade.
+        """
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", **headers},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            return json.loads(response.read().decode("utf-8"))
+
+    def _request_headers(self) -> dict[str, str]:
+        """Return the outgoing headers, without ever logging the token."""
+        return self._headers()
+
+    def configured(self) -> bool:
+        """Return whether enough settings exist to attempt a call."""
+        return bool(self.base_url and self.model)
+
+    def _api_key_configured(self) -> bool:
+        """Return whether a bearer token is present, without exposing it."""
+        return self._api_key_present
+
+    def _chat(
+        self,
+        system_prompt: str,
+        user_content: str,
+        *,
+        timeout: float,
+        grammar: str | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Send one chat completion request and return the assistant text.
+
+        Args:
+            system_prompt: System message.
+            user_content: User message.
+            timeout: Hard deadline in seconds.
+            grammar: Optional inline GBNF grammar for constrained decoding.
+            extra_body: Extra request-body fields, e.g. ``chat_template_kwargs``.
+
+        Returns:
+            The assistant text.
+
+        Raises:
+            Exception: Propagated to the caller, which degrades to ``None``.
+        """
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream": False,
+        }
+        if grammar:
+            body["grammar"] = grammar
+        if extra_body:
+            body.update(dict(extra_body))
+        response = self._transport(
+            f"{self.base_url}/chat/completions", body, timeout, self._request_headers()
+        )
+        return _first_message_text(response)
+
+    def _parse_raw_json(self, raw: str) -> Any:
+        """Extract and decode the JSON object from a model reply.
+
+        Args:
+            raw: Raw completion text, possibly fenced or wrapped in prose.
+
+        Returns:
+            The decoded object, or ``None`` when the reply carries no JSON.
+
+        Raises:
+            ValueError: When the reply is not decodable JSON.
+        """
+        return _extract_json(raw)
+
+    # ------------------------------------------------------------- deep refresh
+
+    def deep_refresh(
+        self, request: DeepRefreshRequest, *, timeout_s: float | None = None
+    ) -> DeepRefreshSuggestions | None:
+        """Ask the model for a deep cognitive refresh.
+
+        Args:
+            request: The bounded deep-refresh input.
+            timeout_s: Override for the hard deadline.
+
+        Returns:
+            A :class:`DeepRefreshSuggestions` - ``degraded`` whenever the model
+            could not be trusted - or ``None`` when the provider is unusable.
+        """
+        started = time.monotonic()
+        if not self.available():
+            return None
+        deadline = float(timeout_s if timeout_s is not None else self.deep_timeout_s)
+        with self._lock:
+            self.stats["deep_refresh_calls"] += 1
+        try:
+            raw = self._chat(
+                DEEP_REFRESH_SYSTEM_PROMPT,
+                json.dumps(request.to_dict(), ensure_ascii=False, sort_keys=True),
+                timeout=deadline,
+                grammar=self._grammar_for("deep_refresh"),
+                extra_body=self._extra_body(),
+            )
+            suggestions = parse_deep_refresh(
+                self._parse_raw_json(raw), provider=self.name, latency_ms=_ms(started)
+            )
+        except Exception as exc:  # noqa: BLE001 - any failure means degradation
+            with self._lock:
+                self.stats["deep_refresh_degraded"] += 1
+            LOGGER.debug("%s deep refresh degraded: %s", self.name, exc)
+            return DeepRefreshSuggestions(
+                provider=self.name,
+                degraded=True,
+                reason=f"error:{type(exc).__name__}",
+                latency_ms=_ms(started),
+            )
+
+        if suggestions is None:
+            with self._lock:
+                self.stats["deep_refresh_degraded"] += 1
+            return DeepRefreshSuggestions(
+                provider=self.name,
+                degraded=True,
+                reason="invalid_json",
+                latency_ms=_ms(started),
+            )
+
+        with self._lock:
+            if suggestions.degraded:
+                self.stats["deep_refresh_degraded"] += 1
+            else:
+                self.stats["deep_refresh_ok"] += 1
+        return suggestions
+
+    # ----------------------------------------------------------------- explain
+
+    def explain_state(
+        self, payload: Mapping[str, Any], *, state_key: str = ""
+    ) -> dict[str, str] | None:
+        """Ask the model for first-person psychological language.
+
+        Args:
+            payload: Structured psychological state (no long history).
+            state_key: Stable cache key; any change to it invalidates the entry.
+                An empty key disables caching for that call.
+
+        Returns:
+            A mapping of the six explanation fields, or ``None`` when the caller
+            must use its deterministic template. Never raises.
+        """
+        if not self.available():
+            return None
+        if state_key:
+            cached = self._cache_get(state_key)
+            if cached is not None:
+                with self._lock:
+                    self.stats["cache_hits"] += 1
+                return cached
+
+        with self._lock:
+            self.stats["explain_calls"] += 1
+        try:
+            raw = self._chat(
+                EXPLAIN_STATE_SYSTEM_PROMPT,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+                timeout=self.timeout_s,
+                grammar=self._grammar_for("explanation"),
+                extra_body=self._extra_body(),
+            )
+            explanation = parse_explanation(self._parse_raw_json(raw))
+        except Exception as exc:  # noqa: BLE001 - any failure means degradation
+            with self._lock:
+                self.stats["explain_degraded"] += 1
+            LOGGER.debug("%s explanation degraded: %s", self.name, exc)
+            return None
+
+        if explanation is None:
+            with self._lock:
+                self.stats["explain_degraded"] += 1
+            return None
+
+        with self._lock:
+            self.stats["explain_ok"] += 1
+        if state_key:
+            self._cache_put(state_key, explanation)
+        return explanation
+
+    # ------------------------------------------------------------------- health
+
+    def health(self) -> dict[str, Any]:
+        """Return a JSON-serialisable, secret-free snapshot.
+
+        The API key is never echoed; only whether one is configured is reported.
+        """
+        with self._lock:
+            return {
+                "provider": self.name,
+                "available": self.available(),
+                "base_url": self.base_url,
+                "model": self.model,
+                "api_key": "configured" if self._api_key_configured() else "not configured",
+                "stats": dict(self.stats),
+                "cache_entries": len(self._cache),
+            }
+
+    def invalidate(self) -> None:
+        """Drop every cached explanation."""
+        with self._lock:
+            self._cache.clear()
+
+    # -------------------------------------------------------------------- cache
+
+    def _cache_get(self, key: str) -> dict[str, str] | None:
+        """Return a cached explanation when it is still fresh."""
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            stored_at, value = entry
+            if time.monotonic() - stored_at > self._cache_ttl_s:
+                self._cache.pop(key, None)
+                return None
+            return dict(value)
+
+    def _cache_put(self, key: str, value: Mapping[str, str]) -> None:
+        """Store one explanation, bounding the cache size."""
+        with self._lock:
+            self._cache[key] = (time.monotonic(), dict(value))
+            while len(self._cache) > 128:
+                self._cache.pop(next(iter(self._cache)))
+
+    # ------------------------------------------------------------------ internal
+
+    def _extra_body(self) -> dict[str, Any] | None:
+        """Return provider-specific request-body fields, if any."""
+        return None
+
+    def _grammar_for(self, name: str) -> str | None:
+        """Return inline GBNF text for constrained decoding, or ``None``.
+
+        Args:
+            name: Grammar base name, resolved against the bundled directory.
+
+        Returns:
+            The grammar text, or ``None`` when unconstrained decoding is used.
+        """
+        return _grammar_text(name)
+
+    def __repr__(self) -> str:
+        """Return a stable, secret-free repr."""
+        return (
+            f"{type(self).__name__}(name={self.name!r}, base_url={self.base_url!r}, "
+            f"model={self.model!r}, api_key="
+            f"{'configured' if self._api_key_configured() else 'not configured'})"
+        )
+
+
+class LocalCPUProvider(_OpenAICompatibleProvider):
+    """Semantic provider backed by the existing local model client.
+
+    This is a thin adapter over :class:`companion_runtime.local_llm.LocalModelClient`
+    - the client is read and reused, never modified. It exists so a deployment
+    that already runs a ``llama.cpp`` server can opt back into local strong
+    semantics, with the same strict degradation the client already guarantees.
+
+    Args:
+        config: Local model configuration. When omitted, a configuration with
+            ``enabled=True`` is built so that explicitly selecting this provider
+            is enough to activate the local endpoint.
+        transport: Inject the underlying client's transport, used by tests.
+        grammar: Inline GBNF grammar for constrained deep-refresh decoding.
+        name: Provider name; overridden by :class:`LocalGPUProvider`.
+    """
+
+    def __init__(
+        self,
+        config: LocalModelConfig | None = None,
+        *,
+        transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]]
+        | None = None,
+        grammar: str | None = None,
+        name: str = LOCAL_CPU_NAME,
+    ) -> None:
+        """Build the wrapped client and expose its settings."""
+        resolved = config if config is not None else LocalModelConfig(enabled=True)
+        self._client = LocalModelClient(resolved, transport=transport)
+        self._config = resolved
+        self._grammar = grammar
+        super().__init__(
+            name=name,
+            base_url=resolved.base_url,
+            model=resolved.model,
+            # The token is forwarded into the base class's closure-only key slot so
+            # a protected endpoint stays protected, while ``repr``/``health`` report
+            # nothing but "configured".
+            api_key=resolved.api_key,
+            timeout_s=resolved.explain_timeout_s,
+            deep_timeout_s=resolved.explain_timeout_s,
+            max_tokens=resolved.max_tokens,
+            temperature=resolved.temperature,
+            headers=resolved.headers,
+            transport=self._client_transport,
+        )
+
+    # --------------------------------------------------------------- delegation
+
+    @property
+    def client(self) -> LocalModelClient:
+        """Return the wrapped local model client."""
+        return self._client
+
+    def _client_transport(
+        self, url: str, body: dict[str, Any], timeout: float, headers: dict[str, str]
+    ) -> Mapping[str, Any]:
+        """Delegate to the wrapped client's transport seam."""
+        return self._client._transport(url, body, timeout, headers)  # noqa: SLF001
+
+    def configured(self) -> bool:
+        """Return whether the wrapped client is enabled and reachable-looking."""
+        return bool(self._config.enabled and self.base_url and self.model)
+
+    def available(self) -> bool:
+        """Return whether the wrapped local client is enabled."""
+        return bool(self._config.enabled)
+
+    def _extra_body(self) -> dict[str, Any] | None:
+        """Reuse the client's ``chat_template_kwargs`` request fields."""
+        kwargs = dict(self._config.chat_template_kwargs or {})
+        return {"chat_template_kwargs": kwargs} if kwargs else None
+
+    def _grammar_for(self, name: str) -> str | None:
+        """Return the explicit grammar override, else the bundled grammar."""
+        return self._grammar if self._grammar else super()._grammar_for(name)
+
+    def health(self) -> dict[str, Any]:
+        """Return the provider snapshot plus the wrapped client's own snapshot."""
+        snapshot = super().health()
+        snapshot["client"] = self._client.health()
+        return snapshot
+
+
+class LocalGPUProvider(LocalCPUProvider):
+    """Identical transport to :class:`LocalCPUProvider`, named for a GPU deployment.
+
+    Patch v0.2 section 17 lists this as a separate option only because operators
+    think in terms of where the weights run. The wire format is unchanged: it is
+    the **same OpenAI-compatible endpoint**, served from a GPU instead of the CPU.
+    No code path, prompt or contract differs - only the reported name, so health
+    output and logs make the deployment obvious.
+
+    Args:
+        config: Local model configuration, as for :class:`LocalCPUProvider`.
+        transport: Inject the underlying client's transport, used by tests.
+        grammar: Inline GBNF grammar for constrained deep-refresh decoding.
+    """
+
+    def __init__(
+        self,
+        config: LocalModelConfig | None = None,
+        *,
+        transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]]
+        | None = None,
+        grammar: str | None = None,
+    ) -> None:
+        """Build the provider with the ``local_gpu`` name."""
+        super().__init__(config, transport=transport, grammar=grammar, name=LOCAL_GPU_NAME)
+
+
+class RemoteAPIProvider(_OpenAICompatibleProvider):
+    """Strong semantics from any OpenAI-compatible remote endpoint.
+
+    The API key comes from ``CR_SEMANTIC_API_KEY`` only. It is never accepted from
+    a config file, never written to disk, never logged, and never included in
+    :meth:`health` - which reports only ``configured`` / ``not configured``.
+
+    Args:
+        base_url: Base URL, e.g. ``https://api.example.com/v1``.
+        model: Remote model name.
+        api_key: Bearer token. Defaults to ``CR_SEMANTIC_API_KEY`` when omitted.
+        env: Environment mapping used for the default key lookup.
+        timeout_s: Default hard deadline for one call.
+        deep_timeout_s: Hard deadline for a deep refresh, which may be far longer
+            than an interactive call; defaults to ``timeout_s``.
+        max_tokens: Completion cap.
+        temperature: Sampling temperature.
+        grammar: Inline GBNF grammar, only meaningful for self-hosted gateways.
+        headers: Extra request headers.
+        transport: Injectable transport used by tests.
+    """
+
+    def __init__(
+        self,
+        base_url: str = "",
+        *,
+        model: str = "",
+        api_key: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout_s: float = 30.0,
+        deep_timeout_s: float | None = None,
+        max_tokens: int = 1024,
+        temperature: float = 0.0,
+        grammar: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]]
+        | None = None,
+    ) -> None:
+        """Store the endpoint settings; the key is read from the environment."""
+        source = os.environ if env is None else env
+        resolved_key = source.get(API_KEY_ENV_VAR, "") if api_key is None else api_key
+        self._grammar = grammar
+        super().__init__(
+            name=REMOTE_API_NAME,
+            base_url=base_url,
+            model=model,
+            api_key=str(resolved_key or ""),
+            timeout_s=timeout_s,
+            deep_timeout_s=deep_timeout_s,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            headers=headers,
+            transport=transport,
+        )
+
+    def available(self) -> bool:
+        """Return whether a base URL, a model and an API key are all present."""
+        return bool(self.base_url and self.model and self._api_key_configured())
+
+    def _grammar_for(self, name: str) -> str | None:
+        """Return the explicit grammar override, else the bundled grammar."""
+        return self._grammar if self._grammar else super()._grammar_for(name)
+
+
+# --------------------------------------------------------------------------------------
+# Factory
+# --------------------------------------------------------------------------------------
+
+
+def build_provider(
+    config: Any = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]]
+    | None = None,
+) -> SemanticProvider:
+    """Build the configured semantic provider, never raising.
+
+    Selection order:
+
+    1. ``config.semantic_provider`` (or ``config.extras['semantic']['provider']``);
+    2. ``CR_SEMANTIC_PROVIDER``;
+    3. :data:`DISABLED_NAME`.
+
+    Any unknown name and any construction failure falls back to
+    :class:`DisabledProvider`, so the Runtime always has a working port.
+
+    Args:
+        config: Optional Runtime configuration (``RuntimeConfig`` or any object or
+            mapping exposing the same names).
+        env: Environment mapping, defaults to :data:`os.environ`.
+        transport: Testing seam passed to the constructed provider's HTTP client.
+
+    Returns:
+        A :class:`SemanticProvider`; :class:`DisabledProvider` on every failure.
+    """
+    source = os.environ if env is None else env
+    try:
+        name = resolve_provider_name(config, source)
+        if name == DISABLED_NAME:
+            return DisabledProvider()
+        if name in {LOCAL_CPU_NAME, LOCAL_GPU_NAME}:
+            return _build_local(name, config, source, transport)
+        if name == REMOTE_API_NAME:
+            return _build_remote(config, source, transport)
+    except Exception as exc:  # noqa: BLE001 - the factory must never raise
+        LOGGER.warning("Semantic provider construction failed (%s); using disabled", exc)
+        return DisabledProvider()
+    return DisabledProvider()
+
+
+def _build_local(
+    name: str,
+    config: Any,
+    env: Mapping[str, str],
+    transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]] | None,
+) -> SemanticProvider:
+    """Build a local CPU/GPU provider from config and environment settings."""
+    base_url = _first_str(
+        _config_value(config, "semantic_base_url", "base_url"), env.get("CR_SEMANTIC_BASE_URL")
+    )
+    model = _first_str(
+        _config_value(config, "semantic_model", "model"), env.get("CR_SEMANTIC_MODEL")
+    )
+    local_config = LocalModelConfig.from_env(env)
+    if base_url:
+        local_config.base_url = base_url.rstrip("/")
+    if model:
+        local_config.model = model
+    # An explicitly selected local provider is an opt-in: the pre-existing
+    # ``CR_LOCAL_MODEL_ENABLED`` flag stays available to turn it back off.
+    if not local_config.enabled and "CR_LOCAL_MODEL_ENABLED" not in env:
+        local_config.enabled = True
+    timeout = _first_float(env.get("CR_SEMANTIC_TIMEOUT_S"))
+    if timeout is not None:
+        local_config.explain_timeout_s = timeout
+    factory = LocalGPUProvider if name == LOCAL_GPU_NAME else LocalCPUProvider
+    return factory(local_config, transport=transport)
+
+
+def _build_remote(
+    config: Any,
+    env: Mapping[str, str],
+    transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]] | None,
+) -> SemanticProvider:
+    """Build the remote API provider from config and environment settings.
+
+    The API key is read from the environment exclusively; a key placed in the
+    configuration object is deliberately ignored, because the Runtime's config is
+    serialisable and must never be able to carry a credential.
+    """
+    base_url = _first_str(
+        _config_value(config, "semantic_base_url", "base_url"), env.get("CR_SEMANTIC_BASE_URL")
+    )
+    model = _first_str(
+        _config_value(config, "semantic_model", "model"), env.get("CR_SEMANTIC_MODEL")
+    )
+    return RemoteAPIProvider(
+        base_url or "",
+        model=model or "",
+        env=env,
+        timeout_s=_first_float(env.get("CR_SEMANTIC_TIMEOUT_S")) or 30.0,
+        max_tokens=int(_first_float(env.get("CR_SEMANTIC_MAX_TOKENS")) or 1024),
+        transport=transport,
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------------------
+
+
+def _config_value(config: Any, *names: str) -> str | None:
+    """Read one string setting from a config object, mapping or ``extras``.
+
+    Args:
+        config: Runtime configuration, plain mapping, or ``None``.
+        *names: Candidate attribute/key names, in priority order.
+
+    Returns:
+        The first non-empty string found, otherwise ``None``.
+    """
+    if config is None:
+        return None
+    for name in names:
+        value = _read_one(config, name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    extras = _read_one(config, "extras")
+    if isinstance(extras, Mapping):
+        semantic = extras.get("semantic")
+        if isinstance(semantic, Mapping):
+            for name in names:
+                value = semantic.get(name)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return None
+
+
+def _read_one(config: Any, name: str) -> Any:
+    """Return ``config[name]`` or ``config.name``, or ``None``."""
+    if isinstance(config, Mapping):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def _first_str(*values: Any) -> str:
+    """Return the first non-empty string among ``values``, else ``''``."""
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _first_float(value: Any) -> float | None:
+    """Return ``value`` as a float, or ``None`` when it is not numeric."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_message_text(response: Any) -> str:
+    """Return the assistant text of an OpenAI-compatible response.
+
+    Args:
+        response: Decoded response mapping.
+
+    Returns:
+        The assistant message content.
+
+    Raises:
+        ValueError: When the response carries no usable message.
+    """
+    choices = response.get("choices") if isinstance(response, Mapping) else None
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("endpoint returned no choices")
+    message = choices[0].get("message") if isinstance(choices[0], Mapping) else None
+    if not isinstance(message, Mapping):
+        raise ValueError("endpoint returned no message")
+    content = message.get("content")
+    if not isinstance(content, str):
+        raise ValueError("endpoint returned non-text content")
+    return content
+
+
+def _grammar_text(name: str) -> str | None:
+    """Load a bundled GBNF grammar for constrained decoding.
+
+    Args:
+        name: Grammar base name, e.g. ``deep_refresh``.
+
+    Returns:
+        The grammar text, or ``None`` when no grammar file is bundled. A missing
+        grammar only removes constrained decoding; it never breaks the Runtime.
+    """
+    try:
+        from .local_llm import load_grammar
+
+        return load_grammar(name)
+    except Exception:  # noqa: BLE001 - a missing grammar is never fatal
+        return None
+
+
+def _ms(started: float) -> int:
+    """Return elapsed milliseconds since ``started``."""
+    return int((time.monotonic() - started) * 1000)
