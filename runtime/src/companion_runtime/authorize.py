@@ -111,8 +111,11 @@ def authorize(
             allow_reply=False,
         )
 
-    # --- contact budget
-    if request.is_proactive:
+    # --- contact budget.
+    # A message that was already committed is in its *delivery* stage: the
+    # decision was made under the old conditions, so the cooldown and the daily
+    # budget no longer apply. Only boundaries can still stop it.
+    if request.is_proactive and request.action != "send":
         if runtime_state.cooldown_until is not None and runtime_state.cooldown_until > stamp:
             return AuthorizeResult(
                 allowed=False,

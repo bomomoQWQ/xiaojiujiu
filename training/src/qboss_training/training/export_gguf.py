@@ -28,11 +28,11 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..errors import TrainingError
+from ..errors import ToolUnavailable, TrainingError
 from ..utils.io import write_json
 from ..utils.secrets import utc_now_iso
 
@@ -89,6 +89,10 @@ class ExportConfig:
     output_dir: str
     #: llama.cpp 仓库或安装根目录
     llama_cpp_dir: str | None = None
+    #: 直接指定 convert_hf_to_gguf.py（llama_cpp_dir 之外的另一种定位方式）
+    convert_script: str | None = None
+    #: 直接指定 llama-quantize 二进制
+    quantize_binary: str | None = None
     #: GGUF 文件基础名（不含扩展名）
     name: str = "qboss-2b"
     outtype: str = "f16"
@@ -138,7 +142,7 @@ def resolve_convert_script(llama_cpp_dir: str | Path | None) -> Path:
       * ``<root>/convert_hf_to_gguf.py`` 之外的常见嵌套（``scripts/`` 等）
     """
     if llama_cpp_dir is None:
-        raise TrainingError(
+        raise ToolUnavailable(
             "未提供 llama.cpp 目录。请用 --llama-cpp-dir 指向 llama.cpp 仓库根目录，"
             "或用 --convert-script 直接指定 convert_hf_to_gguf.py 的路径。"
         )
@@ -156,7 +160,7 @@ def resolve_convert_script(llama_cpp_dir: str | Path | None) -> Path:
     if root.is_file() and root.suffix == ".py":
         return root
 
-    raise TrainingError(
+    raise ToolUnavailable(
         f"在 {root} 下找不到 convert_hf_to_gguf.py。已尝试："
         + ", ".join(str(item) for item in candidates)
     )
@@ -168,7 +172,7 @@ def resolve_quantize_binary(llama_cpp_dir: str | Path | None) -> Path:
         found = shutil.which("llama-quantize") or shutil.which("quantize")
         if found:
             return Path(found)
-        raise TrainingError(
+        raise ToolUnavailable(
             "PATH 中找不到 llama-quantize。请用 --llama-cpp-dir 指定 llama.cpp 目录，"
             "或把编译产物加入 PATH。"
         )
@@ -196,7 +200,7 @@ def resolve_quantize_binary(llama_cpp_dir: str | Path | None) -> Path:
     if found:
         return Path(found)
 
-    raise TrainingError(
+    raise ToolUnavailable(
         "找不到 llama-quantize。请先编译 llama.cpp：\n"
         "  cmake -B build -DCMAKE_BUILD_TYPE=Release\n"
         "  cmake --build build --config Release -j"
@@ -247,13 +251,25 @@ def build_quantize_command(
     return command
 
 
+def _is_placeholder(path: Path) -> bool:
+    """dry-run 用的占位路径含 ``<...>``，不应做存在性检查。"""
+    return "<" in str(path)
+
+
 def plan_export(config: ExportConfig) -> list[tuple[str, list[str]]]:
     """只规划命令，不执行。返回 ``[(标签, 命令), ...]``。"""
     output_dir = Path(config.output_dir)
     f16_path = output_dir / f"{config.name}-{config.outtype}.gguf"
     plan: list[tuple[str, list[str]]] = []
 
-    convert_script = resolve_convert_script(config.llama_cpp_dir)
+    if config.convert_script:
+        convert_script = Path(config.convert_script)
+        # dry-run 的占位路径（如 <llama.cpp>/convert_hf_to_gguf.py）不做存在性检查
+        if not _is_placeholder(convert_script) and not convert_script.exists():
+            raise TrainingError(f"指定的转换脚本不存在：{convert_script}")
+    else:
+        convert_script = resolve_convert_script(config.llama_cpp_dir)
+
     plan.append(
         (
             "convert",
@@ -264,7 +280,12 @@ def plan_export(config: ExportConfig) -> list[tuple[str, list[str]]]:
     )
 
     if config.quant_types:
-        quantize_binary = resolve_quantize_binary(config.llama_cpp_dir)
+        if config.quantize_binary:
+            quantize_binary = Path(config.quantize_binary)
+            if not _is_placeholder(quantize_binary) and not quantize_binary.exists():
+                raise TrainingError(f"指定的 llama-quantize 不存在：{quantize_binary}")
+        else:
+            quantize_binary = resolve_quantize_binary(config.llama_cpp_dir)
         for quant_type in config.quant_types:
             target = output_dir / f"{config.name}-{quant_type}.gguf"
             plan.append(
@@ -303,35 +324,21 @@ def run_export(config: ExportConfig) -> ExportReport:
 
     try:
         plan = plan_export(config)
-    except TrainingError as exc:
+    except ToolUnavailable as exc:
         if not config.dry_run:
             raise
+        # dry-run 且**工具未就绪**：这是可接受的，用占位路径展示命令形状。
+        # 注意这里只吞 ToolUnavailable —— 若用户显式给了错误的
+        # --convert-script 路径（TrainingError），那是输入错误，必须直接报错，
+        # 不能因为 dry-run 就假装成功。
         report.notes.append(f"工具未就绪（dry-run 继续）：{exc}")
-        # dry-run 且工具缺失时，用占位路径展示命令形状
-        plan = [
-            (
-                "convert",
-                build_convert_command(
-                    Path("<llama.cpp>/convert_hf_to_gguf.py"),
-                    config.model_dir,
-                    f16_path,
-                    outtype=config.outtype,
-                ),
-            )
-        ]
-        for quant_type in config.quant_types:
-            plan.append(
-                (
-                    f"quantize:{quant_type}",
-                    build_quantize_command(
-                        Path("<llama.cpp>/llama-quantize"),
-                        f16_path,
-                        output_dir / f"{config.name}-{quant_type}.gguf",
-                        quant_type,
-                        threads=config.threads,
-                    ),
-                )
-            )
+        placeholder = replace(
+            config,
+            convert_script=str(Path("<llama.cpp>") / "convert_hf_to_gguf.py"),
+            quantize_binary=str(Path("<llama.cpp>") / "llama-quantize"),
+            llama_cpp_dir=None,
+        )
+        plan = plan_export(placeholder)
 
     for label, command in plan:
         report.commands.append(list(command))

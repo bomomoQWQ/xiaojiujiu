@@ -71,6 +71,9 @@ OP_ACTION_RESULT = "action_result"
 #: Bounded per-session memory of the last reported event id.
 LAST_EVENT_ID_CACHE = 64
 
+#: How many times a failing start is retried before the adapter gives up quietly.
+MAX_START_ATTEMPTS = 3
+
 
 class _ObservationScopeFilter(CustomFilter):
     """Pass only for messages AstrBot itself already treats as wake events.
@@ -113,6 +116,7 @@ class CompanionRuntimePlugin(Star):
         self.config = config or {}
         self._settings = Settings.from_mapping(self.config)
         self._started = False
+        self._start_failures = 0
         self._transport: AiohttpRuntimeTransport | None = None
         self._queue: BoundedRetryQueue | None = None
         self._bridge: ContextBridge | None = None
@@ -205,10 +209,8 @@ class CompanionRuntimePlugin(Star):
                     log=self.logger,
                 )
         except Exception:
-            self._started = False
-            self.logger.warning(
-                "companion_runtime adapter failed to start; AstrBot behaviour is unchanged",
-                exc_info=True,
+            self._note_start_failure(
+                "adapter could not be constructed; AstrBot behaviour is unchanged",
             )
             return
 
@@ -219,11 +221,23 @@ class CompanionRuntimePlugin(Star):
         self._outbox = outbox
         _ObservationScopeFilter.observe_all = self._settings.observe_mode == OBSERVE_MODE_ALL
 
-        queue.start()
-        if outbox is not None:
-            self._tasks.append(
-                asyncio.create_task(outbox.run(), name="companion-runtime-outbox"),
-            )
+        try:
+            if outbox is not None:
+                self._tasks.append(
+                    asyncio.create_task(outbox.run(), name="companion-runtime-outbox"),
+                )
+            queue.start()
+        except Exception:
+            # Nothing is running yet, so dropping the wiring is enough cleanup.
+            self._tasks.clear()
+            self._transport = None
+            self._executor = None
+            self._queue = None
+            self._bridge = None
+            self._outbox = None
+            self._note_start_failure("background workers could not be scheduled")
+            return
+
         self.logger.info(
             "companion_runtime adapter started (adapter_id=%s, base_url=%s, "
             "observe_mode=%s, outbox=%s)",
@@ -231,6 +245,31 @@ class CompanionRuntimePlugin(Star):
             self._settings.base_url,
             self._settings.observe_mode,
             "on" if outbox is not None else "off",
+        )
+
+    def _note_start_failure(self, message: str) -> None:
+        """Record a failed start, giving up after a few attempts.
+
+        Retrying forever would mean a broken adapter logging on every single
+        message, so after ``MAX_START_ATTEMPTS`` the plugin stays quiet until
+        AstrBot reloads it.
+        """
+        self._start_failures += 1
+        if self._start_failures >= MAX_START_ATTEMPTS:
+            self._started = True
+            self.logger.error(
+                "companion_runtime %s; adapter disabled after %d attempts "
+                "(reload the plugin after fixing the config)",
+                message,
+                self._start_failures,
+            )
+            return
+        self._started = False
+        self.logger.warning(
+            "companion_runtime %s (attempt %d/%d)",
+            message,
+            self._start_failures,
+            MAX_START_ATTEMPTS,
         )
 
     # ------------------------------------------------------------------
@@ -250,6 +289,12 @@ class CompanionRuntimePlugin(Star):
             queue = self._queue
             if queue is None:
                 return
+            wake = bool(getattr(event, "is_at_or_wake_command", False))
+            if not wake and self._settings.observe_mode != OBSERVE_MODE_ALL:
+                # Defence in depth: the scope filter already keeps non-wake
+                # messages out, and this keeps the guarantee true even if the
+                # host ever evaluates handler filters differently.
+                return
             session = event.unified_msg_origin
             record = EventRecord(
                 kind=EVENT_USER_MESSAGE,
@@ -262,7 +307,7 @@ class CompanionRuntimePlugin(Star):
                 self_id=as_str(event.get_self_id()),
                 group_id=as_str(event.get_group_id()),
                 message_id=as_str(getattr(event.message_obj, "message_id", "")),
-                wake=bool(getattr(event, "is_at_or_wake_command", False)),
+                wake=wake,
                 # A user message immediately pauses endogenous dispatch on the
                 # Runtime side (entry barrier), so the proactive system can never
                 # speak before the Runtime has seen what the user just said.

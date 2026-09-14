@@ -17,6 +17,7 @@ natural-language summary for RAG, the strong semantic API and the main LLM.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import random
@@ -64,7 +65,10 @@ class CandidateValue:
 
     def to_dict(self) -> dict[str, float]:
         """Return a JSON-serialisable rendering."""
-        return {key: round(value, 6) for key, value in self.__dict__.items()}
+        return {
+            key: round(float(value), 6)
+            for key, value in dataclasses.asdict(self).items()
+        }
 
 
 #: Phrases that mark a statement as durable and preference-like.
@@ -299,6 +303,25 @@ def consolidate(
             skipped += 1
             continue
 
+        existing = _find_duplicate(projection, candidate)
+        if existing is not None:
+            # The same content was already remembered: strengthen the existing
+            # memory instead of storing a near-duplicate row.
+            existing.importance = clamp(existing.importance + 0.05 * candidate.value)
+            existing.confidence = clamp(existing.confidence + 0.05)
+            existing.source_event_ids = sorted(
+                set(existing.source_event_ids) | set(candidate.source_event_ids)
+            )
+            projection.upsert_memory(connection, existing)
+            projection.set_candidate_status(
+                connection,
+                candidate.candidate_id,
+                "merged",
+                consolidated_memory_id=existing.memory_id,
+            )
+            skipped += 1
+            continue
+
         summary = candidate.summary
         if summarizer is not None:
             try:
@@ -349,6 +372,23 @@ def consolidate(
 
     archived.extend(archive_stale(projection, connection, config=config, now=stamp))
     return ConsolidationResult(consolidated=consolidated, archived=archived, skipped=skipped)
+
+
+def _find_duplicate(projection: MemoryProjection, candidate: MemoryCandidate) -> Memory | None:
+    """Return an existing memory with the same content, if any.
+
+    Deduplication is lexical: the same source-event set, or an identical summary,
+    means the fact is already remembered.
+    """
+    sources = set(candidate.source_event_ids)
+    for memory in projection.list_memories(
+        status=[MemoryStatus.ACTIVE.value, MemoryStatus.LOW_ACTIVATION.value], limit=300
+    ):
+        if memory.summary.strip() == candidate.summary.strip():
+            return memory
+        if sources and sources & set(memory.source_event_ids):
+            return memory
+    return None
 
 
 def _find_conflicts(
@@ -636,8 +676,8 @@ class MemoryStore:
         pool = self._projection.list_activated(limit=500)
         pool.sort(key=lambda item: item.activation, reverse=True)
         for stale in pool[size:]:
-            if stale.memory_id in {t.memory_id for t in touched}:
-                continue
+            # The pool is a bounded working set: whatever falls outside the top-N
+            # by activation is dropped, even when it was touched this round.
             self._projection.delete_activation(connection, stale.memory_id)
         return touched
 

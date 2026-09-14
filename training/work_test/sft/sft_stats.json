@@ -1,8 +1,0 @@
-{
-  "mode": "no_tokenize",
-  "records": 60,
-  "by_task": {
-    "event_eval": 30,
-    "emotion_explain": 30
-  }
-}

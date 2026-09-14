@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from ..errors import ConfigError
+from ..sft.format import DEFAULT_PRETTY_JSON
 
 LOGGER = logging.getLogger("qboss_training.training")
 
@@ -194,7 +195,9 @@ class TrainingConfig:
     report_to: tuple[str, ...] = ()
     resume_from_checkpoint: str | None = None
     enable_thinking: bool = False
-    pretty_json: bool = True
+    #: 与 sft.format.DEFAULT_PRETTY_JSON / inference.build_inference_messages
+    #: 共用同一默认值，防止训练与推理的 JSON 序列化漂移。
+    pretty_json: bool = DEFAULT_PRETTY_JSON
     packing: bool = False
     dataloader_num_workers: int = 0
     #: 训练前是否做一次模型体检（打印可训练参数与冻结命中情况）

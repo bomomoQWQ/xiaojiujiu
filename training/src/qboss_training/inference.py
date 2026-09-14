@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 from .contracts import get_contract
+from .sft.format import DEFAULT_PRETTY_JSON
 from .utils.jsonx import extract_json
 
 LOGGER = logging.getLogger("qboss_training.inference")
@@ -66,12 +67,16 @@ def build_inference_messages(
     task: str,
     model_input: Mapping[str, Any],
     *,
-    pretty: bool = True,
+    pretty: bool = DEFAULT_PRETTY_JSON,
 ) -> list[dict[str, str]]:
     """构造推理用消息。
 
     **必须与 SFT 构建时完全一致**（同样的 system prompt、同样的 JSON 序列化
-    缩进策略），否则会出现"训练能过、推理不过"的诡异现象。
+    缩进策略），否则会出现"训练能过、推理不过"的诡异现象 ——
+    模型学到的是某种特定的空白与键序，换个 dumps 就崩。
+
+    ``pretty`` 直接引用 :data:`~qboss_training.sft.format.DEFAULT_PRETTY_JSON`，
+    这样训练侧与推理侧**不可能**因为各自写死默认值而漂移。
     """
     contract = get_contract(task)
     indent = 1 if pretty else None
@@ -87,6 +92,10 @@ def build_inference_messages(
 def extract_output(text: str, task: str) -> tuple[dict[str, Any] | None, str | None]:
     """从生成文本里抽 JSON。
 
+    兼容两种形态：
+      * 裸对象 ``{...契约字段...}``（训练时教的目标形态）；
+      * 包裹形态 ``{"output": {...}}``（教师/推理端偶尔会多包一层）。
+
     Returns:
         ``(解析结果或 None, 错误信息或 None)``
     """
@@ -95,7 +104,11 @@ def extract_output(text: str, task: str) -> tuple[dict[str, Any] | None, str | N
     def _accept(candidate: Any) -> bool:
         if not isinstance(candidate, Mapping):
             return False
-        return set(contract.required_fields) <= set(candidate)
+        if set(contract.required_fields) <= set(candidate):
+            return True
+        # 包裹形态：output 字段里含全部契约字段
+        inner = candidate.get("output")
+        return isinstance(inner, Mapping) and set(contract.required_fields) <= set(inner)
 
     try:
         payload = extract_json(text, validate=_accept)

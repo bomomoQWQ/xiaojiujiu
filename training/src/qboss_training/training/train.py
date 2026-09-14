@@ -333,7 +333,7 @@ def run_training(config: TrainingConfig, *, smoke: bool = False) -> dict[str, An
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) 基座 + tokenizer
-    model, tokenizer = load_base_model(config.model, config.quantization)
+    model, tokenizer = load_base_model(config.model, quantization=config.quantization)
 
     # 2) 冻结策略（LoRA 之前）
     freeze_report = apply_freeze_policy(model, config.freeze)

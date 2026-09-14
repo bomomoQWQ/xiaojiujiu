@@ -309,7 +309,9 @@ def apply_new_emotion_events(
     values = state.values
 
     for source, evaluation in evaluations:
-        if evaluation.direction == EmotionDirection.NEUTRAL.value and evaluation.impact <= 0.0:
+        if evaluation.impact <= config.min_event_impact:
+            # Too small to be worth an impact event; the appraisal itself is still
+            # available to callers and to the working situation.
             continue
         signed = evaluation.impact
         if evaluation.direction == EmotionDirection.NEGATIVE.value:

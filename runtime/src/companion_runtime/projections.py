@@ -10,6 +10,7 @@ chronological ordering, which keeps the SQL simple and portable.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import random
 import sqlite3
@@ -236,10 +237,21 @@ class SituationProjection:
     ) -> str:
         """Insert or replace one working-situation item.
 
+        When ``item_id`` is omitted the item is keyed by its content so that
+        repeated projections of the same fact refresh a single row instead of
+        piling up duplicates in the bounded working set.
+
         Returns:
             The item identifier.
         """
-        identifier = item_id or new_id("memory")
+        identifier = item_id
+        if identifier is None:
+            existing = self._db.query_one(
+                "SELECT item_id FROM working_situation_items WHERE content = ? AND kind = ? "
+                "AND status = 'active' LIMIT 1",
+                (content, kind),
+            )
+            identifier = str(existing["item_id"]) if existing is not None else new_id("memory")
         now = isoformat(utcnow())
         connection.execute(
             "INSERT INTO working_situation_items(item_id, kind, content, confidence, salience, "
@@ -1016,7 +1028,7 @@ class AttemptProjection:
 
     def upsert(self, connection: sqlite3.Connection, attempt: ActionAttempt) -> str:
         """Insert or replace an attempt row."""
-        attempt.updated_at = utcnow()
+        attempt.updated_at = attempt.updated_at or utcnow()
         connection.execute(
             "INSERT INTO action_attempts(attempt_id, candidate_id, state, intent, goal, based_on_version, "
             "created_at, updated_at, committed_at, rendered_text, failure_reason, reconcile_action, "
@@ -1433,30 +1445,42 @@ class UserModelProjection:
 
     GLOBAL_SCOPE = "global"
 
-    def record_observation(self, connection: sqlite3.Connection, observation: dict[str, Any]) -> str:
+    def record_observation(self, connection: sqlite3.Connection, observation: Any) -> str:
         """Append one interaction observation.
+
+        Args:
+            connection: Write connection.
+            observation: Either an
+                :class:`~companion_runtime.typing.InteractionObservation` or an
+                equivalent mapping. A dataclass is normalised here so callers do
+                not have to serialise datetimes themselves.
 
         Returns:
             The observation identifier.
         """
-        identifier = observation.get("observation_id") or new_id("observation")
+        if dataclasses.is_dataclass(observation) and not isinstance(observation, type):
+            data: dict[str, Any] = dataclasses.asdict(observation)
+        else:
+            data = dict(observation)
+        identifier = data.get("observation_id") or new_id("observation")
+        created_at = data.get("created_at")
         connection.execute(
             "INSERT INTO interaction_observations(observation_id, created_at, attempt_id, action_json, "
             "context_json, outcome_json, source_event_ids, attribution_confidence, source_weight, "
             "semantic_confidence, weight, applied) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 identifier,
-                isoformat(observation.get("created_at") or utcnow()),
-                observation.get("attempt_id"),
-                dumps(observation.get("action") or {}),
-                dumps(observation.get("context") or {}),
-                dumps(observation.get("outcome") or {}),
-                dumps(list(observation.get("source_event_ids") or [])),
-                float(observation.get("attribution_confidence", 0.5)),
-                float(observation.get("source_weight", 0.5)),
-                float(observation.get("semantic_confidence", 0.5)),
-                float(observation.get("weight", 0.0)),
-                int(bool(observation.get("applied", False))),
+                isoformat(created_at if isinstance(created_at, datetime) else parse_datetime(created_at) or utcnow()),
+                data.get("attempt_id"),
+                dumps(data.get("action") or {}),
+                dumps(data.get("context") or {}),
+                dumps(data.get("outcome") or {}),
+                dumps(list(data.get("source_event_ids") or [])),
+                float(data.get("attribution_confidence", 0.5)),
+                float(data.get("source_weight", 0.5)),
+                float(data.get("semantic_confidence", 0.5)),
+                float(data.get("weight", 0.0)),
+                int(bool(data.get("applied", False))),
             ),
         )
         return identifier
@@ -1526,10 +1550,27 @@ class UserModelProjection:
     def set_summary(
         self, connection: sqlite3.Connection, summary: dict[str, Any], scope: str = GLOBAL_SCOPE
     ) -> None:
-        """Replace the natural-language summary of a parameter block."""
+        """Replace the natural-language summary of a parameter block.
+
+        The row is created with the model's seed parameters when it does not exist
+        yet: a prose summary about the user must never be silently dropped just
+        because the numeric block has not been persisted first.
+        """
+        from .user_model import default_parameter_block
+
+        now = isoformat(utcnow())
+        payload = dumps(summary)
+        cursor = connection.execute(
+            "UPDATE user_model_params SET last_summary_json = ? WHERE scope = ?", (payload, scope)
+        )
+        if cursor.rowcount:
+            return
+        params, precision = default_parameter_block()
         connection.execute(
-            "UPDATE user_model_params SET last_summary_json = ? WHERE scope = ?",
-            (dumps(summary), scope),
+            "INSERT INTO user_model_params(scope, params_json, precision_json, observations, "
+            "effective_count, last_updated_at, last_summary_json) VALUES(?, ?, ?, 0, 0, ?, ?) "
+            "ON CONFLICT(scope) DO UPDATE SET last_summary_json = excluded.last_summary_json",
+            (scope, dumps(params), dumps(precision), now, payload),
         )
 
 

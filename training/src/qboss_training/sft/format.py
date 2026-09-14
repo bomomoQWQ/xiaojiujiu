@@ -28,6 +28,14 @@ LOGGER = logging.getLogger("qboss_training.sft")
 
 IGNORE_INDEX = -100
 
+#: JSON 序列化是否缩进。**训练侧与推理侧共用的唯一事实来源。**
+#: 缩进能让小模型更容易生成结构正确的 JSON（每个字段独立一行），
+#: 但它同时意味着训练与推理必须一致，否则分布不匹配。
+#: 三处引用：本模块的 build_messages / SFTBuildConfig.pretty_json、
+#: qboss_training.training.config.TrainingConfig.pretty_json、
+#: qboss_training.inference.build_inference_messages 的 pretty 默认值。
+DEFAULT_PRETTY_JSON = True
+
 #: Qwen3 系列思维链边界标记
 THINK_OPEN = " thinking"
 THINK_CLOSE = "<｜end▁of▁thinking｜>"
@@ -103,7 +111,7 @@ class SFTStats:
 def build_messages(
     record: Mapping[str, Any],
     *,
-    pretty: bool = False,
+    pretty: bool = DEFAULT_PRETTY_JSON,
     system_prompt: str | None = None,
 ) -> list[dict[str, str]]:
     """把训练记录转成 chat messages（system / user / assistant）。
@@ -111,6 +119,10 @@ def build_messages(
     user 段是**规范化后的输入 JSON**，assistant 段是**规范化后的输出 JSON**。
     规范化很关键：训练时与推理时的序列化方式必须完全一致，
     否则模型学到的是某一种空白/键序，推理时换个 dumps 就崩。
+
+    ``pretty`` 的默认值取自 :data:`DEFAULT_PRETTY_JSON`（即
+    :class:`SFTBuildConfig` 的 ``pretty_json`` 默认值），
+    避免"函数默认值"与"配置默认值"各说一套。
     """
     task = str(record.get("task", ""))
     contract = get_contract(task)
@@ -306,15 +318,9 @@ def apply_completion_only_labels(
     mask = char_mask(full_text, completion_start, think_end_offset)
     labels: list[int] = []
     supervised = 0
+    total_chars = len(mask)
     for token_id, (start, end) in zip(input_ids, offsets):
-        # 跨边界 token 只要与 supervised 区间有重叠就算 supervised，
-        # 否则 content 的第一个 token 会因为含模板换行被整段掩掉。
-        keep = False
-        span_end = max(end, start + 1)
-        for position in range(max(0, start), min(len(mask), span_end)):
-            if mask[position]:
-                keep = True
-                break
+        keep = _token_is_supervised(int(start), int(end), mask, total_chars)
         if keep:
             labels.append(int(token_id))
             supervised += 1
@@ -323,18 +329,50 @@ def apply_completion_only_labels(
     return labels, supervised
 
 
+def _token_is_supervised(
+    start: int, end: int, mask: Sequence[bool], total_chars: int
+) -> bool:
+    """判断一个 token 是否落在 supervised（参与 loss）区间内。
+
+    * **正常 token**（``end > start``）：只要与 supervised 区间**有重叠**就算监督。
+      用重叠而非"完全包含"是必须的 —— completion 的第一个 token 往往同时含
+      模板换行与内容首字符，若要求完全包含，它会整段被掩掉，
+      模型就学不到 response 的开头（表现为"开头总是漏字"）。
+    * **零宽 token**（``end <= start``）：某些 tokenizer 对控制/特殊 token
+      给出的 offset 是 ``(n, n)``，没有对应字符。这类 token **一律不监督**：
+      它们通常来自提示词侧的模板标记，纳入 loss 会把模板串学进去。
+      实测中它们恰好落在 completion 起点，若不排除会引入噪声。
+      其余非零宽 token 的覆盖范围不受影响，所以"漏学开头"的风险不存在。
+    """
+    if total_chars == 0:
+        return False
+    if end <= start:
+        return False
+    for position in range(max(0, start), min(total_chars, end)):
+        if mask[position]:
+            return True
+    return False
+
+
 # --------------------------------------------------------------------------
 # 3) 数据集构建（需要 transformers，只有在 train/smoke 时才 import）
 # --------------------------------------------------------------------------
 
 @dataclass
 class SFTBuildConfig:
-    """SFT 构建配置。"""
+    """SFT 构建配置。
+
+    注意 ``pretty_json`` 的默认值必须与
+    :class:`~qboss_training.training.config.TrainingConfig` 的 ``pretty_json``
+    以及 :func:`~qboss_training.inference.build_inference_messages` 的 ``pretty``
+    默认值保持一致。三处任一漂移都会造成"训练与推理序列化不同"，
+    表现为训练 loss 正常但评测变差，且极难排查。
+    """
 
     model_name_or_path: str
     max_seq_length: int = 1024
     enable_thinking: bool = False
-    pretty_json: bool = False
+    pretty_json: bool = DEFAULT_PRETTY_JSON
     #: 生成 prompt 时用的模板参数
     template_kwargs: dict[str, Any] = field(default_factory=dict)
     #: 丢弃超过 max_seq_length 的样本（False 则截断）

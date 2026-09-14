@@ -82,16 +82,20 @@ POSITIVE_TERMS = POSITIVE_VALENCE_TERMS
 NEGATIVE_TERMS = NEGATIVE_VALENCE_TERMS
 
 APPROACH_TERMS: tuple[str, ...] = (
-    "想靠近", "靠近", "想确认", "确认", "想问", "想知道", "想留住", "留住",
-    "想留住", "想联系", "想找他", "想找她", "想说", "想表达", "想陪", "陪伴",
-    "想见", "想主动", "想追问", "追问", "想解释", "想争取", "想挽回", "希望继续",
-    "想继续", "想留下", "靠近一点",
+    "想靠近", "靠近一点", "想确认", "想多问", "想问清楚", "想知道",
+    "想联系", "想找对方", "想说清楚", "想表达", "想陪", "陪伴",
+    "想见", "想主动", "想追问", "想解释", "想争取", "想挽回",
+    "希望继续", "想继续", "想留住对方", "想留住他", "想留住她",
 )
 
+#: 注意：APPROACH_TERMS 里刻意**不含**广义的"想留" ——
+#: 它会匹配到"想留一点空间/想留出空间"，而那是节制的表达，
+#: 混进来会让"approach 高 + impulse 无靠近表述"的判断失效。
 RESTRAINT_TERMS: tuple[str, ...] = (
     "克制", "忍住", "压住", "压下来", "收住", "不打扰", "不给压力", "不给负担",
     "退一步", "保持距离", "不显得依赖", "不想显得", "避免", "顾虑", "犹豫",
-    "按捺", "不主动", "先不说", "放在心里", "不追问", "留出空间", "尊重",
+    "按捺", "不主动", "先不说", "放在心里", "不追问", "留出空间", "留一点空间",
+    "尊重", "缓一缓",
 )
 
 AMPLIFIER_TERMS: tuple[str, ...] = (
@@ -126,19 +130,53 @@ def count_terms(text: str, terms: Iterable[str]) -> int:
     return sum(1 for term in set(terms) if term in text)
 
 
-#: 否定前缀：命中这些前缀时该词条的极性应反转或不计数
+#: 否定前缀：命中这些前缀时该词条的极性应反转。
+#:
+#: 刻意**不**收录单字 "非"：它会匹配到 "非常/非但" 这类**加强**词，
+#: 把"非常开心"判成被否定的正向 → 整个极性反向（实测踩过这个坑）。
+#: 中文里真正的"非"式否定几乎都带第二个字（"并非"），单独收录即可。
+#: 同理 "无" 在 "无比/无论" 里也不是否定，故只收多字形式。
 NEGATION_PREFIXES: tuple[str, ...] = (
-    "不", "没", "无", "别", "未", "非", "并不", "并不太", "谈不上", "算不上",
+    "不", "没", "别", "未", "没有", "没什么", "不会", "不想", "不愿",
+    "并不", "并不太", "谈不上", "算不上", "并非", "毫无", "无法",
+    "难以", "不再", "不再那么",
 )
+
+#: 否定检测的回顾窗口（字符）。中文否定可以隔几个字才生效：
+#: "没有**想**主**动**靠近的念头" —— "没有" 距 "想主动" 有 1 字。
+NEGATION_WINDOW = 6
+
+#: 子句边界：否定只在同一个子句内生效。
+#: 若不切分，会跨句误判 —— 例如
+#: "……不太依赖。想确认用户之后是否还会回来。" 里，
+#: 前句的"不"会跑到 6 字窗口内把后句的"想确认"判成被否定。
+_CLAUSE_BOUNDARIES = "，,。.！!？?；;：:、\n ”\"'）)】」』"
+
+
+def _negation_window(text: str, index: int) -> str:
+    """取词条前用于判断否定的片段：限制在同一个子句内。"""
+    start = max(0, index - NEGATION_WINDOW)
+    window = text[start:index]
+    # 从右往左找最近的子句边界，边界之后才是本子句
+    for offset in range(len(window) - 1, -1, -1):
+        if window[offset] in _CLAUSE_BOUNDARIES:
+            return window[offset + 1 :]
+    return window
+
+
+def is_negated_at(text: str, index: int) -> bool:
+    """判断 ``text[index:]`` 处的词条是否被否定。"""
+    window = _negation_window(text, index)
+    return any(prefix in window for prefix in NEGATION_PREFIXES)
 
 
 def count_terms_negation_aware(
     text: str, terms: Iterable[str]
 ) -> tuple[int, int]:
-    """返回 ``(正向出现次数, 被否定次数)``。
+    """返回 ``(肯定出现次数, 被否定次数)``。
 
     中文里"不安心""没觉得开心"会把正向词说反，纯子串匹配会得出相反极性。
-    这里用简化的前缀检测纠正：词条前面 1~2 字内出现否定词即视为否定。
+    这里用简化的"同子句前缀否定"检测纠正。
     """
     positive = 0
     negated = 0
@@ -148,8 +186,7 @@ def count_terms_negation_aware(
             index = text.find(term, start)
             if index < 0:
                 break
-            window = text[max(0, index - 3) : index]
-            if any(window.endswith(prefix) for prefix in NEGATION_PREFIXES):
+            if is_negated_at(text, index):
                 negated += 1
             else:
                 positive += 1
@@ -158,15 +195,25 @@ def count_terms_negation_aware(
 
 
 def tone_score(text: str) -> int:
-    """情绪极性分数（只看 valence 词，不含冲动/节制维度）。
+    """情绪极性分数（带符号，只看 valence 词）。
 
-    正向 valence 词净出现次数 - 负向 valence 词净出现次数，且：
-      * 被否定的正向词不计入正向（"不安心" 不再算正向）；
-      * 被否定的负向词不计入负向（"不难过" 不再算负向）。
+    与简单计数的差别：**被否定的词按反向计入**，而不是丢弃。
+      * "不难过"  → 否定负向词 → +1（确实偏正向）
+      * "不安心"  → 否定正向词 → -1（确实偏负向）
+      * "完全没有冲突" → 否定负向词 → +1
+
+    这个符号处理很重要：情绪解释输出里常出现
+    "完全没有冲突""不想显得太依赖"这类否定式，若直接丢弃，
+    一段实际很正向的描述会被算成 0，从而漏掉"情绪方向翻转"。
     """
-    positive, _ = count_terms_negation_aware(text, POSITIVE_VALENCE_TERMS)
-    negative, _ = count_terms_negation_aware(text, NEGATIVE_VALENCE_TERMS)
-    return positive - negative
+    positive, positive_negated = count_terms_negation_aware(text, POSITIVE_VALENCE_TERMS)
+    negative, negative_negated = count_terms_negation_aware(text, NEGATIVE_VALENCE_TERMS)
+
+    # 正向词：肯定出现 +1；被否定 -1
+    # 负向词：肯定出现 -1；被否定 +1
+    net_positive = positive - positive_negated
+    net_negative = negative - negative_negated
+    return net_positive - net_negative
 
 
 def tone_label(score: int, tolerance: int = 0) -> str:
@@ -211,7 +258,36 @@ def has_dialogue(text: str) -> bool:
 
 
 def contains_any(text: str, terms: Iterable[str]) -> bool:
+    """文本是否包含任一词条（**不做**否定判断）。"""
     return any(term in text for term in terms)
+
+
+def _first_hit(text: str, terms: Iterable[str]) -> str:
+    """返回第一个命中的词条，用于把违规原因写清楚。"""
+    for term in terms:
+        if term in text:
+            return term
+    return ""
+
+
+def contains_positive_any(text: str, terms: Iterable[str]) -> bool:
+    """文本是否**肯定地**包含任一词条。
+
+    与 :func:`contains_any` 的区别：会跳过被否定的命中。
+    例如"没有想主动靠近的念头"里虽然含"想主动"，但那是**否认**靠近，
+    不应被当作"表达了主动靠近"。这类误判在中文里非常常见
+    （"不想显得太依赖""不打算追问"），必须逐条排除。
+    """
+    for term in set(terms):
+        start = 0
+        while True:
+            index = text.find(term, start)
+            if index < 0:
+                break
+            if not is_negated_at(text, index):
+                return True
+            start = index + len(term)
+    return False
 
 
 def _collect_input_numbers(payload: Any) -> list[float]:
@@ -471,15 +547,26 @@ def check_emotion_explain_invariants(
         for key in ("experience", "focus", "conflict", "impulse", "inhibition", "expression")
     )
 
-    # EX01 强度必须与输入一致 —— 不得放大
+    # EX01 强度必须与输入一致 —— 不得放大（§11.3）
+    #
+    # 判据刻意**不**依赖 tone_score 的绝对值：情绪解释会同时写出冲动与节制，
+    # 后者自带正向/中性词，会把整体分数拉回 0 附近，导致"明显放大"被漏判。
+    # 改为直接判"是否使用了强化表达 + 是否出现负向感受词"，
+    # 这更贴近"放大"的语义本身。
     score = tone_score(all_text)
-    if direction == "-" and intensity is not None and intensity <= 0.45:
-        if score <= -2 and contains_any(all_text, AMPLIFIER_TERMS):
+    light_negative = (
+        direction == "-" and intensity is not None and intensity <= 0.45
+    )
+    if light_negative:
+        has_amplifier = contains_any(all_text, AMPLIFIER_TERMS)
+        has_negative_feeling = contains_any(all_text, NEGATIVE_VALENCE_TERMS)
+        if has_amplifier and has_negative_feeling:
             violations.append(
                 Violation(
                     "EX01_AMPLIFY_LIGHT_EMOTION",
                     ERROR,
-                    f"输入为轻度负向（intensity={intensity:.2f}），但输出使用了强化表述，"
+                    f"输入为轻度负向（intensity={intensity:.2f}），但输出使用了强化表达"
+                    f"（命中：{_first_hit(all_text, AMPLIFIER_TERMS)}），"
                     "违反『不得放大轻微情绪』",
                     "experience",
                 )
@@ -508,7 +595,12 @@ def check_emotion_explain_invariants(
             )
 
     # EX02 情绪方向不得翻转
-    if direction == "-" and score >= 2:
+    #
+    # 阈值取 ±1（"净极性反号"）。这比"±2"更严格，因为短文本里
+    # 一段明显正向的描述（"非常开心…觉得特别温暖…很放松"）净分数可能只有 1，
+    # 用 ±2 会漏掉最典型的翻转。代价是边界样本可能被多报，
+    # 但方向翻转是本任务最不能容忍的错误，偏向"宁可多报"。
+    if direction == "-" and score >= 1:
         violations.append(
             Violation(
                 "EX02_DIRECTION_FLIP",
@@ -517,7 +609,7 @@ def check_emotion_explain_invariants(
                 "experience",
             )
         )
-    if direction == "+" and score <= -2:
+    if direction == "+" and score <= -1:
         violations.append(
             Violation(
                 "EX02_DIRECTION_FLIP",
@@ -547,8 +639,8 @@ def check_emotion_explain_invariants(
     #   (a) approach 高，却完全没有靠近类表述；
     #   (b) approach 低，却出现了明确的主动靠近表述。
     if approach is not None:
-        has_approach_terms = contains_any(impulse, APPROACH_TERMS)
-        strong_approach_terms = contains_any(
+        has_approach_terms = contains_positive_any(impulse, APPROACH_TERMS)
+        strong_approach_terms = contains_positive_any(
             impulse, ("想靠近", "想追问", "想留住", "想主动", "想确认")
         )
         if approach >= 0.6 and not has_approach_terms:
@@ -576,7 +668,7 @@ def check_emotion_explain_invariants(
     if restraint is not None:
         restraint_evidence = _text(output.get("restraint_evidence"))
         restraint_surface = " ".join([inhibition, _text(output.get("conflict")), restraint_evidence])
-        if restraint >= 0.6 and not contains_any(restraint_surface, RESTRAINT_TERMS):
+        if restraint >= 0.6 and not contains_positive_any(restraint_surface, RESTRAINT_TERMS):
             violations.append(
                 Violation(
                     "EX05_INHIBITION_RESTRAINT_MISMATCH",

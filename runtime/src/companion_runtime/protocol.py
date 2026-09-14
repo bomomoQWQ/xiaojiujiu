@@ -136,9 +136,9 @@ def _looks_like_retraction(text: str) -> bool:
 
 def _topic_tokens(text: str) -> set[str]:
     """Return content tokens of a text, minus stopwords."""
-    from .utility import tokenize
+    from .utility import topic_tokens
 
-    return {token for token in tokenize(text) if token not in TOPIC_OVERLAP_STOPWORDS and len(token) > 1}
+    return topic_tokens(text) - TOPIC_OVERLAP_STOPWORDS
 
 
 def classify(
@@ -310,15 +310,19 @@ def reconcile(
                 )
 
         # 2. The user's situation makes the intent inappropriate.
-        if _is_crisis(text) and candidate_type in {"contact", "share", "curious_question"}:
+        if _is_crisis(text):
             return ReconcileDecision(
                 action=ReconcileAction.ABORT.value,
                 reason="user_situation_changed_severely",
-                notes=["原表达不再合适，应先关心"],
+                notes=["用户处境发生重大变化，原表达不再合适，应先关心"],
             )
 
-        # 3. The user retracts the premise.
-        if _looks_like_retraction(text) and (event_tokens & intent_tokens or not intent_tokens):
+        # 3. The user retracts the premise. The retraction must touch the same
+        # subject matter, otherwise "never mind" about something unrelated would
+        # wrongly kill a valid intention. When neither side carries a clear
+        # subject, the retraction is honoured rather than ignored.
+        overlap = event_tokens & intent_tokens
+        if _looks_like_retraction(text) and (overlap or not intent_tokens or not event_tokens):
             return ReconcileDecision(
                 action=ReconcileAction.ABORT.value,
                 reason="premise_retracted",
@@ -368,8 +372,22 @@ def _satisfies(text: str, candidate_type: str) -> bool:
 
 
 def _is_crisis(text: str) -> bool:
-    """Return whether a message describes a serious negative event."""
-    markers = ("家里出事", "出事了", "去世", "抢救", "医院", "崩溃", "很难受", "emergency")
+    """Return whether a message describes a serious negative event.
+
+    A crisis always takes precedence over a prepared message: whatever the
+    character was about to say is no longer the right thing to say.
+    """
+    markers = (
+        "家里出事",
+        "出事了",
+        "去世",
+        "抢救",
+        "急诊",
+        "住院",
+        "崩溃",
+        "很难受",
+        "emergency",
+    )
     return any(marker in (text or "") for marker in markers)
 
 

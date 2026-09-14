@@ -90,7 +90,10 @@ AstrBot/
 
 - `wake`（默认，推荐）：只上报 **AstrBot 本身就会处理** 的消息（私聊、被 @、唤醒词、回复机器人）。
   实现方式是自定义过滤器判定 `event.is_at_or_wake_command`，该字段只由真实的唤醒条件置位，
-  因此本插件**永远不会**把一条普通群消息变成唤醒事件。
+  因此本插件**永远不会**把一条普通群消息变成唤醒事件；handler 内部还会再校验一次同样的条件
+  （双保险：即使宿主的过滤器语义变化，`wake` 模式下也不会上报非唤醒消息）。
+  另外注意：AstrBot 只有在 `is_at_or_wake_command=True` 时才会调用 LLM，因此即便过滤器完全失效，
+  最坏后果也只是这类消息继续流经后续管线阶段，而不会让机器人回复它们。
 - `all`：上报全部消息。代价是：AstrBot 会把这类消息标记为已唤醒（`is_wake=True`）并让它们继续
   流经限流、内容安全等后续管线阶段。这会改变宿主行为，仅在你清楚后果时开启。
 
@@ -236,6 +239,8 @@ AstrBot/
 | `rejected` | 未获授权，未发送（`error` 含原因，如 `aborted_by_user_message`） |
 | `skipped` | 无法执行（`missing_session`、`unsupported_action_type:…`） |
 
+> 行动 id 总是出现在请求路径中；仅结果回报的请求体额外附带 `action_id`，便于 Runtime 实现直接对齐。
+
 - 设计 §69：`committed != sent`。只有 `status=ok` 且 `result.sent=true` 才算真正发出。
 - 回报是幂等的；失败时进入本地有界重试队列，最终由租约到期兜底。
 - 建议 Runtime 对 `rejected` 与 `skipped` 也落一条 `action_attempt` 终态，避免反复派发。
@@ -313,7 +318,7 @@ cd data/plugins/astrbot_plugin_companion_runtime
 python -m pytest tests -q          # 或：python -m unittest discover -s tests -t .
 ```
 
-覆盖内容（104 项，全部离线）：
+覆盖内容（121 项，全部离线）：
 
 | 文件 | 覆盖 |
 | --- | --- |
@@ -322,7 +327,7 @@ python -m pytest tests -q          # 或：python -m unittest discover -s tests 
 | `tests/test_retry_queue.py` | 去重、写满淘汰最旧、退避重试、超次放弃、超时丢弃、worker 启停 |
 | `tests/test_bridge.py` | 缓存命中、**超时放弃**、错误降级、过期缓存兜底、截断、版本号清洗、预热 |
 | `tests/test_outbox.py` | render 成功/失败/超时、send 授权通过与拒绝、**授权失败 fail-closed**、平台未找到、重复租约重放、续租心跳、轮询退避 |
-| `tests/test_plugin_integration.py` | 用 `tests/stubs/astrbot`（模拟 AstrBot 4.28 公开接口）验证 `main.py` 全链路：事件上报、临时 TextPart 注入、send 前授权、初始化/终止清理 |
+| `tests/test_plugin_integration.py` | 用 `tests/stubs/astrbot`（模拟 AstrBot 4.28 公开接口）验证 `main.py` 全链路：事件上报、`wake`/`all` 两种监听范围、临时 TextPart 注入、send 前授权、启动失败自限、初始化/终止清理 |
 | `tests/test_packaging.py` | schema 与 Settings 键一致、元数据字段与版本范围、**无内嵌凭据**、仅 import 白名单内的 AstrBot 模块、纯核心不 import AstrBot、`terminate` 可达 |
 
 > 说明：`tests/stubs/astrbot/` 只是 AstrBot 公开接口的最小替身，用来在没有 AstrBot 的环境里验证插件**接线**；
@@ -348,4 +353,4 @@ python -m pytest tests -q          # 或：python -m unittest discover -s tests 
 ## 11. 版本
 
 - `0.1.0`：首个可用版本。协议 v1；render/send 两种行动；严格短超时注入；有界重试队列；
-  租约心跳；`wake`/`all` 两种监听范围；离线测试 104 项。
+  租约心跳；`wake`/`all` 两种监听范围；离线测试 121 项。

@@ -286,12 +286,43 @@ def contains_any(text: str, needles: Iterable[str]) -> str | None:
 
 
 def tokenize(text: str) -> list[str]:
-    """Split text into lowercase alphanumeric tokens for lexical scoring.
+    """Split text into lowercase tokens for lexical scoring.
 
-    Works for Latin words and for CJK by falling back to individual characters
-    when no whitespace-delimited tokens are found.
+    Latin words are returned whole. CJK text has no spaces, so it is decomposed
+    into individual characters - good enough for coarse lexical scoring and for
+    "does this text mention this character at all" checks.
+
+    Args:
+        text: Source text.
+
+    Returns:
+        A list of tokens.
     """
     lowered = (text or "").lower()
     words = re.findall(r"[a-z0-9_]+", lowered)
     cjk = re.findall(r"[\u4e00-\u9fff]", lowered)
     return words + cjk
+
+
+def topic_tokens(text: str) -> set[str]:
+    """Extract topical tokens, using CJK bigrams rather than single characters.
+
+    Single CJK characters are far too common to indicate a shared subject: with
+    them, "面试有点紧张" and "询问面试结果" look unrelated. Bigrams make the
+    overlap meaningful, which is what the protocol layer needs in order to decide
+    whether the user has just answered the question the Runtime was about to ask.
+
+    Args:
+        text: Source text.
+
+    Returns:
+        A set of lowercase Latin words and CJK bigrams.
+    """
+    lowered = (text or "").lower()
+    tokens: set[str] = set(re.findall(r"[a-z0-9_]{2,}", lowered))
+    for run in re.findall(r"[\u4e00-\u9fff]+", lowered):
+        if len(run) == 1:
+            tokens.add(run)
+            continue
+        tokens.update(run[index : index + 2] for index in range(len(run) - 1))
+    return tokens

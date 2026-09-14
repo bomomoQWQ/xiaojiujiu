@@ -1,0 +1,2 @@
+[console_scripts]
+companion-runtime = companion_runtime.cli:main

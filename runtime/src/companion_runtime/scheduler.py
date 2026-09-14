@@ -171,8 +171,13 @@ def plan(
         config.scheduler.min_interval_seconds,
         config.scheduler.max_interval_seconds,
     )
-    # Jitter spreads wake-ups so parallel instances do not beat in sync.
-    delay *= 1.0 + source.uniform(-0.05, 0.05)
+    # Jitter spreads wake-ups so parallel instances do not beat in sync. It is
+    # applied *after* clamping so the configured bounds are always respected.
+    delay = clamp(
+        delay * (1.0 + source.uniform(-0.05, 0.05)),
+        config.scheduler.min_interval_seconds,
+        config.scheduler.max_interval_seconds,
+    )
 
     quiet = _in_quiet_hours(config, target)
     if quiet:
@@ -183,7 +188,6 @@ def plan(
             max(config.scheduler.max_interval_seconds, 8 * 3600.0),
         )
         reasons.append("quiet_hours")
-
     return WakePlan(next_wake_at=now + timedelta(seconds=delay), delay_seconds=delay, reasons=reasons, quiet_hours=quiet)
 
 

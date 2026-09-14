@@ -55,7 +55,12 @@ FOLLOW_UP_PATTERNS: tuple[tuple[re.Pattern[str], str, float], ...] = (
 )
 
 RESOLUTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"(结果|通过|过啦|过了|成功了|失败|没过|挂了|录取|offer)", re.IGNORECASE), "result_reported"),
+    (
+        re.compile(
+            r"(结果|通过|过[啦了]|成功了|失败|没过|挂了|录取|offer|拿到)", re.IGNORECASE
+        ),
+        "result_reported",
+    ),
     (re.compile(r"(我回来了|到家了|落地了|回来了)", re.IGNORECASE), "arrived"),
     (re.compile(r"(搞定了|解决了|完成了|做完了|没事了)", re.IGNORECASE), "settled"),
     (re.compile(r"(i (passed|got it|made it)|results? (are )?(out|in))", re.IGNORECASE), "result_reported"),
@@ -152,7 +157,7 @@ def detect(
         if match is None:
             continue
         topics = [match.group(0)]
-        if any(title[:4] == existing_matter.title[:4] for existing_matter in existing):
+        if any(_same_subject(title, existing_matter.title) for existing_matter in existing):
             continue
         proposals.append(
             UnfinishedProposal(
@@ -166,6 +171,23 @@ def detect(
         )
         break
     return proposals
+
+
+def _same_subject(candidate_title: str, existing_title: str) -> bool:
+    """Return whether two matter titles refer to the same subject.
+
+    The follow-up titles are natural language ("等待面试结果" vs "等待用户告知结果"),
+    so a shared content token is the right granularity: the point is to avoid
+    opening a second matter about the interview, not to compare strings.
+    """
+    from .utility import tokenize
+
+    generic = {"等待", "用户", "结果", "告知", "关心", "后续"}
+    left = {token for token in tokenize(candidate_title)} - generic
+    right = {token for token in tokenize(existing_title)} - generic
+    if not left or not right:
+        return candidate_title == existing_title
+    return bool(left & right)
 
 
 def detect_resolution(

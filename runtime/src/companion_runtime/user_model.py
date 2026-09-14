@@ -32,6 +32,7 @@ recorded as ``reply_delay = 21600`` and gets a tiny weight, never as
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import sqlite3
@@ -149,7 +150,10 @@ class EvidenceWeight:
 
     def to_dict(self) -> dict[str, float]:
         """Return a JSON-serialisable rendering."""
-        return {key: round(value, 6) for key, value in self.__dict__.items()}
+        return {
+            key: round(float(value), 6)
+            for key, value in dataclasses.asdict(self).items()
+        }
 
 
 @dataclass(slots=True)
@@ -169,7 +173,18 @@ class BehaviourReaction:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable rendering."""
-        return dict(self.__dict__)
+        return {
+            "replied": self.replied,
+            "reply_delay_seconds": self.reply_delay_seconds,
+            "reply_length": self.reply_length,
+            "continued_topic": self.continued_topic,
+            "asked_back": self.asked_back,
+            "turns": self.turns,
+            "explicit_negative": self.explicit_negative,
+            "explicit_positive": self.explicit_positive,
+            "busy_probability": self.busy_probability,
+            "boundary_touched": self.boundary_touched,
+        }
 
 
 def source_weight(reaction: BehaviourReaction, config: Any) -> float:
@@ -199,7 +214,8 @@ def attribution_weight(reaction: BehaviourReaction, config: Any) -> float:
     """Return how much this observation can be attributed to the behaviour.
 
     If the user is very likely busy, a slow or missing reply says almost nothing
-    about the behaviour, so the attribution weight collapses toward a floor.
+    about the behaviour, so the attribution weight collapses toward a floor:
+    ``w_attribution = clamp(1 - P(busy), floor, 1)``.
 
     Args:
         reaction: Observed reaction.
@@ -210,7 +226,7 @@ def attribution_weight(reaction: BehaviourReaction, config: Any) -> float:
     """
     busy = clamp(reaction.busy_probability)
     floor = config.busy_attribution_floor
-    return clamp(1.0 - busy * (1.0 - floor), floor, 1.0)
+    return clamp(1.0 - busy, floor, 1.0)
 
 
 def recency_weight(observed_at: datetime | None, now: datetime, half_life_days: float = 21.0) -> float:
@@ -311,6 +327,23 @@ def behaviour_class_of(action: Mapping[str, Any]) -> str:
     return TYPE_TO_BEHAVIOUR.get(kind, "proactive_contact")
 
 
+def default_parameter_block(prior_precision: float = 1.0) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the seed parameter and precision blocks for a fresh model.
+
+    Args:
+        prior_precision: Prior precision for every feature.
+
+    Returns:
+        ``(params, precision)``, both JSON-serialisable. This is shared with the
+        storage layer so that a summary can be stored even before the model has
+        ever been persisted.
+    """
+    params: dict[str, Any] = {name: list(values) for name, values in DEFAULT_THETA.items()}
+    params["delta"] = {}
+    precision = {name: [prior_precision] * len(FEATURE_NAMES) for name in TARGET_NAMES}
+    return params, precision
+
+
 def _vector(features: Mapping[str, float]) -> list[float]:
     """Convert a feature mapping into a vector in :data:`FEATURE_NAMES` order."""
     return [float(features.get(name, 0.0)) for name in FEATURE_NAMES]
@@ -332,6 +365,21 @@ class UserInteractionModel:
         self._load()
 
     # ------------------------------------------------------------------ storage
+
+    @property
+    def projection(self) -> UserModelProjection:
+        """Return the projection backing this model (read access)."""
+        return self._projection
+
+    @property
+    def observations(self) -> int:
+        """Return how many observations have been folded into the model."""
+        return self._observations
+
+    @property
+    def effective_count(self) -> float:
+        """Return the evidence-weighted sample size."""
+        return self._effective_count
 
     def _load(self) -> None:
         """Load parameters from the projection, seeding defaults when absent."""
@@ -688,13 +736,18 @@ class UserInteractionModel:
             "observations": self._observations,
             "effective_count": round(self._effective_count, 3),
             "behaviour_offsets": {
-                cls: {name: round(v, 4) for name, v in targets.items()}
-                for cls, targets in self._delta.items()
+                behaviour_class: {
+                    target: [round(value, 4) for value in vector]
+                    for target, vector in targets.items()
+                }
+                for behaviour_class, targets in self._delta.items()
                 if targets
             },
         }
         for target in TARGET_NAMES:
-            view[target] = {name: round(value, 4) for name, value in zip(FEATURE_NAMES, self._theta[target])}
+            view[target] = {
+                name: round(value, 4) for name, value in zip(FEATURE_NAMES, self._theta[target])
+            }
         view["semantic"] = self.semantic_view()
         return view
 

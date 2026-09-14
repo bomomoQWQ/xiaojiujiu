@@ -224,6 +224,20 @@ class Runtime:
         """Return the current runtime state (a fresh read)."""
         return self.projections.runtime.read()
 
+    def reload_user_model(self) -> UserInteractionModel:
+        """Re-instantiate the user model from its persisted parameters.
+
+        The in-memory instance is a cache. Any code path that can write user-model
+        parameters outside this object's control (the reducer's proposal handler,
+        for example) must call this so the instance does not serve stale beliefs.
+
+        Returns:
+            The refreshed model, also stored on ``self.user_model``.
+        """
+        with self._write_lock:
+            self.user_model = UserInteractionModel(self.projections.user_model, self.config)
+            return self.user_model
+
     def version(self) -> int:
         """Return the current runtime version."""
         return self.state().version
@@ -296,7 +310,10 @@ class Runtime:
         report.new_matters_due = tick_result["newly_due"]
         report.expired_matters = tick_result["expired"]
 
-        # --- boundaries (expiry is implicit; nothing is deleted)
+        # --- boundaries (expiry is implicit; nothing is deleted).
+        # ``allow_proactive`` is derived state: because boundaries carry expiry
+        # times, a tick must recompute the permission rather than let a stale flag
+        # keep the character silent forever after the window closed.
         boundary_module.decay_and_persist(self.projections.boundaries, conn, now=now)
 
         # --- candidate deadlines
@@ -317,6 +334,10 @@ class Runtime:
             state=state,
             is_proactive=True,
         )
+        # ``allow_proactive`` is derived state, not something remembered: it is
+        # recomputed from the live boundaries on every tick so that an expired
+        # window cannot leave the character muted forever.
+        state.allow_proactive = boundary_verdict.allow_proactive
         boundary_pressure = 1.0 if not boundary_verdict.allow_proactive else 0.0
         recent_contacts = self._recent_contact_count(now)
         drive_inputs = motivation_module.DriveInputs(
@@ -434,21 +455,36 @@ class Runtime:
                 if revoked:
                     boundary_module.revoke(self.projections.boundaries, conn, revoked, now=stamp)
 
-                verdict = boundary_module.evaluate(
+                # Two separate questions must not be conflated: whether I may
+                # *reply* (always true unless explicitly denied) and whether I may
+                # initiate contact later (what an explicit boundary removes).
+                reply_verdict = boundary_module.evaluate(
                     self.projections.boundaries.active(stamp),
                     now=stamp,
                     state=state,
                     is_proactive=False,
                 )
-                outcome.reply_blocked = not verdict.allow_reply
+                proactive_verdict = boundary_module.evaluate(
+                    self.projections.boundaries.active(stamp),
+                    now=stamp,
+                    state=state,
+                    is_proactive=True,
+                )
+                outcome.reply_blocked = not reply_verdict.allow_reply
 
-                # --- unfinished matters resolved by this message
+                # --- unfinished matters resolved by this message.
+                # Resolution runs *before* the working situation is projected so
+                # that the projection already reflects the settled state.
                 live_matters = self.projections.unfinished.list_open()
+                resolved_ids: list[str] = []
                 for unfinished_id, why in unfinished_module.detect_resolution(event, live=live_matters):
                     if unfinished_module.resolve(
                         self.projections.unfinished, conn, unfinished_id, note=why
                     ):
                         outcome.unfinished_resolved.append(unfinished_id)
+                        resolved_ids.append(unfinished_id)
+                if resolved_ids:
+                    self._retire_candidates_for(resolved_ids, conn, now=stamp)
 
                 # --- emotion appraisal and mood
                 busy = self.user_model.busy_probability(
@@ -495,7 +531,6 @@ class Runtime:
                         expires_at=stamp + timedelta(hours=12),
                     )
                 self.projections.situation.expire(conn, stamp)
-                self.projections.situation.prune(conn)
 
                 # --- unfinished matters created by this message
                 proposals = unfinished_module.detect(
@@ -516,6 +551,22 @@ class Runtime:
                         source_id=matter.unfinished_id,
                         expires_at=matter.expire_at,
                     )
+                for unfinished_id in resolved_ids:
+                    matter = self.projections.unfinished.get(unfinished_id)
+                    title = matter.title if matter is not None else unfinished_id
+                    self.projections.situation.upsert(
+                        conn,
+                        kind="inference",
+                        content=f"未尽之事已了结：{title}",
+                        salience=0.5,
+                        confidence=0.9,
+                        source_kind="unfinished",
+                        source_id=unfinished_id,
+                        expires_at=stamp + timedelta(hours=6),
+                    )
+
+                # Keep the working set bounded only after every contributor ran.
+                self.projections.situation.prune(conn)
 
                 # --- memory candidate
                 salience = max((e.intensity for e in created), default=0.0)
@@ -557,7 +608,9 @@ class Runtime:
                 self._invalidate_candidates(conn, now=stamp, user_message=content)
 
                 state.last_user_message_at = stamp
-                state.allow_proactive = verdict.allow_proactive
+                # ``allow_proactive`` itself is not written here: it is derived on
+                # every tick from the live boundaries, so writing it would only
+                # create a second source of truth.
                 version = self.projections.runtime.write(state, conn, expect_version=state.version)
                 outcome.version = version
                 self.events.append(
@@ -655,8 +708,7 @@ class Runtime:
                     )
                     alignments[item.candidate_id] = self._emotion_alignment(item, active)
 
-                inputs = motivation_module.MotivationInputs(
-                    state=state,
+                inputs = motivation_module.MotivationInputs(                    state=state,
                     candidates=pending,
                     predictions=predictions,
                     boundary_allow_proactive=verdict.allow_proactive,
@@ -690,11 +742,16 @@ class Runtime:
                         None,
                     )
                     if chosen is not None and create_attempt:
+                        # ``lazy_tick`` already bumped the version, so the commit
+                        # must build on a freshly read state, not on the snapshot
+                        # taken before the tick.
+                        commit_state = self.projections.runtime.read()
                         attempt_id, outbox_id = self._commit_attempt(
-                            conn, chosen=chosen, state=state, now=stamp
+                            conn, chosen=chosen, state=commit_state, now=stamp
                         )
                         outcome.attempt_id = attempt_id
                         outcome.outbox_id = outbox_id
+                        outcome.version = commit_state.version
                 return outcome
 
     def _commit_attempt(
@@ -999,6 +1056,24 @@ class Runtime:
                 )
                 expired.append(candidate.candidate_id)
         return expired
+
+    def _retire_candidates_for(
+        self, unfinished_ids: Sequence[str], conn: Any, *, now: datetime
+    ) -> list[str]:
+        """Retire candidates whose grounding unfinished matter just settled."""
+        markers = {f"{candidate_module.UNFINISHED_SOURCE_PREFIX}{uid}" for uid in unfinished_ids}
+        retired: list[str] = []
+        for candidate in self.projections.candidates.list_active(limit=100):
+            if not markers & set(candidate.sources):
+                continue
+            self.projections.candidates.set_status(
+                conn,
+                candidate.candidate_id,
+                CandidateStatus.RESOLVED.value,
+                reason="grounding_matter_resolved",
+            )
+            retired.append(candidate.candidate_id)
+        return retired
 
     def _invalidate_candidates(self, conn: Any, *, now: datetime, user_message: str) -> list[str]:
         """Retire candidates whose ``invalidate_when`` conditions just became true."""

@@ -17,10 +17,9 @@ from typing import Any, Callable, Iterable, Sequence
 
 import pytest
 
-# 让测试可以直接 import qboss_training（无需先 pip install -e .）
-SRC = Path(__file__).resolve().parents[1] / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+# 让测试可以直接 import qboss_training 与 tests.*（无需先 pip install -e .）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _bootstrap import PROJECT_ROOT, SRC  # noqa: E402
 
 from qboss_training.fixtures import build_fixture_records  # noqa: E402
 from qboss_training.utils.secrets import forget_secrets  # noqa: E402

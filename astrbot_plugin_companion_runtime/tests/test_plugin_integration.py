@@ -208,6 +208,55 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["platform"], "webchat")
         self.assertTrue(record["preempts_proactive"])
 
+    async def test_non_wake_message_is_not_reported_in_wake_mode(self) -> None:
+        await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+
+        await self._handler("on_message_observed")(
+            self.plugin,
+            StubMessageEvent(text="群里的闲聊", wake=False),
+        )
+
+        self.assertEqual(transport.event_bodies, [])
+        self.assertEqual(len(self.plugin._queue), 0)
+
+    async def test_non_wake_message_is_reported_in_all_mode(self) -> None:
+        await self._plugin(observe_mode="all")
+        transport = StubRuntimeTransport.instances[-1]
+
+        await self._handler("on_message_observed")(
+            self.plugin,
+            StubMessageEvent(text="群里的闲聊", wake=False),
+        )
+
+        self.assertTrue(await wait_until(lambda: len(transport.event_bodies) == 1))
+        self.assertFalse(transport.event_bodies[0]["events"][0]["wake"])
+
+    async def test_repeated_start_failures_stop_retrying(self) -> None:
+        class ExplodingTransport:
+            calls = 0
+
+            def __init__(self, **kwargs: Any) -> None:
+                del kwargs
+                type(self).calls += 1
+                raise RuntimeError("boom")
+
+        self.main.AiohttpRuntimeTransport = ExplodingTransport
+        plugin = self.main.CompanionRuntimePlugin(
+            context=self.context,
+            config={"runtime_base_url": "http://127.0.0.1:8799"},
+        )
+        self.plugin = plugin
+        handler = self._handler("on_message_observed")
+
+        for _ in range(6):
+            await handler(plugin, StubMessageEvent())
+
+        # Three attempts, then the adapter stays quiet instead of logging on
+        # every single message.
+        self.assertEqual(ExplodingTransport.calls, 3)
+        self.assertTrue(plugin._started)
+
     async def test_scope_filter_never_wakes_a_sleeping_bot(self) -> None:
         await self._plugin()
         registration = self.filters.registration_for("on_message_observed")

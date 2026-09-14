@@ -151,6 +151,8 @@ def commit(
         The committed attempt.
     """
     stamp = now or utcnow()
+    attempt.created_at = attempt.created_at or stamp
+    attempt.updated_at = stamp
     projection.upsert(connection, attempt)
     transition(
         projection,
@@ -199,6 +201,7 @@ def transition(
         return attempt
     if not force and not can_transition(from_state, to_state):
         raise IllegalTransition(from_state, to_state)
+    stamp = now or utcnow()
     projection.record_transition(
         connection,
         attempt_id=attempt.attempt_id,
@@ -208,7 +211,10 @@ def transition(
         runtime_version=runtime_version,
     )
     attempt.state = to_state
-    attempt.updated_at = now or utcnow()
+    # ``updated_at`` tracks the *logical* clock supplied by the caller, not the
+    # wall clock: staleness decisions must be reproducible under a simulated time
+    # axis, which is exactly how the long-absence scenarios are tested.
+    attempt.updated_at = stamp
     if to_state in {AttemptState.ABORTED.value, AttemptState.FAILED.value, AttemptState.EXPIRED.value}:
         attempt.failure_reason = reason
     projection.upsert(connection, attempt)

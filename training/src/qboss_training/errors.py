@@ -7,6 +7,17 @@ class TrainingError(Exception):
     """本工程所有自定义异常的基类。"""
 
 
+class ToolUnavailable(TrainingError):
+    """外部工具不存在（llama.cpp 的转换脚本 / 量化程序等）。
+
+    单独成一个类型，是为了让 ``--dry-run`` 能区分两种情况：
+
+      * **工具没装**：dry-run 下可以继续，用占位路径展示将要执行的命令；
+      * **用户显式给了错误路径**（如 ``--convert-script`` 指向不存在的文件）：
+        这是输入错误，必须直接报错，不能因为 dry-run 就假装成功。
+    """
+
+
 class JsonExtractionError(TrainingError):
     """从模型回复中抽取 JSON 失败。"""
 

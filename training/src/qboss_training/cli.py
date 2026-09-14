@@ -55,6 +55,7 @@ from .eval.evaluator import (
 )
 from .inference import build_gold_replay_backend, load_backend
 from .sft.format import (
+    DEFAULT_PRETTY_JSON,
     SFTBuildConfig,
     build_sft_dataset,
     build_messages,
@@ -231,7 +232,10 @@ def _add_sft(sub: Any) -> None:
         "--enable-thinking", action="store_true", help="渲染 think 段（默认关闭并掩码）"
     )
     parser.add_argument(
-        "--pretty-json", action="store_true", default=True, help="JSON 缩进（默认开启）"
+        "--pretty-json",
+        action="store_true",
+        default=DEFAULT_PRETTY_JSON,
+        help="JSON 缩进（默认开启，与训练/推理默认一致）",
     )
     parser.add_argument("--compact-json", action="store_true", help="改为紧凑 JSON")
     parser.add_argument(
@@ -327,6 +331,12 @@ def _add_gguf(sub: Any) -> None:
     parser.add_argument("--model-dir", required=True, help="合并后的 HF 权重目录")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--llama-cpp-dir", help="llama.cpp 仓库根目录")
+    parser.add_argument(
+        "--convert-script", help="直接指定 convert_hf_to_gguf.py 路径（替代 --llama-cpp-dir）"
+    )
+    parser.add_argument(
+        "--quantize-binary", help="直接指定 llama-quantize 可执行文件路径"
+    )
     parser.add_argument("--name", default="qboss-2b", help="GGUF 文件名前缀")
     parser.add_argument("--outtype", default="f16")
     parser.add_argument(
@@ -822,6 +832,8 @@ def cmd_gguf(args: argparse.Namespace) -> int:
         model_dir=args.model_dir,
         output_dir=args.output_dir,
         llama_cpp_dir=args.llama_cpp_dir,
+        convert_script=args.convert_script,
+        quantize_binary=args.quantize_binary,
         name=args.name,
         outtype=args.outtype,
         quant_types=quants,

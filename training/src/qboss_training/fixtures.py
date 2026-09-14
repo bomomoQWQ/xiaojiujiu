@@ -140,10 +140,14 @@ def make_event_eval_record(
     }
 
     if make_invalid:
-        # 故意制造一个跨字段矛盾：方向与关系信号冲突
-        output["relation_signal"] = (
-            "slight_distance" if direction == "+" else "strong_approach"
-        )
+        # 必须**确定性地**产出违规样本，否则"用夹具验证校验器"的测试会假绿。
+        # `direction=0` 与任何非 neutral 的 relation_signal 都是矛盾组合
+        # （见 invariants._DIRECTION_SIGNAL_MAP），因此改方向最可靠 ——
+        # 改 relation_signal 在 direction="+-" 时是无效的，因为 +- 允许所有取值。
+        output["direction"] = "0"
+        if output.get("relation_signal") == "neutral":
+            output["relation_signal"] = "strong_distance"
+        output["impact"] = 0.9
 
     return {
         "id": f"ee_fixture_{index:04d}",
@@ -383,8 +387,15 @@ def make_emotion_explain_record(
     }
 
     if make_invalid:
-        # 故意制造方向翻转：负向输入却给出明显正向感受
+        # 必须**确定性地**违规：把输入方向强制为负向，同时给出明显正向感受，
+        # 保证触发 EX02_DIRECTION_FLIP。
+        # 若只在"正向"情况下改文案，direction 恰为 "+" 时反而变为合法（实测踩过）。
+        input_direction = "-"
         output["experience"] = "非常开心，被温暖到了。"
+        output["focus"] = "觉得很满足，很放松。"
+        output["conflict"] = "完全没有冲突，很平顺。"
+    else:
+        input_direction = direction
 
     return {
         "id": f"ex_fixture_{index:04d}",
@@ -399,7 +410,7 @@ def make_emotion_explain_record(
                 {
                     "target": target,
                     "cause": f"用户说了：{user_text}",
-                    "direction": direction,
+                    "direction": input_direction,
                     "intensity": intensity,
                     "semantic_label": None,
                     "action_tendency": conflict,

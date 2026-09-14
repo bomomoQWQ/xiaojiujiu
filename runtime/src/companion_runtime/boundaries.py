@@ -55,7 +55,11 @@ def _compile(expression: str) -> re.Pattern[str]:
 #: words is not.
 BOUNDARY_PATTERNS: tuple[BoundaryPattern, ...] = (
     BoundaryPattern(
-        _compile(r"(今天|今晚|这几天|今天内)?\s*(不要|别|不用|不需要)\s*(再)?\s*(主动|先)?\s*(联系|找我|发消息|打扰|来消息)"),
+        _compile(
+            r"(今天|今晚|这几天|今天内|以后|永远|再也|从今往后)?\s*"
+            r"(都)?\s*(不要|别|不用|不需要)\s*(再)?\s*(都)?\s*"
+            r"(主动)?\s*(联系|找我|发消息|打扰|来消息)"
+        ),
         BoundaryType.TEMPORAL.value,
         allow_proactive=False,
         allow_reply=True,
@@ -76,7 +80,10 @@ BOUNDARY_PATTERNS: tuple[BoundaryPattern, ...] = (
         note="explicit no-proactive instruction",
     ),
     BoundaryPattern(
-        _compile(r"(以后|永远|再也|从今往后)\s*(都)?\s*(不要|别|不用)\s*(再)?\s*(主动|联系|找我|发消息)"),
+        _compile(
+            r"(以后|永远|再也|从今往后)\s*(都)?\s*(不要|别|不用)\s*(再)?\s*"
+            r"(主动|联系|找我|发消息)"
+        ),
         BoundaryType.PERMANENT.value,
         allow_proactive=False,
         allow_reply=True,
@@ -84,7 +91,30 @@ BOUNDARY_PATTERNS: tuple[BoundaryPattern, ...] = (
         note="permanent no-proactive instruction",
     ),
     BoundaryPattern(
-        _compile(r"(别|不要|不要再|不许)\s*(一直|老是|总是|反复)?\s*(问|追问|打听)\s*(我)?\s*(这个|这件事|在干嘛|在哪|在做什么)"),
+        _compile(r"(永远|再也|从今往后)\s*(都)?\s*(不要|别|不用)?"),
+        BoundaryType.PERMANENT.value,
+        allow_proactive=False,
+        allow_reply=True,
+        hours=None,
+        note="permanent no-proactive instruction",
+    ),
+    # The catch-all temporal rule is deliberately last: it is the broadest, and
+    # the deduplication keeps the first (most specific) match per scope.
+    BoundaryPattern(
+        _compile(
+            r"(今天|今晚|这几天|今天内)?\s*(都)?\s*(不要|别|不用|不需要)\s*(再)?\s*"
+            r"(都)?\s*(主动)?\s*(联系|找我|发消息|打扰|来消息)"
+        ),
+        BoundaryType.TEMPORAL.value,
+        allow_proactive=False,
+        allow_reply=True,
+        note="user asked not to be contacted proactively",
+    ),
+    BoundaryPattern(
+        _compile(
+            r"(别|不要|不要再|不许)\s*(一直|老是|总是|反复)?\s*"
+            r"(问|追问|打听)\s*(我)?\s*(这个|这件事|在干嘛|在哪|在做什么)"
+        ),
         BoundaryType.TOPIC.value,
         allow_proactive=True,
         allow_reply=True,
@@ -152,8 +182,8 @@ def detect_boundaries(
     if not text.strip():
         return []
     reference = now or event.timestamp
-    found: list[Boundary] = []
-    for rule in BOUNDARY_PATTERNS:
+    found: dict[str, tuple[int, Boundary]] = {}
+    for index, rule in enumerate(BOUNDARY_PATTERNS):
         if not rule.pattern.search(text):
             continue
         hours = rule.hours
@@ -162,20 +192,39 @@ def detect_boundaries(
             # little longer rather than shorter.
             hours *= 0.85 + 0.3 * state.values.boundary_respect
         expires = reference + timedelta(hours=hours) if hours is not None else None
-        found.append(
-            Boundary(
-                boundary_id=new_id("boundary"),
-                type=rule.boundary_type,
-                scope=rule.scope,
-                allow_reply=rule.allow_reply,
-                allow_proactive=rule.allow_proactive,
-                starts_at=reference,
-                expires_at=expires,
-                source_event_id=event.event_id,
-                note=rule.note,
-            )
+        candidate = Boundary(
+            boundary_id=new_id("boundary"),
+            type=rule.boundary_type,
+            scope=rule.scope,
+            allow_reply=rule.allow_reply,
+            allow_proactive=rule.allow_proactive,
+            starts_at=reference,
+            expires_at=expires,
+            source_event_id=event.event_id,
+            note=rule.note,
         )
-    return found
+        strength = _rule_strength(rule, hours)
+        current = found.get(rule.scope)
+        # One boundary per scope. The strongest rule wins, so a permanent
+        # instruction is never silently downgraded to a 24h window by the
+        # broad temporal rule matching the same sentence.
+        if current is None or strength > current[0]:
+            found[rule.scope] = (strength, candidate)
+    return [boundary for _strength, boundary in found.values()]
+
+
+def _rule_strength(rule: BoundaryPattern, hours: float | None) -> int:
+    """Score how strong a matched rule is, for deduplication within a scope."""
+    strength = 0
+    if rule.boundary_type == BoundaryType.PERMANENT.value:
+        strength += 100
+    elif rule.boundary_type == BoundaryType.CONDITIONAL.value:
+        strength += 10
+    if hours is None:
+        strength += 50
+    if not rule.allow_proactive:
+        strength += 5
+    return strength
 
 
 def detect_revocation(event: RawEvent, *, active: Sequence[Boundary]) -> list[str]:
@@ -269,7 +318,9 @@ def evaluate(
     Args:
         boundaries: Boundaries currently in force.
         now: Reference time.
-        state: Runtime state (global ``allow_proactive`` kill switch).
+        state: Runtime state; kept so the verdict can be reused as a global kill
+            switch without changing the signature, and so future policy can read
+            the value profile.
         is_proactive: Whether the action is an unprompted contact.
         scope: Optional topic scope of the action.
 
@@ -279,14 +330,21 @@ def evaluate(
     """
     blocking: list[str] = []
     constraints: list[str] = []
-    allow_proactive = bool(state.allow_proactive)
+    # Hard boundaries are the *only* thing that can deny proactive permission.
+    # The stored flag is deliberately not consulted here, because that flag is
+    # itself derived from this function - reading it back would make the value
+    # self-latching and an expired boundary could never release it.
+    allow_proactive = True
     allow_reply = True
 
     for boundary in boundaries:
         if not boundary.is_active(now):
             continue
         scope_match = boundary.scope in {"all_topics", scope or "all_topics"}
-        if is_proactive and scope_match and not boundary.allow_proactive:
+        # A boundary that forbids proactive contact removes proactive permission
+        # regardless of what kind of action is being evaluated: the caller asked
+        # about permission, not about this particular action's shape.
+        if scope_match and not boundary.allow_proactive:
             allow_proactive = False
             blocking.append(boundary.boundary_id)
             if boundary.note:

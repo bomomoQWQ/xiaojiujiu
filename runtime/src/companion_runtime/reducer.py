@@ -235,7 +235,10 @@ class Reducer:
         """
         notes: list[str] = []
         if proposal.task_type == TaskKind.EMOTION_EVAL.value:
-            hours = delta_seconds(utcnow(), proposal.created_at) / 3600.0
+            # Measure staleness from the dispatch moment; fall back to "now" when
+            # the caller did not supply one, which simply means no damping.
+            reference = proposal.created_at or utcnow()
+            hours = delta_seconds(utcnow(), reference) / 3600.0
             rebased = protocol_module.rebase_emotion_evaluation(
                 payload,
                 mood_valence=state.mood_valence,
@@ -669,6 +672,10 @@ class Reducer:
             attempt_id = str(item.payload.get("attempt_id") or "")
             attempt = self._p.attempts.get(attempt_id) if attempt_id else None
             if attempt is not None and attempt.state not in action_module.TERMINAL_STATES:
+                # The attempt was handed to the renderer and the renderer failed,
+                # so it passed through ``rendering`` on the way to ``failed``.
+                if attempt.state == AttemptState.COMMITTED.value:
+                    action_module.mark_rendering(self._p.attempts, conn, attempt, now=stamp)
                 action_module.fail(self._p.attempts, conn, attempt, reason=error, now=stamp)
                 self._events.append(
                     EventType.PROACTIVE_ABORTED,

@@ -22,7 +22,7 @@ import httpx
 
 from ..config import BudgetConfig, ClientConfig, RetryConfig
 from ..errors import BudgetExceeded, GeneratorError, MissingCredentialError
-from ..utils.secrets import getenv_secret, redact
+from ..utils.secrets import getenv_secret, redact, register_secret
 
 
 @dataclass
@@ -231,6 +231,10 @@ class DeepSeekClient:
         self._owns_transport = transport is None
         self._api_key = api_key
         self._rng = rng or random.Random(0)
+        # 显式注入的 key 也要登记脱敏：否则服务端把 key 回显在错误信息里时，
+        # 会原样进入异常文本与日志。这是安全红线，不能只在环境变量路径上做。
+        if api_key:
+            register_secret(api_key)
 
     # -- 凭据 ---------------------------------------------------------------
 

@@ -59,6 +59,8 @@ class MotivationInputs:
     cooldown_active: bool = False
     now: datetime | None = None
     elapsed_seconds: float = 0.0
+    #: When set, the round is executed even under a blocking boundary so the
+    #: decision can be inspected. It never makes the action executable.
     force_allow: bool = False
 
 
@@ -178,11 +180,20 @@ def candidate_utility(
     settings = config.utility
     values = state.values
 
+    # A concrete reason to speak - an unfinished matter that is due, or a strong
+    # need - is what actually separates "reaching out" from "staying quiet". Pure
+    # loneliness alone is deliberately not enough for a restrained character.
+    urgency = 0.0
+    if candidate.unfinished_relevance > 0.0 or candidate.internal_need > 0.0:
+        urgency = settings.urgency_gain * max(
+            candidate.unfinished_relevance * 1.25, candidate.internal_need * 0.8
+        )
+
     internal = settings.internal_gain * (
         0.45 * candidate.internal_need
         + 0.35 * candidate.unfinished_relevance
         + 0.20 * clamp(emotion_alignment)
-    )
+    ) + urgency
     reply_mean = prediction.reply_probability
     reply = conservative_reply if conservative_reply is not None else reply_mean
     if prediction.boundary_risk > 0.25 and conservative_reply is not None:
@@ -273,9 +284,11 @@ def _exp_neg(value: float) -> float:
 def precondition_holds(candidate: CandidateIntent, situation_text: str) -> tuple[bool, str | None]:
     """Check a candidate's preconditions against the current situation.
 
-    Preconditions are natural-language; the first version treats an empty list as
-    satisfied and otherwise requires a coarse keyword presence check. The semantic
-    layer may tighten this later.
+    Preconditions are natural language, so the check is a coarse keyword-presence
+    test over the working situation: a precondition counts as satisfied when at
+    least one of its content tokens appears there. Missing evidence therefore
+    blocks the candidate, which is the safe direction - a thought whose
+    preconditions cannot be shown to hold should not become an action.
 
     Args:
         candidate: Candidate to test.
@@ -288,12 +301,31 @@ def precondition_holds(candidate: CandidateIntent, situation_text: str) -> tuple
         return True, None
     lowered = situation_text.lower()
     for condition in candidate.preconditions:
-        keywords = [token for token in condition.replace("，", " ").replace(",", " ").split() if len(token) > 1]
+        keywords = _condition_tokens(condition)
         if not keywords:
             continue
-        if not any(keyword.lower() in lowered for keyword in keywords):
+        if not any(keyword in lowered for keyword in keywords):
             return False, condition
     return True, None
+
+
+#: Filler words that carry no discriminating power in a precondition.
+_CONDITION_STOPWORDS = frozenset(
+    {"需要", "必须", "如果", "已经", "当前", "条件", "用户", "the", "a", "is", "if", "must"}
+)
+
+
+def _condition_tokens(condition: str) -> list[str]:
+    """Extract discriminating tokens from a natural-language precondition.
+
+    Latin words are used whole; CJK text is decomposed into bigrams (plus single
+    characters for very short conditions) so that "需要用户在线" can be matched
+    against a situation that mentions "在线" without a word segmenter.
+    """
+    from .utility import topic_tokens, tokenize
+
+    tokens = set(topic_tokens(condition)) | set(tokenize(condition))
+    return [token for token in tokens if token not in _CONDITION_STOPWORDS]
 
 
 def is_candidate_proactive(candidate: CandidateIntent) -> bool:
@@ -517,7 +549,12 @@ def decide(
     )
 
     assessments: list[CandidateAssessment] = []
-    hard_blocked = not inputs.boundary_allow_proactive and not inputs.force_allow
+    # ``force_allow`` exists so that tests and diagnostic tooling can *run* a
+    # round under a boundary and observe the decision it would have produced. A
+    # forced round still refuses to act: the hard gate is not a momentum term,
+    # and the returned utilities are the ones that would have applied.
+    boundary_denied = not inputs.boundary_allow_proactive
+    hard_blocked = boundary_denied
 
     for candidate in inputs.candidates:
         prediction = inputs.predictions.get(candidate.candidate_id)
@@ -577,9 +614,16 @@ def decide(
     )
 
     if not eligible:
-        outcome.reason = (
-            "blocked_by_boundary" if hard_blocked else "no_candidate_beats_silence"
-        )
+        # Order matters: a hard boundary is reported as the cause even when other
+        # reasons would also have sufficed, because it is the binding one.
+        if hard_blocked:
+            outcome.reason = "blocked_by_boundary"
+        elif cooldown_active:
+            outcome.reason = "cooldown_active"
+        elif all(a.breakdown.blocked for a in assessments) and assessments:
+            outcome.reason = "all_candidates_blocked"
+        else:
+            outcome.reason = "no_candidate_beats_silence"
         outcome.next_wake_at = now + timedelta(seconds=config.utility.max_sleep_seconds)
         return MotivationResult(outcome=outcome, assessments=assessments)
 

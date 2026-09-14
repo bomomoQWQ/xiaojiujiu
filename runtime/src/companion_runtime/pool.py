@@ -121,6 +121,10 @@ def apply_one(
     if op == "retire":
         if not operation.candidate_id:
             raise ValueError("retire requires candidate_id")
+        if projections.candidates.get(operation.candidate_id) is None:
+            # Retiring a candidate that does not exist is a protocol error, not a
+            # silent success: it usually means a stale identifier was passed in.
+            raise KeyError(f"unknown candidate: {operation.candidate_id}")
         projections.candidates.set_status(
             conn,
             operation.candidate_id,

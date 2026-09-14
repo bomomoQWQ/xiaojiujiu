@@ -9,7 +9,9 @@ documented and overridable from three places, in order of increasing priority:
 
 No configuration value ever stores an API key: secrets stay in the host
 framework's own environment and are read - never persisted - by the host. The
-Runtime also redacts any key-shaped value before logging, see :func:`redact`.
+Runtime additionally redacts any credential-shaped key before it can be logged
+or returned by an inspection endpoint, see :func:`redact` and
+:func:`redact_tree`.
 """
 
 from __future__ import annotations
@@ -43,6 +45,29 @@ def redact(key: str, value: Any) -> Any:
     """
     if _SECRET_PATTERN.search(key or ""):
         return "***redacted***"
+    return value
+
+
+def redact_tree(value: Any, key: str = "") -> Any:
+    """Recursively mask secret-shaped keys inside a nested structure.
+
+    The Runtime is designed to *never* store an API key, but the redaction layer
+    still guards the inspection endpoints: a key smuggled in through ``extras``
+    must not be echoed back to a client or written to a log.
+
+    Args:
+        value: Arbitrary value (mapping, list or scalar).
+        key: Name under which ``value`` is held, if any.
+
+    Returns:
+        A copy of ``value`` with credential-shaped entries masked.
+    """
+    if key and _SECRET_PATTERN.search(key):
+        return "***redacted***"
+    if isinstance(value, Mapping):
+        return {str(k): redact_tree(v, str(k)) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_tree(item, key) for item in value]
     return value
 
 
@@ -80,6 +105,8 @@ class EmotionConfig:
     emotion_retire_threshold: float = 0.02
     max_active_emotion_events: int = 24
     event_reactivity: float = 1.0
+    #: Impacts at or below this value are not worth an emotion event at all.
+    min_event_impact: float = 0.06
 
 
 @dataclass(slots=True)
@@ -113,7 +140,7 @@ class DriveConfig:
 class SilenceConfig:
     """Baseline utility of staying silent."""
 
-    base: float = 0.25
+    base: float = 0.15
     restraint_gain: float = 0.35
     boundary_gain: float = 0.30
     cooldown_gain: float = 0.25
@@ -131,8 +158,11 @@ class UtilityConfig:
     boundary_cost_gain: float = 0.75
     interrupt_gain: float = 0.18
     repeat_gain: float = 0.45
-    risk_gain: float = 0.22
+    risk_gain: float = 0.10
     uncertainty_penalty: float = 0.12
+    #: Extra weight of a *concrete reason* to speak (a due matter, a strong
+    #: emotional need). Without a reason, a restrained character stays silent.
+    urgency_gain: float = 0.70
     downside_quantile: float = 0.05
     repeat_window_seconds: float = 3600.0
     repeat_contact_tolerance: int = 2
@@ -143,7 +173,7 @@ class UtilityConfig:
     max_sleep_seconds: float = 1800.0
     utility_epsilon: float = 1e-9
     #: Above this predicted boundary risk a candidate is judged conservatively.
-    conservative_risk_threshold: float = 0.25
+    conservative_risk_threshold: float = 0.30
 
 
 @dataclass(slots=True)
@@ -159,7 +189,7 @@ class UnfinishedConfig:
     """Unfinished-matter lifecycle."""
 
     default_priority: float = 0.55
-    default_expiry_hours: float = 72.0
+    default_expiry_hours: float = 168.0
     due_grace_seconds: float = 900.0
     max_active: int = 40
 
@@ -287,8 +317,7 @@ class RuntimeConfig:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable, secret-redacted view of the config."""
-        raw = dataclasses.asdict(self)
-        return {key: redact(key, value) for key, value in raw.items()}
+        return redact_tree(dataclasses.asdict(self))
 
     def dumps(self) -> str:
         """Return a pretty JSON rendering of :meth:`to_dict`."""
