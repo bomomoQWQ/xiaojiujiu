@@ -1,0 +1,11 @@
+name: astrbot_plugin_companion_runtime
+display_name: 陪伴 Runtime 适配器
+short_desc: 内源主动型长期陪伴 Runtime 的宿主侧薄适配层。
+desc: >-
+  薄适配插件：异步上报消息事件、在严格短超时内以临时 TextPart 注入 Runtime 上下文、
+  以带租约的方式消费 Runtime outbox（render 调用当前聊天模型，send 经授权后发送）。
+  不持有任何心理状态或记忆，全部认知由 Runtime 负责。
+author: companion-runtime
+version: 0.1.0
+repo: https://github.com/example/astrbot_plugin_companion_runtime
+astrbot_version: ">=4.28,<5"

@@ -1,0 +1,168 @@
+{
+  "enabled": {
+    "description": "启用适配器",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后插件不监听、不注入、不消费 outbox，AstrBot 行为与未安装时一致。"
+  },
+  "runtime_base_url": {
+    "description": "Runtime 基础地址",
+    "type": "string",
+    "default": "http://127.0.0.1:8720",
+    "hint": "Runtime HTTP API 根地址，必须包含 http:// 或 https://，不要以 / 结尾。"
+  },
+  "runtime_token": {
+    "description": "Runtime 访问令牌（可选）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "以 Authorization: Bearer <token> 发送。留空表示 Runtime 不校验。也可以用环境变量 COMPANION_RUNTIME_TOKEN 提供，插件不会写入或记录该值。"
+  },
+  "adapter_id": {
+    "description": "适配器标识",
+    "type": "string",
+    "default": "default",
+    "hint": "Runtime 用来区分多个 AstrBot 实例；同一 Runtime 下每个实例必须不同。"
+  },
+  "request_timeout_ms": {
+    "description": "普通 Runtime 请求超时（毫秒）",
+    "type": "int",
+    "default": 1500,
+    "hint": "事件上报、租约、结果回报等请求的超时，范围 200–30000。"
+  },
+  "context_timeout_ms": {
+    "description": "上下文获取硬超时（毫秒）",
+    "type": "int",
+    "default": 400,
+    "hint": "on_llm_request 内获取 Runtime 上下文的最长等待，范围 50–2000，超过上限会被强制截断。超时即放弃注入（fail-open），不会影响本轮回复。",
+    "obvious_hint": true
+  },
+  "context_cache_ttl_ms": {
+    "description": "上下文缓存有效期（毫秒）",
+    "type": "int",
+    "default": 30000,
+    "hint": "TTL 内的缓存命中不会产生任何等待；过期的缓存仍会在获取失败时作为兜底使用。"
+  },
+  "context_cache_max_sessions": {
+    "description": "上下文缓存会话数上限",
+    "type": "int",
+    "default": 64,
+    "hint": "按最近使用淘汰。"
+  },
+  "context_prefetch": {
+    "description": "后台预热上下文缓存",
+    "type": "bool",
+    "default": true,
+    "hint": "收到消息后立即在后台拉取一次上下文，使 on_llm_request 内的严格超时几乎总是命中缓存。"
+  },
+  "observe_mode": {
+    "description": "消息监听范围",
+    "type": "string",
+    "default": "wake",
+    "options": ["wake", "all"],
+    "hint": "wake（推荐）：只上报 AstrBot 本身就会处理的消息（私聊、@机器人、唤醒词、回复机器人）。all：上报全部消息，但会把这些消息标记为已唤醒并让它们继续走后续管线流程，可能改变限流/内容安全等阶段的行为，请确认后再开启。",
+    "obvious_hint": true
+  },
+  "report_assistant_messages": {
+    "description": "上报机器人实际发出的消息",
+    "type": "bool",
+    "default": true,
+    "hint": "在消息发送后把纯文本回报给 Runtime，作为用户可见的现实记录。不包含 Runtime 的隐藏上下文。"
+  },
+  "inject_enabled": {
+    "description": "启用上下文注入",
+    "type": "bool",
+    "default": true,
+    "hint": "把 Runtime 当前上下文以临时 TextPart 注入本轮请求；关闭后只上报、不注入。"
+  },
+  "inject_max_chars": {
+    "description": "注入文本长度上限",
+    "type": "int",
+    "default": 2000,
+    "hint": "超出部分截断。0 表示不限制（不建议）。"
+  },
+  "outbox_enabled": {
+    "description": "启用 outbox 消费",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后不拉取 render/send 行动，Runtime 无法主动联系用户，但仍会记录事件。"
+  },
+  "outbox_poll_interval_ms": {
+    "description": "outbox 轮询间隔（毫秒）",
+    "type": "int",
+    "default": 1000,
+    "hint": "范围 200–60000；连续失败会指数退避到最长 30 秒。"
+  },
+  "outbox_max_actions_per_poll": {
+    "description": "每轮最多租约行动数",
+    "type": "int",
+    "default": 2,
+    "hint": "范围 1–16。"
+  },
+  "outbox_lease_ttl_ms": {
+    "description": "租约时长（毫秒）",
+    "type": "int",
+    "default": 30000,
+    "hint": "租约到期 Runtime 可重新派发该行动；长时间 render 期间适配器会自动续租。"
+  },
+  "outbox_max_concurrency": {
+    "description": "行动并发上限",
+    "type": "int",
+    "default": 1,
+    "hint": "弱资源部署建议保持 1。"
+  },
+  "render_timeout_ms": {
+    "description": "render 超时（毫秒）",
+    "type": "int",
+    "default": 60000,
+    "hint": "调用当前聊天模型渲染主动消息的最长等待，超时按失败回报。"
+  },
+  "send_timeout_ms": {
+    "description": "send 超时（毫秒）",
+    "type": "int",
+    "default": 20000,
+    "hint": "授权后执行发送的最长等待，超时按失败回报。"
+  },
+  "queue_max_items": {
+    "description": "本地重试队列容量",
+    "type": "int",
+    "default": 256,
+    "hint": "有界队列；写满时丢弃最旧的条目（最近的事件更重要）。"
+  },
+  "queue_max_attempts": {
+    "description": "单条最大重试次数",
+    "type": "int",
+    "default": 6,
+    "hint": "超过后放弃该条目并计入 dropped。"
+  },
+  "queue_max_age_ms": {
+    "description": "单条最长滞留时间（毫秒）",
+    "type": "int",
+    "default": 600000,
+    "hint": "超过该时间仍未送达的条目会被丢弃。"
+  },
+  "queue_base_backoff_ms": {
+    "description": "重试基础退避（毫秒）",
+    "type": "int",
+    "default": 500,
+    "hint": "指数退避的初始间隔，带随机抖动。"
+  },
+  "queue_max_backoff_ms": {
+    "description": "重试退避上限（毫秒）",
+    "type": "int",
+    "default": 30000,
+    "hint": "指数退避的上限。"
+  },
+  "queue_send_timeout_ms": {
+    "description": "队列单次投递超时（毫秒）",
+    "type": "int",
+    "default": 10000,
+    "hint": "保证队列即使遇到网络卡死也能继续推进。"
+  },
+  "debug": {
+    "description": "调试日志",
+    "type": "bool",
+    "default": false,
+    "hint": "输出更多超时/失败细节；不会输出令牌与消息正文。"
+  }
+}

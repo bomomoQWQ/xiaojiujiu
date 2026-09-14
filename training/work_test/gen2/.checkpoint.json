@@ -1,0 +1,39 @@
+{
+  "checkpoint_version": 2,
+  "generator_version": "1.0.0",
+  "task": "event_eval",
+  "cursor": 5,
+  "output_file": "work_test\\gen2\\event_eval.jsonl",
+  "system_prompt_fingerprint": "108b88bc74d94ad9",
+  "stats": {
+    "requested": 5,
+    "accepted": 0,
+    "rejected_schema": 0,
+    "rejected_invariant": 0,
+    "rejected_duplicate_exact": 0,
+    "rejected_duplicate_near": 5,
+    "request_failures": 0,
+    "retries": 0,
+    "repaired": 0,
+    "budget_stopped": false,
+    "resumed_from": 1,
+    "started_at": "2026-09-14T16:02:59Z",
+    "finished_at": "2026-09-14T16:02:59Z"
+  },
+  "budget": {
+    "requests": 5,
+    "prompt_tokens": 2500,
+    "completion_tokens": 500,
+    "total_tokens": 3000,
+    "estimated_usd": 0.001225,
+    "limits": {
+      "max_requests": 50,
+      "max_prompt_tokens": 900000,
+      "max_completion_tokens": 600000,
+      "max_total_tokens": 1400000,
+      "max_usd": 10.0
+    }
+  },
+  "updated_at": "2026-09-14T16:02:59Z",
+  "accepted_total": 1
+}

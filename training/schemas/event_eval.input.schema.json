@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.runtime/schemas/event_eval.input.schema.json",
+  "title": "event_eval_input",
+  "description": "2B 事件评价的输入契约。刻意保持短上下文：几百 token 量级（架构文档 74.2）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["current_event", "context_turns", "background_mood", "character_values", "known_facts"],
+  "properties": {
+    "current_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["speaker", "text"],
+      "properties": {
+        "speaker": {
+          "type": "string",
+          "enum": ["user", "char", "system", "environment"],
+          "description": "事件来源。environment 表示非对话事件（如时间流逝、外部消息）。"
+        },
+        "text": {"type": "string", "minLength": 1, "maxLength": 400}
+      }
+    },
+    "context_turns": {
+      "type": "array",
+      "maxItems": 6,
+      "description": "少量必要上下文，最多 6 轮。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["speaker", "text"],
+        "properties": {
+          "speaker": {"type": "string", "enum": ["user", "char"]},
+          "text": {"type": "string", "minLength": 1, "maxLength": 400}
+        }
+      }
+    },
+    "background_mood": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valence", "arousal"],
+      "description": "背景心境（慢变量）。",
+      "properties": {
+        "valence": {"type": "number", "minimum": -1, "maximum": 1},
+        "arousal": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "character_values": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "角色价值观权重，用于解释『同一事件对不同角色影响不同』。",
+      "properties": {
+        "autonomy": {"type": "number", "minimum": 0, "maximum": 1},
+        "boundary": {"type": "number", "minimum": 0, "maximum": 1},
+        "relatedness": {"type": "number", "minimum": 0, "maximum": 1},
+        "stability": {"type": "number", "minimum": 0, "maximum": 1},
+        "honesty": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "known_facts": {
+      "type": "array",
+      "maxItems": 5,
+      "description": "当前相关事实（来自长期记忆/用户模型）。",
+      "items": {"type": "string", "minLength": 1, "maxLength": 160}
+    }
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.runtime/schemas/event_eval.schema.json",
+  "title": "event_eval",
+  "description": "2B 事件评价输出。回答『这件事对角色是什么性质？』。注意：本模型绝不输出最终情绪值（如 嫉妒=0.82），只输出事件性质维度；最终情绪由 Runtime 代码结合价值观/背景心境/用户模型/旧情绪状态计算。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "direction",
+    "impact",
+    "activation",
+    "uncertainty",
+    "relation_signal",
+    "responsibility",
+    "confidence",
+    "evidence"
+  ],
+  "properties": {
+    "direction": {
+      "type": "string",
+      "enum": ["+", "-", "0", "+-"],
+      "description": "事件对角色整体是正向(+)、负向(-)、中性(0)还是混合(+-)。"
+    },
+    "impact": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "影响程度(幅度，与方向无关)。0=几乎无影响，1=极强影响。"
+    },
+    "activation": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "激活/紧绷/兴奋程度。0=平静，1=高度激活。"
+    },
+    "uncertainty": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "事件含义与后续走向的不确定性。0=非常确定，1=完全不明。"
+    },
+    "relation_signal": {
+      "type": "string",
+      "enum": [
+        "strong_approach",
+        "slight_approach",
+        "neutral",
+        "slight_distance",
+        "strong_distance"
+      ],
+      "description": "这件事传递的关系信号：拉近还是拉远。"
+    },
+    "responsibility": {
+      "type": "string",
+      "enum": ["self", "other", "situation", "shared", "unclear"],
+      "description": "事件责任归属。不明确时用 unclear，不要强行归因。"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "对本次评价的自信程度。"
+    },
+    "evidence": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 60,
+      "description": "支持该评价的输入依据，须来自输入文本片段，不得引入输入中不存在的事实。"
+    }
+  }
+}

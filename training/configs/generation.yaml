@@ -1,0 +1,83 @@
+# =============================================================================
+# 数据生成配置（DeepSeek OpenAI 兼容接口）
+# =============================================================================
+#
+# 本文件**绝不**包含 API key。key 只从环境变量读取：
+#
+#   PowerShell（仅当前会话）:  $env:DEEPSEEK_API_KEY = "sk-..."
+#   bash:                      export DEEPSEEK_API_KEY=sk-...
+#
+# 任何形如 api_key / token / secret 的字段都会被 config 加载器直接拒绝。
+# =============================================================================
+
+generation:
+  # event_eval | emotion_explain（单任务）。两种都要就分别跑两次。
+  task: event_eval
+
+  # 目标样本数（含已存在的样本；续跑时按"已有 + 本次新增"计算）
+  target_samples: 200
+
+  # 每批条数：一批内并发执行，批末落盘 + 存断点
+  batch_size: 8
+  # 并发请求数：DeepSeek 限流下建议 2~4
+  concurrency: 4
+
+  # 每条种子的拒绝采样上限（schema 不过就换个采样重试）
+  max_sample_attempts: 3
+  # 教师自检修正：额外一次请求，成本翻倍，数据质量要求高时开启
+  self_verify: false
+
+  seed: 20240607
+
+  # 近似去重阈值（字符 3-gram Jaccard）。
+  # 标定依据见 src/qboss_training/utils/dedup.py：
+  # 短中文文本上 0.90 是"几乎不误杀、仍能抓到近乎相同的样本"的拐点；
+  # 降到 0.85 以下会开始丢弃本质不同的真数据（比漏去重更糟）。
+  near_duplicate_threshold: 0.90
+
+  output_dir: data/raw
+  checkpoint_file: data/raw/.checkpoint.json
+
+  client:
+    # 默认 DeepSeek 官方地址；兼容任何 OpenAI 兼容端点
+    base_url: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+    model: deepseek-chat
+    request_timeout_s: 120.0
+    max_connections: 8
+    temperature: 1.0
+    top_p: 0.95
+    max_tokens: 512
+    # 让服务端强制返回 JSON，显著降低抽取失败率
+    response_format_json: true
+
+  retry:
+    max_attempts: 4
+    initial_backoff_s: 1.5
+    max_backoff_s: 30.0
+    backoff_multiplier: 2.0
+    jitter_s: 0.5
+    retry_status_codes: [408, 409, 425, 429, 500, 502, 503, 504]
+
+  budget:
+    # 三重上限 + 金额上限，任一命中即停止并保留断点
+    max_requests: 400
+    max_prompt_tokens: 900000
+    max_completion_tokens: 600000
+    max_total_tokens: 1400000
+    max_usd: 3.0
+    # 价格仅用于量级估算，请按官方价目表校准
+    usd_per_million_prompt_tokens: 0.27
+    usd_per_million_completion_tokens: 1.10
+
+split:
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  seed: 42
+  # 分层键：task 必留；加 direction/event_kind 可让验证集覆盖更均衡
+  stratify_by: [task, direction]
+  # 切分前去重阈值（0 关闭）
+  dedupe_near_threshold: 0.95
+  # 切分后跨 split 泄漏阈值：命中的 val/test 样本会被移回 train
+  leakage_threshold: 0.9
