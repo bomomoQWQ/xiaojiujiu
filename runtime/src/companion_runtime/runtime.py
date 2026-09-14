@@ -295,6 +295,10 @@ class Runtime:
         from .providers import build_provider
 
         self.semantic_provider = build_provider(self.config)
+        #: Timestamp of the last *attempted* deep refresh. Used both to pace the
+        #: "idle refresh" trigger and to enforce the minimum interval, so a
+        #: long-running Runtime does not refresh on every heartbeat.
+        self._last_deep_refresh_at: datetime | None = None
         self.reducer = Reducer(
             db=self._db,
             events=self.events,
@@ -1050,22 +1054,26 @@ class Runtime:
 
         from .deep_refresh import build_request, evaluate_triggers, ground_suggestions
 
-        signals = dict(trigger_context or {})
+        # Signals the Runtime can answer for itself are computed here; only the
+        # ones that genuinely require an outside judgement (a model flagging a
+        # suspicious history, or the motivation layer mid-decision) come from the
+        # caller. Anything a caller omits is treated as "not established", never
+        # optimistically assumed.
+        signals = self._refresh_signals(now=stamp)
+        signals.update(trigger_context or {})
         unresolved = self.projections.semantics.list_unresolved(limit=200)
         trigger = evaluate_triggers(
             unresolved_count=len(unresolved),
-            hours_since_last_refresh=signals.get("hours_since_last_refresh", 0.0),
             config=config,
-            **{
-                key: value
-                for key, value in signals.items()
-                if key != "hours_since_last_refresh"
-            },
+            **signals,
         )
         outcome.trigger = trigger.to_dict()
         if not trigger.should_refresh and not force:
             outcome.reason = trigger.reason
             return outcome
+        # Record the attempt time before spending, so a provider that times out
+        # still counts against the interval rather than being retried every tick.
+        self._last_deep_refresh_at = stamp
 
         request = build_request(runtime=self, now=stamp, limit=config.max_operations_per_refresh)
         started = time.monotonic()
@@ -1139,6 +1147,42 @@ class Runtime:
                 except ValueError:
                     outcome.settled_events = 0
         return outcome
+
+    def _refresh_signals(self, *, now: datetime) -> dict[str, Any]:
+        """Return the deep-refresh trigger signals the Runtime can answer itself.
+
+        Patch v0.2 section 21 lists several reasons to spend on a refresh. Six of
+        them are observable from state the Runtime already holds, so requiring the
+        caller to supply them would mean that in the default deployment - no
+        operator, no model - the refresh would simply never fire. The remaining
+        two (``history_suspect``, ``user_evidence_overturns``) are judgements the
+        Runtime cannot make, and they default to ``False`` rather than being
+        guessed at.
+
+        Args:
+            now: Reference time.
+
+        Returns:
+            Keyword arguments for :func:`companion_runtime.deep_refresh.evaluate_triggers`.
+        """
+        active_candidates = self.projections.candidates.list_active(limit=50)
+        matters = self.projections.unfinished.list_open()
+        due = [item for item in matters if item.status == UnfinishedStatus.DUE.value]
+        # Every trigger below is only meaningful when there is something for a
+        # refresh to reason about. On a brand-new Runtime the pool is empty and
+        # nothing is pending because nothing has happened yet, and firing then
+        # would spend a request to rediscover exactly that.
+        has_material = bool(matters) or self.projections.semantics.unresolved_count() > 0
+        if not has_material:
+            return {"candidate_pool_size": None, "matter_due": False, "hours_since_last_refresh": 0.0}
+
+        baseline = self._last_deep_refresh_at or self.projections.runtime.read().last_tick_at
+        hours_since = (now - baseline).total_seconds() / 3600.0 if baseline else 0.0
+        return {
+            "candidate_pool_size": len(active_candidates),
+            "matter_due": bool(due),
+            "hours_since_last_refresh": max(0.0, hours_since),
+        }
 
     def _is_resolvable(self, identifier: str) -> bool:
         """Return whether a grounding identifier names something that exists.

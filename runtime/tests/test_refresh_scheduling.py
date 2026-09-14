@@ -64,13 +64,18 @@ class _Provider:
 
 
 def _runtime(**semantic_overrides: Any) -> Runtime:
-    """Build an in-memory Runtime with refresh triggers made reachable."""
+    """Build an in-memory Runtime on the simulated timeline.
+
+    The creation epoch is pinned to :data:`BASE_TIME`; otherwise the Runtime's
+    clock starts at wall-clock time, which is *after* every timestamp these tests
+    use and would make elapsed-time maths meaningless.
+    """
     config = build_config()
     config.semantic.unresolved_backlog_threshold = 1
     config.semantic.deep_refresh_min_interval_seconds = 0.0
     for key, value in semantic_overrides.items():
         setattr(config.semantic, key, value)
-    return Runtime(config=config)
+    return Runtime(config=config, created_at=BASE_TIME)
 
 
 class TestRefreshRunsUnattended:
@@ -147,6 +152,86 @@ class TestRefreshRunsUnattended:
             outcome = runtime.endogenous_round(now=BASE_TIME + timedelta(minutes=5), force=True)
             assert outcome.deep_refresh["reason"] == "disabled"
             assert provider.refresh_calls == 0
+        finally:
+            runtime.close()
+
+
+class TestRefresIsNotSpentIdly:
+    """A brand-new Runtime must not refresh to rediscover that nothing happened."""
+
+    def test_a_fresh_runtime_does_not_refresh(self) -> None:
+        runtime = _runtime()
+        provider = _Provider()
+        runtime.semantic_provider = provider
+        try:
+            outcome = runtime.deep_refresh(now=BASE_TIME)
+            assert outcome.ran is False
+            assert outcome.reason == "not_needed"
+            assert provider.refresh_calls == 0
+        finally:
+            runtime.close()
+
+    def test_an_empty_runtime_does_not_take_the_heartbeat_refresh(self) -> None:
+        runtime = _runtime()
+        provider = _Provider()
+        runtime.semantic_provider = provider
+        try:
+            runtime.endogenous_round(now=BASE_TIME + timedelta(hours=48), force=True)
+            assert provider.refresh_calls == 0
+        finally:
+            runtime.close()
+
+    def test_the_signals_are_computed_not_required_from_the_caller(self) -> None:
+        """Otherwise the default deployment would never fire a refresh at all."""
+        runtime = _runtime()
+        try:
+            runtime.process_user_message(content="算了，也没什么。", timestamp=BASE_TIME)
+            signals = runtime._refresh_signals(now=BASE_TIME + timedelta(hours=30))
+            assert "candidate_pool_size" in signals
+            assert "matter_due" in signals
+            assert signals["hours_since_last_refresh"] > 0
+        finally:
+            runtime.close()
+
+    def test_a_due_matter_is_detected_without_a_caller(self) -> None:
+        runtime = _runtime()
+        runtime.semantic_provider = _Provider()
+        try:
+            runtime.process_user_message(
+                content="明天下午面试，结束告诉你结果。", timestamp=BASE_TIME
+            )
+            matter = runtime.projections.unfinished.list_open()[0]
+            due_at = matter.waiting_until + timedelta(hours=1)
+            # The waiting -> due transition happens on the tick, which is exactly
+            # the order the heartbeat uses.
+            runtime.lazy_tick(due_at)
+            signals = runtime._refresh_signals(now=due_at)
+            assert signals["matter_due"] is True
+        finally:
+            runtime.close()
+
+    def test_the_minimum_interval_is_respected_across_rounds(self) -> None:
+        """A heartbeat loop must not spend on every tick."""
+        runtime = _runtime(deep_refresh_min_interval_seconds=3600.0)
+        provider = _Provider()
+        runtime.semantic_provider = provider
+        try:
+            # Two deferred events: the provider understands one, so material
+            # remains and the second round is genuinely paced rather than idle.
+            runtime.process_user_message(content="算了，也没什么。", timestamp=BASE_TIME)
+            runtime.process_user_message(
+                content="随便吧，都行。", timestamp=BASE_TIME + timedelta(minutes=1)
+            )
+            first = runtime.endogenous_round(
+                now=BASE_TIME + timedelta(minutes=5), force=True
+            )
+            assert first.deep_refresh.get("ran") is True
+            second = runtime.endogenous_round(
+                now=BASE_TIME + timedelta(minutes=10), force=True
+            )
+            assert second.deep_refresh.get("ran") is False
+            assert second.deep_refresh.get("reason") == "min_interval_not_elapsed"
+            assert provider.refresh_calls == 1
         finally:
             runtime.close()
 
