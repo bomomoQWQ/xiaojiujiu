@@ -1,4 +1,4 @@
-"""Motivational game: utility, silence, hazard and softmax selection.
+﻿"""Motivational game: utility, silence, hazard and softmax selection.
 
 This layer answers the only question that matters before the main LLM runs:
 *do I actually act, and if so, which of my candidate thoughts wins?*
@@ -111,10 +111,15 @@ def silence_utility(
 ) -> float:
     """Return the utility of staying silent, a *formal* available action.
 
-    ``U_silence = B0 + aR + bB + cC - dI - eP^2``.
+    ``U_silence = B0 + aR + bB + cC + fI - eP^2``.
 
-    High pressure makes continued silence progressively more unpleasant (the
-    ``P^2`` term), which is what eventually breaks a long quiet stretch.
+    Impulse *raises* the value of silence rather than lowering it: a character that
+    wants to reach out but has nothing to say is aware of the pull, and holding back
+    is what it is choosing. This is what makes loneliness alone insufficient -- the
+    resting candidate gains value from impulse too, but not as much, so a concrete
+    reason is required to tip the comparison. High pressure still makes silence
+    progressively more unpleasant (the ``P^2`` term), which is what eventually
+    breaks a long quiet stretch once something is actually pending.
 
     Args:
         state: Runtime state.
@@ -133,7 +138,7 @@ def silence_utility(
         + settings.restraint_gain * state.restraint
         + settings.boundary_gain * clamp(boundary_risk)
         + settings.cooldown_gain * cooldown_term
-        - settings.impulse_penalty * state.approach_impulse
+        + settings.impulse_gain * state.approach_impulse
         - settings.pressure_penalty * (state.pressure ** 2)
     )
     return value
@@ -181,8 +186,11 @@ def candidate_utility(
     values = state.values
 
     # A concrete reason to speak - an unfinished matter that is due, or a strong
-    # need - is what actually separates "reaching out" from "staying quiet". Pure
-    # loneliness alone is deliberately not enough for a restrained character.
+    # need - is what actually separates "reaching out" from "staying quiet". The
+    # internal-need term is scaled down deliberately: the resting "I just want to be
+    # in contact" candidate always carries some need, and if that alone were enough
+    # the character would speak from loneliness, which is exactly what must not
+    # happen.
     urgency = 0.0
     if candidate.unfinished_relevance > 0.0 or candidate.internal_need > 0.0:
         urgency = settings.urgency_gain * max(
@@ -397,7 +405,12 @@ def target_drives(inputs: DriveInputs, *, state: RuntimeState, config: RuntimeCo
         + 1.60 * max(0.0, inputs.emotion_tendency)
         + 0.90 * values.user_care * inputs.unfinished
         + 0.60 * inputs.memory_activation
-        + (0.85 + 0.25 * values.relationship_maintenance) * absence_term
+        # The absence term is the long-run driver. It is deliberately strong enough
+        # that a long silence visibly raises impulse (so the character reaches out
+        # when a concrete reason appears), while the *silent* default is preserved by
+        # restraint and the silence utility rising with it: loneliness alone still
+        # never crosses the line. See `test_scenario_2*` for both halves.
+        + (1.55 + 0.30 * values.relationship_maintenance) * absence_term
         + 0.20 * values.curiosity
         - (0.55 + 0.35 * values.boundary_respect) * inputs.boundary_pressure
         - 0.40 * inputs.user_busy

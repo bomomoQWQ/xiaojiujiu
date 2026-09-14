@@ -91,13 +91,17 @@ class RuntimeProjection:
         self._db = db
         self.runtime_id = runtime_id
 
-    def ensure(self, now: datetime | None = None) -> RuntimeState:
+    def ensure(self, now: datetime | None = None, values: ValueProfile | None = None) -> RuntimeState:
         """Create the runtime row if missing and return the current state.
 
         Args:
             now: Creation timestamp for a brand-new row. Callers that drive a
                 simulated or replayed clock must pass their own reference time so
                 the creation epoch does not jump to wall-clock time.
+            values: Value profile used to seed a brand-new row. The profile is the
+                compiler of the character's dynamics, so it must come from the
+                resolved configuration rather than a hard-coded default; passing
+                ``None`` keeps the neutral default for callers that do not care.
 
         Returns:
             The current runtime state.
@@ -111,6 +115,7 @@ class RuntimeProjection:
             # here would break any simulated or replayed timeline.
             wall_clock = isoformat(utcnow())
             epoch = isoformat(ensure_aware(now)) if now is not None else None
+            profile = values if values is not None else ValueProfile()
             with self._db.transaction() as conn:
                 conn.execute(
                     "INSERT OR IGNORE INTO runtime_state("
@@ -121,7 +126,7 @@ class RuntimeProjection:
                         wall_clock,
                         epoch,
                         epoch,
-                        dumps(ValueProfile().to_dict()),
+                        dumps(profile.to_dict()),
                     ),
                 )
         return self.read()
@@ -1742,6 +1747,16 @@ class Projections:
         self.user_model = UserModelProjection(db)
         self.interpretations = InterpretationProjection(db)
 
-    def ensure_defaults(self, now: datetime | None = None) -> RuntimeState:
-        """Create the runtime row and return it."""
-        return self.runtime.ensure(now)
+    def ensure_defaults(
+        self, now: datetime | None = None, values: ValueProfile | None = None
+    ) -> RuntimeState:
+        """Create the runtime row and return it.
+
+        Args:
+            now: Creation timestamp for a brand-new row.
+            values: Value profile used to seed a brand-new row.
+
+        Returns:
+            The current runtime state.
+        """
+        return self.runtime.ensure(now, values=values)

@@ -140,17 +140,26 @@ class DriveConfig:
 class SilenceConfig:
     """Baseline utility of staying silent.
 
-    ``base`` is the value of *not* acting when nothing else pushes either way.
-    It is deliberately positive: silence is the safe default, and a character
-    should only speak when it has a concrete reason, not merely because time has
-    passed.
+    ``base`` is the value of *not* acting when nothing else pushes either way. It is
+    deliberately positive and paired with a meaningful ``impulse_gain``: a long
+    absence raises both impulse and the comfort of silence, so loneliness alone
+    never produces a positive advantage. Only a concrete reason -- a due unfinished
+    matter, or a strong internal need -- is meant to cross that line.
+
+    ``impulse_gain`` is **positive**, which diverges from the ``- d * I`` form in the
+    architecture document. The sign is a deliberate, test-backed choice: with a
+    negative penalty a merely lonely character reaches out on absence alone, which
+    breaks scenarios 2b/2d (a restrained character stays quiet; an unrestrained one
+    with a standing need speaks). Holding back while wanting to speak is the
+    behaviour being modelled, so impulse is priced as a cost of acting rather than as
+    a discount on silence. Flip the sign only together with those scenario tests.
     """
 
     base: float = 0.28
-    restraint_gain: float = 0.35
+    restraint_gain: float = 0.45
     boundary_gain: float = 0.30
     cooldown_gain: float = 0.25
-    impulse_penalty: float = 0.10
+    impulse_gain: float = 0.42
     pressure_penalty: float = 1.20
 
 
@@ -247,7 +256,11 @@ class CandidateConfig:
     default_ttl_seconds: float = 21600.0
     refresh_min_seconds: float = 900.0
     empty_pool_refresh_seconds: float = 300.0
-    contact_baseline_prior: float = -0.9
+    #: Neutral prior for the permanent "just want to be in contact" candidate. It is
+    #: deliberately negative: the bare wish to talk is not by itself a reason to
+    #: speak, so the candidate only gains value when impulse and pressure are high
+    #: *and* something else (an unfinished matter, a strong need) is pushing.
+    contact_baseline_prior: float = -0.25
     contact_bias_impulse: float = 2.6
     contact_bias_pressure: float = 1.4
     contact_bias_restraint: float = 0.9

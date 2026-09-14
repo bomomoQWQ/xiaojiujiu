@@ -44,9 +44,15 @@ __all__ = [
 SECTION_PSYCH = "【当前心理状态】"
 SECTION_SITUATION = "【当前工作局势】"
 SECTION_INTENT = "【当前最终意图】"
+SECTION_SITUATION_INTENT = "【刚刚差点要说的话】"
 SECTION_MEMORY = "【必要记忆】"
 SECTION_BOUNDARY = "【表达边界】"
 SECTION_TIME = "【时间连续性】"
+
+#: How long a *closed* attempt stays worth recalling. A committed intention that
+#: the user pre-empted is only interesting while it is still "just now"; after this
+#: window it is history rather than a conversational cue.
+RECENT_INTENT_WINDOW_SECONDS = 120.0
 
 
 @dataclass(slots=True)
@@ -208,6 +214,7 @@ def describe_intent(
     lead_seconds = None
     if attempt.committed_at is not None:
         lead_seconds = round((stamp - attempt.committed_at).total_seconds(), 3)
+    closed = attempt.state in CLOSED_ATTEMPT_STATES
     return {
         "attempt_id": attempt.attempt_id,
         "state": attempt.state,
@@ -222,8 +229,63 @@ def describe_intent(
             AttemptState.RENDERING.value,
             AttemptState.READY_TO_SEND.value,
         },
+        # A closed attempt is reported as an *almost-said* memory, never as the
+        # current final intent: claiming an abandoned intention is still live would
+        # misrepresent the state to the main LLM.
+        "closed": closed,
+        "closed_state": attempt.state if closed else None,
+        "closed_reason": attempt.failure_reason if closed else None,
+        "closed_seconds_ago": lead_seconds if closed else None,
         "pending_candidate_count": pending_count,
     }
+
+
+#: Terminal attempt states. An attempt in one of these has stopped occupying
+#: attention, but may still be recent enough to be worth recalling.
+CLOSED_ATTEMPT_STATES: frozenset[str] = frozenset(
+    {
+        AttemptState.RESOLVED.value,
+        AttemptState.ABORTED.value,
+        AttemptState.EXPIRED.value,
+        AttemptState.FAILED.value,
+    }
+)
+
+
+def _recently_closed_attempt(
+    projections: Projections, now: datetime, *, window_seconds: float | None = None
+) -> tuple[ActionAttempt | None, CandidateIntent | None]:
+    """Return a very recent closed attempt and its candidate, if any.
+
+    Only attempts that reached ``committed`` are considered: an intention the
+    character never actually formed is not something it "almost said".
+
+    Args:
+        projections: Projection bundle.
+        now: Reference time.
+        window_seconds: Recall window; defaults to
+            :data:`RECENT_INTENT_WINDOW_SECONDS`.
+
+    Returns:
+        ``(attempt, candidate)``, either of which may be ``None``.
+    """
+    window = RECENT_INTENT_WINDOW_SECONDS if window_seconds is None else window_seconds
+    for candidate_attempt in projections.attempts.list_all(limit=10):
+        if candidate_attempt.state not in CLOSED_ATTEMPT_STATES:
+            continue
+        if candidate_attempt.committed_at is None:
+            continue
+        age = (now - candidate_attempt.committed_at).total_seconds()
+        if age < 0 or age > window:
+            # Too old to be "just now": it is history, not a conversational cue.
+            return None, None
+        backing = (
+            projections.candidates.get(candidate_attempt.candidate_id)
+            if candidate_attempt.candidate_id
+            else None
+        )
+        return candidate_attempt, backing
+    return None, None
 
 
 def build(
@@ -266,6 +328,12 @@ def build(
     candidate = (
         projections.candidates.get(attempt.candidate_id) if attempt and attempt.candidate_id else None
     )
+    if attempt is None:
+        # Nothing is in flight, but an intention may have been closed a moment ago
+        # because the user spoke first. That is exactly the "I was about to say
+        # something" case, and it must survive the re-coordination that closed the
+        # attempt, otherwise the cue is lost at the moment it becomes interesting.
+        attempt, candidate = _recently_closed_attempt(projections, stamp)
     live_candidates = projections.candidates.list_active(limit=20)
 
     boundary_views: list[dict[str, Any]] = []
@@ -366,12 +434,21 @@ def render_block(bundle: ContextBundle) -> str:
         lines.append("")
 
     if bundle.intent:
-        lines.append(SECTION_INTENT)
+        closed = bool(bundle.intent.get("closed"))
+        lines.append(SECTION_INTENT if not closed else SECTION_SITUATION_INTENT)
         lines.append(f"- 想做的事：{bundle.intent.get('intent')}")
         if bundle.intent.get("goal"):
             lines.append(f"- 目的：{bundle.intent.get('goal')}")
         lead = bundle.intent.get("lead_seconds_before_user_message")
-        if bundle.intent.get("committed_not_yet_sent") and lead is not None and lead >= 0:
+        if closed:
+            seconds = bundle.intent.get("closed_seconds_ago")
+            if seconds is not None and seconds >= 0:
+                lines.append(
+                    f"- 在用户开口前 {round(seconds, 1)} 秒，我已经决定要这么做；"
+                    "这个意图已经结束，不需要再执行"
+                )
+            lines.append("- 这只是一件刚刚发生的小事，是否提起由当前语境决定，不要硬凹")
+        elif bundle.intent.get("committed_not_yet_sent") and lead is not None and lead >= 0:
             lines.append(f"- 在用户消息到达前 {round(lead, 1)} 秒，我已经决定这样做（尚未发出）")
         lines.append("")
 

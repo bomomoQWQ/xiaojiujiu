@@ -204,8 +204,9 @@ class Runtime:
         # The runtime row is created here so that maintenance tooling always sees a
         # fully initialised database. The version stays at 0 until a real tick or
         # event occurs, and ``lazy_tick`` may still install its own epoch the first
-        # time it is driven.
-        self.projections.ensure_defaults(created_at)
+        # time it is driven. The configured value profile is what compiles the
+        # character's dynamics, so it seeds the row rather than a neutral default.
+        self.projections.ensure_defaults(created_at, values=self.config.values)
         self.memory_store = memory_module.MemoryStore(self.projections.memory, self.config)
         self.user_model = UserInteractionModel(self.projections.user_model, self.config)
         self.rng = random.Random(seed)
