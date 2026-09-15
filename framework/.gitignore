@@ -1,0 +1,14 @@
+# 运行产物：每次 cf run 都写一份 trace.jsonl / framework.log / 原程序数据库
+runs/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/

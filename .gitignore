@@ -41,6 +41,7 @@ runtime/data/
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
 .venv/
@@ -58,6 +59,15 @@ astrbot_plugin_companion_runtime/
 /scratch/
 .scratch_*/
 /data/
+
+# Verification-script output. Both simulations write report.json, diagnostics.log,
+# transcript.md and a few runtime.sqlite3 under whatever --base-dir they are given;
+# HANDOFF §3 uses ./bb-run and ./res-run, --fault runs conventionally go to ./bb-fault.
+/bb/
+/bb-run/
+/bb-fault/
+/res/
+/res-run/
 
 # Editors and OS
 .vscode/
