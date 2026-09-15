@@ -1,4 +1,4 @@
-"""The JSONL mirror must be a copy of the event log, and today it is not.
+"""The JSONL mirror must be a copy of the event log, and it now is.
 
 Found by `scripts/relationship_progression_simulation.py`, which compared the mirror with
 the database at the end of a two-and-a-half-month run: `raw_events.jsonl` had 320 lines
@@ -6,25 +6,17 @@ while `/health.raw_events` reported 393 events, and **every** `user_message`,
 `proactive_sent` and `assistant_message` was absent, with nothing in the log to say so.
 `eventlog.py`'s own docstring and `runtime/README.md` both promise a faithful prefix.
 
-The test below reproduces it in process, without the simulation, and is marked
-``xfail(strict=True)``: it documents the defect without leaving a red suite, and the
-moment the defect is fixed the test starts passing - which under ``strict`` turns into a
-failure that forces whoever fixed it to delete the marker. That is deliberate: an
-expected-failure marker must not outlive the bug it describes.
+The cause was in `EventLog._release_frame`. A released savepoint hands its queued lines to
+its *enclosing* level, and the enclosing level was looked up as "the frame registered one
+depth up" - which only exists if that level has already logged an event of its own. A user
+message reaches the log two levels deep and was the only event of its savepoint, so the
+lookup answered `None` and the lines were dropped. The enclosing level now gets a frame of
+its own when it has none, so the lines wait for the commit that makes them durable.
 
-What the reproduction shows (measured, this file's first run):
-
-    database events: 12   mirror lines: 4
-      proactive_committed      db=3   mirror=1
-      system                   db=6   mirror=3
-      user_message             db=3   mirror=0
-
-So the loss is not per event *type* by design - it is a batch: events appended inside a
-transaction do not reach the mirror. The strongest lead is in `EventLog._mirror_after_commit`,
-which keys its frames by transaction depth and registers the flush hooks only on the frame's
-*first* event (``already_scheduled``), so a frame that outlives the transaction that
-created it would swallow later events without a hook to write them. That is a hypothesis,
-not a conclusion - the fix has to establish it.
+These tests were written before the fix and the first one carried
+``xfail(strict=True)`` - deliberately, so that fixing the defect would turn XPASS into a
+failure and force the marker's removal rather than letting an expected-failure marker
+outlive its bug. That is what happened here; the marker is gone.
 """
 
 from __future__ import annotations
@@ -32,24 +24,29 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 
-import pytest
-
 from companion_runtime.runtime import Runtime
-from companion_runtime.typing import CandidateIntent, new_id
+from companion_runtime.typing import CandidateIntent, EventType, new_id
 
 from conftest import BASE_TIME, build_config
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "known defect: events appended inside a transaction never reach the JSONL mirror "
-        "(user_message 3->0, system 6->3 in the minimal reproduction). Remove this marker "
-        "when the mirror is complete."
-    ),
-)
+def _mirrored_events(path: Path) -> dict[str, str]:
+    """Return ``{event_id: event_type}`` for everything the mirror holds."""
+    import json
+
+    mirrored: dict[str, str] = {}
+    if not path.exists():
+        return mirrored
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        payload = json.loads(line)
+        mirrored[payload["event_id"]] = payload["event_type"]
+    return mirrored
+
+
 def test_every_event_reaches_the_mirror(tmp_path: Path) -> None:
-    """A mixed sequence, counted twice: once in the database, once in the mirror."""
+    """A mixed sequence, compared by identifier and type - not by count alone."""
     config = build_config()
     config.storage.database_path = str(tmp_path / "mirror.sqlite3")
     config.storage.raw_log_path = str(tmp_path / "raw_events.jsonl")
@@ -72,19 +69,19 @@ def test_every_event_reaches_the_mirror(tmp_path: Path) -> None:
                 state = runtime.projections.runtime.ensure()
                 runtime._commit_attempt(conn, chosen=candidate, state=state, now=BASE_TIME)
 
-        database = {event.event_id for event in runtime.events.recent(500)}
-        mirrored = {
-            line.strip()
-            for line in (tmp_path / "raw_events.jsonl").read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        }
+        database = {event.event_id: event.event_type for event in runtime.events.recent(500)}
+        mirrored = _mirrored_events(tmp_path / "raw_events.jsonl")
     finally:
         runtime.close()
 
-    assert len(mirrored) == len(database), (
-        f"the mirror must hold every event: {len(database)} in the database, "
-        f"{len(mirrored)} in the mirror"
-    )
+    missing = {event_id: kind for event_id, kind in database.items() if event_id not in mirrored}
+    assert not missing, f"events absent from the mirror: {missing}"
+    assert mirrored == database, "the mirror must hold the same events, not merely as many"
+    # The three types the simulation found missing, named so a regression is legible: a
+    # user message reaches the log two levels deep, which is the shape that used to lose
+    # its lines outright.
+    assert EventType.USER_MESSAGE.value in mirrored.values()
+    assert EventType.PROACTIVE_COMMITTED.value in mirrored.values()
 
 
 def test_a_run_without_the_mirror_still_works(tmp_path: Path) -> None:

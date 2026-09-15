@@ -326,26 +326,31 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
 
 ### 未完成（异地继续时从这里接）
 
-**#1 原始事件镜像不完整**（最严重，**未修，但已在套件里有最小复现**）
-—— `runtime/src/companion_runtime/eventlog.py`
+**#1 原始事件镜像不完整**（最严重，**已修 + 已验证**）—— `runtime/src/companion_runtime/eventlog.py`
 - 现象：`backend/raw_events.jsonl` **320 行** vs `/health.raw_events` **393**；
   **全部 51 条 `user_message`、11 条 `proactive_sent`、11 条 `assistant_message` 都不在镜像里**，
-  且 `diagnostics.log` 无任何警告（`Discarding`/`Could not write` 零命中）。镜像 docstring 与
-  `runtime/README.md` 都承诺它是事件日志的忠实前缀 → **灾备/审计工件在悄悄撒谎**。
-- **最小复现（在进程内，不需要仿真）**：`runtime/tests/test_event_mirror.py::test_every_event_reaches_the_mirror`，
-  标了 `xfail(strict=True)`——缺陷在时它是"预期失败"，一旦修好会变成 XPASS 并**报错逼人删掉标记**。
-  实测：库内 **12** 条事件 vs 镜像 **4** 行（`user_message` 3→0、`system` 6→3、`proactive_committed` 3→1）。
-  复现脚本（未纳入版本控制）：`.scratch_blackbox/probe_mirror.py`，注意**测试夹具默认关掉镜像**
-  （`conftest.build_config` 里 `mirror_raw_events = False`），探针必须显式打开才看得到。
-- **结论与线索**：丢失**不是按事件类型设计成子集**，而是**事务内追加的事件整批不写**。
-  最强线索在 `EventLog._mirror_after_commit`：frame **以事务深度为键**，且只有 frame 的
-  *第一个* 事件会注册 flush 钩子（`already_scheduled`）——若某个 frame 活得比创建它的事务更久，
-  后续事件会被塞进这个 frame 而**没有钩子再去写它**。这是**假设，不是结论**，修的人必须先证实它。
-- 下一步：先证实/推翻上面的假设（可在 `_flush_mirror`/`_discard_frame` 打点，或让 frame 带一个
-  "已注册钩子/所属事务令牌"的标识）；再定契约（"每个事件都写"还是"文档化为子集"）；
-  再定**写失败时怎么办**（现在静默吞掉不可接受）。回归测试要**枚举事件类型**而不是列两个。
+  且无任何警告。镜像 docstring 与 `runtime/README.md` 都承诺它是事件日志的忠实前缀。
+- **根因**（打点探针定位，非猜测）：`EventLog._release_frame`。保存点释放时要把排队的事件交给
+  **外层**事务，而"外层"是按"depth-1 上已注册的 frame"查的——**只有该层自己先记过事件才会有那个
+  frame**。而用户消息是**在两层深（保存点里）**追加的，且往往是那个保存点里**唯一**的事件，
+  于是查找返回 `None` → **整批行被静默丢弃**。打点原文：
+  `after_commit type=user_message depth=2 ... frame_after=new pending=1` → `RELEASE frame pending=1`
+  →（无后续）→ 只有后来 depth=1 的 `system` 被写出。
+- **改法**：外层层若还没有 frame，**就地为它建一个**并让释放的行排队等它提交；
+  只有在"根本没有外层事务"（数据库层不会产生这种 release）时才直接写，**且是写而不是丢**。
+- **测试**：`runtime/tests/test_event_mirror.py`——库内 vs 镜像**按 event_id + type 逐条比对**
+  （不只比数量），并点名 user_message / proactive_committed；另有一条对照（关镜像时什么都不写）。
+  注意：夹具 `conftest.build_config` 默认 `mirror_raw_events=False`，必须显式打开。
+  这条测试**先以 `xfail(strict=True)` 写过**——缺陷在时是"预期失败"，修好后变 XPASS 并报错逼人摘标记，
+  事实正是如此，标记已摘。
+- **变异证据**：把该分支换回 `return`（修前行为）→ 测试立刻红：
+  `events absent from the mirror: {'evt_...': 'user_message'}`；恢复后绿。
+- **端到端证据**：四套仿真复跑 **77/335/25/105 全绿**，且关系仿真 `inspection.md` 里
+  **`jsonl_mirror_incomplete` 整节消失**。
+- 遗留（不在本条范围）：镜像**写失败**时仍是"记一条警告"（`_write_mirror_or_warn`），
+  契约上"忠实前缀"已成立，但"失败是否应让 `/health` 可见"没有做。
 
-**#3 + #5 用户提问进长期记忆 / 提问式记忆挤占 4 个名额**（用户已定口径，未实现）
+**#3 + #5 用户提问进长期记忆 / 提问式记忆挤占 4 个名额**（用户已定口径，**未实现**）
 - 现象：8 条记忆的 summary 就是提问句（如"我喜欢你这件事情，你还记得我说过吗？"）；10 次探针里
   **4 次**的记忆区被提问式记忆占满，而被问起的那条披露**召回引擎确实返回了**
   （`recalled=true`、排名 4/10）**却输给预算**，只进 9/10 次。

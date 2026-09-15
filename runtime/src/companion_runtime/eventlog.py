@@ -240,18 +240,43 @@ class EventLog:
 
         A released savepoint is neither a commit nor a rollback: its rows now
         belong to the enclosing transaction, so its lines must commit or roll back
-        with the parent instead of being written early or dropped. A frame with no
-        enclosing frame to adopt it simply drops its lines.
+        with the parent instead of being written early or dropped.
+
+        The parent level is found by walking one depth up, and that lookup used to be
+        the whole story - which lost every line in this shape: a savepoint appends the
+        *only* event of its transaction, so the enclosing level has never created a
+        frame to adopt it, ``_parent_frame`` answers ``None`` and the lines were dropped.
+        It is not a corner case: a user message reaches the log two levels deep, so the
+        mirror was missing every user message, every proactive send and every assistant
+        message while the database had them (the simulation counted 320 mirrored events
+        against 393 stored ones). An enclosing level with no frame yet now gets one, so
+        the lines wait for the commit that will actually make them durable. Only a
+        release with no enclosing transaction at all - which the database layer does not
+        produce, since releases are savepoint events - writes straight away, and it
+        writes rather than drops.
         """
         with self._mirror_lock:
             # Resolve the parent *before* unregistering this frame: the parent is
             # found by looking at the depths still holding this one.
             parent = self._parent_frame(frame)
             entries = self._collect_frame(frame)
-            if not entries or parent is None:
+            if not entries:
                 return
-            for event_seq, event in entries:
-                parent.events[event_seq] = event
+            if parent is None:
+                depth = self._db.transaction_depth()
+                if depth > 0:
+                    # The enclosing transaction has not logged an event of its own yet,
+                    # so nothing is registered at its depth. Create its frame now: the
+                    # lines belong to it and it is the level that will commit.
+                    parent = _MirrorFrame(events={})
+                    self._mirror_frames[depth] = parent
+        if parent is None:
+            self._write_mirror_or_warn(
+                [event for _seq, event in entries], f"{len(entries)} event(s)"
+            )
+            return
+        for event_seq, event in entries:
+            parent.events[event_seq] = event
         # The parent needs a flush of its own for the adopted lines: its earlier
         # one has already run or carries only its own events.
         self._db.post_commit(lambda: self._flush_mirror(parent))
