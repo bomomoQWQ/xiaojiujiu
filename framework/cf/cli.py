@@ -38,6 +38,8 @@ from .config import (
 from .host import DEFAULT_PLUGIN_ROOT
 from .logbook import Logbook
 from .mock_openai import MockReply, MockScript
+from .onebot import OneBotFrontend
+from .onebot_service import OneBotService, tail_transcript
 from .program import ProgramClient, ProgramError
 from .tui import ChatTUI
 
@@ -616,6 +618,99 @@ def _pick(*candidates: Any, default: Any = None) -> Any:
 # --------------------------------------------------------------------------- cli
 
 
+def cmd_onebot(args: argparse.Namespace) -> int:
+    """Talk to a real AstrBot over OneBot v11, with a chat box and a live log.
+
+    This is the piece that answers "does the real deployment behave the way we think":
+    the framework's own host drives the adapter in process, while this connects to a
+    running AstrBot as a OneBot implementation would (reverse WebSocket), so a message
+    typed here travels the whole real path - adapter, plugin, Runtime - and every API
+    call AstrBot makes on the way back is printed.
+    """
+    # A real model replies with emoji, and the Windows console defaults to GBK, where
+    # printing one raises UnicodeEncodeError and takes the whole session down.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    frontend = OneBotFrontend(
+        ws_url=args.ws_url,
+        token=args.token or os.environ.get("CF_ONEBOT_TOKEN", ""),
+        self_id=args.self_id,
+        user_id=args.user_id,
+        group_id=args.group_id,
+        reconnect_interval=args.reconnect_interval,
+    )
+    service = OneBotService(
+        frontend, host=args.http_host, port=args.http_port, log_path=args.log_file or None
+    )
+    service.start()
+    print(f"onebot: {args.ws_url}  (self_id={args.self_id})")
+    print(f"chat+log: http://{args.http_host}:{service.port}/")
+    if not frontend.wait_connected(timeout=args.connect_timeout):
+        print(f"连接 {args.ws_url} 超时（{args.connect_timeout}s）")
+        service.stop()
+        return 1
+    print("connected")
+    try:
+        for text in args.say or []:
+            frontend.send_user_message(text, group=args.group)
+            if not args.wait:
+                # With --wait the transcript below prints the same line already.
+                print(f"我: {text}")
+        if args.wait:
+            for line in tail_transcript(service, seconds=args.wait, interval=0.4):
+                print(line)
+        if args.repl:
+            print("输入消息回车发送，空行退出。")
+            while True:
+                try:
+                    line = input("我> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                if not line:
+                    break
+                if line.startswith("/"):
+                    _onebot_debug_command(service, line)
+                    continue
+                try:
+                    frontend.send_user_message(line, group=args.group)
+                except Exception as exc:  # noqa: BLE001 - report, keep the session
+                    print(f"发送失败: {type(exc).__name__}: {exc}")
+            return 0
+        if args.say or args.wait:
+            return 0
+        print("前台运行中，Ctrl+C 退出。")
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        service.stop()
+
+
+def _onebot_debug_command(service: OneBotService, line: str) -> None:
+    """Handle a ``/`` command inside the REPL: debug views, no chat side effects."""
+    parts = line.split(maxsplit=1)
+    command = parts[0]
+    rest = parts[1] if len(parts) > 1 else ""
+    if command == "/state":
+        _print_result(service.frontend.snapshot())
+    elif command == "/calls":
+        for call in service.frontend.calls[-10:]:
+            print(f"  {call.action} -> {call.status}/{call.retcode} {json.dumps(call.params, ensure_ascii=False)[:120]}")
+    elif command == "/frames":
+        for frame in service.frontend.frame_log(limit=20):
+            arrow = "←" if frame["direction"] == "in" else "→"
+            print(f"  {arrow} {frame['kind']} {json.dumps(frame['payload'], ensure_ascii=False)[:200]}")
+    elif command == "/event":
+        payload = json.loads(rest) if rest else {}
+        service.frontend._send(payload, kind="event")
+        print("  已注入事件")
+    elif command == "/meta":
+        print("  " + json.dumps(service.frontend.send_meta_event(rest or "connect"), ensure_ascii=False))
+    else:
+        print("  可用：/state /calls /frames /event <json> /meta [sub_type]")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser."""
     parser = argparse.ArgumentParser(
@@ -751,6 +846,25 @@ def build_parser() -> argparse.ArgumentParser:
     config_show.add_argument("--config", required=True)
     config_show.add_argument("--persona", default="")
     config_show.set_defaults(func=cmd_config_show)
+
+    onebot = sub.add_parser(
+        "onebot", help="连到真实 AstrBot 的 OneBot v11 前端：聊天、日志、调试"
+    )
+    onebot.add_argument("--ws-url", required=True, help="AstrBot 的反向 WS 地址，如 ws://host:6299/ws")
+    onebot.add_argument("--token", default="", help="access token（缺省读 CF_ONEBOT_TOKEN）")
+    onebot.add_argument("--self-id", default="10001", help="机器人账号（X-Self-ID）")
+    onebot.add_argument("--user-id", default="20001", help="默认私聊对象")
+    onebot.add_argument("--group-id", default="30001", help="默认群号")
+    onebot.add_argument("--group", action="store_true", help="以群聊身份发送")
+    onebot.add_argument("--http-host", default="127.0.0.1", help="控制面绑定地址")
+    onebot.add_argument("--http-port", type=int, default=6300, help="控制面端口（0 = 自动）")
+    onebot.add_argument("--log-file", default="", help="把每条帧写进这个 JSONL")
+    onebot.add_argument("--reconnect-interval", type=float, default=3.0, help="断线重连的起始间隔（秒）")
+    onebot.add_argument("--connect-timeout", type=float, default=10.0, help="等待连接建立的秒数")
+    onebot.add_argument("--say", action="append", default=[], help="发一条消息后退出（可重复）")
+    onebot.add_argument("--wait", type=float, default=0.0, help="发送后收集回复的秒数")
+    onebot.add_argument("--repl", action="store_true", help="交互式聊天（/state /calls /frames 可调试）")
+    onebot.set_defaults(func=cmd_onebot)
 
     return parser
 
