@@ -1,0 +1,16 @@
+# Local environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# AstrBot writes these beside an installed plugin
+data/
+*.log
+config.json
+
+# Nothing secret may ever be committed here: the Runtime API key lives in the
+# Runtime's environment (CR_SEMANTIC_API_KEY), never in the plugin.
+.env
+.env.*

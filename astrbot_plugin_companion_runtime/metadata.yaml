@@ -1,8 +1,9 @@
 name: astrbot_plugin_companion_runtime
-display_name: 陪伴 Runtime 适配器
-short_desc: 内源主动型长期陪伴 Runtime 的宿主侧薄适配层（即时演出由主 LLM 负责；Runtime 默认不接任何模型）。
+display_name: 小九九 · 长期陪伴 Runtime 适配器
+short_desc: 把 AstrBot 接上跨时间的持久认知层（情绪 / 记忆 / 未尽之事 / 主动开口）；Runtime 默认不接任何模型。
 desc: >-
-  薄适配插件：异步上报消息事件、在严格短超时内以临时 TextPart 注入 Runtime 上下文、
+  小九九 Runtime（https://github.com/bomomoQWQ/xiaojiujiu）的宿主侧薄适配层。
+  异步上报消息事件、在严格短超时内以临时 TextPart 注入 Runtime 上下文、
   以带租约的方式消费 Runtime outbox（render 调用当前聊天模型，send 经授权后发送）。
   注入内容按架构补丁 v0.2 是「角色进入本轮之前的长期状态（背景）」，不是本轮该有的情绪；
   优先级顺序（宿主设定与安全约束 > 当前用户原话 > 当前确定事实 > 显式边界 > Runtime 持久心理状态）
@@ -11,7 +12,14 @@ desc: >-
   Runtime 默认不接任何模型（disabled 为标准配置，可选的低频强语义只有远端 remote_api），
   插件既不探测模型、也不需要知道当前用的是哪种 provider，
   未解释事件积压同样不影响本插件行为。
-author: companion-runtime
+  单独安装本插件而不运行 Runtime 时，AstrBot 的行为与未安装时完全一致（fail-open）。
+author: bomomoQWQ
 version: 0.1.0
-repo: https://github.com/example/astrbot_plugin_companion_runtime
+repo: https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime
 astrbot_version: ">=4.28,<5"
+social_link: https://github.com/bomomoQWQ
+tags:
+  - 陪伴
+  - 长期记忆
+  - 主动性
+  - runtime

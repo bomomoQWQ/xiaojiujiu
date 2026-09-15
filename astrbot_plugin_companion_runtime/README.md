@@ -1,6 +1,50 @@
 # astrbot_plugin_companion_runtime
 
-「内源主动型长期陪伴 AI Runtime」的 **宿主侧薄适配插件**。
+「小九九 · 内源主动型长期陪伴 AI Runtime」的 **宿主侧薄适配插件**。
+
+> **它不是一个能单独用的插件。** 情绪、记忆、用户模型、候选意图、动机博弈与行动决策全部在
+> 主程序 **小九九 Runtime** 里：<https://github.com/bomomoQWQ/xiaojiujiu>。
+> 只装本插件而不跑 Runtime 时，AstrBot 的行为与未安装时**完全一致**——那是 fail-open 设计，
+> 不是故障。
+
+## 安装
+
+**第一步：先把 Runtime 跑起来**（主仓库里有 `Dockerfile` 与 `docker-compose.yml`）：
+
+```bash
+git clone https://github.com/bomomoQWQ/xiaojiujiu.git
+cd xiaojiujiu
+docker compose up -d --build       # runtime + astrbot 一起起，插件已挂载好
+curl http://127.0.0.1:8787/health  # 应当返回 200
+```
+
+AstrBot 已经用别的方式部署时，只跑 Runtime 一个容器：
+
+```bash
+docker run -d --name xiaojiujiu -p 127.0.0.1:8787:8787 \
+  -v xiaojiujiu-data:/data xiaojiujiu
+```
+
+**第二步：安装本插件**。在 AstrBot WebUI 的「插件市场」搜索 `companion_runtime` 安装；
+或手动克隆到 AstrBot 的插件目录：
+
+```bash
+git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git \
+  AstrBot/data/plugins/astrbot_plugin_companion_runtime
+```
+
+**第三步：把插件指向 Runtime**。在插件配置里设置 `runtime_base_url`：
+
+| 部署方式 | `runtime_base_url` |
+|---|---|
+| 两个容器都在 compose 网络里 | `http://runtime:8787` |
+| 同主机分别部署（插件默认值） | `http://127.0.0.1:8787` |
+
+多会话部署还要把 Runtime 的 `conversation_id` 设成会话的 `unified_msg_origin`
+（如 `aiocqhttp:FriendMessage:10001`，可用环境变量 `CR_CONVERSATION_ID`），否则主动消息
+无法投递回形成该意图的会话。细节见主仓库 README 与 `runtime/README.md`。
+
+## 这个插件做什么
 
 它不属于 AstrBot 本体，也不包含任何认知逻辑：情绪、记忆、用户模型、候选意图、动机博弈、
 行动决策全部由 **Runtime** 负责；本插件只做四件机械的事：
