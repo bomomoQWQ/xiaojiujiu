@@ -113,8 +113,15 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 1. 插件市场发布（`metadata.yaml` 已按规范校准；发布入口 <https://cloud.astrbot.app/>，
    需要 AstrBot Cloud 账号，我这边没有）。
 2. 加 CI（需要给令牌 `workflow` 权限，或在网页上直接建 `.github/workflows/`）。
-3. 跨会话隔离的**正向**断言：现在只断言了"B 的话题不出现在 A"，没断言"渲染措辞不提别的会话"。
-   prompt 侧的过滤已经做了（`api_v1._scope_matters`），但黑盒里还没有对应的检查。
+3. **一个尚未解释的现象**（下一个接手的人可以从这里开始）：群聊里每条 render/send 行的
+   `intent` 都是「询问等待检查结果」，它的渲染 prompt 里也不含"考试"，但**投递出去的句子**
+   写的是"询问等待考试结果"。两侧都用运行库核对过（`.scratch_blackbox/routing_latest.py`
+   与 `check_prompt_scope.py`），暂时不知道这句话从哪里来。黑盒仿真里对应的检查因此只作为
+   诊断输出（`story.ops_note`），没有当成断言——不想推一条自己解释不通的断言。
+   切入点：仿真宿主侧的假 LLM（`proactive_text_for()` 只读 `- 想做的事：` 行）与最终交付文本
+   之间的链路，以及 `host` 记录 delivered 文本的地方。
+   Runtime 侧的性质已经用单测钉住：渲染 prompt 不会带别的会话的未尽之事
+   （`api_v1._scope_matters`，测试 `TestAProactivePromptStaysInItsChat`）。
 4. `committed != sent` 与"平台已发出 / 结果已上报"之间的崩溃窗口（需要平台回执或宿主持久化幂等日志）。
 
 ```bash

@@ -203,7 +203,7 @@ uv venv .venv --python 3.12
 uv pip install --python .venv\Scripts\python.exe -e ".[test]"
 
 # 自检
-.venv\Scripts\python.exe -m pytest tests -q          # 期望 826 passed
+.venv\Scripts\python.exe -m pytest tests -q          # 期望 828 passed
 
 # 起服务（只监听 loopback）
 .venv\Scripts\python.exe -m companion_runtime.cli --base-dir . serve --host 127.0.0.1 --port 8787

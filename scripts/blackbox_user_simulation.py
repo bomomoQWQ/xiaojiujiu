@@ -2365,6 +2365,25 @@ def phase_isolation(story: Story, ctx: "Context") -> None:
         f"expected>=1 actual={len(b_proactives)} window={window_b.start.isoformat()}.."
         f"{window_b.end.isoformat()}",
     )
+    # The other direction: a message delivered into the second chat should be *written*
+    # about the second chat's business. This is reported, not asserted, because the
+    # wording is produced by the harness's own stub LLM rather than by the Runtime, and
+    # the two sides currently disagree: every group-chat row in the database carries
+    # intent "询问等待检查结果" (and its render prompt contains no mention of the exam),
+    # yet the delivered sentence says "询问等待考试结果". Until that is explained,
+    # asserting on the phrasing would be asserting on the stub. The Runtime-side
+    # property - the render prompt does not carry another chat's matter - is asserted
+    # directly in `runtime/tests/test_obligation_subject_and_routing.py`
+    # (``TestAProactivePromptStaysInItsChat``).
+    foreign = [
+        {"at": turn.at.isoformat(), "text": turn.text}
+        for turn in b_proactives
+        if any(word in turn.text for word in ("考试", "面试"))
+    ]
+    story.ops_note(
+        "wording of the second chat's unprompted messages (not asserted: see the comment)",
+        _short(foreign) or f"{len(b_proactives)} message(s), none naming the first chat's subject",
+    )
     a_messages = story.recorder.between(a_quiet_start, story.clock.now(), SESSION_A)
     a_proactives = [turn for turn in a_messages if turn.kind == "proactive"]
     V.check(
