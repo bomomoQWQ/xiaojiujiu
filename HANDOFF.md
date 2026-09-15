@@ -174,31 +174,44 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 | `cross_session`（把私聊内容发到群聊） | 4 |
 | `default_session`（全部发到默认会话） | 5 |
 
-**接下来值得做的（按我的排序）**：
+### 🚫 已冻结（2026-09-15，先不做）
 
-1. 插件市场发布（`metadata.yaml` 已按规范校准；发布入口 <https://cloud.astrbot.app/>，
-   需要 AstrBot Cloud 账号，我这边没有）。
-2. 加 CI（需要给令牌 `workflow` 权限，或在网页上直接建 `.github/workflows/`）。
-3. **渲染 prompt 里曾有两行同名指令**（已修复；这类形状值得记住）：背景块自己也有
-   `- 想做的事：…`，内容是 Runtime 当前持有的意图——对一条主动消息来说往往是**上一次**
-   想说的那件事——而指令区又有一行同名的。任何读者取第一行就会照旧的写，
-   "群聊里的体检提醒被写成考试"就是这么来的。现在背景块那行改标为
-   `- 之前想做的事（背景，不是现在的任务）`，并且在渲染主动消息时整行剔除
-   （`api_v1._drop_intent_lines`）；黑盒仿真有一条正向断言守着这个性质。
-4. `committed != sent` 与"平台已发出 / 结果已上报"之间的崩溃窗口（需要平台回执或宿主持久化幂等日志）。
+下面两件**明确冻结**，不要因为"看起来该做"就顺手捡起来。冻结的是**发布动作**，
+不是准备工作——`metadata.yaml` 已按市场规范校准，CI 要跑什么也已经清楚，随时可以解冻。
+
+| 事项 | 冻结原因 | 解冻条件 |
+|---|---|---|
+| **AstrBot 插件市场发布** | 需要 AstrBot Cloud 账号，本项目这边没有；且发布是对外动作，时机应由所有者定 | 有了账号并决定发布时：到 <https://cloud.astrbot.app/> 提交插件仓库地址即可，`metadata.yaml` 已按[市场 JSON 规范](https://docs.astrbot.app/dev/plugin-market/2026-06-27.html)校准，无需再改 |
+| **加 CI** | 需要令牌带 `workflow` 权限（或在网页上手动建文件），本项目现有的推送凭据没有该权限 | 拿到带 `workflow` 权限的令牌，或决定在网页上直接新建 `.github/workflows/` |
+
+> 冻结期间：**不要**尝试推送 `.github/workflows/`（GitHub 会直接拒绝），
+> **不要**为了发布去改 `metadata.yaml` 或两个 README 的安装说明。
+> 两个 README 现在都写"克隆安装"，这与"尚未上架"是一致的，不是待修的缺陷。
+
+### 接下来值得做的
+
+1. `committed != sent` 与"平台已发出 / 结果已上报"之间的崩溃窗口
+   （需要平台回执或宿主持久化幂等日志）。
+2. framework/ 与 scripts/ 两个仿真脚本的整合（见 §7.1 的分工说明；
+   目前两者互不依赖，这是有意的，整合前先想清楚要合并什么）。
+3. 聊天窗口还没做的部分：多行输入、跨会话历史、全屏 curses 版本、
+   回复的 Markdown 着色（清单见 `framework/README.md` §8）。
+
+**已修复但值得记住的形状**：渲染 prompt 里曾有两行同名指令。背景块自己也有
+`- 想做的事：…`，内容是 Runtime 当前持有的意图——对一条主动消息来说往往是**上一次**
+想说的那件事——而指令区又有一行同名的。任何读者取第一行就会照旧的写，
+"群聊里的体检提醒被写成考试"就是这么来的。现在背景块那行改标为
+`- 之前想做的事（背景，不是现在的任务）`，并且在渲染主动消息时整行剔除
+（`api_v1._drop_intent_lines`）；黑盒仿真有一条正向断言守着这个性质。
 
 ```bash
 python scripts/blackbox_user_simulation.py --base-dir ./bb        # 70/70，退出码 0
 python scripts/blackbox_user_simulation.py --base-dir ./bb --fault leak   # 注错：证明检查会咬人
 ```
 
-发布状态：
+**发布状态（冻结中，见上表）**：插件市场尚未提交，市场里搜不到，两个 README 的安装说明
+都是"克隆"；没有 CI。这两项都**不是**待修缺陷，是**有意暂停**。
 
-- AstrBot **插件市场尚未提交**（两个 README 的安装说明都是"克隆"，市场里搜不到）；
-  要发布就到 <https://cloud.astrbot.app/> 提交插件仓库地址，`metadata.yaml` 已按
-  [市场 JSON 规范](https://docs.astrbot.app/dev/plugin-market/2026-06-27.html) 校准。
-- **没有 CI**：GitHub 拒绝推送 `.github/workflows/` 下的文件，除非令牌带 `workflow` 权限。
-  想加 CI 就给令牌加权限，或直接在网页上新建该文件。
 
 ---
 
