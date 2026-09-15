@@ -1156,6 +1156,7 @@ class Runtime:
                     unfinished=self.projections.unfinished.list_open(),
                     active_emotions=active,
                     now=stamp,
+                    situation_terms=memory_module.situation_terms(self.projections),
                 )
                 hits = self.memory_store.retrieve(cue, limit=self.config.memory.activation_pool_size, rng=self.rng)
                 touched = self.memory_store.activate(conn, hits, now=stamp)
@@ -2264,6 +2265,15 @@ class Runtime:
             existing=existing,
             now=now,
             emotion_intensity=max((e.intensity for e in active), default=0.0),
+            # Subjects an unfinished matter already owns - live ones and ones that
+            # settled recently enough to still hold their subject. A memory about one
+            # of them must not become a second candidate about it.
+            spoken_for=[
+                matter.title
+                for matter in unfinished_module.subject_guards(
+                    self.projections.unfinished.list_all(limit=200), now=now
+                )
+            ],
         )
         operations = candidate_module.plan_operations(
             proposals=proposals, existing=existing, config=self.config

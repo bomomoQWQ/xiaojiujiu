@@ -19,6 +19,7 @@ Each test states the invariant it protects:
 
 from __future__ import annotations
 
+import math
 import random
 from datetime import timedelta
 from pathlib import Path
@@ -32,14 +33,19 @@ from companion_runtime import scheduler as scheduler_module
 from companion_runtime.cli import main as cli_main
 from companion_runtime.config import RuntimeConfig
 from companion_runtime.db import Database
-from companion_runtime.projections import MemoryProjection
+from companion_runtime.projections import MemoryProjection, Projections
 from companion_runtime.runtime import Runtime
 from companion_runtime.typing import (
     ActivatedMemory,
+    Actor,
+    EventType,
     Memory,
     MemoryCandidate,
     MemoryKind,
     MemoryStatus,
+    RawEvent,
+    UnfinishedMatter,
+    UnfinishedStatus,
 )
 from companion_runtime.utility import exponential_decay
 
@@ -344,6 +350,577 @@ def test_memories_are_visible_through_the_operator_surface(client: Any, runtime:
 # --------------------------------------------------------------------------------------
 # 2. deduplication is decided by content
 # --------------------------------------------------------------------------------------
+
+
+def test_a_correction_written_as_a_soft_negation_is_read_as_a_negation() -> None:
+    """``不太喜欢`` is the opposite of ``喜欢``, and the code must know it.
+
+    The check used to be a list of negative phrases, so "我现在不太喜欢咖啡了" matched
+    only the *positive* marker "喜欢" - a correction then looked like agreement and the
+    old and the new statement both stayed asserted. Polarity is decided structurally
+    now: a negation cue inside the window in front of a positive marker flips it.
+    """
+    assert memory_module.polarity_of("我平时喜欢喝咖啡，一天两杯。") == "positive"
+    assert memory_module.polarity_of("其实我现在不太喜欢咖啡了，改喝茶。") == "negative"
+    assert memory_module.polarity_of("我不喜欢咖啡") == "negative"
+    assert memory_module.polarity_of("我现在没那么喜欢咖啡了") == "negative"
+    assert memory_module.polarity_of("我讨厌咖啡") == "negative"
+    assert memory_module.polarity_of("我不喝咖啡了") == "negative"
+    assert memory_module.polarity_of("我明天下午三点面试") is None
+
+
+def test_a_correction_replaces_the_older_statement_whichever_order_it_arrives_in() -> None:
+    """The newer statement wins, in both consolidation orders.
+
+    Two things have to hold: a newer candidate replaces an older memory, and an older
+    candidate that reaches the pass *after* the newer one must not replace it - it is
+    history, so it is stored as already-replaced instead. Consolidation selects by
+    value but applies in time order, and ``_is_newer`` is the guard.
+    """
+    old_summary = "我平时喜欢喝咖啡，一天两杯。"
+    new_summary = "其实我现在不太喜欢咖啡了，改喝茶。"
+    stored = memory_module.Memory(
+        memory_id="mem_coffee",
+        kind=MemoryKind.USER_PREFERENCE.value,
+        summary=old_summary,
+        topics=["咖啡"],
+        importance=0.7,
+        confidence=0.8,
+        created_at=BASE_TIME,
+    )
+    correction = {
+        "candidate_id": "mcd_correction",
+        "summary": new_summary,
+        "kind": MemoryKind.USER_PREFERENCE.value,
+        "source_event_ids": ["evt_tea"],
+        "value": 0.8,
+        "topics": ["咖啡"],
+        "created_at": BASE_TIME + timedelta(days=1),
+    }
+    # Same words as the statement it corrects, but made *before* it.
+    late_old = correction | {
+        "candidate_id": "mcd_late_old",
+        "summary": old_summary,
+        "source_event_ids": ["evt_coffee"],
+        "created_at": BASE_TIME - timedelta(days=1),
+    }
+
+    # Case 1: the correction arrives second and replaces what it corrects.
+    db, projection = _memory_projection()
+    try:
+        with db.transaction() as conn:
+            projection.upsert_memory(conn, stored)
+            projection.upsert_candidate(conn, MemoryCandidate(**correction))
+            memory_module.consolidate(projection, conn, config=RuntimeConfig(), now=BASE_TIME)
+        replacement = [m for m in projection.list_memories(status=None) if m.memory_id != "mem_coffee"]
+        old = projection.get_memory("mem_coffee")
+        assert len(replacement) == 1
+        assert replacement[0].structured[memory_module.SUPERSEDES_KEY] == ["mem_coffee"]
+        assert memory_module.is_superseded(old)
+        assert memory_module.supersession_record(old)["superseded_by_hint"] == new_summary
+    finally:
+        db.close()
+
+    # Case 2: an *older* statement reaches the pass late. It is stored - history is not
+    # rewritten - but as replaced, so the character does not end up holding both.
+    db, projection = _memory_projection()
+    try:
+        with db.transaction() as conn:
+            projection.upsert_memory(
+                conn,
+                memory_module.Memory(
+                    memory_id="mem_current",
+                    kind=MemoryKind.USER_PREFERENCE.value,
+                    summary=new_summary,
+                    topics=["咖啡"],
+                    importance=0.7,
+                    confidence=0.8,
+                    created_at=BASE_TIME,
+                ),
+            )
+            projection.upsert_candidate(conn, MemoryCandidate(**late_old))
+            memory_module.consolidate(projection, conn, config=RuntimeConfig(), now=BASE_TIME)
+        late = [m for m in projection.list_memories(status=None) if m.memory_id != "mem_current"]
+        assert len(late) == 1, "the older statement is still stored"
+        assert late[0].summary == old_summary
+        assert memory_module.is_superseded(late[0]), "but it is not asserted"
+        assert late[0].structured[memory_module.SUPERSEDED_HINT_KEY] == new_summary
+        current = projection.get_memory("mem_current")
+        assert not memory_module.is_superseded(current), "the newer belief stands"
+        assert late[0].memory_id in current.structured[memory_module.SUPERSEDES_KEY]
+    finally:
+        db.close()
+
+
+def test_the_four_long_term_kinds_all_have_a_producer() -> None:
+    """Design §16 asks for four kinds; each must be reachable from a user message."""
+    from companion_runtime.memory import propose_from_event
+    from companion_runtime.projections import Projections
+
+    db = Database(":memory:")
+    db.migrate()
+    projections = Projections(db)
+    config = RuntimeConfig()
+    state = projections.runtime.ensure()
+    try:
+        cases = {
+            "我平时喜欢手冲咖啡。": MemoryKind.USER_PREFERENCE.value,
+            "我生日是三月三号。": MemoryKind.STABLE_KNOWLEDGE.value,
+            "面试过了！谢谢你那天惦记我。": MemoryKind.RELATIONSHIP.value,
+            "今天又加班到十点。": MemoryKind.EPISODIC.value,
+        }
+        for index, (text, expected) in enumerate(cases.items()):
+            event = RawEvent(
+                event_id=f"evt_kind_{index}",
+                event_type=EventType.USER_MESSAGE.value,
+                actor=Actor.USER.value,
+                content=text,
+                timestamp=BASE_TIME,
+            )
+            candidate = propose_from_event(
+                event,
+                state=state,
+                unfinished=[],
+                emotion_salience=0.4,
+                config=config,
+                created_at=BASE_TIME,
+            )
+            assert candidate is not None, f"{text!r} produced no candidate at all"
+            assert candidate.kind == expected, f"{text!r} -> {candidate.kind}, want {expected}"
+    finally:
+        db.close()
+
+
+def test_the_working_situation_is_a_recall_cue() -> None:
+    """Design §20: an unrelated sentence can recall through the *situation*.
+
+    The situation term used to be ``0.25 * lexical``, i.e. a copy of the sentence
+    score, so "the situation" recalled nothing the sentence did not already contain.
+    """
+    db, projection = _memory_projection()
+    config = RuntimeConfig()
+    store = memory_module.MemoryStore(projection, config)
+    try:
+        with db.transaction() as conn:
+            projection.upsert_memory(
+                conn,
+                memory_module.Memory(
+                    memory_id="mem_work",
+                    kind=MemoryKind.EPISODIC.value,
+                    summary="用户最近工作量很大，经常加班到很晚。",
+                    topics=["工作"],
+                    importance=0.6,
+                    confidence=0.7,
+                    created_at=BASE_TIME,
+                ),
+            )
+        sentence_only = memory_module.RetrievalCue(query_text="在吗", now=BASE_TIME)
+        with_situation = memory_module.RetrievalCue(
+            query_text="在吗",
+            situation_terms=["用户最近几天工作量较大"],
+            now=BASE_TIME,
+        )
+        none_found = store.retrieve(sentence_only, rng=random.Random(0))
+        found = store.retrieve(with_situation, rng=random.Random(0))
+
+        # A sentence that says nothing about work scores on importance and recency
+        # alone; the situation is what puts the memory at the top, and the hit says so.
+        baseline = next(hit for hit in none_found if hit.memory.memory_id == "mem_work")
+        assert baseline.lexical == 0.0 and baseline.situation == 0.0
+        assert found[0].memory.memory_id == "mem_work"
+        assert found[0].situation > 0.0, "the recall is attributed to the situation"
+        assert found[0].score > baseline.score
+    finally:
+        db.close()
+
+
+def test_a_fact_just_learned_is_shown_even_when_the_working_set_is_saturated() -> None:
+    """The section must carry what the user just said, not only what is already hot.
+
+    In a long conversation a handful of memories share words with the live matters,
+    are recalled every round, and pin at activation 1.0. A fact stated minutes ago
+    then ranks last of eight and never reaches a four-line section - which is how the
+    black-box simulation caught it: the character had just been told about the user's
+    coffee and the prompt did not mention it.
+    """
+    db = Database(":memory:")
+    db.migrate()
+    projections = Projections(db)
+    config = RuntimeConfig()
+    store = memory_module.MemoryStore(projections.memory, config)
+    try:
+        with db.transaction() as conn:
+            for index in range(6):
+                old = memory_module.Memory(
+                    memory_id=f"mem_hot_{index}",
+                    kind=MemoryKind.EPISODIC.value,
+                    summary=f"用户提过的第 {index} 件旧事，和面试有关。",
+                    topics=["面试"],
+                    importance=0.6,
+                    confidence=0.8,
+                    created_at=BASE_TIME - timedelta(days=3),
+                )
+                projections.memory.upsert_memory(conn, old)
+                projections.memory.upsert_activation(
+                    conn,
+                    ActivatedMemory(
+                        memory_id=old.memory_id,
+                        activation=1.0,
+                        last_recalled_at=BASE_TIME,
+                        recall_count=50,
+                    ),
+                )
+            fresh = memory_module.Memory(
+                memory_id="mem_just_learned",
+                kind=MemoryKind.USER_PREFERENCE.value,
+                summary="对了，我喝咖啡只喝手冲，不加糖。",
+                topics=["咖啡"],
+                importance=0.53,
+                confidence=0.5,
+                created_at=BASE_TIME,
+            )
+            projections.memory.upsert_memory(conn, fresh)
+            projections.memory.upsert_activation(
+                conn,
+                ActivatedMemory(
+                    memory_id=fresh.memory_id,
+                    activation=0.55,
+                    last_recalled_at=BASE_TIME,
+                    recall_count=1,
+                ),
+            )
+
+        # An unrelated sentence: nothing recalls the coffee fact, and the six hot
+        # memories are recalled by the unfinished matter.
+        cue = memory_module.RetrievalCue(
+            query_text="在忙什么呢",
+            unfinished_titles=["等待面试结果"],
+            now=BASE_TIME,
+        )
+        selected = context_module.select_memories(
+            projections, limit=4, cue=cue, store=store, now=BASE_TIME
+        )
+        by_id = {item["memory_id"]: item for item in selected}
+        assert "mem_just_learned" in by_id, (
+            f"the fact just learned is missing: {[item['summary'] for item in selected]}"
+        )
+        assert by_id["mem_just_learned"]["selection"] == "recent"
+        assert len(selected) <= 4
+
+        # Once it is no longer fresh it has to earn its place through recall or
+        # importance, like everything else.
+        much_later = BASE_TIME + timedelta(hours=context_module.FRESH_WINDOW_HOURS + 1)
+        later = context_module.select_memories(
+            projections, limit=4, cue=cue, store=store, now=much_later
+        )
+        assert all(item["selection"] != "recent" for item in later)
+    finally:
+        db.close()
+
+
+def test_losing_the_pool_row_also_changes_the_status() -> None:
+    """The pool *is* the working set, so a memory that leaves it must say so.
+
+    Two ways out exist - decaying below the tiny floor, and being crowded out of the
+    bounded pool - and both used to delete the row while leaving ``status = active``.
+    The operator surface then reported a memory that could never be recalled into the
+    prompt as "retrievable", and the prompt's durable source could still inject it.
+    """
+    db, projection = _memory_projection()
+    config = RuntimeConfig()
+    store = memory_module.MemoryStore(projection, config)
+    try:
+        _seed_faded_memory(projection, db, activation=0.5, memory_id="mem_fades")
+        _seed_faded_memory(projection, db, activation=0.4, memory_id="mem_crowded")
+        with db.transaction() as conn:
+            # Decay far past the floor: the row is dropped.
+            store.decay_pool(conn, dt_seconds=10_000_000.0)
+        assert projection.list_activated(limit=10) == []
+        for memory_id in ("mem_fades", "mem_crowded"):
+            assert projection.get_memory(memory_id).status == MemoryStatus.LOW_ACTIVATION.value
+
+        # ... and being crowded out of a one-slot pool demotes too.
+        with db.transaction() as conn:
+            projection.set_memory_status(
+                conn, "mem_fades", MemoryStatus.ACTIVE.value
+            )
+            projection.set_memory_status(
+                conn, "mem_crowded", MemoryStatus.ACTIVE.value
+            )
+            hit_high = memory_module.RetrievalHit(
+                memory=projection.get_memory("mem_fades"),
+                score=0.9,
+                matched_tokens=3,
+                recalled=True,
+            )
+            hit_low = memory_module.RetrievalHit(
+                memory=projection.get_memory("mem_crowded"),
+                score=0.5,
+                matched_tokens=3,
+                recalled=True,
+            )
+            store.activate(conn, [hit_high, hit_low], now=BASE_TIME, pool_size=1)
+        assert projection.get_memory("mem_fades").status == MemoryStatus.ACTIVE.value
+        assert projection.get_memory("mem_crowded").status == (
+            MemoryStatus.LOW_ACTIVATION.value
+        ), "crowded out of the pool is out of the working set"
+    finally:
+        db.close()
+
+
+def test_only_a_real_cue_match_puts_a_memory_into_the_pool() -> None:
+    """Importance and recency alone must not keep a memory permanently warm.
+
+    Every memory scores ``0.3 * importance`` plus recency, so an important memory
+    clears the activation gate forever whether or not anything recalled it. Folding
+    those hits into the pool pinned the same entries at activation 1.0 and the working
+    set stopped moving: nothing ever faded, and every new fact was ranked last.
+    """
+    db, projection = _memory_projection()
+    config = RuntimeConfig()
+    store = memory_module.MemoryStore(projection, config)
+    try:
+        with db.transaction() as conn:
+            projection.upsert_memory(
+                conn,
+                memory_module.Memory(
+                    memory_id="mem_unrelated",
+                    kind=MemoryKind.STABLE_KNOWLEDGE.value,
+                    summary="用户住在城南，工作在城北。",
+                    topics=["住"],
+                    importance=0.9,
+                    confidence=0.8,
+                    created_at=BASE_TIME,
+                ),
+            )
+        cue = memory_module.RetrievalCue(query_text="今天天气不错", now=BASE_TIME)
+        hits = store.retrieve(cue, rng=random.Random(0))
+        unrelated = next(hit for hit in hits if hit.memory.memory_id == "mem_unrelated")
+        assert unrelated.matched_tokens == 0, "nothing in the cue mentions where they live"
+        with db.transaction() as conn:
+            touched = store.activate(conn, hits, now=BASE_TIME)
+        assert touched == [], "an unmatched memory must not enter the working set"
+        assert projection.list_activated(limit=10) == []
+
+        # One shared bigram in a longer sentence is a coincidence, not a recollection.
+        cue = memory_module.RetrievalCue(query_text="他住在哪里呢", now=BASE_TIME)
+        hits = store.retrieve(cue, rng=random.Random(0))
+        unrelated = next(hit for hit in hits if hit.memory.memory_id == "mem_unrelated")
+        assert unrelated.matched_tokens == 1 and unrelated.recalled is False
+        with db.transaction() as conn:
+            touched = store.activate(conn, hits, now=BASE_TIME)
+        assert touched == [], "one shared bigram in a sentence is not a recall"
+
+        # A real match does put it in.
+        cue = memory_module.RetrievalCue(query_text="他现在住在城南吗", now=BASE_TIME)
+        hits = store.retrieve(cue, rng=random.Random(0))
+        with db.transaction() as conn:
+            touched = store.activate(conn, hits, now=BASE_TIME)
+        assert [item.memory_id for item in touched] == ["mem_unrelated"]
+
+        # A whole short question counts too: "咖啡" is one bigram, and a memory that
+        # contains the whole cue is what it is about.
+        with db.transaction() as conn:
+            store.decay_pool(conn, dt_seconds=10_000_000.0)
+        short = memory_module.RetrievalCue(query_text="城南", now=BASE_TIME)
+        hits = store.retrieve(short, rng=random.Random(0))
+        assert next(hit for hit in hits if hit.memory.memory_id == "mem_unrelated").recalled
+        with db.transaction() as conn:
+            touched = store.activate(conn, hits, now=BASE_TIME)
+        assert [item.memory_id for item in touched] == ["mem_unrelated"]
+    finally:
+        db.close()
+
+
+def test_a_question_is_not_filed_as_a_durable_fact() -> None:
+    """``我生日是什么时候来着`` is something that happened, not knowledge about the user.
+
+    The marker list alone read it as stable knowledge - the very marker ("我生日") that
+    is supposed to recognise the statement of a birthday - and the character then held
+    the *question* as a durable fact about the user.
+    """
+    db = Database(":memory:")
+    db.migrate()
+    projections = Projections(db)
+    config = RuntimeConfig()
+    state = projections.runtime.ensure()
+    try:
+        question = RawEvent(
+            event_id="evt_question",
+            event_type=EventType.USER_MESSAGE.value,
+            actor=Actor.USER.value,
+            content="我生日是什么时候来着",
+            timestamp=BASE_TIME,
+        )
+        statement = RawEvent(
+            event_id="evt_statement",
+            event_type=EventType.USER_MESSAGE.value,
+            actor=Actor.USER.value,
+            content="我生日是三月三号。",
+            timestamp=BASE_TIME,
+        )
+        asked = memory_module.propose_from_event(
+            question,
+            state=state,
+            unfinished=[],
+            emotion_salience=0.4,
+            config=config,
+            created_at=BASE_TIME,
+        )
+        told = memory_module.propose_from_event(
+            statement,
+            state=state,
+            unfinished=[],
+            emotion_salience=0.4,
+            config=config,
+            created_at=BASE_TIME,
+        )
+        assert told is not None and told.kind == MemoryKind.STABLE_KNOWLEDGE.value
+        assert asked is not None and asked.kind == MemoryKind.EPISODIC.value, (
+            f"a question was filed as {asked.kind if asked else None}"
+        )
+    finally:
+        db.close()
+
+
+def test_a_memory_about_a_taken_subject_does_not_become_a_second_candidate() -> None:
+    """The live matter asks its own follow-up; the memory path must not ask again.
+
+    Once memories persist, the memory-curiosity path can pick up a fact about a
+    subject an unfinished matter already owns - and that is how the black-box
+    simulation saw the bot ask about the interview result *after* the user had
+    reported it: the memory "面试过了！谢谢你那天惦记我" became a second question about
+    the same matter.
+    """
+    from companion_runtime import candidate as candidate_module
+    from companion_runtime.typing import ActivatedMemory
+
+    db = Database(":memory:")
+    db.migrate()
+    projections = Projections(db)
+    config = RuntimeConfig()
+    state = projections.runtime.ensure()
+    try:
+        interview = memory_module.Memory(
+            memory_id="mem_interview",
+            kind=MemoryKind.RELATIONSHIP.value,
+            summary="面试过了！谢谢你那天惦记我。",
+            topics=["面试"],
+            importance=0.7,
+            confidence=0.8,
+            created_at=BASE_TIME,
+        )
+        birthday = memory_module.Memory(
+            memory_id="mem_birthday",
+            kind=MemoryKind.STABLE_KNOWLEDGE.value,
+            summary="我生日是三月三号。",
+            topics=["生日"],
+            importance=0.8,
+            confidence=0.8,
+            created_at=BASE_TIME,
+        )
+        activated = [
+            (ActivatedMemory(memory_id=item.memory_id, activation=0.8), item)
+            for item in (interview, birthday)
+        ]
+        with db.transaction() as conn:
+            for item in (interview, birthday):
+                projections.memory.upsert_memory(conn, item)
+
+        produced = candidate_module.generate(
+            state=state,
+            config=config,
+            unfinished=[],
+            activated=activated,
+            existing=[],
+            now=BASE_TIME,
+            spoken_for=["等待面试结果"],
+        )
+        intents = [candidate.intent for candidate in produced]
+        assert any("生日" in intent for intent in intents), (
+            f"the unrelated memory must still be able to start a conversation: {intents}"
+        )
+        assert not any("面试" in intent for intent in intents), (
+            f"the interview subject is spoken for: {intents}"
+        )
+
+        # With a live matter for that subject, the subject is covered by exactly one
+        # candidate: the matter's own follow-up. (The Runtime passes the same
+        # ``spoken_for`` list it builds from ``unfinished.subject_guards``.)
+        matters = [
+            UnfinishedMatter(
+                unfinished_id="unf_interview",
+                title="等待面试结果",
+                status=UnfinishedStatus.WAITING.value,
+                priority=0.8,
+                created_at=BASE_TIME,
+                updated_at=BASE_TIME,
+            )
+        ]
+        produced = candidate_module.generate(
+            state=state,
+            config=config,
+            unfinished=matters,
+            activated=activated,
+            existing=[],
+            now=BASE_TIME,
+            spoken_for=[matter.title for matter in matters],
+        )
+        intents = [candidate.intent for candidate in produced]
+        assert sum(1 for intent in intents if "面试" in intent) == 1, intents
+    finally:
+        db.close()
+
+
+def test_the_prompt_carries_durable_facts_even_when_nothing_recalled_them() -> None:
+    """The memory section is not just "what is currently activated".
+
+    A section fed only by the activation pool goes empty as soon as the pool decays,
+    and every durable fact vanishes with it - which is what happened: at day 3 of a
+    quiet week the acting layer was handed no memories at all. Durable kinds
+    (stable knowledge, preferences, relational experiences) are injected from
+    importance, and a cue can add what this moment brings back.
+    """
+    db = Database(":memory:")
+    db.migrate()
+    projections = Projections(db)
+    try:
+        with db.transaction() as conn:
+            projections.memory.upsert_memory(
+                conn,
+                memory_module.Memory(
+                    memory_id="mem_birthday",
+                    kind=MemoryKind.STABLE_KNOWLEDGE.value,
+                    summary="我生日是三月三号。",
+                    topics=["生日"],
+                    importance=0.8,
+                    confidence=0.8,
+                    created_at=BASE_TIME,
+                ),
+            )
+        # Nothing is in the activation pool at all.
+        assert projections.memory.list_activated(limit=10) == []
+        selected = context_module.select_memories(projections, limit=4)
+        assert [item["memory_id"] for item in selected] == ["mem_birthday"]
+        assert selected[0]["selection"] == "durable"
+
+        # A faded memory is not injected by importance alone ...
+        with db.transaction() as conn:
+            projections.memory.set_memory_status(
+                conn, "mem_birthday", MemoryStatus.LOW_ACTIVATION.value
+            )
+        assert context_module.select_memories(projections, limit=4) == []
+
+        # ... but a cue that matches it still brings it back.
+        store = memory_module.MemoryStore(projections.memory, RuntimeConfig())
+        cue = memory_module.RetrievalCue(query_text="我生日是什么时候", now=BASE_TIME)
+        selected = context_module.select_memories(
+            projections, limit=4, cue=cue, store=store
+        )
+        assert [item["memory_id"] for item in selected] == ["mem_birthday"]
+        assert selected[0]["selection"] == "cue"
+    finally:
+        db.close()
 
 
 def test_a_near_identical_restatement_merges_even_when_topics_differ() -> None:
@@ -692,8 +1269,29 @@ def _seed_faded_memory(
         )
 
 
-def test_a_faded_memory_is_demoted_and_a_restatement_brings_it_back() -> None:
-    """``LOW_ACTIVATION`` is reachable, and it is a demotion rather than a loss."""
+def _hours_to_fade(config: RuntimeConfig, *, activation: float) -> float:
+    """Return how long ``activation`` takes to fall below the demotion gate.
+
+    Derived from the configured rate rather than hard-coded, so a test that is about
+    the *behaviour* of fading does not silently become a test about one number. The
+    crossing instant itself is not enough - sitting exactly on the gate keeps a
+    memory active - so a tenth of the interval is added.
+    """
+    rate = config.memory.activation_decay_rate
+    crossing = math.log(activation / config.memory.activation_threshold) / rate / 3600.0
+    return crossing * 1.1
+
+
+def test_a_faded_memory_leaves_the_working_set_but_a_cue_still_recalls_it() -> None:
+    """Demotion means "not on the character's mind" - it does not mean forgotten.
+
+    The earlier version of this test asserted that a faded memory could no longer be
+    retrieved at all. That assertion *was* the defect: a fact the user stated once and
+    never repeated faded within hours and then became permanently unreachable, so
+    asking about it returned nothing. What fading must do is leave the working set
+    (the unprompted prompt section) while staying recallable, and a recall puts it
+    back.
+    """
     db, projection = _memory_projection()
     config = RuntimeConfig()
     store = memory_module.MemoryStore(projection, config)
@@ -704,20 +1302,40 @@ def test_a_faded_memory_is_demoted_and_a_restatement_brings_it_back() -> None:
             hit.memory.memory_id for hit in store.retrieve(cue, rng=random.Random(0))
         ] == ["mem_coffee"]
 
-        # Four simulated hours take activation 0.5 below the 0.18 gate.
+        hours = _hours_to_fade(config, activation=0.5)
         with db.transaction() as conn:
-            store.decay_pool(conn, dt_seconds=4 * 3600.0)
+            store.decay_pool(conn, dt_seconds=hours * 3600.0)
 
         faded = projection.get_memory("mem_coffee")
         assert faded.status == MemoryStatus.LOW_ACTIVATION.value
-        assert store.retrieve(cue, rng=random.Random(0)) == []
-        assert store.activated_memories(limit=8) == []
+        assert store.activated_memories(limit=8) == [], "a faded memory is not on its mind"
         assert memory_module.supersession_record(faded)["retrieval_reason"] == (
             f"status:{MemoryStatus.LOW_ACTIVATION.value}"
         )
 
-        # Saying the same fact again is the reinforcement that revives it.
+        # ... but the cue still finds it, and being recalled reinstates it.
+        hits = store.retrieve(cue, rng=random.Random(0))
+        assert [hit.memory.memory_id for hit in hits] == ["mem_coffee"]
         with db.transaction() as conn:
+            store.activate(conn, hits, now=BASE_TIME + timedelta(hours=hours))
+        assert projection.get_memory("mem_coffee").status == MemoryStatus.ACTIVE.value
+        assert [item.memory_id for _, item in store.activated_memories(limit=8)] == [
+            "mem_coffee"
+        ]
+
+        # A restatement reinforces it as well, even without a cue.
+        with db.transaction() as conn:
+            current = next(
+                item.activation
+                for item in projection.list_activated(limit=500)
+                if item.memory_id == "mem_coffee"
+            )
+            store.decay_pool(
+                conn, dt_seconds=_hours_to_fade(config, activation=current) * 3600.0
+            )
+            assert projection.get_memory("mem_coffee").status == (
+                MemoryStatus.LOW_ACTIVATION.value
+            )
             projection.upsert_candidate(
                 conn,
                 MemoryCandidate(
@@ -734,13 +1352,36 @@ def test_a_faded_memory_is_demoted_and_a_restatement_brings_it_back() -> None:
 
         assert result.consolidated == [], "the restatement merges instead of duplicating"
         assert result.skipped == 1
-        revived = projection.get_memory("mem_coffee")
-        assert revived.status == MemoryStatus.ACTIVE.value
-        assert [
-            hit.memory.memory_id for hit in store.retrieve(cue, rng=random.Random(0))
-        ] == ["mem_coffee"]
+        assert projection.get_memory("mem_coffee").status == MemoryStatus.ACTIVE.value
     finally:
         db.close()
+
+
+def test_a_fact_told_once_survives_the_next_two_days(runtime: Runtime) -> None:
+    """The working set must outlive a single day, or "long-term memory" is a misnomer.
+
+    With the rate this replaced (1.5e-4/s, a half-life of 1.3 hours) every memory was
+    gone from the working set - and with it from the prompt's 【必要记忆】 - within
+    half a day unless the user repeated it, which is the normal case that never
+    happens.
+    """
+    fact = "记住，我不喜欢别人连续追问我在干嘛。"
+    runtime.process_user_message(content=fact, timestamp=BASE_TIME)
+    runtime.endogenous_round(now=BASE_TIME + timedelta(hours=2), force=True)
+    assert len(runtime.projections.memory.list_memories()) == 1
+
+    # Two days pass with no further mention of it.
+    two_days = BASE_TIME + timedelta(days=2)
+    runtime.endogenous_round(now=two_days, force=True)
+
+    memory = runtime.projections.memory.list_memories()[0]
+    assert memory.status == MemoryStatus.ACTIVE.value, "two quiet days is not forgetting"
+    bundle = context_module.build(runtime=runtime, now=two_days)
+    assert fact in [item["summary"] for item in bundle.memories], (
+        "a durable fact must still be in front of the acting layer"
+    )
+    # Fading is pinned separately (the demotion tests); this test is about the promise
+    # that a fact told once is still *there* the day after tomorrow.
 
 
 def test_demotion_happens_at_the_configured_activation_threshold() -> None:

@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 from typing import Any, Mapping, Sequence
 
 from .config import RuntimeConfig
+from .memory import DEDUPE_MIN_SHARED_TOKENS
 from .typing import (
     ActivatedMemory,
     CandidateIntent,
@@ -32,7 +33,7 @@ from .typing import (
     UnfinishedStatus,
     new_id,
 )
-from .utility import clamp, sigmoid, utcnow
+from .utility import clamp, sigmoid, tokenize, utcnow
 
 LOGGER = logging.getLogger("companion_runtime.candidate")
 
@@ -148,6 +149,37 @@ def _unfinished_candidate(
     )
 
 
+def _speaks_for_a_taken_subject(memory: Memory, spoken_for: Sequence[str]) -> bool:
+    """Return whether a memory is about a subject some matter already owns.
+
+    The bar is deliberately looser than the one deduplication and contradiction use:
+    two shared *characters* rather than two shared CJK bigrams. The cost of a false
+    positive here is small - one curiosity candidate is not generated, and if the
+    matter is live its own follow-up still asks - while the cost of a false negative
+    is the user-visible one this fixes ("面试过了！谢谢你那天惦记我" shares only the
+    bigram 面试 with the matter title "等待面试结果", and asking again about a result
+    the user just reported is exactly what must not happen).
+
+    Args:
+        memory: The memory that might become a curiosity candidate.
+        spoken_for: Subjects that are spoken for - the live matters plus the ones that
+            settled recently enough to still hold their subject
+            (:func:`~companion_runtime.unfinished.subject_guards`).
+
+    Returns:
+        ``True`` when the memory and one of those subjects are about the same thing.
+    """
+    if not spoken_for:
+        return False
+    memory_tokens = set(tokenize(memory.summary))
+    if not memory_tokens:
+        return False
+    for subject in spoken_for:
+        if len(memory_tokens & set(tokenize(subject))) >= DEDUPE_MIN_SHARED_TOKENS:
+            return True
+    return False
+
+
 def _memory_candidate(
     activation: ActivatedMemory, memory: Memory, *, now: datetime, config: RuntimeConfig
 ) -> CandidateIntent:
@@ -182,6 +214,7 @@ def generate(
     unfinished: Sequence[UnfinishedMatter] = (),
     activated: Sequence[tuple[ActivatedMemory, Memory]] = (),
     existing: Sequence[CandidateIntent] = (),
+    spoken_for: Sequence[str] = (),
     now: datetime | None = None,
     emotion_intensity: float = 0.0,
 ) -> list[CandidateIntent]:
@@ -218,6 +251,13 @@ def generate(
         existing_targets.add(candidate.target)
 
     for activation, memory in activated[:4]:
+        if _speaks_for_a_taken_subject(memory, spoken_for):
+            # A memory about a subject an unfinished matter already owns must not
+            # become a *second* candidate about it. The live matter path asks its own
+            # follow-up; the memory path asking as well is how "面试过了！谢谢你那天
+            # 惦记我" turned into another question about the interview result - after
+            # the user had just reported it.
+            continue
         candidate = _memory_candidate(activation, memory, now=stamp, config=config)
         if candidate.target in existing_targets:
             continue

@@ -163,6 +163,87 @@ SUPERSEDED_REASON = "superseded_by_newer_memory"
 #: Activation added by one reinforcement (a restatement of the same fact).
 REINFORCEMENT_ACTIVATION = 0.35
 
+#: How much a shared token with the working situation is worth, relative to one
+#: shared token with the current sentence. Below 1.0 because the situation is
+#: background: it colours recall, it does not dominate it.
+SITUATION_WEIGHT = 0.7
+
+#: Markers of a statement about the *relationship* rather than about a fact
+#: (design §16's fourth kind). Deliberately conservative: it takes an explicit
+#: relational act, not merely a warm sentence.
+RELATIONSHIP_MARKERS = (
+    "谢谢你",
+    "谢谢",
+    "陪我",
+    "陪你",
+    "在乎",
+    "在意",
+    "惦记",
+    "想你",
+    "想我",
+    "对不起",
+    "抱歉",
+    "信任",
+    "安全感",
+    "离不开",
+    "习惯了有",
+    "thank you",
+    "miss you",
+    "sorry",
+)
+
+#: Markers that make a message a *question* rather than a statement. A question is
+#: something that happened (episodic at most): "我生日是什么时候来着" must not be
+#: filed as stable knowledge about the user, which is exactly what the marker "我生日"
+#: alone did.
+QUESTION_MARKERS = ("?", "？", "吗", "呢", "什么时候", "多少", "为什么", "怎么", "哪", "记不记得", "还记")
+
+#: Markers of a durable fact about the user (design §16's "stable knowledge").
+STABLE_MARKERS = (
+    "我叫",
+    "我是",
+    "我的生日",
+    "我生日",
+    "生日是",
+    "出生",
+    "我住在",
+    "住在",
+    "我家在",
+    "老家",
+    "工作在",
+    "上班",
+    "职业",
+    "专业",
+    "毕业",
+    "手机号",
+    "微信号",
+    "邮箱",
+    "全名",
+)
+
+#: Markers of an explicit *withdrawal*: the user is taking something back rather than
+#: replacing it with a stated alternative. "改成/换成" are deliberately not here -
+#: they announce a change whose new state carries its own polarity ("改喝茶了" is not
+#: a negative statement about tea).
+CORRECTION_MARKERS = ("不喝", "不吃", "戒了", "戒掉", "不再", "不想要", "不打算")
+
+#: Negation cues that may sit immediately in front of a positive marker and flip it.
+#: Phrase matching alone cannot express this: "不太喜欢", "没那么喜欢" and "不喜欢" all
+#: mean the opposite of "喜欢", and the first two do not contain the third as a
+#: substring - which is how a correction came to be read as agreement.
+NEGATION_CUES = ("不", "没", "别", "无", "非", "don't", "do not", "not", "no longer", "never")
+
+#: How many characters before a positive marker are searched for a negation cue.
+#: "我现在不太喜欢" needs three ("不太"); a longer window starts matching negations
+#: that belong to another clause.
+NEGATION_WINDOW = 3
+
+#: Positive markers whose polarity a negation cue can flip.
+POSITIVE_MARKERS = ("喜欢", "爱", "想要", "偏爱", "prefer", "like", "love")
+
+#: Markers that are negative on their own.
+NEGATIVE_MARKERS = ("讨厌", "厌恶", "受不了", "hate", "dislike", "can't stand")
+
 
 def score_candidate(
     *,
@@ -288,10 +369,16 @@ def propose_from_event(
 
     kind = MemoryKind.EPISODIC.value
     lowered = text.lower()
+    is_question = any(marker in text for marker in QUESTION_MARKERS)
     if any(marker in lowered for marker in PREFERENCE_MARKERS):
         kind = MemoryKind.USER_PREFERENCE.value
-    elif any(marker in lowered for marker in ("我叫", "我是", "我的生日", "住在", "工作是")):
+    elif not is_question and any(marker in lowered for marker in STABLE_MARKERS):
         kind = MemoryKind.STABLE_KNOWLEDGE.value
+    elif not is_question and any(marker in lowered for marker in RELATIONSHIP_MARKERS):
+        # A relational act is not a preference and not an episode: it is the material
+        # the relationship model is built from (design §16's fourth kind, which had no
+        # producer at all - the kind existed only in the enum and the importance table).
+        kind = MemoryKind.RELATIONSHIP.value
 
     return MemoryCandidate(
         candidate_id=new_id("memory_candidate"),
@@ -377,8 +464,13 @@ def consolidate(
     """
     stamp = now or utcnow()
     pending = projection.pending_candidates(limit=limit * 3)
-    # Prefer high-value, then strict ordering for determinism.
+    # Which candidates to process is a question of worth (highest value first), but
+    # the order they are *applied* in must be the order they were said: a correction
+    # can only redefine a statement that is already stored, so applying a batch by
+    # value would let an older statement be written after the newer one that
+    # corrected it - and then contradict it.
     pending = sorted(pending, key=lambda c: (-c.value, c.created_at or stamp))[:limit]
+    pending.sort(key=lambda c: c.created_at or stamp)
 
     consolidated: list[str] = []
     archived: list[str] = []
@@ -425,30 +517,51 @@ def consolidate(
                     provenance = PROVENANCE_SEMANTIC_API
 
         supersedes = _find_conflicts(projection, candidate, connection, now=stamp)
+        # An older statement can be consolidated *after* the newer one that corrects it
+        # (the maintenance pass may reach it later). It is still history, so it is
+        # stored - but as a replaced memory, not as something the character believes:
+        # "新信息不负责删除过去，而负责重新定义过去与现在的关系" (design §18).
+        superseded_by = _find_newer_contradiction(projection, candidate)
         importance = clamp(
             0.5 * kind_importance(candidate.kind, config) + 0.5 * candidate.value
         )
+        #: When the statement was made, not when it was filed: this is what makes
+        #: "newer redefines older" decidable, and it is what the recency term wants.
+        stated_at = ensure_aware(candidate.created_at) or stamp
+        structured: dict[str, Any] = {
+            "value_breakdown": candidate.value,
+            "confidence": candidate.confidence,
+            # Who produced this memory. The rule path must not read as a model.
+            "proposed_by": provenance,
+            SUPERSEDES_KEY: supersedes,
+            "topics": candidate.topics,
+        }
+        if superseded_by is not None:
+            structured[SUPERSEDED_HINT_KEY] = superseded_by.summary
+            structured[SUPERSEDED_AT_KEY] = isoformat_or_none(superseded_by.created_at)
         memory = Memory(
             memory_id=new_id("memory"),
             kind=candidate.kind,
             summary=summary,
-            structured={
-                "value_breakdown": candidate.value,
-                "confidence": candidate.confidence,
-                # Who produced this memory. The rule path must not read as a model.
-                "proposed_by": provenance,
-                SUPERSEDES_KEY: supersedes,
-                "topics": candidate.topics,
-            },
+            structured=structured,
             topics=list(candidate.topics),
             importance=importance,
             confidence=candidate.confidence,
             status=MemoryStatus.ACTIVE.value,
             source_event_ids=list(candidate.source_event_ids),
-            created_at=stamp,
+            created_at=stated_at,
             updated_at=stamp,
         )
         projection.upsert_memory(connection, memory)
+        if superseded_by is not None:
+            # The pair is recorded from both sides, so the newer memory can say what
+            # it replaced even though the older row arrived later.
+            superseded_by.structured = dict(superseded_by.structured) | {
+                SUPERSEDES_KEY: sorted(
+                    set(superseded_by.structured.get(SUPERSEDES_KEY) or []) | {memory.memory_id}
+                )
+            }
+            projection.upsert_memory(connection, superseded_by)
         projection.set_candidate_status(
             connection,
             candidate.candidate_id,
@@ -600,6 +713,7 @@ def _find_duplicate(projection: MemoryProjection, candidate: MemoryCandidate) ->
     topics = set(candidate.topics or ())
     if not summary and not topics:
         return None
+    candidate_polarity = polarity_of(summary)
     for memory in projection.list_memories(
         status=[MemoryStatus.ACTIVE.value, MemoryStatus.LOW_ACTIVATION.value], limit=300
     ):
@@ -609,6 +723,17 @@ def _find_duplicate(projection: MemoryProjection, candidate: MemoryCandidate) ->
         if summary and stored and summary == stored:
             return memory
         if not summary or not stored:
+            continue
+        # A restatement is never a statement that says the opposite. Similar wording
+        # with the other polarity is a *contradiction*, and merging it would fold the
+        # correction into the memory it corrects - the summary shown to the model would
+        # then be the old one while the new evidence disappeared into it.
+        other_polarity = polarity_of(stored)
+        if (
+            candidate_polarity is not None
+            and other_polarity is not None
+            and candidate_polarity != other_polarity
+        ):
             continue
         ratio = _similarity(summary, stored)
         if ratio >= DEDUPE_EXACT_RATIO:
@@ -661,6 +786,63 @@ def _similarity(left: str, right: str) -> float:
     return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
 
 
+def _is_newer(candidate_at: datetime | None, memory_at: datetime | None) -> bool:
+    """Return whether a candidate may redefine a memory, judged by time.
+
+    Args:
+        candidate_at: When the new statement was made (``None`` means unknown).
+        memory_at: When the stored memory was formed.
+
+    Returns:
+        ``True`` when the candidate is at least as new as the memory. An unknown
+        timestamp on either side cannot prove staleness, so it does not block the
+        replacement - the alternative would be a system that can never correct itself.
+    """
+    if candidate_at is None or memory_at is None:
+        return True
+    return ensure_aware(candidate_at) >= ensure_aware(memory_at)
+
+
+def polarity_of(text: str) -> str | None:
+    """Return ``"positive"``/``"negative"`` for a statement about a preference.
+
+    The naive version of this check is a list of negative phrases plus a list of
+    positive ones. It reads "我现在不太喜欢咖啡了" as *positive*, because the phrase
+    "不喜欢" does not occur in "不太喜欢" as a substring - so a correction looked like
+    agreement, and both the old and the new statement stayed in the belief set at
+    once. That is the one failure a companion must not have.
+
+    Polarity is therefore decided structurally: a negative marker anywhere is
+    negative; otherwise a positive marker is negative when a negation cue sits
+    within :data:`NEGATION_WINDOW` characters in front of it, and positive
+    otherwise. "喜欢咖啡" is positive, "不太喜欢咖啡" and "不喜欢咖啡" are negative,
+    "讨厌咖啡" is negative.
+
+    Args:
+        text: The statement.
+
+    Returns:
+        The polarity, or ``None`` when the sentence takes no position.
+    """
+    lowered = (text or "").lower()
+    if not lowered:
+        return None
+    if any(marker in lowered for marker in NEGATIVE_MARKERS):
+        return "negative"
+    if any(marker in lowered for marker in CORRECTION_MARKERS):
+        return "negative"
+    for marker in POSITIVE_MARKERS:
+        start = lowered.find(marker)
+        while start != -1:
+            window = lowered[max(0, start - NEGATION_WINDOW) : start]
+            if any(cue in window for cue in NEGATION_CUES):
+                return "negative"
+            start = lowered.find(marker, start + 1)
+    if any(marker in lowered for marker in POSITIVE_MARKERS):
+        return "positive"
+    return None
+
+
 def _find_conflicts(
     projection: MemoryProjection,
     candidate: MemoryCandidate,
@@ -671,8 +853,10 @@ def _find_conflicts(
     """Find existing memories that the candidate appears to supersede.
 
     A conflict is a same-kind, still-live memory *about the same thing* that carries
-    the opposite polarity marker (e.g. "likes coffee" now vs "doesn't like coffee"
-    before).
+    the opposite polarity (:func:`polarity_of`), e.g. "likes coffee" now vs "doesn't
+    like coffee" before. A correction phrased as a replacement ("不太喜欢…了，改喝茶")
+    is one of those cases, which is why polarity is decided structurally rather than
+    by matching a list of negative phrases.
 
     "About the same thing" is measured with the same bigram tokens
     :func:`_similarity` uses, not with the stored single-character topic tags:
@@ -699,12 +883,7 @@ def _find_conflicts(
     subject = topic_tokens(candidate.summary)
     if not subject:
         return []
-    lowered = candidate.summary.lower()
-    polarity = None
-    if any(marker in lowered for marker in ("不喜欢", "讨厌", "不再", "don't", "hate", "no longer")):
-        polarity = "negative"
-    elif any(marker in lowered for marker in ("喜欢", "love", "like", "prefer")):
-        polarity = "positive"
+    polarity = polarity_of(candidate.summary)
     if polarity is None:
         return []
 
@@ -714,12 +893,14 @@ def _find_conflicts(
             continue
         if len(subject & topic_tokens(memory.summary)) < DEDUPE_MIN_SHARED_TOKENS:
             continue
-        other = memory.summary.lower()
-        other_polarity = None
-        if any(marker in other for marker in ("不喜欢", "讨厌", "不再", "don't", "hate", "no longer")):
-            other_polarity = "negative"
-        elif any(marker in other for marker in ("喜欢", "love", "like", "prefer")):
-            other_polarity = "positive"
+        if not _is_newer(candidate.created_at, memory.created_at):
+            # A statement can only redefine one that came *before* it. Without this
+            # guard the outcome depends on the order a batch happens to be processed
+            # in - consolidation sorts by value, not by time - and an older memory
+            # could withdraw the newer statement that corrected it, leaving the
+            # character asserting the version the user had already replaced.
+            continue
+        other_polarity = polarity_of(memory.summary)
         if other_polarity is None or other_polarity == polarity:
             continue
         memory.confidence = clamp(memory.confidence * 0.8)
@@ -730,6 +911,97 @@ def _find_conflicts(
         projection.upsert_memory(connection, memory)
         superseded.append(memory.memory_id)
     return superseded
+
+
+def _find_newer_contradiction(
+    projection: MemoryProjection, candidate: MemoryCandidate
+) -> Memory | None:
+    """Return a newer memory that already contradicts this older statement.
+
+    The mirror image of :func:`_find_conflicts` for a statement that reaches the
+    maintenance pass *after* the one that corrected it. The statement is still
+    stored - history is not rewritten - but it is marked as replaced by the newer
+    memory instead of being asserted alongside it, which is what would otherwise
+    leave the character holding two opposite beliefs at once.
+
+    Args:
+        projection: Memory storage.
+        candidate: The older statement being consolidated.
+
+    Returns:
+        The newest contradicting memory, or ``None``.
+    """
+    subject = topic_tokens(candidate.summary)
+    polarity = polarity_of(candidate.summary)
+    if not subject or polarity is None:
+        return None
+    newest: Memory | None = None
+    for memory in projection.list_memories(status=MemoryStatus.ACTIVE.value, limit=200):
+        if memory.kind != candidate.kind or is_superseded(memory):
+            continue
+        if len(subject & topic_tokens(memory.summary)) < DEDUPE_MIN_SHARED_TOKENS:
+            continue
+        if _is_newer(candidate.created_at, memory.created_at):
+            continue
+        other = polarity_of(memory.summary)
+        if other is None or other == polarity:
+            continue
+        if newest is None or (
+            memory.created_at is not None
+            and (newest.created_at is None or memory.created_at > newest.created_at)
+        ):
+            newest = memory
+    return newest
+
+
+def _is_recall(cue_bigrams: int, query_match: int, matched: int) -> bool:
+    """Return whether a cue brought the memory to mind rather than merely scoring it.
+
+    Two shared bigrams with the sentence or with one situation entry is the module's
+    usual bar for "these two texts are about the same thing" (deduplication and
+    contradiction use the same number). A short cue is the exception: "咖啡" is one
+    bigram, so a whole-question cue of that length counts when the memory contains it.
+
+    Args:
+        cue_bigrams: How many bigrams the current sentence has.
+        query_match: How many of them the memory shares.
+        matched: The best overlap with any cue term, the sentence included.
+
+    Returns:
+        ``True`` when the memory was actually recalled.
+    """
+    if query_match >= DEDUPE_MIN_SHARED_TOKENS or matched >= DEDUPE_MIN_SHARED_TOKENS:
+        return True
+    return 0 < cue_bigrams <= 2 and query_match == cue_bigrams
+
+
+def _was_brought_to_mind(hit: RetrievalHit) -> bool:
+    """Return whether a retrieval hit was recalled by a *cue* rather than by existing.
+
+    Every memory scores something: ``0.3 * importance`` plus recency means an
+    important memory clears the activation gate forever, whether or not the current
+    moment has anything to do with it. The pool is supposed to hold what was brought
+    to mind, so a hit counts only when one of the *matching* cue terms fired - the
+    sentence, the working situation, or an open matter.
+
+    The emotion term is deliberately not part of this test: it is
+    ``cue intensity x importance``, i.e. it scales every memory by its own importance
+    rather than selecting one, so counting it would make every important memory
+    permanently hot - which is exactly the failure this predicate exists to prevent.
+
+    A single shared bigram does not count either. CJK bigrams like 是/我 appear in
+    almost every sentence, and one of them was enough to keep an unrelated memory
+    permanently warm; the module's other decisions (deduplication, contradiction) all
+    require :data:`DEDUPE_MIN_SHARED_TOKENS` shared tokens for the same reason. The
+    rule itself lives in :func:`_is_recall` and arrives here as ``hit.recalled``.
+
+    Args:
+        hit: One retrieval hit.
+
+    Returns:
+        ``True`` when a cue term matched this memory meaningfully.
+    """
+    return bool(hit.recalled or hit.unfinished > 0.0)
 
 
 def archive_stale(
@@ -779,6 +1051,10 @@ class RetrievalCue:
     topics: list[str] = field(default_factory=list)
     emotion_intensity: float = 0.0
     now: datetime | None = None
+    #: What the working situation currently holds (facts and inferences). This is a
+    #: cue of its own: an unrelated sentence can still bring back a memory, because
+    #: the *situation* - not the sentence - is what it touches (design §20).
+    situation_terms: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Normalise optional collections and the reference time."""
@@ -801,6 +1077,17 @@ class RetrievalHit:
     recently_recalled_penalty: float = 0.0
     epsilon: float = 0.0
     score: float = 0.0
+    #: How many CJK bigrams the best-matching cue term shared with this memory. A
+    #: single shared bigram is a coincidence ("是", "我" appear in everything), so
+    #: callers that ask "did this moment really bring it to mind" want a count, not a
+    #: flag.
+    matched_tokens: int = 0
+    #: Whether a cue actually brought this memory to mind: two shared bigrams with the
+    #: sentence or with one situation entry (the module's usual "same subject" bar), or
+    #: a short cue that the memory contains entirely ("咖啡" asked as a whole question).
+    #: Callers must not re-derive this from the scores: importance and recency alone
+    #: carry every memory past any threshold.
+    recalled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable rendering."""
@@ -814,6 +1101,8 @@ class RetrievalHit:
             "recently_recalled_penalty": round(self.recently_recalled_penalty, 6),
             "epsilon": round(self.epsilon, 6),
             "score": round(self.score, 6),
+            "matched_tokens": self.matched_tokens,
+            "recalled": self.recalled,
         }
 
 
@@ -825,16 +1114,38 @@ class MemoryStore:
         self._projection = projection
         self._config = config
 
-    def _usable(self, memory: Memory) -> bool:
-        """Return whether a memory may take part in retrieval, activation or the prompt.
+    @property
+    def activation_threshold(self) -> float:
+        """Return the activation a recall must reach to enter the working set."""
+        return self._config.memory.activation_threshold
 
-        Two independent statements withdraw a memory from the working set: archival
-        (the Runtime decided it is no longer part of what the character knows) and
-        supersession (a newer statement replaced it). Demotion to
-        ``low_activation`` is a third: the memory is still known, but it is out of
-        the working set until something reinforces it.
+    def _in_working_set(self, memory: Memory) -> bool:
+        """Return whether a memory may be *injected* as what is on the character's mind.
+
+        The working set is the activation pool: memories that are currently salient.
+        A faded (``low_activation``) memory is deliberately not part of it - that is
+        what fading means - and archival is stronger still.
         """
         return memory.status == MemoryStatus.ACTIVE.value and not is_superseded(memory)
+
+    def _retrievable(self, memory: Memory) -> bool:
+        """Return whether a *cue* may recall this memory.
+
+        Retrievability is not the same question as salience. A fact the user stated
+        once and never repeated fades out of the working set within a couple of days,
+        but it is still something the character knows, and asking about it must bring
+        it back - otherwise "it remembers me" is false for every fact that was not
+        mentioned in the last few hours, which is the normal case.
+
+        So a faded memory stays retrievable and a recall puts it back into the working
+        set (:meth:`activate`). Only two statements withdraw a memory completely:
+        archival (the Runtime decided it is no longer part of what the character
+        knows) and supersession (a newer statement replaced it).
+        """
+        return (
+            memory.status in {MemoryStatus.ACTIVE.value, MemoryStatus.LOW_ACTIVATION.value}
+            and not is_superseded(memory)
+        )
 
     def retrieve(
         self,
@@ -849,11 +1160,15 @@ class MemoryStore:
         ``Score = lexical + situation + unfinished + emotion + recency
         + 0.3 * importance - recently_recalled_penalty + epsilon``.
 
+        Faded memories take part: they are still known, and a cue that matches one is
+        exactly how a fact comes back (see :meth:`_retrievable`). Archived and
+        superseded memories never do.
+
         Args:
             cue: Retrieval cue.
             limit: Maximum number of hits.
             rng: Random source for the exploration epsilon.
-            candidates: Pre-fetched candidate memories (defaults to active set).
+            candidates: Pre-fetched candidate memories (defaults to the recallable set).
 
         Returns:
             Hits ordered by descending score.
@@ -863,17 +1178,35 @@ class MemoryStore:
             candidates
             if candidates is not None
             else self._projection.list_memories(
-                status=MemoryStatus.ACTIVE.value, limit=300
+                status=[MemoryStatus.ACTIVE.value, MemoryStatus.LOW_ACTIVATION.value],
+                limit=300,
             )
         )
         # A caller may hand in its own candidate set, so the eligibility filter is
-        # applied here as well: an archived, demoted or superseded memory must not
-        # be retrievable by any route.
-        pool = [memory for memory in pool if self._usable(memory)]
+        # applied here as well: an archived or superseded memory must not be
+        # retrievable by any route.
+        pool = [memory for memory in pool if self._retrievable(memory)]
         if not pool:
             return []
 
         query_tokens = set(tokenize(cue.query_text)) | set(cue.topics or [])
+        # "Was this memory really brought to mind?" is asked with CJK *bigrams*, the
+        # same measure deduplication and contradiction use: ``tokenize`` splits CJK into
+        # single characters, and two characters in common ("我", "是") is a coincidence
+        # rather than a recollection.
+        query_bigrams = topic_tokens(cue.query_text)
+        # The working situation is a cue in its own right (design §20): "what is going
+        # on right now" brings back what it touches. It used to be faked as a quarter
+        # of the lexical score, and then - once it was real - it was a single bag of
+        # every situation entry, which saturated for every memory (they are all the
+        # user's own sentences and share 用户/说/我). It is scored per entry now, by the
+        # best-matching one and normalised by the shorter side.
+        situation_tokens: list[set[str]] = [
+            set(tokenize(term)) for term in cue.situation_terms if term
+        ]
+        situation_bigrams: list[set[str]] = [
+            topic_tokens(term) for term in cue.situation_terms if term
+        ]
         unfinished_tokens: set[str] = set()
         for title in cue.unfinished_titles:
             unfinished_tokens |= set(tokenize(title))
@@ -882,12 +1215,24 @@ class MemoryStore:
         hits: list[RetrievalHit] = []
         for memory in pool:
             memory_tokens = set(memory.topics) | set(tokenize(memory.summary))
+            memory_bigrams = topic_tokens(memory.summary)
             lexical = 0.0
+            query_match = len(query_bigrams & memory_bigrams)
+            matched = query_match
             if query_tokens and memory_tokens:
                 overlap = query_tokens & memory_tokens
                 lexical = len(overlap) / math.sqrt(len(query_tokens) * max(1, len(memory_tokens)) / 4.0)
                 lexical = clamp(lexical)
-            situation = clamp(0.25 * lexical) if query_tokens else 0.0
+            situation = 0.0
+            for entry, entry_bigrams in zip(situation_tokens, situation_bigrams):
+                if not entry or not memory_tokens:
+                    continue
+                shared = len(entry_bigrams & memory_bigrams)
+                if shared < DEDUPE_MIN_SHARED_TOKENS:
+                    continue
+                matched = max(matched, shared)
+                ratio = shared / max(1, min(len(entry_bigrams), len(memory_bigrams)))
+                situation = max(situation, clamp(ratio) * SITUATION_WEIGHT)
             unfinished = 0.0
             if unfinished_tokens and memory_tokens:
                 unfinished = clamp(len(unfinished_tokens & memory_tokens) / 3.0)
@@ -924,36 +1269,12 @@ class MemoryStore:
                     recently_recalled_penalty=penalty,
                     epsilon=epsilon,
                     score=score,
+                    matched_tokens=matched,
+                    recalled=_is_recall(len(query_bigrams), query_match, matched),
                 )
             )
         hits.sort(key=lambda hit: hit.score, reverse=True)
         return hits[: max(1, limit)]
-
-    def tick_activation(self, *, dt_seconds: float) -> list[str]:
-        """Compute decayed activation values for the pool without persisting them.
-
-        This is a preview of what a decay *would* do. Nothing in the Runtime calls
-        it: :meth:`decay_pool` is the implementation that actually writes the decayed
-        values, demotes faded memories and drops empty entries. Both use the same
-        rate, so a preview and the persisted result agree.
-
-        Args:
-            dt_seconds: Elapsed seconds.
-
-        Returns:
-            Memory identifiers whose activation would fall below ``1e-4``, i.e. the
-            entries :meth:`decay_pool` would drop from the pool.
-        """
-        if dt_seconds <= 0.0:
-            return []
-        factor = exponential_decay(self._config.memory.activation_decay_rate, dt_seconds)
-        dead: list[str] = []
-        for activated in self._projection.list_activated(limit=500):
-            value = activated.activation * factor
-            activated.activation = value
-            if value < 1e-4:
-                dead.append(activated.memory_id)
-        return dead
 
     def activate(
         self,
@@ -965,8 +1286,24 @@ class MemoryStore:
     ) -> list[ActivatedMemory]:
         """Fold retrieval hits into the activation pool.
 
-        Activation accumulates with a saturating update and a recall is recorded,
-        so the same memory is not recalled again immediately.
+        Activation answers "how strongly is this on the character's mind *now*", so a
+        recall raises it to the strength of that recall rather than adding to a
+        lifetime total::
+
+            activation = max(activation, clamp(hit.score))
+
+        The accumulating version this replaced (``base + (1-base) * score``) converged
+        every frequently recalled memory to 1.0 and kept it there, so the pool stopped
+        ranking anything - an old memory that had been recalled fifty times outranked a
+        fact the user had stated a minute ago, and the prompt section filled up with
+        the same four entries forever. Between recall it decays
+        (:meth:`decay_pool`), which is what makes room for something new.
+
+        A recall also *reinstates*: a memory that had faded to ``low_activation`` and
+        is then brought back by a matching cue returns to ``active``. Without this,
+        recall would raise an activation value that nothing ever reads again - the
+        memory would be permanently excluded from the prompt while being retrieved
+        every time it mattered.
 
         Args:
             connection: Write connection.
@@ -983,16 +1320,23 @@ class MemoryStore:
         for hit in hits:
             if hit.score < self._config.memory.activation_threshold:
                 continue
+            if not _was_brought_to_mind(hit):
+                # Importance and recency alone can carry a score past the gate, and a
+                # memory that nothing recalled must not be refreshed: doing so kept
+                # every important-but-irrelevant memory permanently hot, so the working
+                # set stopped being a working set and the oldest entries never faded.
+                continue
             current = existing.get(hit.memory.memory_id)
             base = current.activation if current is not None else 0.0
             updated = ActivatedMemory(
                 memory_id=hit.memory.memory_id,
-                activation=clamp(base + (1.0 - base) * clamp(hit.score)),
+                activation=clamp(max(base, clamp(hit.score))),
                 last_recalled_at=now,
                 recall_count=(current.recall_count if current else 0) + 1,
                 reason=f"retrieval:{round(hit.score, 3)}",
             )
             self._projection.upsert_activation(connection, updated)
+            self._reinstate_if_faded(connection, hit.memory)
             touched.append(updated)
 
         for memory_id in self.decay_pool(connection, dt_seconds=1.0):
@@ -1001,8 +1345,10 @@ class MemoryStore:
         pool = self._projection.list_activated(limit=500)
         pool.sort(key=lambda item: item.activation, reverse=True)
         for stale in pool[size:]:
-            # The pool is a bounded working set: whatever falls outside the top-N
-            # by activation is dropped, even when it was touched this round.
+            # The pool is a bounded working set: whatever falls outside the top-N by
+            # activation is dropped, even when it was touched this round. Being
+            # crowded out *is* leaving the working set, so the status follows the row.
+            self._demote(connection, stale.memory_id)
             self._projection.delete_activation(connection, stale.memory_id)
         return touched
 
@@ -1013,9 +1359,10 @@ class MemoryStore:
         same boundary the activation gate uses on the way in - is demoted to
         :data:`~companion_runtime.typing.MemoryStatus.LOW_ACTIVATION`. Demotion is
         the middle rung of ``active -> low_activation -> archived``: the memory
-        leaves the working set (retrieval, :meth:`activated_memories` and the prompt
-        all require ``active``) without being forgotten, and a later reinforcement
-        (:func:`reinforce`) puts it back.
+        leaves the *working set* (the unprompted prompt section and the candidate
+        generator's ``memory:`` sources) while staying retrievable by a matching cue,
+        which puts it back (:meth:`activate`); a restatement reinforces it
+        (:func:`reinforce`).
 
         Args:
             connection: Write connection.
@@ -1030,6 +1377,11 @@ class MemoryStore:
                 self._config.memory.activation_decay_rate, dt_seconds
             )
             if value < 1e-4:
+                # The row is gone, so the memory is out of the working set - and its
+                # status has to say so. Dropping the row while leaving ``active``
+                # behind made the operator surface report a memory that could never be
+                # recalled into the prompt as "retrievable".
+                self._demote(connection, activated.memory_id)
                 self._projection.delete_activation(connection, activated.memory_id)
                 removed.append(activated.memory_id)
                 continue
@@ -1038,30 +1390,48 @@ class MemoryStore:
             self._demote_if_faded(connection, activated.memory_id, activation=value)
         return removed
 
-    def _demote_if_faded(
-        self, connection: sqlite3.Connection, memory_id: str, *, activation: float
-    ) -> None:
-        """Move an active memory to ``low_activation`` once it fades below the gate."""
-        if activation >= self._config.memory.activation_threshold:
-            return
+    def _demote(self, connection: sqlite3.Connection, memory_id: str) -> None:
+        """Move a memory to ``low_activation``: known, but not on the character's mind."""
         memory = self._projection.get_memory(memory_id)
-        # Only ``active`` memories are demoted: archival is a stronger statement and
-        # a decay pass must not quietly undo it.
+        # Only ``active`` memories are demoted: archival is a stronger statement and a
+        # decay pass must not quietly undo it.
         if memory is None or memory.status != MemoryStatus.ACTIVE.value:
             return
         self._projection.set_memory_status(
             connection, memory_id, MemoryStatus.LOW_ACTIVATION.value
         )
 
+    def _demote_if_faded(
+        self, connection: sqlite3.Connection, memory_id: str, *, activation: float
+    ) -> None:
+        """Move an active memory to ``low_activation`` once it fades below the gate."""
+        if activation >= self._config.memory.activation_threshold:
+            return
+        self._demote(connection, memory_id)
+
+    def _reinstate_if_faded(self, connection: sqlite3.Connection, memory: Memory) -> None:
+        """Put a faded memory back into the working set because it was just recalled.
+
+        This is the counterpart of :meth:`_demote_if_faded`: demotion means "not on the
+        character's mind", and being recalled by a matching cue is proof that it is.
+        Archival is never undone here - only ``low_activation`` is.
+        """
+        if memory.status != MemoryStatus.LOW_ACTIVATION.value:
+            return
+        self._projection.set_memory_status(
+            connection, memory.memory_id, MemoryStatus.ACTIVE.value
+        )
+
     def activated_memories(self, limit: int = 8) -> list[tuple[ActivatedMemory, Memory]]:
         """Return the activation pool joined with memory content.
 
-        Archived, demoted and superseded memories are excluded. The pool is decayed
-        and bounded but never scanned for status, so without the eligibility filter a
+        Archived and superseded memories are excluded. The pool is decayed and
+        bounded but never scanned for status, so without the eligibility filter a
         memory that archival had removed from what the character knows would still be
         handed to the candidate generator and the prompt - and so would a fact that a
         newer statement replaced, which would make the character assert the version it
-        corrected.
+        corrected. Faded memories are excluded as well: leaving the working set is
+        what demotion means. They are still recallable by cue.
         """
         pool = self._projection.list_activated_memories(
             status=MemoryStatus.ACTIVE.value, limit=limit
@@ -1070,7 +1440,7 @@ class MemoryStore:
         pairs: list[tuple[ActivatedMemory, Memory]] = []
         for activated in pool:
             memory = memories.get(activated.memory_id)
-            if memory is not None and self._usable(memory):
+            if memory is not None and self._in_working_set(memory):
                 pairs.append((activated, memory))
         return pairs
 
@@ -1088,7 +1458,7 @@ class MemoryStore:
         usable = [
             item
             for item in pool
-            if (memory := memories.get(item.memory_id)) is not None and self._usable(memory)
+            if (memory := memories.get(item.memory_id)) is not None and self._in_working_set(memory)
         ]
         if not usable:
             return 0.0
@@ -1107,6 +1477,7 @@ def build_cue(
     unfinished: Sequence[UnfinishedMatter],
     active_emotions: Sequence[Any],
     now: datetime | None = None,
+    situation_terms: Sequence[str] = (),
 ) -> RetrievalCue:
     """Assemble the internal retrieval cue used when nothing external arrives.
 
@@ -1116,6 +1487,10 @@ def build_cue(
         unfinished: Live unfinished matters.
         active_emotions: Active emotion events contributing intensity.
         now: Reference time.
+        situation_terms: What the working situation currently holds. It is a cue in
+            its own right (design §20): "用户最近几天工作量较大" should be able to bring
+            back a memory about work, even when the newest sentence is about
+            something else entirely.
 
     Returns:
         A :class:`RetrievalCue`; no user query is required for recall to happen.
@@ -1128,7 +1503,26 @@ def build_cue(
         topics=[],
         emotion_intensity=clamp(intensity + abs(state.mood_valence) * 0.5),
         now=now or utcnow(),
+        situation_terms=[term for term in situation_terms if term],
     )
+
+
+def situation_terms(projections: Any, *, limit: int = 6) -> list[str]:
+    """Return the working situation's content as recall terms.
+
+    Args:
+        projections: The Runtime's projections.
+        limit: Maximum number of entries to read.
+
+    Returns:
+        The content of the current facts and inferences, newest first.
+    """
+    terms: list[str] = []
+    for item in projections.situation.list_active(limit=limit):
+        content = str(item.get("content") or "").strip()
+        if content:
+            terms.append(content)
+    return terms
 
 
 def next_consolidation_due(
@@ -1175,11 +1569,3 @@ def needs_consolidation(
     return due is not None and due <= now
 
 
-def pool_times(memories: Sequence[Memory]) -> list[datetime]:
-    """Return creation times of memories.
-
-    A small summary helper with no caller in the Runtime. The scheduler does not use
-    it: wake anchors are computed from the pending-candidate window by
-    :func:`next_consolidation_due`, not from when memories were created.
-    """
-    return [m.created_at for m in memories if m.created_at is not None]

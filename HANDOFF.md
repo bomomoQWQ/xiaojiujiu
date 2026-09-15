@@ -151,11 +151,12 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 
 | 项目 | 结果 |
 |---|---|
-| Runtime 离线测试 | 903 passed / 14 skipped（接 `CR_TEST_PG_DSN` 时 917 项，PG 专项不再跳过） |
+| Runtime 离线测试 | 914 passed / 14 skipped（接 `CR_TEST_PG_DSN` 时 PG 专项不再跳过） |
 | 插件离线测试 | 143 passed + 13 subtests |
 | 高仿真故障恢复 | 335/335 |
-| 用户黑盒仿真 | **77 / 77**（退出码 0，连跑三次一致；第 12 阶段起多了"记忆"） |
-| 版本 | Runtime 0.3.0；插件 0.1.0 |
+| 用户黑盒仿真 | **77 / 77**（退出码 0，连跑多次一致） |
+| 记忆质量仿真 | **25 / 25**（`scripts/e2e_memory_simulation.py`，见第 6 节） |
+| 版本 | Runtime 0.3.1；插件 0.1.0 |
 | 许可证 | GPL-3.0-or-later |
 
 > **换机器复现记录**（Linux / Python 3.14.7 / 全新 venv，2026-09-15）：0.2.0 时点上的四行
@@ -245,9 +246,11 @@ python scripts/blackbox_user_simulation.py --base-dir ./bb --fault leak   # 注�
 
 1. 先在 `runtime/tests/` 写一条**会失败的**测试（描述不变量的那句话），再改实现；
 2. 跑 `.venv/bin/python -m pytest`（**别再加 `-q`**，理由见第 3 节的 venv 陷阱）；
-3. 改动涉及跨时间行为（调度、未结事项、回复闭环、投递、**记忆形成**）时，**必须**再跑一次黑盒仿真——
+3. 改动涉及跨时间行为（调度、未结事项、回复闭环、投递、**记忆形成与召回**）时，**必须**再跑一次黑盒仿真——
    0.2.0 靠它抓到两个单测完全没覆盖的缺陷（已了结的义务被重新打开、跨会话投递），
    0.3.0 又靠它抓到一条**断言自身**的随机误报（同一瞬间但投递更早的主动消息被算成"又问了一次"）；
+   改动记忆模块时**必须**额外跑 `scripts/e2e_memory_simulation.py`——0.3.1 的十条修复里有八条是它先抓到的
+   （最典型的一条：记忆形成后约 12 小时就再也检索不到，"长期记忆"实际只有半天有效期）；
 4. 涉及并发/租约/重启时跑韧性仿真；
 5. 提交信息写清：现象 → 根因 → 改了什么 → 怎么复现 → 怎么验证 → 还没做什么。
 
@@ -261,7 +264,7 @@ python scripts/blackbox_user_simulation.py --base-dir ./bb --fault leak   # 注�
 | `runtime/docs/PATCH_V0.2_MAPPING.md` | 设计章节 → 代码位置 → 状态的对照，含**诚实缺口清单** |
 | `runtime/README.md` | 运维手册：配置项、API、降级、蓝屏恢复 |
 | `framework/` | **外接测试框架**：可控虚拟时钟 + OpenAI 兼容 mock 端点 + 变量日志 + `cf` 命令行。不改原程序，见 `framework/README.md` |
-| `scripts/` | 验证与运维脚本（两个仿真、基准、备份） |
+| `scripts/` | 验证与运维脚本（三个仿真、基准、备份） |
 | `archive/` | 已放弃的本地模型路线（留档，不参与构建，包名是历史遗留） |
 | `RECOVERY.md` | 备份 / 恢复 / 权重位置 |
 

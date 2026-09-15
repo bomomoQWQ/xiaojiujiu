@@ -29,6 +29,7 @@ from .typing import (
     ActionAttempt,
     AttemptState,
     CandidateIntent,
+    MemoryKind,
     MemoryStatus,
     RuntimeState,
     UnfinishedStatus,
@@ -60,6 +61,32 @@ SECTION_SITUATION_INTENT = "【刚刚差点要说的话】"
 SECTION_MEMORY = "【必要记忆】"
 SECTION_BOUNDARY = "【表达边界】"
 SECTION_TIME = "【时间连续性】"
+
+#: Memory kinds that describe who the user *is* rather than what happened once. They
+#: are injected from importance when nothing recalled them, so the character does not
+#: lose the basics between two mentions.
+DURABLE_KINDS = frozenset(
+    {
+        MemoryKind.STABLE_KNOWLEDGE.value,
+        MemoryKind.USER_PREFERENCE.value,
+        MemoryKind.RELATIONSHIP.value,
+    }
+)
+
+#: How important a durable memory must be to be injected without being recalled.
+#: ``kind_importance`` alone gives a preference 0.70 and stable knowledge 0.75, and
+#: consolidation averages that with the candidate's own value, so this admits facts
+#: the rules scored well and keeps weak ones out until something recalls them.
+DURABLE_MIN_IMPORTANCE = 0.6
+
+#: How long a newly formed memory is guaranteed a slot in the prompt.
+#:
+#: The working set saturates: a handful of memories that share words with the live
+#: matters are recalled every round, their activation pins at 1.0, and a fact the user
+#: stated ten minutes ago - activation 0.55, ranked eighth - never made it into a
+#: four-line section. "What I just learned about you" is not something to rank against
+#: a saturated pool; it is the whole point of listening.
+FRESH_WINDOW_HOURS = 24.0
 
 #: Preamble that fixes the precedence order from patch v0.2 section 7. The main
 #: LLM must treat the current user message and the current facts as authoritative
@@ -207,37 +234,120 @@ def select_memories(
     projections: Projections,
     *,
     limit: int = 4,
+    cue: Any = None,
+    store: Any = None,
+    now: datetime | None = None,
+    fresh_hours: float = FRESH_WINDOW_HOURS,
 ) -> list[dict[str, Any]]:
-    """Return the most activated memories as prompt-ready items.
+    """Return the memories to put in front of the acting layer, best first.
 
-    Archived memories are filtered out: archival is the Runtime's own statement that
-    a memory is no longer part of what the character knows, so re-injecting it into
-    the prompt would contradict the decision that produced it. Superseded memories
-    are filtered for the matching reason: a newer statement replaced them, and the
-    prompt must carry what the character currently believes rather than the version
-    it corrected. Faded (``low_activation``) memories never reach this point - the
-    activation query only returns ``active`` rows.
+    Four sources, because they answer four different questions:
+
+    1. **what this moment brings back** - a memory recalled by the current cue. This
+       is how a fact the user stated days ago can still be answered when they ask
+       about it, and it is why a faded memory counts here (:meth:`MemoryStore.retrieve`
+       is not restricted to the working set);
+    2. **what I just learned** - a memory formed in the last
+       :data:`FRESH_WINDOW_HOURS`. It is a separate source rather than an entry in the
+       ranking because the ranking saturates: memories that share words with the live
+       matters are recalled every round and pin at activation 1.0, so a fact stated
+       minutes ago ranked eighth of eight and never reached a four-line section;
+    3. **what has been on the character's mind** - the activation pool;
+    4. **who the user is** - durable facts (stable knowledge, preferences, relational
+       experiences) by importance, so the character does not lose the basics just
+       because nothing recalled them for two days.
+
+    Slots are handed out one source at a time, in that order, so no single source can
+    take the whole section.
+
+    Archived memories are excluded, and so are superseded ones: a newer statement
+    replaced them, and the prompt must carry what the character currently believes.
+
+    Args:
+        projections: The Runtime's projections.
+        limit: Maximum number of memories to hand over.
+        cue: Retrieval cue for the current moment (``None`` disables source 1).
+        store: :class:`~companion_runtime.memory.MemoryStore` used for source 1.
+        now: Reference time for "just learned" (``None`` disables source 2).
+        fresh_hours: How long a newly formed memory is guaranteed a slot
+            (``memory.fresh_window_hours``; ``0`` disables source 2).
+
+    Returns:
+        Prompt-ready items with a ``selection`` field naming the source they came from.
     """
-    pool = projections.memory.list_activated_memories(limit=limit)
-    memories = projections.memory.get_memories([item.memory_id for item in pool])
     selected: list[dict[str, Any]] = []
-    for activated in pool:
-        memory = memories.get(activated.memory_id)
-        if memory is None or memory.status != MemoryStatus.ACTIVE.value:
-            continue
+    seen: set[str] = set()
+
+    def add(memory: Any, activation: float, source: str) -> None:
+        """Append one memory once, from whichever source reached it first."""
+        if memory is None or memory.memory_id in seen or len(selected) >= limit:
+            return
+        if memory.status != MemoryStatus.ACTIVE.value and source != "cue":
+            # Only a cue may surface a faded memory: demotion means "not on the
+            # character's mind", and the working set and the durable baseline are
+            # statements about exactly that.
+            return
         if memory_module.is_superseded(memory):
-            continue
+            return
+        seen.add(memory.memory_id)
         selected.append(
             {
                 "memory_id": memory.memory_id,
                 "kind": memory.kind,
                 "summary": memory.summary,
-                "activation": round(activated.activation, 3),
+                "activation": round(activation, 3),
                 "importance": round(memory.importance, 3),
                 "topics": list(memory.topics[:4]),
+                "selection": source,
             }
         )
-    return selected
+
+    relevant: list[tuple[Any, float, str]] = []
+    if cue is not None and store is not None:
+        for hit in store.retrieve(cue, limit=limit):
+            # ``recalled`` is the retrieval layer's own verdict that a cue brought this
+            # memory to mind (two shared bigrams, or a short cue it contains). The
+            # score alone cannot decide it: importance and recency carry every memory
+            # past any threshold.
+            if hit.score >= store.activation_threshold and hit.recalled:
+                relevant.append((hit.memory, hit.score, "cue"))
+
+    just_learned: list[tuple[Any, float, str]] = []
+    if now is not None and fresh_hours > 0.0:
+        cutoff = now - timedelta(hours=fresh_hours)
+        fresh = [
+            memory
+            for memory in projections.memory.list_memories(
+                status=MemoryStatus.ACTIVE.value, limit=200
+            )
+            if memory.created_at is not None and memory.created_at >= cutoff
+        ]
+        fresh.sort(key=lambda memory: memory.created_at, reverse=True)
+        just_learned.extend((memory, 0.0, "recent") for memory in fresh)
+
+    working: list[tuple[Any, float, str]] = []
+    pool = projections.memory.list_activated_memories(limit=limit * 2)
+    memories = projections.memory.get_memories([item.memory_id for item in pool])
+    for activated in pool:
+        working.append((memories.get(activated.memory_id), activated.activation, "activation"))
+
+    durable: list[tuple[Any, float, str]] = []
+    for memory in projections.memory.list_memories(
+        status=MemoryStatus.ACTIVE.value, limit=200
+    ):
+        if memory.kind in DURABLE_KINDS and memory.importance >= DURABLE_MIN_IMPORTANCE:
+            durable.append((memory, 0.0, "durable"))
+
+    sources = (relevant, just_learned, working, durable)
+    depth = 0
+    while len(selected) < limit and any(depth < len(source) for source in sources):
+        for source in sources:
+            if depth < len(source):
+                memory, activation, label = source[depth]
+                add(memory, activation, label)
+        depth += 1
+
+    return selected[:limit]
 
 
 def describe_intent(
@@ -389,6 +499,17 @@ def build(
         attempt, candidate = _recently_closed_attempt(projections, stamp)
     live_candidates = projections.candidates.list_active(limit=20)
 
+    # Recall is cued by the *situation*, not only by the newest sentence (design §20),
+    # so the cue is built the same way the Runtime's own heartbeat builds it.
+    cue = memory_module.build_cue(
+        state=state,
+        recent_events=runtime.events.recent(4),
+        unfinished=projections.unfinished.list_open(),
+        active_emotions=active_emotions,
+        now=stamp,
+        situation_terms=memory_module.situation_terms(projections),
+    )
+
     boundary_views: list[dict[str, Any]] = []
     constraints: list[str] = []
     if include_boundaries:
@@ -403,7 +524,14 @@ def build(
         psychological=dict(explanation or {}),
         situation=build_situation(projections, now=stamp),
         intent=describe_intent(attempt, candidate, pending_count=len(live_candidates), now=stamp),
-        memories=select_memories(projections, limit=4),
+        memories=select_memories(
+            projections,
+            limit=4,
+            cue=cue,
+            store=getattr(runtime, "memory_store", None),
+            now=stamp,
+            fresh_hours=getattr(runtime.config.memory, "fresh_window_hours", FRESH_WINDOW_HOURS),
+        ),
         boundaries=boundary_views,
         time_context=build_time_context(state, now=stamp),
         constraints=constraints,

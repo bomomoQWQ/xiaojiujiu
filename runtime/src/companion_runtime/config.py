@@ -233,8 +233,21 @@ class MemoryConfig:
     candidate_min_value: float = 0.30
     candidate_max_open: int = 200
     activation_threshold: float = 0.18
-    activation_decay_rate: float = 0.00015
+    #: Per-second decay of activation, i.e. of "how much this is on the character's
+    #: mind right now". 7e-6/s is a half-life of ~27.5 hours, which puts a memory
+    #: that is never recalled again below ``activation_threshold`` after ~2 days:
+    #: long enough that a fact told once on Monday is still part of the working set
+    #: on Wednesday, short enough that the pool stays a *working* set.
+    #:
+    #: The value this replaced (1.5e-4/s, a half-life of 1.3 hours) emptied the
+    #: working set - and with it the prompt's memory section - within half a day, so
+    #: in practice the character behaved as if it had no long-term memory at all.
+    activation_decay_rate: float = 0.000007
     activation_pool_size: int = 8
+    #: How long a newly formed memory is guaranteed a slot in the prompt block, in
+    #: hours. The working set saturates in a long conversation, so a fact stated
+    #: minutes ago can rank last; this is the window in which it is shown anyway.
+    fresh_window_hours: float = 24.0
     recent_recall_penalty: float = 0.35
     random_epsilon: float = 0.03
     consolidation_interval_seconds: float = 3600.0

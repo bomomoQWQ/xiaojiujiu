@@ -60,7 +60,7 @@
 .
 ├── runtime/                          # ★ 持久认知 sidecar（独立进程，Python 3.11+）
 │   ├── src/companion_runtime/        #   31 个模块（含协议 v1 兼容层 api_v1.py）
-│   ├── tests/                        #   903 项离线测试（14 项按环境跳过）
+│   ├── tests/                        #   914 项离线测试（14 项按环境跳过）
 │   ├── docs/PATCH_V0.2_MAPPING.md    #   设计章节 → 代码位置 → 状态（含诚实缺口清单）
 │   └── README.md                     #   操作者手册（配置 / API / 蓝屏恢复 / 降级）
 │
@@ -356,7 +356,7 @@ docker run --rm -v xiaojiujiu-data:/data -v E:\companion_runtime_backup:/backup 
 
 ```powershell
 cd runtime
-.venv\Scripts\python.exe -m pytest tests -q          # 903 passed, 14 skipped
+.venv\Scripts\python.exe -m pytest tests -q          # 914 passed, 14 skipped
 
 # 插件测试在插件仓库里（先 git clone，见 §4.2）
 cd ..\astrbot_plugin_companion_runtime
@@ -369,6 +369,8 @@ python scripts\e2e_resilience_simulation.py --base-dir E:\companion_runtime_back
                                                      # 335 项高仿真检查（并发 / 重启 / 断网恢复）
 python scripts\blackbox_user_simulation.py --base-dir E:\companion_runtime_backup\blackbox
                                                      # 77 项用户黑盒检查（见下，13 个阶段）
+python scripts\e2e_memory_simulation.py --base-dir E:\companion_runtime_backup\memory
+                                                     # 25 项记忆质量检查（见下，8 个阶段）
 ```
 
 **用户黑盒仿真**（`scripts/blackbox_user_simulation.py`）是这套验证里最"像用户"的一层：
@@ -407,6 +409,24 @@ python scripts\blackbox_user_simulation.py --base-dir E:\companion_runtime_backu
 两个端到端脚本都会**导入插件仓库的代码**（它们驱动的是真实的插件传输层），
 所以本地必须有 `astrbot_plugin_companion_runtime/` 这份克隆；插件缺失时脚本会明确报错，
 而不是悄悄跳过。
+
+**记忆质量仿真**（`scripts/e2e_memory_simulation.py`）是另一层：它不问"接口对不对"，
+只问"它到底记住了什么"。真文件 SQLite(WAL)、出厂默认配置（无模型无密钥）、一个多星期的普通对话，
+25 项检查照着设计文档写：
+
+| 契约 | 判定方式 |
+|---|---|
+| 不是每句话都值得记（§15） | 问候/闲聊/"今天中午吃炒饭"/"嗯" 都不许变成记忆；明确说过的偏好必须记住 |
+| 四类长期记忆（§16） | 偏好 / 稳定知识 / 关系经历 / 情景各自可达，且分类正确 |
+| 修正（§18） | 旧说法被**撤回而不是删除**，新说法记下它取代了谁，角色只相信其中一条 |
+| 两天后还记不记得 | 说过一次的事实两天后仍 `active`，且仍在提示词里 |
+| 淡出≠忘记（§19） | 一周后降为 `low_activation`，但直接相关的问句仍能召回它，召回后回到工作集 |
+| 刚学到的在不在提示词里 | 刚形成的记忆必须出现在 `【必要记忆】` 里（工作集会饱和，不靠排名） |
+| 遗忘不删除（§19） | 所有形成过的记忆都还在，只是状态不同；淡出的不进提示词 |
+| 没有凭空捏造 | 每条记忆都能追溯到用户自己打过的话，原始事件一条不少 |
+
+它只读两个面：**运维面**（`GET /memories`）与**提示词块**（宿主实际拿到的那段）。
+`--fault trivia`（门限归零）与 `--fault no_maintenance`（维护永不运行）用来证明检查会咬。
 
 测试覆盖的重点不是行数，而是**几类容易悄悄坏掉的东西**：
 
