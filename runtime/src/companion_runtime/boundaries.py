@@ -248,21 +248,31 @@ def referent_for(
     """Return what a deictic instruction ("暂时不要跟我说这个") is about.
 
     The boundary rules match the *instruction*, never its object: "这个" points at
-    whatever was being discussed. Three sources are consulted, most precise first:
+    whatever was being discussed. Two sources are consulted, most precise first:
 
     1. **the open matter built from that very message** - a matter records the events
        it came from, so event identity settles it without any text comparison. This is
        the common case and the one text overlap gets wrong: "我明天下午三点面试，结束了
        告诉你" and the matter title "等待面试结果" share exactly one bigram;
     2. **an open matter whose title overlaps what was said** - for a referent that was
-       discussed rather than just promised;
-    3. **the last thing the user said** - used verbatim (truncated) as a last resort.
+       discussed rather than just promised.
 
     With nothing to go on the answer is ``None``, and every caller must treat that as
     "do not guess": an unbound topic boundary constrains nothing until it expires,
     which is the conservative direction. Guessing here would silence a subject the user
     never named, and the delivery-time gate still stops anything that would mention the
     avoided topic by name.
+
+    There used to be a third step - "the last thing the user said", used verbatim and
+    with no overlap requirement - and it was removed because it contradicted this
+    docstring rather than merely being imprecise. Measured consequence: the user wrote
+    "有件事想说清楚，不要一直追问我在干嘛，我不太喜欢被盯着。" and the boundary was bound
+    to the *politeness formula that preceded it* ("谢谢你听我说这些。"), which shares no
+    bigram with the instruction. A wrong binding is worse than none: the boundary looked
+    enforced while `blocks_candidate` could never match it, so the subject it claimed to
+    protect was silently unprotected. A deictic "这个" whose topic is genuinely not
+    recoverable now yields no subject, and the honest consequence is that this boundary
+    gates nothing - which the delivery-time gate compensates for.
 
     Args:
         previous_events: Earlier user messages, newest first.
@@ -287,7 +297,6 @@ def referent_for(
                 continue
             if len(topic_tokens(text) & topic_tokens(title)) >= DEDUPE_MIN_SHARED_TOKENS:
                 return title
-        return summarize_text(text, 40)
     return None
 
 

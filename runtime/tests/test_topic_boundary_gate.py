@@ -98,12 +98,21 @@ def test_the_referent_can_come_from_a_discussed_matter() -> None:
     assert subject == "等待面试结果"
 
 
-def test_the_referent_falls_back_to_what_was_said() -> None:
-    """With no open matter about it, the last thing the user said is the referent."""
+def test_a_sentence_with_no_matter_and_no_evidence_binds_nothing() -> None:
+    """A previous sentence is *not* by itself the referent - this test used to say it was.
+
+    The version this replaces asserted the fallback ("with no open matter about it, the
+    last thing the user said is the referent") and that fallback was the defect the
+    relationship simulation found: the user wrote "有件事想说清楚，不要一直追问我在干嘛"
+    and the boundary was bound to the politeness formula before it ("谢谢你听我说这些。"),
+    which shares no bigram with the instruction. The boundary then *looked* enforced while
+    `blocks_candidate` could never match it. Binding free text with no shared evidence is
+    worse than binding nothing, so the expectation is inverted here deliberately.
+    """
     subject = boundary_module.referent_for(
         previous_events=[_event(OTHER_TOPIC)], matters=[]
     )
-    assert subject == OTHER_TOPIC
+    assert subject is None, "a sentence nothing points at must not become the subject"
 
 
 def test_the_referent_is_none_when_there_is_nothing_to_bind() -> None:

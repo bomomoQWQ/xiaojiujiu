@@ -106,9 +106,6 @@ PREFERENCE_MARKERS = (
     "一直",
     "以后",
     "记住",
-    "别再",
-    "不要",
-    "最",
     "对我来说",
     "prefer",
     "always",
@@ -116,6 +113,20 @@ PREFERENCE_MARKERS = (
     "hate",
     "love",
 )
+#: Removed from this table, and why they were wrong rather than merely noisy:
+#:
+#: * ``最`` - a single character, so it matched ``最近``/``最后``/``最好`` and made any
+#:   sentence at all a "preference" ("其实我最近挺难的…" was stored as ``user_preference``,
+#:   four such rows in a two-and-a-half-month run). A one-character marker can never
+#:   decide a kind: it is not a word. ``喜欢`` already covers ``最喜欢``/``最爱``.
+#: * ``别再``/``不要`` - these are *instructions addressed to the character*
+#:   ("不要一直追问我在干嘛" is a boundary declaration), not statements about what the
+#:   user likes. Storing the user's instructions as their preferences is how a
+#:   boundary came to be filed as a durable fact about the user.
+#:
+#: The rule this leaves behind: a marker has to be a word about the user, at least two
+#: characters, and the preference branch is guarded against questions exactly like its
+#: two siblings below.
 
 EMPHASIS_MARKERS = ("记住", "重要", "一定要", "千万", "别忘", "remember", "important")
 
@@ -370,7 +381,10 @@ def propose_from_event(
     kind = MemoryKind.EPISODIC.value
     lowered = text.lower()
     is_question = any(marker in text for marker in QUESTION_MARKERS)
-    if any(marker in lowered for marker in PREFERENCE_MARKERS):
+    # Every branch guards against questions, the preference one included: a question is
+    # not a durable fact about the user, and the missing guard here is what filed
+    # "我喜欢你这件事情，你还记得我说过吗？" as a lasting `user_preference`.
+    if not is_question and any(marker in lowered for marker in PREFERENCE_MARKERS):
         kind = MemoryKind.USER_PREFERENCE.value
     elif not is_question and any(marker in lowered for marker in STABLE_MARKERS):
         kind = MemoryKind.STABLE_KNOWLEDGE.value
