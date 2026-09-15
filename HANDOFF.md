@@ -360,7 +360,31 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
   候选类型（`typing.py`）→ 候选持久化（`projections.py`）→ 巩固时候选转记忆（`memory.consolidate`）
   → 提示词选择（`context.select_memories`/`build`）。半做会让原句彻底丢掉，而这正是你明确不要的
   （"框架要留"）。我选择留下验收测试而不是留下半截实现。
-- 实现要点见下（原样保留）：
+- **实现要点见下（原样保留）：**
+- **照抄即可的文件级清单（本轮已把锚点都探明，约 30 行 / 5 个文件）**：
+  1. `typing.py`：`MemoryCandidate` 加 `structured: dict[str, Any] = field(default_factory=dict)`
+     并写进它的 `to_dict()`（第 515-544 行，字段紧跟在 `confidence` 后）。
+  2. `db.py`：`memory_candidates` DDL 加 `structured_json TEXT NOT NULL DEFAULT '{}'`，
+     并在 `ADDED_COLUMNS` 加一行 `("memory_candidates", "structured_json", "TEXT")`
+     （格式就是 `("表", "列", "类型")`，旁边已有 `boundaries.subject` 那条可照抄；老库原地升级）。
+  3. `projections.py`：`MemoryProjection.upsert_candidate` 的**列清单、VALUES、`ON CONFLICT ... SET`
+     三处**都要加 `structured_json`（值用 `dumps(candidate.structured)`），候选行解码处用
+     `loads(row["structured_json"] or "{}")`。
+  4. `memory.py`：
+     - 新增 `proposition_of(text) -> tuple[str, str | None]`：返回 (命题, 疑问框架或 None)。
+       框架起点用 `(你|您)?(还|都)?记(得|不记得)|记不记得` 这类模式切；**剥完若命题短于 4 字或为空
+       就原样返回**（绝不产出半句话，`FRAME_ONLY` 那条验收测试就是钉这个）。
+     - `propose_from_event`：`summary=summarize_text(proposal)`，并把框架写进
+       `candidate.structured["recall_check"] = frame`（同时可存原句 `["raw_text"]`）。
+       注意它现在只返回**一个**候选，不要改成两个（调用方与测试都按单候选写）。
+     - `consolidate`：它已经在用 `structured=structured` 构造 `Memory`（第 ~550 行），
+       把 `candidate.structured` 并进那个 dict 即可（`.update(candidate.structured)`）。
+  5. `context.py`：`select_memories` 的每个来源在入选前跳过
+     `memory.structured.get("recall_check")` 为真的记忆——这就是"不占那 4 个名额"的落点；
+     它们**仍可被线索召回**（`_retrievable` 不动），只是不参与提示词预算。
+  6. 跑 `runtime/tests/test_question_memories.py`：三条应从 `xfailed` 变成 `passed`，
+     然后**删掉三个 `xfail` 标记**（`strict=True` 会以 XPASS 报错逼你做这件事）。
+- **原口径（用户确认，不要再问）**：
 - 现象：8 条记忆的 summary 就是提问句（如"我喜欢你这件事情，你还记得我说过吗？"）；10 次探针里
   **4 次**的记忆区被提问式记忆占满，而被问起的那条披露**召回引擎确实返回了**
   （`recalled=true`、排名 4/10）**却输给预算**，只进 9/10 次。
