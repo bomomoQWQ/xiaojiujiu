@@ -51,6 +51,7 @@ from .host import DEFAULT_PLUGIN_ROOT, AstrBotHost, Platform, SESSION_DEFAULT
 from .logbook import LogBridge, Logbook
 from .main_llm import (
     BASE_URL_ENV,
+    DEFAULT_SYSTEM_PROMPT,
     MODEL_ENV,
     MainLLM,
     OpenAICompatibleMainLLM,
@@ -124,6 +125,10 @@ class HarnessConfig:
     llm_model: str = ""
     llm_system_prompt: str = ""
     llm_temperature: float = 0.8
+    llm_max_tokens: int = 800
+    llm_timeout_s: float = 60.0
+    #: Which environment variable holds the key. Never a key itself.
+    llm_api_key_env: str = "CF_MAIN_LLM_API_KEY"
     #: Partial overrides of the Runtime's 8 value axes -- the personality compiled
     #: into dynamics. Applied when the runtime row is created, so it only takes
     #: effect on a fresh run directory (see :meth:`Harness._apply_values`).
@@ -627,12 +632,16 @@ class Harness:
 
     def _build_llm(self) -> None:
         """Build the acting layer: a real endpoint when configured, else a stand-in."""
-        configured = OpenAICompatibleMainLLM.from_env(
-            logbook=self.logbook,
-            base_url=self.config.llm_base_url or None,
-            model=self.config.llm_model or None,
-            system_prompt=self.config.llm_system_prompt or None,
+        key = os.environ.get(self.config.llm_api_key_env, "")
+        configured = OpenAICompatibleMainLLM(
+            self.config.llm_base_url,
+            model=self.config.llm_model,
+            api_key=key,
+            system_prompt=self.config.llm_system_prompt or DEFAULT_SYSTEM_PROMPT,
             temperature=self.config.llm_temperature,
+            max_tokens=self.config.llm_max_tokens,
+            timeout_s=self.config.llm_timeout_s,
+            logbook=self.logbook,
         )
         if configured.configured:
             self.llm = configured

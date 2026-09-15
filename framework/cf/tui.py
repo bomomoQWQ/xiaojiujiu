@@ -169,17 +169,36 @@ class ChatTUI:
 
     # ------------------------------------------------------------------- loop
 
-    def banner(self, *, llm: Mapping[str, Any], runtime_url: str) -> None:
-        """Print the opening banner: who is talking, and to what."""
+    def banner(
+        self,
+        *,
+        llm: Mapping[str, Any],
+        runtime_url: str,
+        persona: Any = None,
+        config_path: Any = None,
+    ) -> None:
+        """Print the opening banner: who is talking, as whom, and to what."""
         model = llm.get("model") or "(未配置)"
         endpoint = llm.get("base_url") or "(未配置)"
-        self._write(
-            f"{BOLD if self.tty else ''}小九九 · 外接框架聊天窗口{RESET if self.tty else ''}\n"
-            f"  Runtime   : {runtime_url}\n"
-            f"  主 LLM    : {model} @ {endpoint}\n"
-            f"  会话      : {self.session.umo}\n"
-            f"  输入 /help 看命令，/quit 退出。"
-        )
+        lines = [
+            f"{BOLD if self.tty else ''}小九九 · 外接框架聊天窗口{RESET if self.tty else ''}",
+            f"  Runtime   : {runtime_url}",
+            f"  主 LLM    : {model} @ {endpoint}",
+        ]
+        if persona is not None and getattr(persona, "name", ""):
+            where = f" — {persona.description}" if getattr(persona, "description", "") else ""
+            lines.append(f"  人格      : {persona.name}{where}")
+            overrides = getattr(persona, "values", {}) or {}
+            if overrides:
+                shown = ", ".join(f"{k}={v:g}" for k, v in sorted(overrides.items()))
+                lines.append(f"  价值观    : {shown}")
+            else:
+                lines.append("  价值观    : 库默认（未覆盖任何轴）")
+        if config_path is not None:
+            lines.append(f"  配置      : {config_path}")
+        lines.append(f"  会话      : {self.session.umo}")
+        lines.append("  输入 /help 看命令，/quit 退出。")
+        self._write("\n".join(lines))
 
     def run(self) -> int:
         """Read, act, print -- until the operator leaves."""

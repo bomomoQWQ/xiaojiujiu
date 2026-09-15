@@ -28,6 +28,13 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .harness import DEFAULT_PROGRAM_SRC, Harness, HarnessConfig
+from .config import (
+    VALUE_AXES,
+    ClientConfig,
+    ConfigError,
+    load_client_config,
+    write_example,
+)
 from .host import DEFAULT_PLUGIN_ROOT
 from .logbook import Logbook
 from .mock_openai import MockReply, MockScript
@@ -426,29 +433,72 @@ def _print_variables(variables: dict[str, Any]) -> None:
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
-    """Open a chat window: you talk to the main LLM, the Runtime works behind it."""
-    run_dir = Path(args.run_dir) if args.run_dir else DEFAULT_RUNS_DIR / time.strftime("%Y%m%d-%H%M%S")
+    """Open a chat window: you talk to the main LLM, the Runtime works behind it.
+
+    Settings come from three layers, nearest first: the command line, the
+    ``--config`` file, the built-in defaults. The value axes are **merged** rather
+    than replaced, so ``--values user_care=0.9`` adjusts the active persona
+    instead of silently discarding the other seven axes it configured.
+    """
+    try:
+        file_config = load_client_config(args.config, persona=args.persona) if args.config else ClientConfig()
+    except ConfigError as exc:
+        print(f"配置有问题：{exc}", file=sys.stderr)
+        return 2
+
+    llm = file_config.llm
+    clock = file_config.clock
+    rig = file_config.harness
+    persona = file_config.persona
+
+    # The command line wins, per setting; the config file fills the rest.
+    system_prompt = _pick(args.system_prompt, persona.system_prompt, llm.system_prompt, default="")
+    values = {**persona.values, **(_parse_values(args.values, args.values_file) or {})}
+    semantics = "mock" if args.mock_semantics else rig.semantics
+    chosen_run_dir = _pick(args.run_dir, rig.run_dir)
+    run_dir = Path(chosen_run_dir) if chosen_run_dir else DEFAULT_RUNS_DIR / time.strftime("%Y%m%d-%H%M%S")
+
     config = HarnessConfig(
         run_dir=run_dir,
-        program_src=Path(args.program_src),
+        program_src=Path(_pick(args.program_src, rig.program_src, default=DEFAULT_PROGRAM_SRC)),
         base_dir=Path(args.base_dir) if args.base_dir else None,
-        start_time=args.start_time,
-        time_scale=args.time_scale,
-        step=args.step,
-        heartbeat_interval_s=args.heartbeat_interval,
-        status_interval_s=args.status_interval,
-        seed=args.seed,
-        use_mock_semantics=True,
+        start_time=_pick(args.start_time, clock.start_time),
+        time_scale=float(_pick(args.time_scale, clock.time_scale, default=1.0)),
+        step=_pick(args.step, clock.step),
+        heartbeat_interval_s=float(_pick(args.heartbeat_interval, clock.heartbeat_interval_s, default=1.0)),
+        status_interval_s=float(_pick(args.status_interval, clock.status_interval_s, default=2.0)),
+        seed=_pick(args.seed, rig.seed, default=20260915),
+        use_mock_semantics=semantics != "disabled",
         echo_logs=False,
-        llm_base_url=args.llm_base_url,
-        llm_model=args.llm_model,
-        llm_system_prompt=args.system_prompt,
-        llm_temperature=args.temperature,
-        plugin_root=Path(args.plugin_root),
-        values=_parse_values(args.values, args.values_file),
-        semantic_from_main_llm=not args.mock_semantics,
+        llm_base_url=_pick(args.llm_base_url, llm.base_url, default=""),
+        llm_model=_pick(args.llm_model, llm.model, default=""),
+        llm_system_prompt=system_prompt,
+        llm_temperature=float(_pick(args.temperature, llm.temperature, default=0.8)),
+        llm_max_tokens=int(_pick(args.max_tokens, llm.max_tokens, default=800)),
+        llm_timeout_s=float(_pick(args.timeout_s, llm.timeout_s, default=60.0)),
+        llm_api_key_env=_pick(args.api_key_env, llm.api_key_env, default="CF_MAIN_LLM_API_KEY"),
+        plugin_root=Path(_pick(args.plugin_root, rig.plugin_root, default=str(DEFAULT_PLUGIN_ROOT))),
+        values=values,
+        semantic_from_main_llm=semantics == "main_llm",
     )
+
     harness = Harness(config)
+    if file_config.source_path is not None:
+        harness.logbook.event(
+            "config_loaded",
+            {
+                "path": str(file_config.source_path),
+                "persona": persona.name,
+                "persona_description": persona.description,
+                "values_overridden": persona.values,
+                "personas_available": sorted(file_config.personas),
+                "semantics": semantics,
+            },
+            message=(
+                f"[config] {file_config.source_path.name} persona={persona.name} "
+                f"({len(persona.values)} 个轴被覆盖)"
+            ),
+        )
     try:
         harness.start()
     except RuntimeError as exc:
@@ -459,21 +509,27 @@ def cmd_chat(args: argparse.Namespace) -> int:
     tui = ChatTUI(
         platform=harness.platform,
         clock=harness.clock,
-        send=lambda text, session: harness.user_turn(text, session),
+        send=lambda text, umo: harness.user_turn(text, umo),
         status_provider=harness.last_variables,
         control={
-            "beat": lambda _arg: f"心跳 {harness.beat_now() and ''}完成",
+            "beat": lambda _arg: "心跳完成",
             "endogenous": lambda _arg: json.dumps(harness.endogenous({}), ensure_ascii=False)[:400],
             "status": lambda _arg: json.dumps(harness.status(), ensure_ascii=False, indent=2, default=str)[:4000],
         },
+        session_name=rig.session or "default",
         tty=None if not args.no_tty else False,
     )
-    tui.banner(llm=harness.llm.describe() if harness.llm is not None else {}, runtime_url=harness.base_url)
+    tui.banner(
+        llm=harness.llm.describe() if harness.llm is not None else {},
+        runtime_url=harness.base_url,
+        persona=persona,
+        config_path=file_config.source_path,
+    )
     if not getattr(harness.llm, "configured", False):
         print(
             "注意：没有配置主 LLM 端点，当前用确定性替身，回复不代表真模型。\n"
             "      设 CF_MAIN_LLM_BASE_URL / CF_MAIN_LLM_MODEL / CF_MAIN_LLM_API_KEY，\n"
-            "      或传 --llm-base-url / --llm-model，即可接真模型。",
+            "      或传 --llm-base-url / --llm-model，或用 --config 指定配置文件。",
             file=sys.stderr,
         )
     try:
@@ -486,17 +542,30 @@ def cmd_chat(args: argparse.Namespace) -> int:
         print(f"日志：{run_dir}/framework.log  轨迹：{run_dir}/trace.jsonl")
 
 
-#: The Runtime's eight value axes, with the library default and what each one moves.
-VALUE_AXES: dict[str, tuple[float, str]] = {
-    "autonomy": (0.72, "自我推进的意愿：越高越容易自己决定开口"),
-    "boundary_respect": (0.88, "对边界的敬畏：越高越不容易越线，也越容易被拒绝压住"),
-    "emotional_expression": (0.46, "情绪外露：越高情绪越直接地写在话里"),
-    "relationship_maintenance": (0.79, "关系维护：越高越会在长期沉默后主动靠近"),
-    "user_care": (0.85, "对用户的在意：越高越会被对方的未结之事推动"),
-    "conflict_directness": (0.41, "冲突直率：越高越倾向于把话挑明"),
-    "stability_commitment": (0.81, "稳定承诺：越高越不容易被单次波动带偏"),
-    "curiosity": (0.76, "好奇：越高越容易想追问、想了解"),
-}
+def cmd_config_init(args: argparse.Namespace) -> int:
+    """Write a commented example configuration."""
+    try:
+        written = write_example(Path(args.path), force=args.force)
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(f"已写入 {written}")
+    print(f"改完用 `cf chat --config {written}` 启动；`cf config show --config {written}` 看解析结果。")
+    return 0
+
+
+def cmd_config_show(args: argparse.Namespace) -> int:
+    """Print the resolved configuration, so the layering is never a guess."""
+    try:
+        config = load_client_config(args.config, persona=args.persona)
+    except ConfigError as exc:
+        print(f"配置有问题：{exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(config.to_dict(), ensure_ascii=False, indent=2))
+    prompt = config.persona.system_prompt or config.llm.system_prompt
+    print(f"\n--- 生效的 system prompt（来自 {config.persona.source or '（空）'}）---")
+    print(prompt if prompt else "（没有配置任何人格提示词，将使用框架内置的默认人格）")
+    return 0
 
 
 def _parse_values(inline: str, path: str) -> dict[str, float]:
@@ -523,9 +592,25 @@ def _parse_values(inline: str, path: str) -> dict[str, float]:
         values[key.strip()] = float(raw_value)
     unknown = sorted(set(values) - set(VALUE_AXES))
     if unknown:
-        lines = "\n".join(f"  {name:<26} 默认 {default:<5} {doc}" for name, (default, doc) in VALUE_AXES.items())
+        lines = "\n".join(
+            f"  {name:<26} 默认 {default:<5} {doc}" for name, (default, doc) in VALUE_AXES.items()
+        )
         raise SystemExit(f"未知的价值观轴：{', '.join(unknown)}\n可用的轴：\n{lines}")
     return values
+
+
+def _pick(*candidates: Any, default: Any = None) -> Any:
+    """Return the first candidate that is neither ``None`` nor an empty string.
+
+    Layers the three sources of a setting: the command line wins over the config
+    file, which wins over the built-in default. The config-affected flags default
+    to ``None`` precisely so "not given" is distinguishable from "given the same
+    value as the default".
+    """
+    for value in candidates:
+        if value is not None and value != "":
+            return value
+    return default
 
 
 # --------------------------------------------------------------------------- cli
@@ -627,29 +712,45 @@ def build_parser() -> argparse.ArgumentParser:
     backlog.set_defaults(func=cmd_backlog)
 
     chat = sub.add_parser("chat", help="打开聊天窗口：你和主 LLM 对话，Runtime 在后台工作")
+    chat.add_argument("--config", default="", help="客户端配置文件（.toml/.json）；命令行参数优先于它")
+    chat.add_argument("--persona", default="", help="启用哪个命名人格档案（见配置文件）")
     chat.add_argument("--run-dir", default="", help="本次运行的产物目录（默认 runs/<时间戳>）")
-    chat.add_argument("--program-src", default=DEFAULT_PROGRAM_SRC)
-    chat.add_argument("--plugin-root", default=str(Path(DEFAULT_PLUGIN_ROOT)), help="AstrBot 插件仓库位置")
+    chat.add_argument("--program-src", default=None, help="原程序 src 目录（默认读配置或 ../runtime/src）")
+    chat.add_argument("--plugin-root", default=None, help="AstrBot 插件仓库位置")
     chat.add_argument("--base-dir", default="")
     chat.add_argument("--start-time", default=None, help="虚拟起始时间（ISO-8601）")
-    chat.add_argument("--time-scale", type=float, default=1.0, help="虚拟秒 / 真实秒")
+    chat.add_argument("--time-scale", type=float, default=None, help="虚拟秒 / 真实秒")
     chat.add_argument("--step", default=None, help="每个心跳推进的时长，如 30m")
-    chat.add_argument("--heartbeat-interval", type=float, default=1.0,
+    chat.add_argument("--heartbeat-interval", type=float, default=None,
                       help="心跳间隔（真实秒）；0 = 关掉，由 /advance 手动推进")
-    chat.add_argument("--status-interval", type=float, default=2.0,
+    chat.add_argument("--status-interval", type=float, default=None,
                       help="状态栏变量刷新间隔（真实秒），与心跳无关")
-    chat.add_argument("--seed", type=int, default=20260915)
+    chat.add_argument("--seed", type=int, default=None)
     chat.add_argument("--llm-base-url", default="", help="主 LLM 端点（默认读 CF_MAIN_LLM_BASE_URL）")
     chat.add_argument("--llm-model", default="", help="主 LLM 模型名（默认读 CF_MAIN_LLM_MODEL）")
     chat.add_argument("--system-prompt", default="", help="角色设定（宿主人格，最高优先级）")
-    chat.add_argument("--temperature", type=float, default=0.8)
+    chat.add_argument("--temperature", type=float, default=None)
     chat.add_argument("--values", default="",
                       help="覆盖人格价值观轴，如 user_care=0.95,emotional_expression=0.8")
     chat.add_argument("--values-file", default="", help="从 JSON 文件读取价值观轴")
     chat.add_argument("--mock-semantics", action="store_true",
                       help="强语义改用框架自带的 mock 端点（默认是与主 LLM 同一个端点）")
     chat.add_argument("--no-tty", action="store_true", help="关掉终端重绘（管道/重定向时用）")
+    chat.add_argument("--max-tokens", type=int, default=None)
+    chat.add_argument("--timeout-s", type=float, default=None, help="主 LLM 单次调用超时")
+    chat.add_argument("--api-key-env", default=None, help="存放 key 的环境变量名（默认 CF_MAIN_LLM_API_KEY）")
     chat.set_defaults(func=cmd_chat)
+
+    config_parser = sub.add_parser("config", help="客户端配置：生成示例 / 查看解析结果")
+    config_sub = config_parser.add_subparsers(dest="config_action", required=True)
+    config_init = config_sub.add_parser("init", help="写一份带注释的示例配置")
+    config_init.add_argument("path", nargs="?", default="cf.toml")
+    config_init.add_argument("--force", action="store_true", help="覆盖已存在的文件")
+    config_init.set_defaults(func=cmd_config_init)
+    config_show = config_sub.add_parser("show", help="打印解析后的最终配置")
+    config_show.add_argument("--config", required=True)
+    config_show.add_argument("--persona", default="")
+    config_show.set_defaults(func=cmd_config_show)
 
     return parser
 

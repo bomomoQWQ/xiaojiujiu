@@ -56,7 +56,8 @@ xiaojiujiu/                       ← 主项目
 | **聊天窗口（TUI）** | `cf/tui.py` | 行式 REPL + 实时状态栏；主动消息会在你打字时插进来 |
 | **主 LLM 客户端** | `cf/main_llm.py` | 标准 OpenAI 兼容客户端，接到宿主主 LLM 的接缝上 |
 | **AstrBot 宿主模拟** | `cf/host.py` | 假平台 + 真插件（拿 AstrBot 桩加载），走真实的 observe→注入→生成→投递→回报 |
-| **人格价值观参数** | `cf/harness.py`、`cf/cli.py` | 8 个轴，`--values` 覆盖；它们是编译进动力学的性格，不是提示词装饰 |
+| **客户端配置文件** | `cf/config.py` | system prompt + 8 个价值观轴打包成**命名人格档案**，可切换；key 只从环境变量读 |
+| **人格价值观参数** | `cf/harness.py`、`cf/cli.py` | 8 个轴，配置或 `--values` 覆盖；它们是编译进动力学的性格，不是提示词装饰 |
 | **可控虚拟时钟** | `cf/clock.py`、`cf/control.py` | 运行中可 `set` / `advance` / `scale` / `freeze`，命令行驱动 |
 | **OpenAI 兼容端点** | `cf/mock_openai.py` | 作为原程序「强语义理解」（`remote_api`）的输入源，可脚本化、可注错 |
 | **跑马日志** | `cf/logbook.py` | 轮转文本日志 + 结构化 JSONL 轨迹，逐条心跳记录变量 |
@@ -102,7 +103,12 @@ export CF_MAIN_LLM_API_KEY=<你的 key>
 
 ```
 — 聊天（推荐） —
+cf config init      写一份带注释的客户端配置模板（连 personas/*.md 一起）
+cf config show      打印解析后的最终配置（--config 必填，--persona 可选）
+
 cf chat             开一个聊天窗口：你和主 LLM 说话，Runtime 在后台工作
+                    --config cf.toml              客户端配置（命令行参数优先于它）
+                    --persona guarded             启用哪个命名人格档案
                     --llm-base-url / --llm-model  覆盖端点（默认读 CF_MAIN_LLM_*）
                     --system-prompt               角色设定（宿主人格，最高优先级）
                     --values user_care=0.9,...    覆盖人格价值观轴（见 §6）
@@ -225,7 +231,63 @@ cf run --script 'json:{"reinterpretations":[]}'
 
 ---
 
-## 6. 人格：8 个价值观轴
+## 6. 客户端配置与人格
+
+### 6.1 生成并查看
+
+```bash
+cf config init cf.toml          # 写一份带注释的模板，连 personas/*.md 一起
+cf config show --config cf.toml # 看解析后的最终结果（含生效的提示词）
+cf chat --config cf.toml
+cf chat --config cf.toml --persona guarded     # 换人格
+```
+
+配置文件配的是**实验**（谁在演、演谁、时间从哪开始、产物写哪），
+Runtime 自己的 `runtime.toml` 配的是**被测对象**。分开是为了让"这次改动属于被测物还是测试台"永远可回答。
+
+优先级：**命令行 > 配置文件 > 内置默认**。价值观是**合并**不是替换，所以
+`--values user_care=0.9` 只调这一个轴，不会把人格档案里其他七个轴丢掉。
+
+### 6.2 命名人格档案
+
+一个角色 = 一段 system prompt **加上**和它相配的价值观轴。两者分开配很容易打架——
+写成话痨、参数却是克制型，结果就是"说暖话但不跟进"。所以打包成档案：
+
+```toml
+[persona]
+active = "gentle"
+
+[persona.profiles.gentle]
+description = "温和、主动、在意对方"
+system_prompt_file = "personas/gentle.md"   # 长提示词放文件里
+[persona.profiles.gentle.values]
+user_care = 0.95
+emotional_expression = 0.80
+boundary_respect = 0.60
+
+[persona.profiles.guarded]
+system_prompt = """..."""                   # 也可以直接内联
+[persona.profiles.guarded.values]
+boundary_respect = 0.96
+conflict_directness = 0.15
+```
+
+* `system_prompt_file` 相对**配置文件所在目录**解析，不是相对当前工作目录——
+  只在某个目录下能用的配置，做成服务就会坏。
+* **未被启用的档案缺提示词文件不会阻塞启动**，只有你真的切到它才报错。
+  一个没写完的人格不该让你连好用的那个都用不了。
+* 轴名打错会**列出全部可用轴**；数值超出 0..1 直接拒绝。
+
+### 6.3 凭据
+
+**key 绝不写进配置文件。** 只从 `[llm].api_key_env` 指定的环境变量读（默认
+`CF_MAIN_LLM_API_KEY`）。文件里出现 `api_key` / `token` / `secret` 这类键会被**拒绝加载**，
+报错只指出键的路径、绝不回显值。`max_tokens` 这种含 "token" 的普通键不会被误伤
+（按词边界判断，不是按子串）。
+
+---
+
+## 7. 人格：8 个价值观轴
 
 架构文档 §4.2 把人格定义为**编译进动力学的数值**，而不是提示词里的一段形容。Runtime 有 8 个轴：
 
@@ -264,7 +326,7 @@ cf chat --values-file persona.json        # {"user_care": 0.98, ...}
 
 ---
 
-## 7. 日志里有什么
+## 8. 日志里有什么
 
 每次运行产出两个文件（都在 `--run-dir` 下）：
 
@@ -311,12 +373,12 @@ quiet_hours                                      是否落在免打扰时段
 
 ---
 
-## 8. 跑测试
+## 9. 跑测试
 
 ```bash
 cd framework
 PY="$(cd ../runtime && pwd)/.venv/bin/python"
-"$PY" -m pytest tests          # 178 passed
+"$PY" -m pytest tests          # 227 passed
 ```
 
 | 文件 | 覆盖 | 需要原程序 |
@@ -327,19 +389,21 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"
 | `test_harness_e2e.py` | 真程序端到端：接线、纪元、变量一致、故障降级、源码未改动 | **是** |
 | `test_cli.py` | 子进程跑 `cf run`，再用客户端命令驱动它（时间、tick、say、refresh、backlog、tail、shutdown） | **是** |
 | `test_main_llm.py` | OpenAI 客户端：请求形状、密钥不入日志、失败降级、reply/render 分流 | 否 |
+| `test_config.py` | 客户端配置：两种格式、凭据拒绝、命名人格、提示词文件、模板开箱可用 | 否 |
 | `test_host.py` | 假平台、事件桩、AstrBot 三接口；端到端驱动**真插件**；价值观轴生效 | 部分 |
 
 后两个文件在原程序不可用时会自动 skip，所以只装框架也能跑前三个。
 
 ---
 
-## 9. 目录
+## 10. 目录
 
 | 路径 | 说明 |
 |---|---|
 | `cf/tui.py` | 聊天窗口：行式 REPL、实时状态栏、主动消息插入、斜杠命令 |
 | `cf/host.py` | AstrBot 宿主模拟：假平台 + 真插件 + 真实钩子顺序 |
 | `cf/main_llm.py` | 主 LLM：OpenAI 兼容客户端 + 无端点时的确定性替身 |
+| `cf/config.py` | 客户端配置：命名人格档案、价值观轴、凭据拒绝 |
 | `cf/clock.py` | 可控时钟 + `install_process_clock`（重绑 `utcnow` / `utc_now_iso`） |
 | `cf/logbook.py` | 轮转日志、JSONL 轨迹、`LogBridge`（原程序日志桥接） |
 | `cf/mock_openai.py` | OpenAI 兼容端点、grounded 默认回复、`MockScript` / `MockReply` 注错 |
@@ -352,7 +416,7 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"
 
 ---
 
-## 10. 已知边界
+## 11. 已知边界
 
 * **不是黑盒**：为了完整接管时间，原程序被导入本进程（见 §4）。它仍然不被修改，但共享进程。
 * **单进程单 harness**：同时跑两个 harness 需要各自的 venv 或进程，因为 `install_process_clock`
@@ -366,11 +430,11 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"
   （框架会记一条 `heartbeat_disabled`）。
 * **危险率是逐拍抽样的**，一次跳 30 小时只是抽了一次。要演"离开两天"就分成小步走
   （黑盒仿真用约 1.4 小时/步），否则你会以为它不主动，其实只是样本太少。
-* **价值观参数只在创建运行时那一行时写入**，见 §6。
+* **价值观参数只在创建运行时那一行时写入**，见 §7。
 
 ---
 
-## 11. 构建过程中发现的、属于原程序的现象
+## 12. 构建过程中发现的、属于原程序的现象
 
 框架不改原程序，但把它当被测对象时发现了两处值得记录的东西（详见 `cf/harness.py` 的注释）：
 
