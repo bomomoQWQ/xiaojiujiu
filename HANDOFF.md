@@ -326,15 +326,24 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
 
 ### 未完成（异地继续时从这里接）
 
-**#1 原始事件镜像不完整**（最严重，未修）—— `runtime/src/companion_runtime/eventlog.py`
+**#1 原始事件镜像不完整**（最严重，**未修，但已在套件里有最小复现**）
+—— `runtime/src/companion_runtime/eventlog.py`
 - 现象：`backend/raw_events.jsonl` **320 行** vs `/health.raw_events` **393**；
   **全部 51 条 `user_message`、11 条 `proactive_sent`、11 条 `assistant_message` 都不在镜像里**，
   且 `diagnostics.log` 无任何警告（`Discarding`/`Could not write` 零命中）。镜像 docstring 与
   `runtime/README.md` 都承诺它是事件日志的忠实前缀 → **灾备/审计工件在悄悄撒谎**。
-- 下一步：先查**机制**（为什么恰好这三类缺失——是否存在第二条写入路径绕过了镜像，例如批量/ingest
-  路径；或某些类型只写库不写文件）；再定契约（"每个事件都写"或"文档化为子集"）；再定
-  **写失败时怎么办**（现在静默吞掉是不可接受的）。回归测试应**枚举事件类型**而不是列两个，
-  以防未来新增类型再漏。
+- **最小复现（在进程内，不需要仿真）**：`runtime/tests/test_event_mirror.py::test_every_event_reaches_the_mirror`，
+  标了 `xfail(strict=True)`——缺陷在时它是"预期失败"，一旦修好会变成 XPASS 并**报错逼人删掉标记**。
+  实测：库内 **12** 条事件 vs 镜像 **4** 行（`user_message` 3→0、`system` 6→3、`proactive_committed` 3→1）。
+  复现脚本（未纳入版本控制）：`.scratch_blackbox/probe_mirror.py`，注意**测试夹具默认关掉镜像**
+  （`conftest.build_config` 里 `mirror_raw_events = False`），探针必须显式打开才看得到。
+- **结论与线索**：丢失**不是按事件类型设计成子集**，而是**事务内追加的事件整批不写**。
+  最强线索在 `EventLog._mirror_after_commit`：frame **以事务深度为键**，且只有 frame 的
+  *第一个* 事件会注册 flush 钩子（`already_scheduled`）——若某个 frame 活得比创建它的事务更久，
+  后续事件会被塞进这个 frame 而**没有钩子再去写它**。这是**假设，不是结论**，修的人必须先证实它。
+- 下一步：先证实/推翻上面的假设（可在 `_flush_mirror`/`_discard_frame` 打点，或让 frame 带一个
+  "已注册钩子/所属事务令牌"的标识）；再定契约（"每个事件都写"还是"文档化为子集"）；
+  再定**写失败时怎么办**（现在静默吞掉不可接受）。回归测试要**枚举事件类型**而不是列两个。
 
 **#3 + #5 用户提问进长期记忆 / 提问式记忆挤占 4 个名额**（用户已定口径，未实现）
 - 现象：8 条记忆的 summary 就是提问句（如"我喜欢你这件事情，你还记得我说过吗？"）；10 次探针里
