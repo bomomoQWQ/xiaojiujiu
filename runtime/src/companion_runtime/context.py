@@ -507,7 +507,17 @@ def render_block(bundle: ContextBundle) -> str:
     if bundle.intent:
         closed = bool(bundle.intent.get("closed"))
         lines.append(SECTION_INTENT if not closed else SECTION_SITUATION_INTENT)
-        lines.append(f"- 想做的事：{bundle.intent.get('intent')}")
+        # The label differs between the two cases on purpose: a render prompt states
+        # what to write now with the same "- 想做的事：" line, and an identically
+        # labelled *background* line above it is read as the instruction by whatever
+        # reads first. That happened in practice - a check-up reminder in one chat was
+        # written about the interview the character had last wanted to mention - so the
+        # stale intent is marked as background rather than repeating the live label.
+        lines.append(
+            f"- 想做的事：{bundle.intent.get('intent')}"
+            if not closed
+            else f"- 之前想做的事（背景，不是现在的任务）：{bundle.intent.get('intent')}"
+        )
         if bundle.intent.get("goal"):
             lines.append(f"- 目的：{bundle.intent.get('goal')}")
         lead = bundle.intent.get("lead_seconds_before_user_message")

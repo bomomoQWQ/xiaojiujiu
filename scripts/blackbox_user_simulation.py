@@ -2365,24 +2365,22 @@ def phase_isolation(story: Story, ctx: "Context") -> None:
         f"expected>=1 actual={len(b_proactives)} window={window_b.start.isoformat()}.."
         f"{window_b.end.isoformat()}",
     )
-    # The other direction: a message delivered into the second chat should be *written*
-    # about the second chat's business. This is reported, not asserted, because the
-    # wording is produced by the harness's own stub LLM rather than by the Runtime, and
-    # the two sides currently disagree: every group-chat row in the database carries
-    # intent "询问等待检查结果" (and its render prompt contains no mention of the exam),
-    # yet the delivered sentence says "询问等待考试结果". Until that is explained,
-    # asserting on the phrasing would be asserting on the stub. The Runtime-side
-    # property - the render prompt does not carry another chat's matter - is asserted
-    # directly in `runtime/tests/test_obligation_subject_and_routing.py`
-    # (``TestAProactivePromptStaysInItsChat``).
+    # The other direction: a message delivered into the second chat must be *written*
+    # about the second chat's business. This used to fail for a real reason: the render
+    # prompt carried two identically labelled "- 想做的事：" lines - the background
+    # block's stale intent (the exam, raised in the other chat) above the instruction
+    # for this message - and the first one wins for any reader, real model or stub. The
+    # block now labels the stale intent as background ("之前想做的事（背景，不是现在的任务）"),
+    # so the instruction is the only line that looks like one.
     foreign = [
         {"at": turn.at.isoformat(), "text": turn.text}
         for turn in b_proactives
         if any(word in turn.text for word in ("考试", "面试"))
     ]
-    story.ops_note(
-        "wording of the second chat's unprompted messages (not asserted: see the comment)",
-        _short(foreign) or f"{len(b_proactives)} message(s), none naming the first chat's subject",
+    V.check(
+        "a reminder delivered into the second chat is about that chat's own business",
+        not foreign,
+        _short(foreign) or f"{len(b_proactives)} unprompted message(s), none off-topic",
     )
     a_messages = story.recorder.between(a_quiet_start, story.clock.now(), SESSION_A)
     a_proactives = [turn for turn in a_messages if turn.kind == "proactive"]

@@ -385,6 +385,24 @@ def _context_text(
         return ""
 
 
+def _drop_intent_lines(block: str) -> str:
+    """Remove the background block's own intent line from a render prompt.
+
+    A render prompt states what to write with ``- 想做的事：…``. The background block
+    carries the Runtime's current intent under the same label, and a reader (a real
+    model as much as the test stub) takes the *first* one it finds - which is the
+    block's, i.e. whatever the character last wanted to say. That is how a check-up
+    reminder in one chat came out worded about an interview from another. The render
+    instruction below is the only line that may look like one.
+    """
+    kept = [
+        line
+        for line in (block or "").splitlines()
+        if not line.strip().startswith("- 想做的事：")
+    ]
+    return "\n".join(kept).strip()
+
+
 def _scope_matters(runtime: Any, bundle: Any, *, conversation_id: str) -> None:
     """Keep only the open matters that belong to ``conversation_id``.
 
@@ -607,6 +625,7 @@ def _render_payload(
     block = _context_text(
         runtime, now, conversation_id=_text(getattr(item, "conversation_id", "")).strip() or None
     )
+    block = _drop_intent_lines(block)
     if block:
         lines.extend([block, ""])
     lines.append("【现在要写的话】")
