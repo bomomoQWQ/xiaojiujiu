@@ -368,7 +368,7 @@ python scripts\e2e_patch_v02.py                      # 28 项基础真机检查
 python scripts\e2e_resilience_simulation.py --base-dir E:\companion_runtime_backup\resilience-final
                                                      # 335 项高仿真检查（并发 / 重启 / 断网恢复）
 python scripts\blackbox_user_simulation.py --base-dir E:\companion_runtime_backup\blackbox
-                                                     # 69 项用户黑盒检查（见下）
+                                                     # 70 项用户黑盒检查（见下）
 ```
 
 **用户黑盒仿真**（`scripts/blackbox_user_simulation.py`）是这套验证里最"像用户"的一层：

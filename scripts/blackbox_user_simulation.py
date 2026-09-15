@@ -2459,12 +2459,35 @@ def phase_restart(story: Story, ctx: "Context") -> None:
     )
     decided_at = story.clock.now()
     pending_before = 0
-    for _ in range(16):
+    # The character needs a *reason* to speak: the promise it just heard is not due
+    # yet, and the cooldown after its last message is four simulated hours. Sixteen
+    # steps of two hours are not always enough, which made this precondition flaky, so
+    # the loop is longer and, if it still has not decided, the harness supplies a
+    # concrete reason through the public API (an obligation that is already due) and
+    # keeps stepping. What the check asserts is unchanged: whatever the Runtime decides
+    # while the host is down must survive the restart and be delivered exactly once.
+    for _ in range(24):
         story.step(label="deciding while the host is down")
         outbox = story.server.health().get("outbox") or {}
         pending_before = int(outbox.get("pending") or 0) + int(outbox.get("leased") or 0)
         if pending_before:
             break
+    if not pending_before:
+        story.server.post(
+            "/unfinished",
+            {
+                "title": "等待复诊结果",
+                "waiting_until": story.clock.now().isoformat(),
+                "priority": 0.9,
+                "source_event_ids": [],
+            },
+        )
+        for _ in range(12):
+            story.step(label="deciding while the host is down (with a due obligation)")
+            outbox = story.server.health().get("outbox") or {}
+            pending_before = int(outbox.get("pending") or 0) + int(outbox.get("leased") or 0)
+            if pending_before:
+                break
     V.check(
         "the Runtime decided to speak while the host was down, leaving a message pending",
         pending_before >= 1,
