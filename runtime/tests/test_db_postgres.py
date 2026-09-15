@@ -325,15 +325,24 @@ def test_postgres_database_declares_its_dialect() -> None:
     assert PostgresDatabase.describe is not DatabaseBase.describe
 
 
-def test_the_driver_is_needed_only_to_connect() -> None:
-    """The lexer, the schema checks and the class itself import without psycopg."""
+def test_the_driver_is_needed_only_to_connect(monkeypatch) -> None:
+    """The lexer, the schema checks and the class itself import without psycopg.
+
+    The equality below restates the module's own definition
+    (``PSYCOPG_AVAILABLE = psycopg is not None``) and, on a machine where the driver
+    *is* installed, the rest of the old test never ran at all. The missing-driver
+    case is therefore simulated instead of left to the host.
+    """
     assert PSYCOPG_AVAILABLE == (db_postgres.psycopg is not None)
-    if PSYCOPG_AVAILABLE:
-        return
+    monkeypatch.setattr(db_postgres, "psycopg", None)
     store = PostgresDatabase("postgresql://postgres:sekrit@127.0.0.1:55432/runtime")
     try:
-        # Without the driver the store still describes itself instead of raising.
+        # Construction stays lazy without the driver...
+        assert store.busy_timeout_ms == 5000
+        # ...and the store describes itself instead of raising.
         assert "psycopg" in str(store.describe()["error"])
+        # The driver-free parts still work.
+        assert db_postgres.translate_placeholders("SELECT ? AS a") == "SELECT %s AS a"
     finally:
         store.close()
 

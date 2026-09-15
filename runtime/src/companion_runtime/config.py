@@ -85,12 +85,19 @@ class ServerConfig:
 class StorageConfig:
     """Where the Runtime keeps its state.
 
-    Two backends are supported and they are deliberately equivalent: SQLite (the
-    default, a single file that can be snapshotted and shipped) and PostgreSQL
-    (chosen when ``dsn`` is set, for deployments that want a network database,
-    several Runtime processes or the operational tooling around a server). The
-    schema, the column types and the transaction semantics are the same on both,
-    so a deployment can move between them without a data-shape change.
+    Two backends are supported and they are deliberately equivalent in *shape*:
+    SQLite (the default, a single file that can be snapshotted and shipped) and
+    PostgreSQL (chosen when ``dsn`` is set, for deployments that want a network
+    database, several Runtime processes or the operational tooling around a
+    server). The schema, the column types and the transaction semantics are the
+    same on both, so a deployment can move between them without a data-shape
+    change.
+
+    They are not equivalent in *durability tooling*: the checkpoint/verify/backup/
+    restore commands in :mod:`companion_runtime.maintenance` are built on SQLite
+    machinery, so a PostgreSQL deployment has none of them and gets a loud refusal
+    instead (see :attr:`durability_gap_acknowledged`). Everything the Runtime
+    itself needs to read and write works on both.
     """
 
     database_path: str = "./data/runtime.sqlite3"
@@ -103,6 +110,17 @@ class StorageConfig:
     mirror_raw_events: bool = True
     busy_timeout_ms: int = 5000
     wal: bool = True
+    #: Whether the operator has acknowledged that the backend ``dsn`` selects has
+    #: no implementation of the SQLite-only durability commands
+    #: (``checkpoint``/``verify``/``backup``/``restore``: PRAGMA, the WAL
+    #: checkpoint, ``VACUUM INTO`` and file-level copies). Default ``False``, which
+    #: is what a PostgreSQL DSN gets: ``open_database`` then logs one warning naming
+    #: the gap, so it is visible at startup instead of at the first scheduled
+    #: maintenance pass. ``True`` silences that warning and nothing else - it does
+    #: not add an implementation, and every one of those commands still raises
+    #: ``maintenance.DurabilityUnsupported``. Durability of a PostgreSQL deployment
+    #: is the server's own tooling (WAL archiving, pg_basebackup, pg_dump).
+    durability_gap_acknowledged: bool = False
 
     @property
     def is_postgres(self) -> bool:
@@ -264,6 +282,17 @@ class UserModelConfig:
     prior_precision: float = 1.0
     learning_rate: float = 0.35
     forgetting_rate: float = 0.0000025
+    #: Time-based forgetting of the user model's confidence, as a half-life in hours
+    #: (design §28: ``Theta_t ~ N(Theta_{t-1}, Q dt)``). A long silence must make the
+    #: old beliefs less certain, and this is the timescale it happens on: with the
+    #: default, a week without contact halves the confidence accumulated on top of the
+    #: prior, while the beliefs themselves stay where the evidence put them.
+    #:
+    #: Separate from ``forgetting_rate`` on purpose: that one is the per-observation
+    #: nudge applied when a new observation lands, and it is a plain fraction, not a
+    #: rate. One knob with two units was how the time-based path came to be missing
+    #: (there was nothing to read).
+    drift_half_life_hours: float = 168.0
     min_weight: float = 0.02
     explicit_positive_weight: float = 1.0
     explicit_negative_weight: float = 1.0
@@ -271,7 +300,20 @@ class UserModelConfig:
     no_reply_weight: float = 0.06
     slow_reply_weight: float = 0.12
     busy_attribution_floor: float = 0.10
+    #: The reply delay assumed when an observation carries no timing information of
+    #: its own, and the baseline a user starts from before their own reply history
+    #: exists (design §29's baseline normalisation).
     default_reply_delay_seconds: float = 3600.0
+    #: How long a delivered proactive message may go unanswered before the silence
+    #: itself is recorded as evidence (design §22.3). It is *weak* evidence: weight
+    #: ``no_reply_weight`` damped by ``1 - P(busy)``, so a silence during a busy
+    #: stretch teaches almost nothing.
+    #:
+    #: The trade-off is explicit: the attempt is consumed when the silence is
+    #: recorded, so a reply that arrives *after* this horizon is no longer attributed
+    #: to that message (it counts as unprompted contact). Waiting forever would mean
+    #: the model never learns from silence at all, which is the state this replaced.
+    silence_after_hours: float = 36.0
     max_observations_in_memory: int = 400
     conservative_z: float = 1.645
     cold_start_prior_mean: float = 0.10

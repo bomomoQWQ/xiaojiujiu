@@ -569,6 +569,25 @@ def test_hazard_is_zero_for_non_positive_advantage() -> None:
     assert motivation.hazard_rate(0.0, config=config) == pytest.approx(
         config.utility.hazard_base * softplus(0.0), rel=1e-6
     )
+    # The bound above cannot detect a missing sign guard: ``hazard_rate`` is a
+    # strictly positive softplus, so it stays under ``hazard_base * 1.05`` for every
+    # advantage below ~+0.13. What actually keeps a losing candidate silent is the
+    # eligibility filter in ``decide``, so that is what is asserted: no matter how
+    # long the exposure, a negative advantage never accumulates a chance to act.
+    state = RuntimeState()
+    state.approach_impulse = 0.0
+    state.pressure = 0.0
+    state.restraint = 0.9
+    result = _decide(
+        state=state,
+        candidates=[make_candidate(internal_need=0.1, unfinished_relevance=0.0)],
+        elapsed_seconds=1e9,
+    )
+    assert result.outcome.advantage < 0
+    assert result.outcome.hazard == 0.0
+    assert result.outcome.action_probability == 0.0
+    assert result.outcome.acted is False
+    assert result.outcome.reason == "no_candidate_beats_silence"
 
 
 def test_hazard_grows_with_advantage_and_is_smooth() -> None:

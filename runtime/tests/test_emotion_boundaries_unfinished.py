@@ -240,7 +240,30 @@ def test_relation_signals_decay_slower_for_stable_characters() -> None:
     _, created_b = emotion_module.apply_new_emotion_events(
         evaluations=[(event, b)], active=[], state=unstable, config=config
     )
-    assert created_a[0].decay_rate <= created_b[0].decay_rate
+    # ``<=`` used to let this pass with the modulation deleted (both rates would be
+    # the plain config default), so the contract is pinned exactly: stability 1.0
+    # keeps 65% of the rate, stability 0.0 keeps all of it.
+    assert a.relation_signal in {"distance", "uncertain", "guilt", "loss"}, a.relation_signal
+    assert created_a[0].decay_rate < created_b[0].decay_rate
+    assert created_a[0].decay_rate == pytest.approx(config.emotion_decay_rate * 0.65)
+    assert created_b[0].decay_rate == pytest.approx(config.emotion_decay_rate)
+
+    # Control: an event that is not a relation signal does not get the modulation,
+    # so the two characters must hold it for exactly the same time.
+    plain = make_event("面试过啦")
+    plain_stable = emotion_module.appraise_event(plain, state=stable, config=config)
+    plain_unstable = emotion_module.appraise_event(plain, state=unstable, config=config)
+    assert plain_stable.relation_signal not in {"distance", "uncertain", "guilt", "loss"}
+    _, created_plain_stable = emotion_module.apply_new_emotion_events(
+        evaluations=[(plain, plain_stable)], active=[], state=stable, config=config
+    )
+    _, created_plain_unstable = emotion_module.apply_new_emotion_events(
+        evaluations=[(plain, plain_unstable)], active=[], state=unstable, config=config
+    )
+    assert created_plain_stable[0].decay_rate == pytest.approx(
+        created_plain_unstable[0].decay_rate
+    )
+    assert created_plain_stable[0].decay_rate == pytest.approx(config.emotion_decay_rate)
 
 
 # --------------------------------------------------------------------------------------

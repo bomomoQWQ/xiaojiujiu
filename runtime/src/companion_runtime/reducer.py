@@ -58,6 +58,8 @@ from .utility import clamp, delta_seconds, ensure_aware, isoformat, max_datetime
 
 LOGGER = logging.getLogger("companion_runtime.reducer")
 
+
+
 #: Outbox statuses in which a row can still be worked on. A row in one of these
 #: states is the live one for its attempt, and is the row a report belongs to.
 _LIVE_OUTBOX_STATUSES: tuple[str, ...] = (
@@ -228,7 +230,9 @@ class Reducer:
 
     # ------------------------------------------------------------------ proposals
 
-    def process_proposal(self, proposal: protocol_module.Proposal) -> ProposalResult:
+    def process_proposal(
+        self, proposal: protocol_module.Proposal, *, now: datetime | None = None
+    ) -> ProposalResult:
         """Classify and (when allowed) apply one asynchronous proposal.
 
         A ``task_id`` identifies one dispatched task, so a second submission of
@@ -241,6 +245,10 @@ class Reducer:
 
         Args:
             proposal: The submitted result.
+            now: The moment this entry is being processed; it is handed to the
+                Runtime's clock first, so a proposal that lands after a long silence is
+                classified against an up-to-date state rather than against the last
+                tick (design §86.4).
 
         Returns:
             A :class:`ProposalResult`.
@@ -1747,6 +1755,7 @@ class Reducer:
         based_on_version: int,
         source_event_ids: Sequence[str],
         priority: str,
+        now: datetime | None = None,
     ) -> str:
         """Record a background-task snapshot at dispatch time."""
         with self._db.transaction() as conn:

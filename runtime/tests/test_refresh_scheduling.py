@@ -63,6 +63,18 @@ class _Provider:
         return {"provider": self.name, "available": self._available}
 
 
+class _ExplodingProvider(_Provider):
+    """Available, but the remote call itself fails.
+
+    ``_Provider(available=False)`` never reaches the remote call at all - the
+    Runtime rejects it up front - so it cannot make a refresh *fail*.
+    """
+
+    def deep_refresh(self, request: Any, *, timeout_s: float | None = None) -> Any:
+        self.refresh_calls += 1
+        raise RuntimeError("remote model is down")
+
+
 def _runtime(**semantic_overrides: Any) -> Runtime:
     """Build an in-memory Runtime on the simulated timeline.
 
@@ -133,13 +145,27 @@ class TestRefreshRunsUnattended:
             runtime.close()
 
     def test_a_failing_refresh_does_not_break_the_round(self) -> None:
-        """The proactive decision matters more than the refresh."""
+        """The proactive decision matters more than the refresh.
+
+        An *unavailable* provider is rejected before it is ever called, so the old
+        version of this test (``_Provider(available=False)`` plus ``"acted" in
+        decision``) never made anything fail and asserted a key that every decision
+        carries. Here the provider answers that it is available and then raises, so
+        the round's fail-open path is the thing under test.
+        """
         runtime = _runtime()
-        runtime.semantic_provider = _Provider(available=False)
+        provider = _ExplodingProvider()
+        runtime.semantic_provider = provider
         try:
             runtime.process_user_message(content="算了，也没什么。", timestamp=BASE_TIME)
             outcome = runtime.endogenous_round(now=BASE_TIME + timedelta(minutes=5), force=True)
+            assert provider.refresh_calls == 1, "the provider must actually have been asked"
+            assert outcome.deep_refresh["ran"] is False
+            assert outcome.deep_refresh["reason"] == "provider_error"
+            # The round still decided, and the backlog is kept rather than lost.
             assert "acted" in outcome.decision["outcome"]
+            assert outcome.decision["outcome"]["reason"]
+            assert runtime.projections.semantics.unresolved_count() == 1
         finally:
             runtime.close()
 

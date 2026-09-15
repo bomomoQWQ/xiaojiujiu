@@ -432,6 +432,14 @@ class Boundary:
     source_event_id: str | None = None
     revoked_at: datetime | None = None
     note: str | None = None
+    #: What a *topic*-scoped boundary is about, bound when it is declared.
+    #:
+    #: The language rules are deictic - "暂时不要跟我说这个" names nothing - so a scope
+    #: like ``topic_avoid`` is a category until it is tied to a referent. Without this
+    #: field there was nothing to compare a candidate against, which is why topic
+    #: boundaries could only ever be enforced at delivery time. ``None`` means the
+    #: referent could not be established; callers must treat that as "do not guess".
+    subject: str | None = None
 
     def is_active(self, now: datetime) -> bool:
         """Return whether the boundary currently constrains proactive contact.
@@ -464,6 +472,7 @@ class Boundary:
             "source_event_id": self.source_event_id,
             "revoked_at": _iso(self.revoked_at),
             "note": self.note,
+            "subject": self.subject,
         }
 
 

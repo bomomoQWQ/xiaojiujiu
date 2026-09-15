@@ -455,8 +455,50 @@ def test_intent_description_includes_the_lead_time(runtime: Runtime) -> None:
 
 
 def test_select_memories_returns_activation_pool(runtime: Runtime) -> None:
-    """Only activated memories are injected, not the whole database."""
-    assert context_module.select_memories(runtime.projections, limit=4) == []
+    """Only activated memories are injected, not the whole database.
+
+    Asserting an empty list on an empty database proved nothing: ``select_memories``
+    could have been deleted outright. So the pool is populated first - one episodic
+    memory is put on the character's mind, another one is stored but never activated -
+    and the assertion is that exactly the activated one comes back, from the
+    activation source.
+    """
+    from datetime import timedelta
+
+    from companion_runtime.typing import ActivatedMemory, Memory
+
+    with runtime.db.transaction() as conn:
+        runtime.projections.memory.upsert_memory(
+            conn,
+            Memory(
+                memory_id="mem_on_mind",
+                kind="episodic",
+                summary="用户以前提过面试",
+                importance=0.9,
+                confidence=0.8,
+                created_at=BASE_TIME - timedelta(days=3),
+            ),
+        )
+        runtime.projections.memory.upsert_activation(
+            conn, ActivatedMemory(memory_id="mem_on_mind", activation=0.7)
+        )
+        # Stored, but not in the working set: it must stay out of the prompt.
+        runtime.projections.memory.upsert_memory(
+            conn,
+            Memory(
+                memory_id="mem_cold",
+                kind="episodic",
+                summary="用户以前提过咖啡",
+                importance=0.9,
+                confidence=0.8,
+                created_at=BASE_TIME - timedelta(days=3),
+            ),
+        )
+
+    selected = context_module.select_memories(runtime.projections, limit=4)
+    assert [item["memory_id"] for item in selected] == ["mem_on_mind"]
+    assert selected[0]["selection"] == "activation"
+    assert selected[0]["activation"] == pytest.approx(0.7, abs=0.001)
 
 
 def test_build_context_is_json_serialisable(runtime: Runtime) -> None:

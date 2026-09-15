@@ -1,4 +1,4 @@
-﻿"""End-to-end scenario tests.
+"""End-to-end scenario tests.
 
 These mirror the scenario set in the architecture document. Each one drives the
 whole Runtime - foreground path, endogenous round, delivery, feedback - rather
@@ -227,26 +227,71 @@ def test_scenario_3_recent_contact_suppresses_a_second_message(runtime: Runtime)
 
 
 def test_scenario_4_busy_user_does_not_lower_acceptance(runtime: Runtime) -> None:
-    """Six hours of silence from a busy user is nearly no evidence."""
-    runtime.process_user_message(content="这几天工作很多，我可能回得慢", timestamp=BASE_TIME)
-    before = runtime.user_model.predict(
-        action={"type": "contact", "proactive": True},
-        context={"busy_probability": 0.0},
-    ).reply_probability
+    """Six hours of silence from a busy user is nearly no evidence.
 
+    The original version of this test never sent anything: with no delivered
+    attempt there is nothing the user could fail to answer, ``_attribute_user_reply``
+    returns nothing to observe, and ``before`` and ``after`` were the same number by
+    construction. The scenario only means something once the silence is a real
+    reaction to a real message, so the flow is driven all the way: the user says they
+    are busy, the character commits/renders/delivers one message, and six hours pass
+    unanswered. The assertions are on the consequences - one weak, damped piece of
+    evidence lands in the model and acceptance barely moves.
+    """
+    from companion_runtime.typing import CandidateIntent, new_id
+
+    # The scenario is literally "six hours without a reply", so the silence horizon
+    # is aligned with the document instead of the 36h deployment default.
+    runtime.config.user_model.silence_after_hours = 6.0
+    runtime.process_user_message(content="今天工作很多，我可能回得慢", timestamp=BASE_TIME)
+
+    # The character does reach out (committed -> rendered -> delivered); otherwise
+    # there is no message for the user to leave unanswered.
+    candidate = CandidateIntent(
+        candidate_id=new_id("candidate"),
+        type="follow_up",
+        intent="面试怎么样啦？",
+        goal="表达关心",
+        sources=["unfinished:unf_busy"],
+    )
+    with runtime.db.transaction() as conn:
+        runtime.projections.candidates.upsert(conn, candidate)
+        state = runtime.projections.runtime.ensure()
+        attempt_id, _outbox_id = runtime._commit_attempt(
+            conn, chosen=candidate, state=state, now=BASE_TIME
+        )
     service = _service(runtime)
     _drain(service, now=BASE_TIME)
-    runtime.process_user_message(
-        content="还在忙，晚点说", timestamp=BASE_TIME + timedelta(hours=6)
-    )
-    after = runtime.user_model.predict(
-        action={"type": "contact", "proactive": True},
-        context={"busy_probability": 0.0},
-    ).reply_probability
+    assert runtime.projections.attempts.get(attempt_id).state == AttemptState.SENT.value
+    assert service._transport.sent, "the scenario needs a message that really went out"
 
-    # The belief may move slightly, but a busy user's slow reply must not read as
-    # a rejection.
-    assert abs(after - before) < 0.08
+    action = {"type": "contact", "proactive": True}
+    context = {"busy_probability": 0.0}
+    before = runtime.user_model.predict(action=action, context=context)
+
+    # Six hours pass and the user says nothing.
+    runtime.lazy_tick(BASE_TIME + timedelta(hours=6, minutes=1))
+
+    after = runtime.user_model.predict(action=action, context=context)
+    observation = runtime.projections.user_model.observation_for_attempt(attempt_id)
+    assert observation is not None, "an unanswered delivered message must leave evidence"
+    assert observation["outcome_json"]["replied"] is False
+    assert float(observation["outcome_json"]["reply_delay_seconds"]) >= 6 * 3600.0
+
+    # The evidence is damped, not a rejection: six hours of silence is itself a
+    # reason to believe the user is busy, and the weight stays under the weakest
+    # possible signal (``no_reply_weight``), let alone a negative one.
+    busy = float(observation["outcome_json"]["busy_probability"])
+    weight = float(observation["weight"])
+    assert busy >= 0.4, "a six-hour silence is itself evidence that the user is busy"
+    assert 0.0 < weight < runtime.config.user_model.no_reply_weight
+    assert weight <= runtime.config.user_model.no_reply_weight * (1.0 - busy) + 1e-9
+
+    # The evidence must actually reach the model - recording a row is not learning.
+    assert after.observation_count > before.observation_count
+    # ...and it must not read as rejection: acceptance may move a hair, not drop.
+    assert after.reply_probability > before.reply_probability - 0.01
+    assert abs(after.reply_probability - before.reply_probability) < 0.08
 
 
 # --------------------------------------------------------------------------------------
@@ -255,22 +300,44 @@ def test_scenario_4_busy_user_does_not_lower_acceptance(runtime: Runtime) -> Non
 
 
 def test_scenario_5_reappraisal_does_not_rewrite_history(runtime: Runtime) -> None:
-    """New understanding is appended; the original wording stays untouched."""
+    """New understanding is appended; the original wording stays untouched.
+
+    The second message used to be "checked" with
+    ``assert second.relation_signal if hasattr(second, "relation_signal") else True``:
+    :class:`~companion_runtime.runtime.MessageOutcome` has no ``relation_signal``
+    attribute, so the expression was always ``True`` and the line asserted nothing at
+    all. What the scenario actually requires is that the later understanding is a
+    *new* record: a new raw event next to the old one, a new interpretation version
+    that names the version it supersedes, and a reappraisal row - with the original
+    event byte-for-byte intact afterwards.
+    """
     first = runtime.process_user_message(
         content="算了，也没什么", timestamp=BASE_TIME
     )
     original_id = first.event.event_id
     original_content = first.event.content
+    original_timestamp = first.event.timestamp
 
     # A later message reveals that the earlier one mattered more than it seemed.
     second = runtime.process_user_message(
         content="你那时候果然没发现", timestamp=BASE_TIME + timedelta(hours=6)
     )
-    assert second.relation_signal if hasattr(second, "relation_signal") else True
+    # New understanding is an appended event, not an edit of the first one.
+    assert second.event.event_id != original_id
+    assert second.event.content == "你那时候果然没发现"
+    assert second.event.timestamp == BASE_TIME + timedelta(hours=6)
+    assert runtime.events.count(EventType.USER_MESSAGE.value) == 2
+    # Neither event was interpreted on the spot: both stay raw-first (§73).
+    assert runtime.projections.semantics.get(original_id)["semantic_status"] == "unresolved"
+    assert (
+        runtime.projections.semantics.get(second.event.event_id)["semantic_status"]
+        == "unresolved"
+    )
 
-    # Interpretations are versioned, never overwritten.
+    # Interpretations are versioned, never overwritten. The second version names the
+    # first one it supersedes, so the chain is traceable rather than a dangling id.
     with runtime.db.transaction() as conn:
-        runtime.projections.interpretations.add_version(
+        first_version = runtime.projections.interpretations.add_version(
             conn,
             target_kind="event",
             target_id=original_id,
@@ -279,7 +346,7 @@ def test_scenario_5_reappraisal_does_not_rewrite_history(runtime: Runtime) -> No
             source_version=runtime.version(),
             source_event_ids=[original_id],
         )
-        runtime.projections.interpretations.add_version(
+        second_version = runtime.projections.interpretations.add_version(
             conn,
             target_kind="event",
             target_id=original_id,
@@ -287,9 +354,9 @@ def test_scenario_5_reappraisal_does_not_rewrite_history(runtime: Runtime) -> No
             confidence=0.7,
             source_version=runtime.version(),
             source_event_ids=[original_id],
-            supersedes_id="interpretation_1",
+            supersedes_id=first_version["interpretation_id"],
         )
-        runtime.projections.interpretations.add_reappraisal(
+        reappraisal_id = runtime.projections.interpretations.add_reappraisal(
             conn,
             source_event_ids=[original_id],
             previous_interpretation="不确定",
@@ -299,11 +366,28 @@ def test_scenario_5_reappraisal_does_not_rewrite_history(runtime: Runtime) -> No
 
     versions = runtime.projections.interpretations.list_for_target("event", original_id)
     assert [item["interpretation_version"] for item in versions] == [1, 2]
+    assert [item["content"] for item in versions] == [
+        "当时可能存在失望",
+        "现在意识到，昨天可能没有察觉用户的失望",
+    ]
+    # v1 survives next to v2 and v2 points back at it.
+    assert versions[0]["confidence"] == pytest.approx(0.55)
+    assert versions[1]["supersedes_id"] == versions[0]["interpretation_id"]
+    latest = runtime.projections.interpretations.latest("event", original_id)
+    assert latest["interpretation_id"] == second_version["interpretation_id"]
+    assert latest["supersedes_id"] == first_version["interpretation_id"]
+
+    # The reappraisal is readable as what it claims to be, not merely present.
+    reappraisals = runtime.projections.interpretations.list_reappraisals()
+    assert [item["reappraisal_id"] for item in reappraisals] == [reappraisal_id]
+    assert reappraisals[0]["new_interpretation"] == "当时可能存在失望"
+    assert reappraisals[0]["previous_interpretation"] == "不确定"
+    assert reappraisals[0]["source_event_ids"] == [original_id]
 
     # The raw event is byte-for-byte unchanged.
     stored = runtime.events.get(original_id)
     assert stored.content == original_content
-    assert runtime.projections.interpretations.list_reappraisals()
+    assert stored.timestamp == original_timestamp
 
 
 def test_scenario_5b_reappraisal_events_are_append_only(runtime: Runtime) -> None:
@@ -741,7 +825,22 @@ def test_degradation_level_0_runs_with_no_models_at_all(runtime: Runtime) -> Non
         runtime, now=matter.waiting_until + timedelta(hours=1)
     )
     assert "utilities" in decision
-    assert runtime.projections.emotion.list_active() or True
+    # "Fully functional" has to mean the loop closes: the rule-only game scores the
+    # candidates, picks one and commits an attempt.
+    assert decision["acted"] is True, decision
+    assert decision["utilities"], "the rule-only game must actually score candidates"
+    assert all("total" in utility for utility in decision["utilities"])
+    assert runtime.projections.attempts.count_in_flight() == 1
+
+    # No model is configured anywhere, yet the rules still produce persistent
+    # emotional state. The `or True` that used to stand here passed on an empty
+    # projection; the state is now built first, so the assertion can fail.
+    settled = runtime.process_user_message(
+        content="面试过啦！", timestamp=matter.waiting_until + timedelta(hours=2)
+    )
+    assert settled.appraisal_source == "coarse_rule"
+    assert runtime.projections.emotion.list_active(), "the rule layer must write an emotion"
+    assert runtime.state().mood_valence > 0.0
 
 
 def test_runtime_survives_a_broken_round(runtime: Runtime, monkeypatch) -> None:
@@ -768,18 +867,25 @@ def test_state_version_is_monotonic(runtime: Runtime) -> None:
 
 
 def test_two_runtimes_on_one_file_do_not_interleave_writes(tmp_path) -> None:
-    """Optimistic concurrency reports a conflict instead of losing a write."""
+    """Optimistic concurrency reports a conflict instead of losing a write.
+
+    The tick below has to move *forward* on the second Runtime's own clock: a tick
+    that integrates nothing returns without writing (so the clock can be advanced
+    cheaply on every write entry), and it is that later write which makes ``first``'s
+    already-read snapshot stale. An earlier instant is clamped away, and then nothing
+    conflicts.
+    """
     from companion_runtime.db import Database
     from companion_runtime.projections import VersionConflict
 
     path = tmp_path / "shared.sqlite3"
     config_a = build_config()
     config_b = build_config()
-    first = Runtime(config_a, seed=1, database=Database(str(path)))
-    second = Runtime(config_b, seed=2, database=Database(str(path)))
+    first = Runtime(config_a, seed=1, database=Database(str(path)), created_at=BASE_TIME)
+    second = Runtime(config_b, seed=2, database=Database(str(path)), created_at=BASE_TIME)
     try:
         stale = first.state()
-        second.lazy_tick(BASE_TIME + timedelta(minutes=1))
+        second.lazy_tick(second.state().last_tick_at + timedelta(minutes=1))
         with pytest.raises(VersionConflict):
             with first.db.transaction() as conn:
                 first.projections.runtime.write(stale, conn, expect_version=stale.version)

@@ -178,6 +178,40 @@ def test_the_model_actually_receives_the_silence_evidence(runtime: Runtime) -> N
     assert runtime.projections.user_model.observation_for_attempt(attempt_id) is not None
 
 
+def test_a_stated_busy_stretch_softens_the_silence_evidence(runtime: Runtime) -> None:
+    """A user who said they are swamped gets their silence read as workload.
+
+    The reply-attribution path has always consulted the stated-busy markers; this path
+    looked only at how long the silence lasted, so the very same sentence softened a
+    *reply* but not a *silence*. Both are the same question - "did they not answer
+    because of me, or because of their week?" - so both must read the same evidence.
+    """
+    attempt_id = _delivered_attempt(runtime)
+    horizon = runtime.config.user_model.silence_after_hours
+    runtime.process_user_message(
+        content="最近工作很多，可能回得慢一点。",
+        timestamp=BASE_TIME + timedelta(hours=1),
+    )
+
+    _hours(runtime, horizon + 2.0)
+
+    observation = runtime.projections.user_model.observation_for_attempt(attempt_id)
+    assert observation is not None
+    outcome = observation["outcome_json"]
+    state = runtime.state()
+    hours_since_contact = (
+        (BASE_TIME + timedelta(hours=horizon + 2.0)) - state.last_contact_at
+    ).total_seconds() / 3600.0
+    without_the_statement = runtime.user_model.busy_probability(
+        hours_since_contact=hours_since_contact,
+        replied_recently=False,
+        context={"stated_busy": False},
+    )
+    assert float(outcome["busy_probability"]) > without_the_statement, (
+        "the stated workload must raise the busy belief, and with it the damping"
+    )
+
+
 def test_silence_never_closes_something_that_was_never_delivered(runtime: Runtime) -> None:
     """Only a *delivered* message can be ignored; an undelivered one is a different fault."""
     candidate = CandidateIntent(

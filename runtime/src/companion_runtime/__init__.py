@@ -17,7 +17,7 @@ from __future__ import annotations
 
 __all__ = ["__version__", "RUNTIME_API_VERSION"]
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 #: Version of the HTTP/proposal contract exposed to the host framework.
 RUNTIME_API_VERSION = "1"

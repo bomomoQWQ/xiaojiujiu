@@ -642,7 +642,13 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
             source_event_ids=list(payload.get("source_event_ids") or []),
             created_at=_payload_datetime(payload, "created_at"),
         )
-        result = runtime.reducer.process_proposal(proposal)
+        # The moment travels with the request when the host stamped one; an entry that
+        # carries none leaves the clock alone (see ``Reducer``'s entry decorator): the
+        # heartbeat integrates the elapsed time anyway, whereas advancing to the wall
+        # clock here would move a simulated timeline to the real one.
+        result = runtime.reducer.process_proposal(
+            proposal, now=_payload_datetime(payload)
+        )
         return result.to_dict()
 
     @router.post("/tasks", tags=["protocol"])
@@ -654,6 +660,9 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
             based_on_version=int(payload.get("based_on_version") or runtime.version()),
             source_event_ids=list(payload.get("source_event_ids") or []),
             priority=str(payload.get("priority") or Priority.P1_NEAR_REALTIME.value),
+            # The moment travels from the request so this entry can advance the clock
+            # before it decides anything (design §86.4); no moment means no advance.
+            now=_payload_datetime(payload),
         )
         return {"task_id": task_id}
 
@@ -697,6 +706,15 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
     @router.get("/schedule", tags=["scheduler"])
     def schedule(hazard_wake_at: str | None = None) -> dict[str, Any]:
         """Return the next endogenous wake-up plan."""
+        # Deliberately *not* a tick entry. The plan is computed from anchors that are
+        # timestamps (unfinished due, boundary expiry, cooldown, the caller's hazard
+        # wake), not from an integrated drive value, so a query has nothing to gain
+        # from moving the world - and it has something to lose: a poll that advances
+        # the clock changes what the next round decides. The hazard anchor is now the
+        # previous *decision* rather than the previous tick, so no read can consume the
+        # character's waiting window; see ``Runtime._record_decision``.
+        # MUTATION M2: the withdrawn read tick, restored.
+        runtime.tick_for_entry()
         signals = scheduler_module.collect_signals(
             runtime=runtime, now=utcnow(), hazard_wake_at=_optional_datetime(hazard_wake_at, "hazard_wake_at")
         )
@@ -811,6 +829,10 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
     @router.post("/user-model/predict", tags=["inspect"])
     def predict_user(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         """Predict the user's reaction to a hypothetical behaviour."""
+        # Deliberately *not* a tick entry: this inspects the model as it stands. A
+        # caller asking a question must not change the character's behaviour by asking
+        # it, and the model's confidence drift is integrated by the entries that make a
+        # decision (the endogenous round, /authorize), not by an inspection.
         prediction = runtime.user_model.predict(
             action=payload.get("action") or {"type": "contact", "proactive": True},
             context=payload.get("context") or {},

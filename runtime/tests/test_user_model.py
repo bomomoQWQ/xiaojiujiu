@@ -168,15 +168,34 @@ def test_busy_context_lowers_reply_probability() -> None:
 
 
 def test_conservative_bound_is_below_the_mean() -> None:
-    """High-risk candidates use a lower quantile instead of the mean."""
-    model, db = make_model()
+    """High-risk candidates use a lower quantile instead of the mean.
+
+    ``conservative_bound`` min()s its result with the point estimate, so the old
+    ``<=`` held even with the entire shrink removed (and also for a quantile
+    pointing the wrong way). Strictness under the shipped ``conservative_z`` is the
+    contract, and the knob is what carries the direction.
+    """
+    config = build_config()
+    config.user_model.conservative_z = 0.12
+    model, db = make_model(config)
     try:
         prediction = model.predict(
             action={"type": "contact", "proactive": True},
             context={"busy_probability": 0.5},
         )
+        assert prediction.uncertainty > 0.0
         bound = model.conservative_bound(prediction)
-        assert bound <= prediction.reply_probability
+        assert bound < prediction.reply_probability
+        assert bound > 0.0
+
+        # No z, no shrink: the bound is the point estimate itself.
+        config.user_model.conservative_z = 0.0
+        assert model.conservative_bound(prediction) == pytest.approx(
+            prediction.reply_probability
+        )
+        # A larger z is strictly more conservative.
+        config.user_model.conservative_z = 2.0
+        assert model.conservative_bound(prediction) < bound
     finally:
         db.close()
 
@@ -471,8 +490,58 @@ def test_prediction_serialisation_is_json_safe() -> None:
 
 
 def test_runtime_exposes_a_working_user_model(runtime: Runtime) -> None:
-    """The Runtime wires the model to its projections."""
+    """The Runtime wires the model to its projections.
+
+    The old version compared ``effective_count >= before`` with ``before == 0.0``
+    after a plain ingest that records no observation at all - ``0.0 >= 0.0``, true
+    even if the Runtime never touched the model. The counter has to leave zero
+    through the Runtime's own feedback entry point.
+    """
+    from companion_runtime.typing import CandidateIntent, OutboxKind, new_id
+
+    candidate = CandidateIntent(
+        candidate_id=new_id("candidate"),
+        type="follow_up",
+        intent="面试怎么样啦？",
+        goal="表达关心",
+        sources=["unfinished:unf_user_model"],
+    )
+    with runtime.db.transaction() as conn:
+        runtime.projections.candidates.upsert(conn, candidate)
+        state = runtime.projections.runtime.ensure()
+        attempt_id, _outbox_id = runtime._commit_attempt(
+            conn, chosen=candidate, state=state, now=BASE_TIME
+        )
+    render_row = [
+        item
+        for item in runtime.projections.outbox.list_items(status=None, limit=50)
+        if item.kind == OutboxKind.RENDER.value
+    ][0]
+    runtime.reducer.complete_render(
+        outbox_id=render_row.outbox_id, text="面试怎么样啦？", now=BASE_TIME
+    )
+    send_row = [
+        item
+        for item in runtime.projections.outbox.list_items(status=None, limit=50)
+        if item.kind == OutboxKind.SEND.value
+    ][0]
+    runtime.reducer.claim_outbox(owner="w", now=BASE_TIME, limit=1, kinds=["send"])
+    runtime.reducer.mark_delivered(outbox_id=send_row.outbox_id, now=BASE_TIME)
+
     before = runtime.user_model.effective_count
-    outcome = runtime.process_user_message(content="在的，我挺好的", timestamp=BASE_TIME)
-    assert outcome.version > 0
-    assert runtime.user_model.numeric_view()["effective_count"] >= before
+    observation = runtime.observe_reply(
+        attempt_id=attempt_id,
+        reaction=BehaviourReaction(
+            replied=True, reply_length=20, continued_topic=True, asked_back=True
+        ),
+        now=BASE_TIME + timedelta(minutes=2),
+    )
+    assert observation["weight"] > 0
+    assert before == pytest.approx(0.0)
+    assert runtime.user_model.numeric_view()["effective_count"] > 0.0
+    # The evidence is in the projection, not only in the in-memory model: a model
+    # rebuilt over the same database sees the same count.
+    reloaded = UserInteractionModel(runtime.projections.user_model, runtime.config)
+    assert reloaded.numeric_view()["effective_count"] == pytest.approx(
+        runtime.user_model.numeric_view()["effective_count"]
+    )

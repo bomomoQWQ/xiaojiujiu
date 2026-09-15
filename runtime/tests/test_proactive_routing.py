@@ -126,19 +126,41 @@ class TestProactiveRouting:
             runtime.close()
 
     def test_it_falls_back_to_the_configured_default(self) -> None:
-        """A candidate with no resolvable sources must not break the commit."""
+        """A candidate with no resolvable sources must not break the commit.
+
+        The old version asserted ``outcome is not None`` (true of every round that
+        returns) and re-read the configured default it had just set in the fixture:
+        the round never committed anything, so the fallback was never asked for.
+
+        The Runtime here has no history at all, which is the only way to isolate the
+        last step of :meth:`Runtime._conversation_for`: with a prior user message the
+        session would be resolved from *that*, and the configured default would never
+        be consulted.
+        """
+        from companion_runtime.typing import AttemptState, CandidateIntent
+
         runtime = _runtime()
         try:
-            runtime.process_user_message(
-                content="在吗",
-                conversation_id="",
-                timestamp=BASE_TIME,
+            assert runtime.events.count() == 0, "the fallback is only reached with no history"
+            candidate = CandidateIntent(
+                candidate_id="cnd_orphan_sources",
+                type="contact",
+                goal="维持关系的连续性",
+                intent="在吗",
+                sources=["evt_does_not_exist"],
             )
-            # No candidate is expected here; the point is that a commit with an
-            # unusable conversation id degrades to the default instead of raising.
-            outcome = runtime.endogenous_round(now=BASE_TIME + timedelta(hours=2), force=True)
-            assert outcome is not None
-            assert runtime.config.conversation_id == "default"
+            with runtime.db.transaction() as conn:
+                runtime.projections.candidates.upsert(conn, candidate)
+                state = runtime.projections.runtime.ensure()
+                attempt_id, outbox_id = runtime._commit_attempt(
+                    conn, chosen=candidate, state=state, now=BASE_TIME
+                )
+
+            attempt = runtime.projections.attempts.get(attempt_id)
+            assert attempt is not None and attempt.state == AttemptState.COMMITTED.value
+            item = runtime.projections.outbox.get(outbox_id)
+            assert item is not None, "the commit must have queued a delivery row"
+            assert item.conversation_id == runtime.config.conversation_id == "default"
         finally:
             runtime.close()
 

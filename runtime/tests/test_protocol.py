@@ -159,6 +159,23 @@ def test_proactive_draft_is_always_re_coordinated_when_the_user_spoke() -> None:
 def test_critical_sensitivity_has_no_staleness_budget() -> None:
     """A draft cannot tolerate even a single intervening version."""
     assert protocol_module.STALENESS_BUDGET["critical"] == 0
+    # The budget only means something if the classifier reads it: with exactly one
+    # intervening version and no user message at all, the draft is still recomputed
+    # instead of being sent as-is.
+    proposal = protocol_module.Proposal(
+        task_id="t1",
+        task_type=TaskKind.PROACTIVE_DRAFT.value,
+        based_on_version=10,
+        source_event_ids=["evt_1"],
+    )
+    classification = protocol_module.classify(
+        proposal,
+        current_version=11,
+        source_events=[],
+        newer_user_events=[],
+    )
+    assert classification.action == ProtocolAction.REBASE.value
+    assert classification.reason == "stale_by_1_versions"
 
 
 # --------------------------------------------------------------------------------------
@@ -419,7 +436,23 @@ def test_reducer_applies_a_valid_proposal(runtime: Runtime) -> None:
     assert result.version > version
     assert runtime.projections.emotion.list_active()
     assert runtime.state().mood_valence < 0.0
-    assert runtime.projections.tasks.get("tsk_1") is not None or True
+    # The docstring's second half, which the old `... is not None or True` never
+    # checked: the applied task snapshot exists, is settled, and the decision that
+    # applied it is in the raw history.
+    task = runtime.projections.tasks.get("tsk_1")
+    assert task is not None, "an applied proposal must leave a task snapshot"
+    assert task["task_type"] == TaskKind.EMOTION_EVAL.value
+    assert task["status"] == "settled"
+    assert str(task["outcome"]).startswith("apply:")
+    assert runtime.projections.tasks.list_in_flight() == []
+    decisions = [
+        item
+        for item in runtime.events.recent(20)
+        if (item.content or "").startswith("proposal:")
+    ]
+    assert [item.content for item in decisions] == ["proposal:emotion_eval"]
+    assert decisions[0].metadata["applied"] is True
+    assert decisions[0].metadata["classification"]["action"] == ProtocolAction.APPLY.value
 
 
 def test_reducer_discards_a_proposal_with_missing_premise(runtime: Runtime) -> None:

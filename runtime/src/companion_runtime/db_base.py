@@ -29,6 +29,59 @@ from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 LOGGER = logging.getLogger("companion_runtime.db")
 
 
+class ConflictError(Exception):
+    """A statement violated a constraint the schema declares: the neutral conflict.
+
+    The Runtime has one place where a constraint violation is a normal outcome
+    rather than a failure: the deduplicating raw-event append, where a second
+    writer inserting an ``event_id`` that already exists means "this message was
+    already ingested". That case used to be recognised by catching
+    :class:`sqlite3.IntegrityError`, a type PostgreSQL does not raise, so the same
+    code silently stopped working the moment ``storage.dsn`` selected the other
+    backend. This class is the backend-neutral spelling of that event: each
+    backend translates its own exception into it at the storage boundary, and a
+    caller writes one ``except`` clause that means the same thing on both.
+
+    What it means:
+        A duplicate primary/unique key, a missing foreign-key target, a
+        ``NOT NULL`` or ``CHECK`` failure. It is *not* a lock or busy condition
+        (SQLite's "database is locked", PostgreSQL's ``lock_timeout``) and not a
+        statement error: those stay the backend's own exception, because the
+        right response to them is different - wait and retry, or fix the SQL.
+
+    What it does not promise:
+        That the transaction which raised it is still usable. SQLite leaves the
+        transaction open after the failing statement, so a caller may read the
+        row that caused the conflict; PostgreSQL aborts the transaction, so the
+        next statement in it fails with "current transaction is aborted" until it
+        is rolled back. A recovery path written for both backends has to assume
+        the stricter one - see :attr:`dialect` for which backend refused.
+
+    Attributes:
+        dialect: The backend that raised it (``"sqlite"``, ``"postgres"``).
+        native: The backend's own exception, also reachable as ``__cause__``.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        dialect: str = "unknown",
+        native: BaseException | None = None,
+    ) -> None:
+        """Build the error.
+
+        Args:
+            *args: Message arguments, passed through to :class:`Exception`
+                unchanged so that ``error.args`` still holds what the backend
+                said.
+            dialect: Backend name, see :attr:`DatabaseBase.dialect`.
+            native: The backend's own exception object.
+        """
+        super().__init__(*args)
+        self.dialect = dialect
+        self.native = native
+
+
 @runtime_checkable
 class DbCursor(Protocol):
     """The cursor surface the Runtime actually uses."""
@@ -56,11 +109,34 @@ class DatabaseBase:
     Subclasses provide :meth:`_begin`, :meth:`_commit`, :meth:`_rollback`,
     :meth:`_savepoint`, :meth:`_release`, :meth:`_rollback_to`, :meth:`_execute`,
     :meth:`column_names`, :meth:`close` and :meth:`migrate`, and set
-    :attr:`dialect`.
+    :attr:`dialect`. They also translate their own constraint violation into
+    :class:`ConflictError` at the statement boundary (see
+    :func:`~companion_runtime.db.Database`'s connection subclass and
+    :class:`~companion_runtime.db_postgres.TranslatingConnection`).
+
+    A backend that cannot run the durability commands in
+    :mod:`companion_runtime.maintenance` leaves
+    :attr:`supports_durability_commands` at its default, which is ``False``: the
+    commands then refuse up front instead of failing halfway through.
     """
 
     #: Short backend name used in logs and health output.
     dialect: str = "unknown"
+
+    #: Whether this backend implements the durability commands of
+    #: :mod:`companion_runtime.maintenance` - ``checkpoint``, ``verify``,
+    #: ``backup`` and ``restore`` - which are built on SQLite machinery
+    #: (``PRAGMA``, the ``-wal``/``-shm`` sidecar files, ``VACUUM INTO`` and
+    #: file-level copies).
+    #:
+    #: The default is ``False`` on purpose: a backend that has not said it can run
+    #: them gets a clear refusal (``maintenance.DurabilityUnsupported``) rather
+    #: than a confusing dialect error halfway through a backup, and never a silent
+    #: no-op that would leave an operator believing a snapshot exists.
+    #: :class:`~companion_runtime.db.Database` sets it to ``True``; a PostgreSQL
+    #: implementation would set it to ``True`` here (or override the commands) and
+    #: live beside :mod:`companion_runtime.maintenance`.
+    supports_durability_commands: bool = False
 
     def __init__(self, *, busy_timeout_ms: int = 5000) -> None:
         """Prepare the shared state.
@@ -71,6 +147,14 @@ class DatabaseBase:
         self.busy_timeout_ms = int(busy_timeout_ms)
         self._lock = threading.RLock()
         self._depth = 0
+        #: Per-thread transaction depth, readable *without* taking ``self._lock``.
+        #:
+        #: ``transaction`` holds ``self._lock`` for the whole block (one connection, one
+        #: writer), so :meth:`in_transaction` blocks when another thread is inside one.
+        #: A caller deciding whether it *may* take another lock must not block on the
+        #: database to find out - that is how a lock-order inversion deadlocks - so the
+        #: depth is mirrored here in thread-local storage for that decision only.
+        self._txn_local = threading.local()
         self._conn: Any = None
         #: One callback frame per open :meth:`transaction` level, outermost first.
         #: Frames are consumed by COMMIT and thrown away by ROLLBACK, which is what
@@ -128,7 +212,10 @@ class DatabaseBase:
 
     def describe(self) -> dict[str, Any]:
         """Return operator-facing facts about the store (never secrets)."""
-        return {"dialect": self.dialect}
+        return {
+            "dialect": self.dialect,
+            "durability_commands": self.supports_durability_commands,
+        }
 
     # ------------------------------------------------------------------ context
 
@@ -162,6 +249,10 @@ class DatabaseBase:
             else:
                 self._savepoint(f"sp_{self._depth}")
             self._depth += 1
+            # Mirror the depth for the lock-free query below. Only the thread holding
+            # the lock can be inside, so its mirror is the whole truth; every other
+            # thread reads zero without touching the lock.
+            self._txn_local.depth = self._depth
             self._txn_frames.append([])
             self._rollback_frames.append([])
             self._release_frames.append([])
@@ -169,6 +260,7 @@ class DatabaseBase:
                 yield self._conn
             except BaseException:
                 self._depth -= 1
+                self._txn_local.depth = self._depth
                 self._txn_frames.pop()
                 rollbacks = self._rollback_frames.pop()
                 self._release_frames.pop()
@@ -181,6 +273,7 @@ class DatabaseBase:
                 raise
             else:
                 self._depth -= 1
+                self._txn_local.depth = self._depth
                 hooks = self._txn_frames.pop()
                 rollbacks = self._rollback_frames.pop()
                 releases = self._release_frames.pop()
@@ -304,6 +397,19 @@ class DatabaseBase:
         """Return whether this thread is currently inside :meth:`transaction`."""
         with self._lock:
             return self._depth > 0
+
+    def in_transaction_nowait(self) -> bool:
+        """Return whether *this* thread is inside a transaction, without locking.
+
+        :meth:`in_transaction` takes the connection lock, which ``transaction`` holds
+        for its whole block - so asking it from a second thread blocks until the first
+        thread's transaction ends. That is fine for inspection and fatal for a guard:
+        a caller deciding whether it may take *another* lock must not wait on the
+        database to find out, because the thread inside the transaction may be waiting
+        for exactly that other lock. This query reads a thread-local mirror instead, so
+        it never blocks and never lies about the calling thread.
+        """
+        return getattr(self._txn_local, "depth", 0) > 0
 
     def transaction_depth(self) -> int:
         """Return the current nesting depth: ``0`` outside any transaction."""

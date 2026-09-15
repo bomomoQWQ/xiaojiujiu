@@ -7,7 +7,7 @@
 
 ## 0.3.2 — 2026-09-15（进行中）
 
-按审计缺口清单继续修，顺序按"对用户行为的影响"排。本版目前完成一条，另两条在跑。
+按审计缺口清单继续修，顺序按"对用户行为的影响"排。本版目前完成两条，第三条（PG 方言闸门）在跑。
 
 ### 修复
 
@@ -15,6 +15,8 @@
   此前反馈回路只有**正面一半**：用户下次开口时，回复被归属到最新一条已发出的主动消息并结算；
   而一条**发出后石沉大海**的消息不留任何痕迹——`no_reply_weight` 那条路径在生产里**永远不可达**，
   于是用户模型只从"有回复"的样本里学习，无论用户怎么冷落它，它都学不到"这个人不太回我"。
+  更糟的是那条消息的 attempt 永远停在 `sent`，而"有在途 attempt"会**堵死该会话后续的所有派发**：
+  一条没人回的消息，等于把这个会话永久静音。
   现在 `lazy_tick` 里多了一道清扫（`Runtime._record_absent_replies`，与既有的"关掉投不出去的
   attempt"清扫并列）：已投递、超过 `user_model.silence_after_hours`（默认 36 小时）仍无观察记录的
   attempt，按 `BehaviourReaction(replied=False, reply_delay_seconds=<实际等待>)` 记一条观察，
@@ -25,21 +27,115 @@
   `TickReport.absent_replies` 让这道清扫可观测。
   代价写在代码注释与配置注释里：attempt 在此被消费，所以**超过这个窗口才回的消息不再归属到那条消息**
   （算作主动联系）；等到天荒地老就等于永远学不到，二者只能选一个。
+- **用户模型学会"随时间变虚"，也学会"对他而言算快还是慢"（审计 #3 / 设计 §28、§29）。**
+  两处此前只有半边：
+  ①**信念没有时间性**——漂移只在"有新观察落库"时跑一次，于是半个月不联系，模型对用户的把握
+  与最后一天说话时**一模一样**；现在 `Runtime` 的 tick 会调用 `UserInteractionModel.tick_drift(dt)`，
+  按 `exp(-rate·dt)` 只衰减"超出先验的那部分精度"（均值是历史事实、不动），
+  效果表现为 `predict().uncertainty` 上升、`conservative_bound` 下降——也就是**久不联系就更保守**。
+  半衰期是新配置项 `user_model.drift_half_life_hours`（默认 168 h），
+  **刻意不复用 `forgetting_rate`**：那是"每条观察的nudge"，是个比例不是速率，
+  一个旋钮两种单位正是这条时间路径当初失踪的原因（没有任何东西可读）。
+  ②**回复延迟只有绝对值判据**——"这个人平时 8 小时才回、今天 2 小时就回了"学不到；
+  现在模型持久化一条**该用户自己的延迟基线**（`log1p` 空间的 EMA + EMA 方差，存在既有的
+  `params_json` 里，不改 schema），新延迟按对数空间的 z 分数打分；
+  样本不足 3 条时不信任基线，退回 `default_reply_delay_seconds` 这个**此前没人读的配置**
+  （现在它有读者了）。相对信号最多给 `positive_probability` 加 ±0.10，
+  且**负向只能抵消已得的加分**：比平时慢只是"较弱的正面证据"，绝不是负面标签——
+  与模块既有的"没有回复不等于负面"不变量一致。
+- 组合性被验证：7 次一天的漂移与 1 次七天的漂移落在**完全相同**的位置
+  （实测四条路径都是 `uncertainty=0.375267`），所以置信度不取决于时钟被轮询的频率。
 
 ### 验证
 
-- 新增 `runtime/tests/test_absent_reply_evidence.py`（6 条）：到点才记（提前一小时什么都没有）、
-  只记一次（连跑十次 tick 仍是一条观察）、窗口内的真实回复优先且不会被后来的沉默判定覆盖、
-  权重确实是"弱证据 × busy 阻尼"（用 `compute_weight` 独立复算比对）、
-  模型**参数真的动了**（同一 action+context 下 `reply_probability` 下降、`observation_count` 上升）、
-  以及**没投递的 attempt 不会被当成被无视**（那是另一种故障）。
-  变异验证：把 `_record_absent_replies` 的调用摘掉 → 3 条失败；恢复 → 全绿。
+- 新增 `runtime/tests/test_absent_reply_evidence.py`（6 条）、
+  `runtime/tests/test_user_model_time.py`（12 条，子代理，含 9 个变异各自的击杀证明）、
+  `runtime/tests/test_user_model_time_wiring.py`（3 条，父代理补的**端到端接线**证据：
+  单测只证明模型会老化，接线测试证明 Runtime 真的在 tick 里调它、持久化它能穿过 reload、
+  且步进与一次性等价）。**既有测试文件一个没改**（`git diff --stat runtime/tests/` 为空）。
+- 变异验证：摘掉 `_record_absent_replies` 调用 → 3 条失败；摘掉 `tick_drift` 调用 → 2 条接线测试失败；
+  两次都恢复并复测。
+- 全量：**983 项、0 失败、15 跳过 = 968 passed**；黑盒 **77/77**（连跑 2 次）、
+  韧性 **335/335**、记忆质量 **25/25**。
+- **PG 方言闸门与中立冲突异常（审计 #12）。** `maintenance` 的备份/恢复/检查点/WAL
+  是 SQLite 专用机器，此前在 PG 上会半路炸成 `TypeError`/`OperationalError`，甚至可能
+  看起来"做了一次备份"。现在 `DatabaseBase.supports_durability_commands`（默认 **False**，
+  失败关闭）是闸门，`maintenance.require_durability(db, command)` 在任何语句、`stat`、`mkdir`
+  或拷贝**之前**抛出类型化的 `DurabilityUnsupported(command, dialect)`；`as_database` 接受
+  `DatabaseBase`；`open_database` 在 PG 且未显式承认缺口时**启动即告警一次**
+  （`storage.durability_gap_acknowledged`），因为"PG 部署没有这些命令"是运维必须知道的事实。
+  写入冲突改由后端中立的 `db_base.ConflictError` 表达（SQLite 侧是 `ConflictError` 与
+  `sqlite3.IntegrityError` 的双继承，旧捕获继续可用），PG 侧在连接边界翻译。
+  **父代理复核时补了一处它点到的陷阱**：PG 在约束冲突后会中止整个事务，所以
+  `process_user_message` 里那次"并发写者抢先"的恢复读，现在把插入包在 **savepoint** 里再回滚到它，
+  两个后端都能接着读。34 条测试；11 个变异各自击杀对应测试（闸门关闭 → 23 红，PG 能力位翻转 → 24 红…）。
+- **§77 表名对照（审计 #13）**：`runtime/docs/DESIGN_TABLE_MAPPING.md`。设计文档 18 张建议表
+  → 同名实现 14 / 改名 1（`emotion_events`→`active_emotion_events`）/ 合并 2
+  （`user_model_global`+`contextual`→`user_model_params(scope)`）/ 有意不实现 1（`memory_embeddings`，
+  依据补丁与 README 的既有降级记录）；反向另有 5 张实现有、设计未列的表。文档同时纠正了审计里
+  "8 张文档未列"的笔误（自枚举只有 5 张，基线 `8564327` 与工作区都是 21 张）。
+- **恒真测试（审计 #15）**：21 条断言重写为**会因行为被破坏而失败**的断言（含审计点名的
+  §87 场景 4/5）。每条都有击杀变异；**29 个变异全部击杀**，并且把旧版本测试从 HEAD 抽出来
+  跑同样 12 个变异 → **旧版全部存活**（前后对照，这是"以前确实恒真"的证据）。没有删除或削弱任何测试。
+- **话题级边界进决策门（审计 #6 / 设计 §52）**。此前 `evaluate(scope=...)` 在决策路径里从不传 `scope`，
+  而 `topic_avoid`/`repeated_interrogation` 两条规则的 `allow_proactive=True`——也就是说它们
+  **永远走"允许"分支**，只在投递前才靠文案拦。根因是 `Boundary` 上**没有"这个"绑到哪里**：
+  规则匹配的是指代性的「暂时不要跟我说**这个**」。现在：边界在声明那一刻绑定主体
+  （`Boundary.subject`，含 `ADDED_COLUMNS` 迁移，旧库原地升级、旧行为 `NULL` 即"没绑定"），
+  绑定**优先用事件身份**（未尽之事的 `source_event_ids`）而非文本重叠——实测「我明天下午三点面试，
+  结束了告诉你」与标题「等待面试结果」只共享 1 个 bigram，纯文本匹配会失败；
+  决策门在**效用比较之前**把违规候选剔除，并在 `decision["boundary_blocked"]` 里报出边界 id 与原因。
+  **绑定不出来时不猜、不拦**（保守方向，投递前的文案闸门仍在）。16 条测试；
+  实测还纠正了我自己的第一版：`repeated_interrogation` 曾拦掉**所有**提问型候选 72 小时，
+  那是"话题级"被做成了"全面禁问"——韧性仿真立刻抓到（自主轮次不再排队渲染工作），
+  现已按"绑定主体 + 提问形状"两个条件同时成立才拦。
+- **入口推进时钟（审计 #2 / 设计 §86.4）——真正的问题不是"哪个入口该 tick"，而是 hazard 区间挂错了东西。**
+  写入口（outbox 领取/确认、渲染上报、投递回执、proposal、观察、候选操作、未尽之事）此前不推进时间，
+  于是紧随其后的 `/schedule`、`/authorize` 会基于滞后的 drive/hazard 判定。我先做了入口级推进点
+  `Runtime.tick_for_entry`，但实测暴露出更严重的缺陷：
+  **`endogenous_round` 的 hazard 区间是用 `stamp - state.last_tick_at` 算的**——也就是说，任何一次
+  推进时钟的入口都会**吃掉角色的等待窗口**。实测 A/B（同一个三天的等待窗口）：
+  先 `GET /schedule` 一次，`last_tick_at` 就被推到"现在"，下一轮 `delta_t` 从 260000 秒变成 **0.002 秒**，
+  `action_probability` 从 0.999999 变成约 0；而候选的效用对比**逐字节相同**（最优 1.32705 vs 沉默 0.908808，
+  优势 +0.418242）。**一次只读轮询把角色三天积累的开口冲动清零**，这比原审计抱怨的"决策基于滞后状态"
+  严重得多。所以正确的修法是：把 hazard 积分区间改为"距离**上一次决策**的时间"（持久化在
+  `RuntimeState.meta`，与既有的深层刷新节流同一手法），而不是"距离上一次时钟推进"；
+  同时**只读端点不再推进世界**（`GET /schedule`、`/user-model/predict`）——查询不该改变角色行为。
+  写入口仍然不 tick：claim/render/deliver 是 outbox 生命周期的一步，入口在中间积分时间等于与它正在
+  上报的操作抢跑（把 tick 塞进 reducer 写入口时韧性仿真两条不变量变红，attempt 被从它自己的上报步骤
+  底下老化掉）。
+  实现过程中还踩到并修掉两个只在"挂住"时才现形的坑：**递归**（tick 自身要写库，写库又触发 tick）
+  与**锁序反转死锁**（一个线程握着数据库连接要运行时写锁，另一个握着写锁要数据库连接）——后者在 DB 层
+  加了**免锁**的事务深度镜像 `in_transaction_nowait`（`in_transaction()` 本身会在别人事务期间阻塞，
+  用在守卫里必死）。不变量测试钉住：只读入口不改变下一轮的判定、两个守卫、递归、并发不死锁。
+
+### 验证（0.3.2 定版时点，本机实测）
+
+| 套件 | 0.3.1 | 0.3.2 |
+|---|---|---|
+| `runtime` 离线测试 | 914 passed / 14 skipped | **1044 passed / 15 skipped**（1059 项） |
+| `scripts/blackbox_user_simulation.py` | 77 / 77 | **77 / 77** |
+| `scripts/e2e_resilience_simulation.py` | 335 / 335 | **335 / 335** |
+| `scripts/e2e_memory_simulation.py` | 25 / 25 | **25 / 25** |
+
+另外这一版**由验证抓到并修掉的真缺陷**（不是我预先知道的）：
+
+1. **`GET /schedule` 一次轮询清零三天开口冲动**（我引入的）：hazard 区间用
+   `stamp - state.last_tick_at` 积分，任何推进时钟的入口都会吃掉等待窗口。A/B 实测：
+   `delta_t` 260000 s → **0.002 s**、`action_probability` 0.999999 → ~0，而候选效用对比逐字节相同。
+2. **`repeated_interrogation` 规则在中文里几乎不可达**：粒子分支 `(别|不要|不要再|不许)` 吃不下
+   "**别再**追问我在干嘛"里的那个 `再`（只有"别一直问我这个"能命中），于是 §52 的这条话题边界
+   从日常语言里根本声明不出来。我的 #6 测试直接构造 Boundary 对象，所以只测到"执行"、测不到"声明"。
+3. **一条没人回的主动消息会把该会话永久静音**（审计 #4 的隐藏面）：attempt 永远停在 `sent`，
+   而在途 attempt 会堵死该会话后续派发。
+4. **`_record_absent_replies` 忽略"用户说过自己忙"**：回复归属路径读 busy 标记，沉默路径不读，
+   同一句话对"回复"生效、对"沉默"不生效。
 
 ### 进行中
 
-- 用户模型时间性（审计 #3）：按 Δt 的漂移 + 回复延迟的基线归一。
-- PG 方言闸门（审计 #12）：`maintenance` 的 SQLite-only 命令必须在 PG 上早失败、说人话；
-  写入冲突改用后端中立的异常类型。
+- **关系递进仿真**（`scripts/relationship_progression_simulation.py`，陌生人→熟人→朋友→恋人，
+  含模拟时钟与后台 dump 的自动审视）：文件已写出并通过语法检查（8 阶段、公开 HTTP 面 dump、
+  `--fault` 自证），**子代理仍在试运行与修 bug**，因此**未纳入本次提交**；它交付后单独提交。
 
 ---
 

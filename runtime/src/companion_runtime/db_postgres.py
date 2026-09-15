@@ -41,14 +41,34 @@ Known differences this module cannot remove:
   dropped, and ``rowid`` (the implicit insertion-order key) becomes ``ctid``,
   PostgreSQL's physical row locator. ``raw_events`` is append-only and the Runtime
   admits one writer at a time, so ``ctid`` is the same ordering ``rowid`` gave.
+* A constraint violation is translated into the backend-neutral
+  :class:`~companion_runtime.db_base.ConflictError` by
+  :meth:`TranslatingConnection.execute`, which is the one funnel both
+  ``PostgresDatabase.execute()`` and a projection's own ``conn.execute()`` go
+  through. The psycopg exception stays reachable as the error's ``__cause__``.
 * The ``PRAGMA``/``-wal``/online-backup helpers in
   :mod:`companion_runtime.maintenance` are SQLite by construction and are out of
-  scope for this backend.
+  scope for this backend: PostgreSQL is made durable by the server's own tooling
+  (WAL archiving, ``pg_basebackup``, ``pg_dump``, replication), not by a
+  ``VACUUM INTO`` of a single file. This backend therefore declares
+  :attr:`PostgresDatabase.supports_durability_commands` as ``False``, and those
+  commands refuse at their entrance with
+  :class:`~companion_runtime.maintenance.DurabilityUnsupported` instead of failing
+  halfway through with a syntax error. A PostgreSQL implementation would set that
+  flag to ``True`` and live beside the SQLite one.
 * The rest of the surface is portable as it stands. There is no ``INSERT OR
   IGNORE``/``INSERT OR REPLACE`` left anywhere in the Runtime - the seed insert in
   ``RuntimeProjection.ensure`` spells it ``ON CONFLICT ... DO NOTHING``, which both
   engines understand - so every statement this backend has to run is either shared
   as written or covered by the rewrites above.
+
+One thing this module cannot paper over, and callers must know: PostgreSQL aborts
+a transaction when a statement fails, so after a caught
+:class:`~companion_runtime.db_base.ConflictError` the *next* statement in that
+transaction fails with "current transaction is aborted" until it is rolled back
+(SQLite, by contrast, keeps the transaction open). A recovery path that reads the
+row which caused the conflict therefore has to run after a rollback on this
+backend - see :attr:`ConflictError.dialect`.
 """
 
 from __future__ import annotations
@@ -60,7 +80,7 @@ from typing import Any, Sequence
 
 from .db import Database as _SqliteDatabase
 from .db import SCHEMA_STATEMENTS, SCHEMA_VERSION
-from .db_base import DatabaseBase
+from .db_base import ConflictError, DatabaseBase
 from .utility import isoformat
 
 try:
@@ -76,6 +96,18 @@ LOGGER = logging.getLogger("companion_runtime.db")
 #: portability checks and the conformance tests do not need it; opening a
 #: connection does, and fails with a clear message instead of an ImportError.
 PSYCOPG_AVAILABLE: bool = psycopg is not None
+
+#: The psycopg exception classes a constraint violation arrives as, or an empty
+#: tuple when the driver is missing. Resolved once, at import, so the translation
+#: in :meth:`TranslatingConnection.execute` never evaluates ``psycopg.errors`` on a
+#: machine that has no driver (an empty ``except`` tuple simply never matches).
+#: ``IntegrityError`` is the parent of ``UniqueViolation``, ``ForeignKeyViolation``,
+#: ``NotNullViolation``, ``CheckViolation`` and ``ExclusionViolation`` - exactly the
+#: set of failures the Runtime treats as a conflict rather than a fault. Lock
+#: timeouts and statement errors are deliberately *not* in it.
+CONFLICT_ERRORS: tuple[type[BaseException], ...] = (
+    () if psycopg is None else (psycopg.errors.IntegrityError,)
+)
 
 #: The transaction-scoped advisory lock key that makes the Runtime single-writer.
 #:
@@ -296,6 +328,13 @@ class TranslatingConnection:
     statement text runs on both backends:
 
     * ``execute`` accepts ``?`` placeholders, like ``sqlite3.Connection.execute``.
+    * Statement failures that mean *the same thing* on both engines are translated:
+      a constraint violation (``psycopg.errors.IntegrityError`` and its subclasses)
+      becomes :class:`~companion_runtime.db_base.ConflictError`, the neutral type a
+      caller can catch without knowing which backend is underneath. Everything
+      else - a lock timeout, a syntax error, a missing table - is re-raised as
+      psycopg raised it, because the right response to those differs per backend
+      and translating them would hide that.
     * Everything else (``cursor()``, ``close()``, ``info``, ...) is delegated to
       psycopg unchanged, so the native ``%s`` API stays reachable for SQL that is
       deliberately PostgreSQL-only. Such a call bypasses the translation.
@@ -323,9 +362,21 @@ class TranslatingConnection:
 
         Returns:
             The psycopg cursor, whose rows are dicts (``row_factory=dict_row``).
+
+        Raises:
+            companion_runtime.db_base.ConflictError: If the statement violated a
+                constraint. The psycopg error is kept as ``__cause__``. Note that
+                PostgreSQL has already aborted the surrounding transaction at that
+                point, so a caller that wants to continue must roll back (or use a
+                savepoint) first.
         """
         statement = translate_placeholders(sql, with_params=bool(params))
-        return self._raw.execute(statement, params or None)
+        try:
+            return self._raw.execute(statement, params or None)
+        except CONFLICT_ERRORS as error:
+            raise ConflictError(
+                str(error), dialect="postgres", native=error
+            ) from error
 
     def close(self) -> None:
         """Close the underlying connection."""
@@ -358,6 +409,19 @@ class PostgresDatabase(DatabaseBase):
 
     #: Backend name used in logs and health output.
     dialect = "postgres"
+
+    #: This backend implements none of the SQLite durability commands
+    #: (:func:`~companion_runtime.maintenance.checkpoint`, ``verify``, ``backup``,
+    #: ``restore``): there is no ``-wal`` file to fold back, no ``PRAGMA
+    #: integrity_check`` and no single database file to copy a snapshot over. They
+    #: therefore refuse up front with
+    #: :class:`~companion_runtime.maintenance.DurabilityUnsupported`, which is the
+    #: honest answer - the alternative would be an operator discovering it from a
+    #: backup that never happened. PostgreSQL durability is the server's own
+    #: (WAL archiving, ``pg_basebackup``, ``pg_dump``, replication). A
+    #: ``pg_dump``-based implementation would flip this flag to ``True`` and add the
+    #: commands beside the SQLite ones in :mod:`companion_runtime.maintenance`.
+    supports_durability_commands = False
 
     #: Re-used from the SQLite backend rather than restated, so the two schemas
     #: cannot drift apart.
@@ -516,6 +580,9 @@ class PostgresDatabase(DatabaseBase):
             "server_version": None,
             "database": None,
             "writer_lock_key": WRITER_LOCK_KEY,
+            # A static fact, so it is reported even when the server is down: an
+            # operator asking "why did my backup refuse?" reads it from here.
+            "durability_commands": self.supports_durability_commands,
         }
         try:
             with self._lock:

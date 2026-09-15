@@ -522,12 +522,12 @@ class BoundaryProjection:
         """Insert or replace a boundary row."""
         connection.execute(
             "INSERT INTO boundaries(boundary_id, type, scope, allow_reply, allow_proactive, starts_at, "
-            "expires_at, revocable_by, source_event_id, revoked_at, note, created_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "expires_at, revocable_by, source_event_id, revoked_at, note, subject, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(boundary_id) DO UPDATE SET type=excluded.type, scope=excluded.scope, "
             "allow_reply=excluded.allow_reply, allow_proactive=excluded.allow_proactive, "
             "starts_at=excluded.starts_at, expires_at=excluded.expires_at, revoked_at=excluded.revoked_at, "
-            "note=excluded.note",
+            "note=excluded.note, subject=excluded.subject",
             (
                 boundary.boundary_id,
                 boundary.type,
@@ -540,6 +540,7 @@ class BoundaryProjection:
                 boundary.source_event_id,
                 isoformat(boundary.revoked_at),
                 boundary.note,
+                boundary.subject,
                 isoformat(utcnow()),
             ),
         )
@@ -561,6 +562,7 @@ class BoundaryProjection:
             source_event_id=data.get("source_event_id"),
             revoked_at=parse_datetime(data.get("revoked_at")),
             note=data.get("note"),
+            subject=data.get("subject"),
         )
 
 

@@ -23,7 +23,6 @@ from __future__ import annotations
 import ast
 import logging
 import random
-import sqlite3
 import threading
 import time
 from contextlib import contextmanager
@@ -42,6 +41,7 @@ from . import protocol as protocol_module
 from . import unfinished as unfinished_module
 from .config import RuntimeConfig, StorageConfig
 from .db import Database, open_database
+from .db_base import ConflictError
 from .eventlog import EventLog, EventQuery
 from .projections import AttemptProjection, Projections, VersionConflict
 from .reducer import Reducer
@@ -90,6 +90,24 @@ PERMISSION_MARKERS = ("多主动", "随时找我", "可以找我", "欢迎找我
 #: spend again immediately. Storing it in the runtime row also keeps it in the same
 #: transaction-protected place as every other piece of state.
 LAST_DEEP_REFRESH_META_KEY = "last_deep_refresh_at"
+
+#: Key under which the moment of the last endogenous *decision* is stored in
+#: ``RuntimeState.meta`` (design §50).
+#:
+#: The action hazard is ``P(act) = 1 - exp(-λ(t)·Δt)``, and ``Δt`` is the time between
+#: two *opportunities to act* - two decisions - not between two advances of the clock.
+#: A round used to read that interval off ``last_tick_at``, which is written by every
+#: tick, including the decision entries that only read (``/context``); a poll could
+#: therefore consume the character's whole waiting window (measured: one ``GET
+#: /schedule`` collapsed the interval from a three-day offline window to 2 ms and
+#: P(act) from ~1 to ~0, and the round that was supposed to reach out stayed silent).
+#: ``last_exchange_at`` exists for the absence term for exactly this reason ("ticks
+#: never write it, so it is a stable anchor"); the hazard needs the same kind of anchor
+#: and it is the round itself.
+#:
+#: Like the deep-refresh pacing, the anchor is a *durable* fact: a restart must not
+#: forget how long the character has been waiting for a decision.
+LAST_DECISION_META_KEY = "last_decision_at"
 
 #: How many delivered attempts reply attribution scans when it has to find the one
 #: belonging to a specific conversation. Delivered attempts accumulate forever (a
@@ -396,11 +414,16 @@ class Runtime:
         # event occurs, and ``lazy_tick`` may still install its own epoch the first
         # time it is driven. The configured value profile is what compiles the
         # character's dynamics, so it seeds the row rather than a neutral default.
-        self.projections.ensure_defaults(created_at, values=self.config.values)
+        initial_state = self.projections.ensure_defaults(created_at, values=self.config.values)
         self.memory_store = memory_module.MemoryStore(self.projections.memory, self.config)
         self.user_model = UserInteractionModel(self.projections.user_model, self.config)
         self.rng = random.Random(seed)
         self._write_lock = threading.RLock()
+        #: Per-thread state for the two re-entrancy questions this class has to answer:
+        #: ``ticking`` (a tick triggered from inside a tick must not run - see
+        #: :meth:`lazy_tick`) and ``write_depth`` (a write entry called from inside an
+        #: existing write session must not tick - see :meth:`tick_for_entry`).
+        self._thread_state = threading.local()
         self._worker_id = f"runtime-{new_id('task').split('_')[-1]}"
         #: Optional semantic provider (architecture patch v0.2).
         #:
@@ -416,6 +439,19 @@ class Runtime:
         #: value in ``state.meta`` is authoritative; this cache only avoids a state
         #: read on the hot path.
         self._last_deep_refresh_at: datetime | None = None
+        #: In-memory mirror of :data:`LAST_DECISION_META_KEY`. The persisted value in
+        #: ``state.meta`` is authoritative and survives a restart; this cache carries
+        #: the anchor written by this process's rounds.
+        self._last_decision_at: datetime | None = None
+        #: The clock as this process found it, captured *before* any entry can tick it.
+        #: It is the interval start for the first round of a database that has no
+        #: recorded decision yet: a brand-new database starts at its creation epoch and
+        #: an existing one at the clock it was left at - i.e. exactly the interval the
+        #: round would have integrated before the anchor existed, so an upgrade does not
+        #: change the first round's behaviour. Reading ``last_tick_at`` live instead
+        #: would let an entry tick between construction and that first round consume the
+        #: whole waiting window.
+        self._initial_clock_at = initial_state.last_tick_at or initial_state.epoch_at
         self.reducer = Reducer(
             db=self._db,
             events=self.events,
@@ -441,9 +477,65 @@ class Runtime:
 
     @contextmanager
     def write_session(self) -> Iterator[None]:
-        """Acquire the single-writer lock for a compound operation."""
+        """Acquire the single-writer lock for a compound operation.
+
+        The nesting depth is tracked per thread so :meth:`tick_for_entry` can tell an
+        *external* entry from an internal step of one that is already in progress.
+        """
         with self._write_lock:
-            yield
+            self._thread_state.write_depth = getattr(self._thread_state, "write_depth", 0) + 1
+            try:
+                yield
+            finally:
+                self._thread_state.write_depth -= 1
+
+    def tick_for_entry(self, now: datetime | None = None) -> TickReport:
+        """Advance the clock for a *decision* entry that is about to judge something.
+
+        This is the entry-level half of design §86.4, and the boundary it draws was
+        measured rather than assumed:
+
+        * **decision entries tick** - ``/authorize``, ``/context``, and the operator
+          commands. The audit's complaint is exactly here: those read a drive value, a
+          hazard rate and a decayed emotion, and without this they read values integrated
+          only up to the last heartbeat, so a decision taken after a long silence was
+          judged against the past.
+        * **read-only entries do not** - ``GET /schedule`` and ``POST
+          /user-model/predict`` inspect the state rather than judge it (the plan is
+          computed from timestamp anchors, not from an integrated drive), and a query
+          that mutates the world is its own defect: a caller polling either endpoint
+          would change the character's behaviour. They used to tick; the hazard anchor
+          (see :meth:`_record_decision`) makes removing that safe, because a tick that
+          no longer has to carry the hazard interval can no longer consume it.
+        * **write entries do not** - a claim, a render report, a delivery receipt or a
+          proposal is a step *of* the outbox and attempt lifecycle, and integrating
+          time in the middle of one races the very operation being reported. Wiring it
+          there was implemented and then withdrawn: it turned two resilience invariants
+          red ("a committed-but-undelivered attempt closes the gate for new rounds", and
+          the autonomous round queuing render work) because the attempt was aged out
+          from under the step that was reporting it.
+
+        Two guards make the call safe where it *is* made. A caller already inside a write
+        session, or already inside a database transaction, leaves the clock to the entry
+        that owns it - not as an optimisation but because a tick opens its own
+        transaction on the shared connection, and a thread that holds the connection
+        while asking for the runtime's write lock deadlocks against a thread holding the
+        write lock and asking for the connection. That inversion is what the first
+        version of this wiring produced.
+
+        Args:
+            now: The entry's moment, or ``None`` when the caller has none.
+
+        Returns:
+            The tick report (empty when the clock was left to the surrounding entry).
+        """
+        if getattr(self._thread_state, "write_depth", 0) > 0:
+            return TickReport()
+        if self._db.in_transaction_nowait():
+            return TickReport()
+        # ``maintenance=False``: an entry integrates time, it does not sweep. See
+        # :meth:`lazy_tick` for why the lifecycle sweeps belong to the heartbeat.
+        return self.lazy_tick(now, maintenance=False)
 
     def state(self) -> RuntimeState:
         """Return the current runtime state (a fresh read)."""
@@ -469,7 +561,7 @@ class Runtime:
 
     # ------------------------------------------------------------------ lazy tick
 
-    def lazy_tick(self, now: datetime | None = None) -> TickReport:
+    def lazy_tick(self, now: datetime | None = None, *, maintenance: bool = True) -> TickReport:
         """Advance the whole Runtime to ``now`` in a single pass.
 
         This is the unified time entry point. It must be called (under the write
@@ -480,12 +572,46 @@ class Runtime:
         approach impulse, restraint, pressure, cooldown, memory activation decay,
         unfinished-matter timing, boundary expiry and candidate deadlines.
 
+        **Re-entrancy.** A tick triggered from inside a tick is not a new external
+        entry, and this guard is load-bearing rather than defensive: the reducer's
+        write entries advance the clock before they decide anything (design §86.4), and
+        the tick itself writes through those same entries
+        (:meth:`_close_stalled_attempts` closes attempts, the absent-reply sweep records
+        observations). Without the guard the two call each other until the stack runs
+        out - which is exactly what happened the first time this was wired. A nested
+        call returns an empty report and leaves the work to the tick already running,
+        which is the honest answer: the clock is being advanced by the caller.
+
+        The flag is per-thread because the Runtime serves several threads and only the
+        inner ``write_session`` serialises them; a shared flag would let one thread's
+        tick swallow another's.
+
         Args:
             now: Reference time, defaults to the current UTC time.
+            maintenance: Whether this tick may also *sweep* - reclaim expired leases,
+                close attempts that can no longer be delivered, record the silences of
+                unanswered messages. The heartbeat (``endogenous_round``, ``POST
+                /tick``) does; an entry tick does not, because an entry is often a step
+                *of* the outbox lifecycle (a claim, a render report, a delivery receipt)
+                and a sweep interleaved with it races the very operation being reported.
+                Time is integrated either way: what an entry needs is that the drive,
+                hazard and decay it is about to read are current, not that unrelated
+                lifecycle work happens in the middle of its own.
 
         Returns:
             A :class:`TickReport` describing what changed.
         """
+        if getattr(self._thread_state, "ticking", False):
+            LOGGER.debug("lazy_tick re-entered from inside a tick; leaving it to the caller")
+            return TickReport()
+        self._thread_state.ticking = True
+        try:
+            return self._lazy_tick(now, maintenance=maintenance)
+        finally:
+            self._thread_state.ticking = False
+
+    def _lazy_tick(self, now: datetime | None = None, *, maintenance: bool = True) -> TickReport:
+        """Do the work of :meth:`lazy_tick`; call that, never this directly."""
         stamp = ensure_aware(now) or utcnow()
         report = TickReport()
         with self.write_session():
@@ -520,12 +646,21 @@ class Runtime:
             dt = delta_seconds(stamp, last)
             report.dt_seconds = dt
             report.changed = dt > 0.0
+            if dt <= 0.0:
+                # Nothing has elapsed, so there is nothing to integrate: no decay, no
+                # sweep, no write. This early return is what makes the clock advance
+                # cheap enough to run on *every* write entry (design §86.4): an entry
+                # that arrives in the same instant as the last tick costs one state read
+                # instead of a full maintenance pass. The sweeps are time-based, so the
+                # tick that already ran at this instant has just done them.
+                return report
 
             with self._db.transaction() as conn:
                 state = self._apply_time_passage(conn, state=state, now=stamp, dt_seconds=dt, report=report)
-                report.released_leases = self.projections.outbox.reclaim_expired(conn, stamp)
-                report.expired_attempts = self._close_stalled_attempts(conn, now=stamp)
-                report.absent_replies = self._record_absent_replies(conn, now=stamp)
+                if maintenance:
+                    report.released_leases = self.projections.outbox.reclaim_expired(conn, stamp)
+                    report.expired_attempts = self._close_stalled_attempts(conn, now=stamp)
+                    report.absent_replies = self._record_absent_replies(conn, now=stamp)
                 # Closing a stalled attempt bumps the version inside this same
                 # transaction (a nested savepoint), so the tick commits on the
                 # version actually stored rather than on the one it read before.
@@ -579,9 +714,15 @@ class Runtime:
             if self.projections.user_model.observation_for_attempt(attempt.attempt_id) is not None:
                 continue
             state = self.projections.runtime.ensure()
+            # The same busy belief the reply-attribution path uses, and for the same
+            # reason: a user who *said* they are swamped should have their silence read
+            # as "busy", not as disinterest. This path used to look only at how long
+            # the silence lasted, so "今天工作很多" softened nothing while a reply
+            # arriving after the same message was damped correctly.
             busy = self.user_model.busy_probability(
                 hours_since_contact=delta_seconds(now, state.last_contact_at) / 3600.0,
                 replied_recently=False,
+                context={"stated_busy": self._recent_stated_busy(now)},
             )
             candidate = (
                 self.projections.candidates.get(attempt.candidate_id)
@@ -727,6 +868,14 @@ class Runtime:
 
         emotion_module.mood_relax(state, emotion_config, dt_seconds)
 
+        # --- user model: belief confidence ages with *time*, not only with new
+        # observations (design §28). Without this the model kept whatever certainty the
+        # last observation gave it, so a fortnight of silence left it as sure about the
+        # user as it was on the day they last spoke. The means are historical facts and
+        # do not move; what relaxes is the precision on top of the prior, which shows
+        # up as more uncertainty and a more conservative bound.
+        self.user_model.tick_drift(dt_seconds, connection=conn)
+
         # --- unfinished matters
         matters = self.projections.unfinished.list_open()
         tick_result = unfinished_module.tick(
@@ -856,18 +1005,25 @@ class Runtime:
                             event=existing, version=state.version, duplicate=True
                         )
                 try:
-                    event = self.events.append(
-                        EventType.USER_MESSAGE,
-                        actor=Actor.USER,
-                        content=content,
-                        conversation_id=conversation_id or self.config.conversation_id,
-                        metadata=metadata,
-                        timestamp=stamp,
-                        runtime_version=state.version,
-                        event_id=event_id,
-                        connection=conn,
-                    )
-                except sqlite3.IntegrityError:
+                    # The insert runs in a nested transaction - a SAVEPOINT - and that
+                    # is what makes the recovery below work on both backends:
+                    # PostgreSQL aborts the *whole* transaction on a constraint
+                    # violation, so with a bare ``except`` the follow-up read would
+                    # fail there, while SQLite tolerates it. Rolling back to the
+                    # savepoint leaves a usable transaction either way.
+                    with self._db.transaction() as insert_conn:
+                        event = self.events.append(
+                            EventType.USER_MESSAGE,
+                            actor=Actor.USER,
+                            content=content,
+                            conversation_id=conversation_id or self.config.conversation_id,
+                            metadata=metadata,
+                            timestamp=stamp,
+                            runtime_version=state.version,
+                            event_id=event_id,
+                            connection=insert_conn,
+                        )
+                except ConflictError:
                     # A concurrent writer appended this identifier between the
                     # check above and this insert (two processes on one database
                     # file). The invariant is the same, so the answer is too.
@@ -890,8 +1046,26 @@ class Runtime:
                 outcome.proactive_paused_until = state.foreground_pause_until
 
                 # --- boundary rules (before any semantic layer wakes up)
+                # A topic-scoped rule matches the *instruction*, never its object, so
+                # the referent of "暂时不要跟我说这个" is resolved here - from the open
+                # matter that was being discussed, else from the last thing the user
+                # said - and travels with the boundary. ``None`` means it could not be
+                # established, and then the boundary constrains nothing: guessing would
+                # silence a subject the user never named.
                 declared = boundary_module.detect_boundaries(
-                    event, state=state, config=self.config, now=stamp
+                    event,
+                    state=state,
+                    config=self.config,
+                    now=stamp,
+                    referent=boundary_module.referent_for(
+                        previous_events=[
+                            prior
+                            for prior in reversed(self.events.recent(8))
+                            if prior.event_type == EventType.USER_MESSAGE.value
+                            and prior.event_id != event.event_id
+                        ],
+                        matters=self.projections.unfinished.list_open(),
+                    ),
                 )
                 for boundary in declared:
                     self.projections.boundaries.upsert(conn, boundary)
@@ -1198,6 +1372,58 @@ class Runtime:
 
     # --------------------------------------------------------- endogenous entry
 
+    # ------------------------------------------------------------------ hazard anchor
+
+    def _record_decision(self, when: datetime, connection=None) -> int:
+        """Persist the moment of the latest motivational verdict (design §50).
+
+        The hazard is integrated over the interval between two decisions, so the
+        moment of the last one is what the next round reads. It is recorded for a
+        round that acts *and* for one that draws "not yet", because the interval that
+        draw covered has been spent either way - that is what keeps the hazard
+        frequency-independent (two short intervals keep the survival probability of
+        one long interval). It is also recorded for a round that holds back on a
+        foreground pause, which is the same verdict its tick used to express.
+
+        Persisted (rather than kept process-local) for the same reason
+        :meth:`_record_deep_refresh` is: a restart must not forget how long the
+        character has been waiting, or it would act as if it had just decided.
+
+        Args:
+            when: The decision's moment.
+            connection: Connection of an enclosing transaction; ``None`` opens one.
+
+        Returns:
+            The new runtime version.
+        """
+        if connection is None:
+            with self._db.transaction() as own_connection:
+                return self._record_decision(when, own_connection)
+        state = self.projections.runtime.ensure(when)
+        state.meta = dict(state.meta) | {LAST_DECISION_META_KEY: isoformat(when)}
+        version = self.projections.runtime.write(state, connection, expect_version=state.version)
+        self._last_decision_at = when
+        return version
+
+    def _last_decision(self, state: RuntimeState | None = None) -> datetime | None:
+        """Return when the last decision was taken, or ``None`` when there is none.
+
+        The persisted value is the authority (it is written on the same path and also
+        survives a restart) and the in-memory mirror is the fallback. A corrupt field
+        yields ``None`` rather than raising, so the caller can fall back to
+        :attr:`_initial_clock_at` instead of taking the round down.
+        """
+        current = state if state is not None else self.state()
+        persisted = current.meta.get(LAST_DECISION_META_KEY)
+        if isinstance(persisted, str):
+            try:
+                parsed = parse_datetime(persisted)
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is not None:
+                return ensure_aware(parsed)
+        return self._last_decision_at
+
     def endogenous_round(
         self,
         *,
@@ -1234,9 +1460,18 @@ class Runtime:
             An :class:`EndogenousOutcome`.
         """
         stamp = ensure_aware(now) or utcnow()
-        # Capture the previous tick before advancing time: the hazard rate must be
-        # integrated over the elapsed interval, not over an arbitrary one.
-        elapsed_seconds = delta_seconds(stamp, self.state().last_tick_at)
+        # The hazard rate is integrated over the interval between two *decisions* - the
+        # character's opportunities to act - not between two advances of the clock.
+        # ``last_tick_at`` is written by every tick, so a read-only decision entry
+        # (``/context``, and the operator commands) would otherwise consume the window
+        # the character has been waiting through; see :data:`LAST_DECISION_META_KEY`.
+        entry_state = self.state()
+        anchor = (
+            self._last_decision(entry_state)
+            or self._initial_clock_at
+            or entry_state.last_tick_at
+        )
+        elapsed_seconds = delta_seconds(stamp, anchor)
         report = self.lazy_tick(stamp)
         outcome = EndogenousOutcome(version=report.version)
 
@@ -1252,6 +1487,9 @@ class Runtime:
             if not force and state.foreground_pause_until is not None and stamp < state.foreground_pause_until:
                 outcome.decision = {"acted": False, "reason": "foreground_pause"}
                 outcome.next_wake_at = state.foreground_pause_until
+                # A paused round still took a verdict (to hold back), so it starts the
+                # next hazard interval - the same thing its tick used to do.
+                outcome.version = self._record_decision(stamp)
                 # A paused foreground silences speech, not maintenance: memory
                 # formation is exactly the kind of work that must still happen
                 # while the character is being quiet.
@@ -1296,6 +1534,14 @@ class Runtime:
                     state=state,
                     is_proactive=True,
                 )
+                # ---- per-candidate boundary gate (also before any utility comparison)
+                # A topic boundary ("别再提面试", "别再一直追问我在干嘛") carries
+                # ``allow_proactive=True`` - being told to drop a subject is not being
+                # told to fall silent - so the gate above cannot express it. Such a
+                # candidate must not be *weighed* at all: weighing it is what spends the
+                # decision on something that can never be sent, and it is how a topic
+                # the user ruled out still won the argument inside the utility model.
+                pending, boundary_blocked = self._partition_by_boundaries(pending, now=stamp)
 
                 predictions: dict[str, Prediction] = {}
                 alignments: dict[str, float] = {}
@@ -1329,7 +1575,16 @@ class Runtime:
                     emotion_alignment=alignments,
                 )
                 outcome.decision = result.to_dict()
+                if boundary_blocked:
+                    # Reported rather than silently dropped: an operator asking "why
+                    # did it not bring that up" needs to see that the user ruled the
+                    # subject out, and which boundary did it.
+                    outcome.decision["boundary_blocked"] = boundary_blocked
                 outcome.next_wake_at = result.outcome.next_wake_at
+                # The round is a hazard trial: the next interval starts here whether it
+                # acted or drew "not yet". The anchor is written inside this transaction
+                # (a savepoint), so a committed attempt builds on the version it stored.
+                outcome.version = self._record_decision(stamp, conn)
 
                 if result.outcome.acted and result.outcome.chosen_candidate_id:
                     chosen = next(
@@ -1357,6 +1612,62 @@ class Runtime:
             # failure domain, exactly like the deep refresh.
             outcome.consolidation = self._consolidate_if_due(now=stamp)
             return outcome
+
+    def _partition_by_boundaries(
+        self, candidates: Sequence[CandidateIntent], *, now: datetime
+    ) -> tuple[list[CandidateIntent], list[dict[str, Any]]]:
+        """Split candidates into the ones a topic boundary allows and the ones it rules out.
+
+        Only the *topic* scopes are handled here; a boundary that forbids proactive
+        contact outright is already handled by
+        :func:`~companion_runtime.boundaries.evaluate`, which the caller consults
+        before this. A candidate that violates a topic boundary is removed from the set
+        the motivational layer sees, so it cannot win a comparison at all.
+
+        The candidate's subject is its target plus its intent text: those are what the
+        generator derived from real state (the topic tags of a memory, the subject of an
+        unfinished matter), so comparing them against the boundary's bound subject is
+        comparing like with like.
+
+        Args:
+            candidates: The candidates that would otherwise be weighed.
+            now: Reference time.
+
+        Returns:
+            ``(allowed, blocked)``; each blocked entry names the candidate, the boundary
+            and a stable reason string, for the operator surface.
+        """
+        boundaries = self.projections.boundaries.active(now)
+        allowed: list[CandidateIntent] = []
+        blocked: list[dict[str, Any]] = []
+        for candidate in candidates:
+            violation = boundary_module.blocks_candidate(
+                boundaries,
+                now=now,
+                subject=f"{candidate.target or ''} {candidate.intent or ''}",
+                is_question=candidate.type in boundary_module.QUESTION_CANDIDATE_TYPES,
+            )
+            if violation is None:
+                allowed.append(candidate)
+                continue
+            boundary_id, reason = violation
+            blocked.append(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "type": candidate.type,
+                    "intent": candidate.intent,
+                    "boundary_id": boundary_id,
+                    "reason": reason,
+                }
+            )
+            LOGGER.info(
+                "candidate %s (%s) is ruled out by boundary %s (%s)",
+                candidate.candidate_id,
+                candidate.type,
+                boundary_id,
+                reason,
+            )
+        return allowed, blocked
 
     def _event_ids_behind(self, source: str) -> list[str]:
         """Return the event ids one candidate source ultimately rests on.
@@ -1937,6 +2248,9 @@ class Runtime:
             KeyError: If the attempt does not exist.
         """
         stamp = ensure_aware(now) or utcnow()
+        # A delivery receipt is an entry: it changes state that the next decision
+        # reads, so the clock moves first (design §86.4).
+        self.lazy_tick(stamp)
         with self.write_session():
             attempt = self.projections.attempts.get(attempt_id)
             if attempt is None:
@@ -2273,6 +2587,34 @@ class Runtime:
             "local_hour": local_now(now).hour,
         }
 
+    def _recent_stated_busy(self, now: datetime, *, window_hours: float = 24.0) -> bool:
+        """Return whether the user recently *said* they are busy.
+
+        The same marker test the entry path applies to the message that arrived
+        (:data:`BUSY_MARKERS`), asked of the recent window: a silence that follows
+        "今天工作很多" is evidence about their workload, not about the character.
+
+        Args:
+            now: Reference time.
+            window_hours: How far back to look.
+
+        Returns:
+            ``True`` when one of the recent user messages states busy-ness.
+        """
+        since = now - timedelta(hours=window_hours)
+        for event in self.events.read(
+            EventQuery(
+                event_types=[EventType.USER_MESSAGE.value],
+                since=since,
+                limit=20,
+                newest_first=True,
+            )
+        ):
+            text = (event.content or "").lower()
+            if any(marker.lower() in text for marker in BUSY_MARKERS):
+                return True
+        return False
+
     def _recent_user_permission(self, now: datetime) -> bool:
         """Return whether the user recently invited proactive contact."""
         events = self.events.read(
@@ -2351,16 +2693,52 @@ class Runtime:
         return retired
 
     def _invalidate_candidates(self, conn: Any, *, now: datetime, user_message: str) -> list[str]:
-        """Retire candidates whose ``invalidate_when`` conditions just became true."""
+        """Retire candidates whose ``invalidate_when`` conditions just became true.
+
+        Two questions are asked, in this order, because they are different: whether the
+        candidate's condition is *visible in the current situation text* (the coarse,
+        text-based test the pool manager also uses), and whether the **state it came
+        from** has moved - the matter it was about resolved, the memory it cited
+        archived or superseded, the question it asked already answered, the boundary it
+        cited revoked, the emotion it rode on decayed. The second question needs the
+        records, not the text, and without it a candidate citing a memory kept asking
+        about something the character no longer believed.
+
+        The record reads are hoisted out of the loop: they are the same for every
+        candidate and a per-candidate query would turn one round into a hundred.
+        """
         situation = " ".join(
             str(item.get("content") or "")
             for item in self.projections.situation.list_active(limit=20)
         )
+        unfinished = self.projections.unfinished.list_all(limit=200)
+        boundaries = self.projections.boundaries.list_all(include_revoked=True)
+        emotions = self.projections.emotion.list_active()
+        recent_events = self.events.read(EventQuery(limit=40, newest_first=True))
         retired: list[str] = []
         for candidate in self.projections.candidates.list_active(limit=100):
             matched = candidate_module.invalidated_by_situation(
                 candidate, situation_text=situation, user_message=user_message
             )
+            if matched is None:
+                matched = candidate_module.invalidated_by_source_state(
+                    candidate,
+                    unfinished=unfinished,
+                    # Only the memories this candidate actually cites: passing the whole
+                    # table would make the answer depend on rows the candidate never
+                    # mentioned.
+                    memories=self.projections.memory.get_memories(
+                        [
+                            source.split(":", 1)[1]
+                            for source in candidate.sources
+                            if source.startswith("memory:")
+                        ]
+                    ),
+                    boundaries=boundaries,
+                    emotions=emotions,
+                    recent_events=recent_events,
+                    now=now,
+                )
             if matched is None:
                 continue
             self.projections.candidates.set_status(
@@ -2395,6 +2773,20 @@ class Runtime:
                     self.projections.unfinished.list_all(limit=200), now=now
                 )
             ],
+            # The shapes that need more than the pool and the matters: ``share`` reads
+            # what the character holds *about* the user (an activated preference or
+            # relational memory) and can be coloured by a live emotion, ``repair`` reads
+            # the evidence that something landed badly (a negative interaction
+            # observation, or a boundary the user had to declare), and ``reply`` reads a
+            # question the user asked that nothing has answered. ``emotion:`` and
+            # ``situation:`` ride along as extra sources on those. Before this call
+            # carried them, all three shapes were reachable only in tests - the rule
+            # producers existed and production never handed them the state they read.
+            observations=self.projections.user_model.list_observations(limit=20),
+            emotions=active,
+            situations=self.projections.situation.list_active(limit=20),
+            boundaries=self.projections.boundaries.active(now),
+            recent_events=self.events.read(EventQuery(limit=40, newest_first=True)),
         )
         operations = candidate_module.plan_operations(
             proposals=proposals, existing=existing, config=self.config

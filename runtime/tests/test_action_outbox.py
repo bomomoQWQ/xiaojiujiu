@@ -195,12 +195,38 @@ def test_abort_preserves_history() -> None:
 
 
 def test_committed_is_not_sent() -> None:
-    """Invariant 9, expressed directly."""
-    attempt = make_attempt()
-    assert attempt.state == AttemptState.PROPOSED.value
-    assert attempt.rendered_text is None
-    assert not action_module.is_terminal(AttemptState.COMMITTED.value)
-    assert AttemptState.COMMITTED.value != AttemptState.SENT.value
+    """Invariant 9, expressed directly.
+
+    The old version read back the literals ``make_attempt()`` had just been given
+    (``state == proposed``, ``rendered_text is None``) and compared two distinct
+    Enum members to each other - both true whatever the product does. The state
+    machine has to refuse the jump for a *stored* committed row.
+    """
+    assert not action_module.can_transition(
+        AttemptState.COMMITTED.value, AttemptState.SENT.value
+    )
+    db = Database(":memory:")
+    db.migrate()
+    projection = AttemptProjection(db)
+    try:
+        attempt = make_attempt()
+        with db.transaction() as conn:
+            action_module.commit(projection, conn, attempt, now=BASE_TIME)
+        assert attempt.state == AttemptState.COMMITTED.value
+        assert attempt.rendered_text is None
+        assert not action_module.is_terminal(AttemptState.COMMITTED.value)
+
+        with db.transaction() as conn:
+            with pytest.raises(action_module.IllegalTransition):
+                action_module.mark_sent(projection, conn, attempt, now=BASE_TIME)
+        stored = projection.get("att_1")
+        assert stored.state == AttemptState.COMMITTED.value
+        assert stored.rendered_text is None
+        assert [item["to_state"] for item in projection.transitions("att_1")] == [
+            AttemptState.COMMITTED.value
+        ]
+    finally:
+        db.close()
 
 
 def test_expire_stale_attempts() -> None:

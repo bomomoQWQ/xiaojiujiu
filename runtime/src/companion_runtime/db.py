@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
-from .db_base import DatabaseBase
+from .db_base import ConflictError, DatabaseBase
 from .utility import ensure_aware, isoformat, parse_datetime
 
 LOGGER = logging.getLogger("companion_runtime.db")
@@ -225,6 +225,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         source_event_id   TEXT,
         revoked_at        TEXT,
         note              TEXT,
+        subject           TEXT,
         created_at        TEXT NOT NULL
     )
     """,
@@ -425,6 +426,82 @@ def loads(value: Any, default: Any = None) -> Any:
         return default
 
 
+class SqliteConflictError(ConflictError, sqlite3.IntegrityError):
+    """SQLite's :class:`~companion_runtime.db_base.ConflictError`.
+
+    Raised in place of a bare ``sqlite3.IntegrityError`` so a constraint violation
+    reaches the caller as the backend-neutral type *and* still is a
+    ``sqlite3.IntegrityError``. The second half is not decoration: call sites that
+    already wrote ``except sqlite3.IntegrityError`` (and any tooling that type-checks
+    a SQLite error, including :func:`~companion_runtime.maintenance.sqlite_error_is_corruption`'s
+    callers) keep working untouched, while new code catches ``ConflictError`` and
+    means the same thing on both backends.
+    """
+
+    @classmethod
+    def from_native(cls, error: sqlite3.IntegrityError) -> SqliteConflictError:
+        """Translate a native ``sqlite3.IntegrityError``.
+
+        Args:
+            error: The exception SQLite raised.
+
+        Returns:
+            The same message and arguments, as a neutral conflict error. SQLite's
+            extended result code and its name (``sqlite_errorcode`` /
+            ``sqlite_errorname``, the difference between a primary-key and a
+            foreign-key violation) are carried over when the running interpreter
+            exposes them, so the translated error is never *less* informative than
+            the native one.
+        """
+        translated = cls(*error.args, dialect="sqlite", native=error)
+        for attribute in ("sqlite_errorcode", "sqlite_errorname"):
+            try:
+                setattr(translated, attribute, getattr(error, attribute))
+            except (AttributeError, TypeError):  # pragma: no cover - interpreter dependent
+                continue
+        return translated
+
+
+class ConflictTranslatingConnection(sqlite3.Connection):
+    """The ``sqlite3.Connection`` subclass every SQLite store opens.
+
+    ``DatabaseBase.transaction()`` and :meth:`DatabaseBase.read` hand the raw
+    connection straight to projections, so statements reach SQLite through two
+    different doors - ``Database.execute()`` and a projection's own
+    ``conn.execute()`` - and both have to report a constraint violation the same
+    way. Translating on the connection itself is the single funnel that covers
+    both, and giving it to :func:`sqlite3.connect` as its ``factory`` keeps it a
+    real ``sqlite3.Connection``: ``row_factory``, ``PRAGMA`` statements, the
+    transaction methods and ``isinstance`` checks all behave exactly as before.
+
+    The three connection-level statement methods are covered. A statement issued
+    through an explicitly created ``cursor()`` is not translated, because psycopg
+    is not involved there either and the Runtime never does it; use
+    :meth:`execute` instead of building a cursor.
+    """
+
+    def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+        """Execute one statement, reporting a constraint violation neutrally."""
+        try:
+            return super().execute(sql, parameters)
+        except sqlite3.IntegrityError as error:
+            raise SqliteConflictError.from_native(error) from error
+
+    def executemany(self, sql: str, parameters: Any) -> sqlite3.Cursor:
+        """Execute one statement per parameter set, translating conflicts."""
+        try:
+            return super().executemany(sql, parameters)
+        except sqlite3.IntegrityError as error:
+            raise SqliteConflictError.from_native(error) from error
+
+    def executescript(self, sql_script: str) -> sqlite3.Cursor:
+        """Execute a script, translating conflicts."""
+        try:
+            return super().executescript(sql_script)
+        except sqlite3.IntegrityError as error:
+            raise SqliteConflictError.from_native(error) from error
+
+
 class Database(DatabaseBase):
     """A thin, thread-safe SQLite wrapper with WAL and explicit transactions.
 
@@ -439,6 +516,11 @@ class Database(DatabaseBase):
 
     #: Backend name used in logs and health output.
     dialect = "sqlite"
+
+    #: SQLite is the backend the durability commands were written for, so it is the
+    #: one that can run them; see
+    #: :attr:`~companion_runtime.db_base.DatabaseBase.supports_durability_commands`.
+    supports_durability_commands = True
 
     def __init__(self, path: str | Path, busy_timeout_ms: int = 5000, wal: bool = True) -> None:
         """Open (and create) the database at ``path``.
@@ -458,6 +540,9 @@ class Database(DatabaseBase):
             check_same_thread=False,
             isolation_level=None,
             timeout=busy_timeout_ms / 1000.0,
+            # Every statement this store ever runs goes through this subclass, which
+            # reports a constraint violation as the backend-neutral ConflictError.
+            factory=ConflictTranslatingConnection,
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -508,7 +593,12 @@ class Database(DatabaseBase):
     def describe(self) -> dict[str, Any]:
         """Return operator-facing facts about the store (never secrets)."""
         mode = self._conn.execute("PRAGMA journal_mode").fetchone()[0]
-        return {"dialect": self.dialect, "path": self.path, "journal_mode": mode}
+        return {
+            "dialect": self.dialect,
+            "path": self.path,
+            "journal_mode": mode,
+            "durability_commands": self.supports_durability_commands,
+        }
 
     # -------------------------------------------------------------- migration
 
@@ -517,6 +607,13 @@ class Database(DatabaseBase):
     ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
         ("runtime_state", "epoch_at", "TEXT"),
         ("runtime_state", "last_exchange_at", "TEXT"),
+        # What a topic-scoped boundary is about (design §52). The language rules are
+        # deictic - "暂时不要跟我说这个" names nothing - so without this column a topic
+        # boundary stays a category and the decision gate has nothing to compare a
+        # candidate against. Existing databases upgrade in place via the ALTER TABLE
+        # below; the old rows read back as ``subject IS NULL``, which every caller
+        # treats as "the referent was never established".
+        ("boundaries", "subject", "TEXT"),
     )
 
     def migrate(self) -> int:
@@ -547,9 +644,19 @@ def open_database(config: Any) -> DatabaseBase:
     instead; the import is deferred so a deployment that never uses PG does not
     need ``psycopg`` installed at all.
 
+    Selecting PostgreSQL logs one warning, once per open, because that backend has
+    no implementation of the SQLite-only durability commands (checkpoint, verify,
+    backup, restore): they refuse with
+    :class:`~companion_runtime.maintenance.DurabilityUnsupported`, and an operator
+    should learn that at startup rather than from a failed scheduled maintenance
+    pass. Setting ``storage.durability_gap_acknowledged`` records that the gap is
+    understood and silences the warning; it changes nothing else, and the warning
+    is the only thing this function says about it.
+
     Args:
         config: The ``storage`` section of the Runtime configuration (or anything
-            exposing ``dsn``, ``database_path``, ``busy_timeout_ms`` and ``wal``).
+            exposing ``dsn``, ``database_path``, ``busy_timeout_ms``, ``wal`` and
+            optionally ``durability_gap_acknowledged``).
 
     Returns:
         A connected store; the caller owns closing it.
@@ -558,6 +665,14 @@ def open_database(config: Any) -> DatabaseBase:
     if dsn:
         from .db_postgres import PostgresDatabase
 
+        if not bool(getattr(config, "durability_gap_acknowledged", False)):
+            LOGGER.warning(
+                "storage.dsn selects the PostgreSQL backend, which implements no durability "
+                "commands: checkpoint/verify/backup/restore refuse with DurabilityUnsupported. "
+                "PostgreSQL durability is the server's own (WAL archiving, pg_basebackup, "
+                "pg_dump, replication). Set storage.durability_gap_acknowledged=true once that "
+                "is understood to silence this warning."
+            )
         return PostgresDatabase(
             dsn,
             busy_timeout_ms=int(getattr(config, "busy_timeout_ms", 5000) or 5000),

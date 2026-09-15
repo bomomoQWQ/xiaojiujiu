@@ -133,8 +133,43 @@ class TestAmbiguityVeto:
         assert ambiguity_veto("谢谢你") is None
 
     def test_every_ambiguity_marker_is_covered_by_a_negative_case(self) -> None:
-        """Guard against someone extending the marker table without a test."""
-        for veto in __import__("companion_runtime.semantic", fromlist=["AMBIGUITY_MARKERS"]).AMBIGUITY_MARKERS:
+        """Guard against someone extending the marker table without a test.
+
+        The loop below cannot fail on its own: ``classify_event`` computes its veto
+        from this same ``AMBIGUITY_MARKERS`` tuple, so every entry - present or
+        future - necessarily returns ``None``. Extending the table is exactly what
+        the docstring claims to guard, so the membership is frozen here instead: a
+        new marker must be added deliberately, next to the case that justifies it.
+        """
+        markers = __import__(
+            "companion_runtime.semantic", fromlist=["AMBIGUITY_MARKERS"]
+        ).AMBIGUITY_MARKERS
+        assert [veto.needle for veto in markers] == [
+            "算了",
+            "也没什么",
+            "没什么",
+            "随便",
+            "都行",
+            "无所谓",
+            "可能",
+            "也许",
+            "大概",
+            "不知道",
+            "不清楚",
+            "还好",
+            "一般",
+            "再说吧",
+            "看情况",
+        ]
+        assert {veto.reason for veto in markers} == {
+            "hedged_withdrawal",
+            "minimising",
+            "indifferent",
+            "uncertain",
+            "mild",
+            "deferred",
+        }
+        for veto in markers:
             assert classify_event(veto.needle) is None, veto.needle
 
 

@@ -18,6 +18,19 @@ randomness.
 
 Hard boundaries never participate in the game: a blocked candidate is removed
 from the pool before utilities are compared.
+
+Two parts of the design were previously declared but not read here, and both are
+now wired into the numbers below:
+
+* a boundary-risky candidate is priced at a *lower quantile* of its predicted reply
+  probability, at the tail probability ``config.utility.downside_quantile``, instead
+  of at the mean - see :func:`conservative_bound`. The width of that bound is the
+  user model's own uncertainty, so "be careful while you are unsure" is the model's
+  estimate rather than a fixed constant;
+* the user-side value now prices all three outcomes of a reply, not only the good
+  one: a reply that is tolerated but lukewarm is *neutral filler* and a reply that
+  lands badly and ends the exchange is *negative* - see
+  :func:`user_outcome_probabilities` and the two weights below.
 """
 
 from __future__ import annotations
@@ -27,6 +40,7 @@ import math
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from statistics import NormalDist
 from typing import Any, Mapping, Sequence
 
 from .config import RuntimeConfig
@@ -38,12 +52,73 @@ from .typing import (
     UtilityBreakdown,
 )
 from .user_model import Prediction
-from .utility import clamp, local_day_key, max_datetime, sigmoid, softmax, softplus, utcnow
+from .utility import (
+    clamp,
+    local_day_key,
+    logit,
+    max_datetime,
+    sigmoid,
+    softmax,
+    softplus,
+    utcnow,
+)
 
 LOGGER = logging.getLogger("companion_runtime.motivation")
 
 #: ``runtime_state.meta`` key holding the local day the contact counter belongs to.
 CONTACT_DAY_META_KEY = "contact_day"
+
+# --------------------------------------------------------------------------------------
+# Constants of the conservative bound (§47) and of the outcome terms of V_user (§46)
+#
+# These are module constants rather than ``UtilityConfig`` fields because ``config.py``
+# is owned by another change in flight. They are reported so the config owner can
+# promote them to real knobs with the same defaults; every one of them is read below.
+# --------------------------------------------------------------------------------------
+
+#: The user model blends four per-target standard errors into one 0..1 figure with
+#: ``uncertainty = clamp(1 - exp(-0.9 * mean_error))`` (see
+#: ``UserInteractionModel.predict``). ``0.9`` is the scale of that blend and is the
+#: only number :func:`conservative_bound` needs in order to recover the mean
+#: logit-space standard error from a :class:`Prediction`.
+#:
+#: WARNING: this duplicates a literal that lives inside ``user_model.py``. It is a
+#: faithful inverse of the documented mapping, not an independent calibration: if that
+#: literal is ever changed, this constant must change with it (or the model should
+#: expose the standard error directly). ``test_motivation_bounds.py`` pins the
+#: agreement against the model's own ``conservative_bound`` so the drift cannot pass
+#: unnoticed.
+USER_MODEL_UNCERTAINTY_SCALE = 0.9
+
+#: Weight of the *neutral* outcome in ``V_user``: a reply that is not positive but
+#: keeps the exchange going is filler. It is a small cost and not a reward because
+#: the user still spends attention on it; ``0.18`` is roughly a fifth of the ``+1.0``
+#: a fully positive, continuing reply is worth. It is strictly positive so that
+#: "acknowledged politely" scores below "welcome", which the previous
+#: reward-only formula could not express at all. Charged at the model's confidence
+#: (:func:`user_outcome_confidence`), so a cold prior is not billed at full price.
+USER_NEUTRAL_OUTCOME_WEIGHT = 0.18
+
+#: Weight of the *negative* outcome in ``V_user``: a reply that is not positive and
+#: does not continue the exchange landed badly. ``1.10`` deliberately makes one bad
+#: landing slightly worse than one perfect exchange is good (the good outcome is
+#: worth at most ``0.55 + 0.45 = 1.0``): the asymmetry is the point of a downside
+#: term, and the magnitude stays explainable in one line - it can cancel a warm
+#: prediction, it cannot veto the whole candidate on its own (the boundary,
+#: interrupt, repeat and risk costs do that part). Charged at the model's confidence
+#: (:func:`user_outcome_confidence`), so a model that has actually watched the user
+#: pays nearly full price and a brand-new one is not punished for imagined harm.
+USER_NEGATIVE_OUTCOME_WEIGHT = 1.10
+
+#: The tail probability ``UserInteractionModel.conservative_bound`` is calibrated at is
+#: ``0.05`` - its ``config.user_model.conservative_z`` of 1.645 is the one-sided 95%
+#: normal quantile - and that is why :func:`conservative_bound` reproduces the model's
+#: own number at the default ``config.utility.downside_quantile``. The mapping is pinned
+#: numerically by ``test_motivation_bounds.py`` rather than by a second constant here,
+#: because a constant nobody reads is the defect this section exists to fix.
+
+#: Standard normal distribution used to turn a tail probability into a z-score.
+_STANDARD_NORMAL = NormalDist()
 
 
 @dataclass(slots=True)
@@ -147,6 +222,156 @@ def silence_utility(
     return value
 
 
+def normal_quantile_z(quantile: float) -> float:
+    """Return the one-sided standard normal quantile ``z`` of a tail probability.
+
+    ``quantile = 0.05`` gives ``1.6449``, which is the value
+    ``config.user_model.conservative_z`` (1.645) approximates in the user model - the
+    reason the default configuration reproduces the model's own bound.
+
+    The argument is clamped into ``[1e-6, 0.5]``: ``0.5`` is the median, where the
+    bound is the mean itself (z = 0, i.e. no caution), and a non-finite or
+    out-of-range value falls back to that same "no caution" end rather than raising -
+    a bad configuration must not take the decision layer down.
+
+    Args:
+        quantile: Tail probability in ``(0, 0.5]``.
+
+    Returns:
+        A non-negative z-score.
+    """
+    if not math.isfinite(quantile):
+        return 0.0
+    tail = clamp(float(quantile), 1e-6, 0.5)
+    return _STANDARD_NORMAL.inv_cdf(1.0 - tail)
+
+
+def conservative_bound(
+    prediction: Prediction,
+    *,
+    quantile: float,
+    target: str = "reply_probability",
+) -> float:
+    """Return the conservative lower quantile of one predicted probability.
+
+    This is the downside bound of design §47, and it is the number the motivational
+    game prices a boundary-risky candidate at. It is the *same closed form* as
+    :meth:`UserInteractionModel.conservative_bound`, re-derived from the
+    :class:`Prediction` alone:
+
+    ``bound = sigmoid(logit(P) - z(q) * e / 2)``, ``e = -ln(1 - U) / 0.9``
+
+    where ``P`` is the predicted probability of ``target``, ``q`` is the configured
+    tail probability (``config.utility.downside_quantile``), ``z(q)`` its one-sided
+    normal quantile, ``U = prediction.uncertainty`` and ``0.9`` is the user model's
+    uncertainty blend (:data:`USER_MODEL_UNCERTAINTY_SCALE`). The model builds ``U``
+    from the mean logit-space standard error as ``U = 1 - exp(-0.9 e)``, so ``e`` is
+    recoverable exactly and no information is invented here.
+
+    Mapping, and what it means in practice:
+
+    * at the default ``q = 0.05`` this returns the model's own
+      ``conservative_bound`` value to within ~1e-5 (the model hardcodes
+      ``conservative_z = 1.645``, this uses the exact 1.6449), so the decision path
+      consumes the model's own bound number without needing the live model object -
+      :func:`decide` is handed plain predictions, not the model. If the Runtime ever
+      hands the live model into the round, this helper should delegate to
+      ``UserInteractionModel.conservative_bound`` and rescale its result by
+      ``z(q) / z(0.05)`` so that ``downside_quantile`` keeps governing the width;
+    * because the width is ``z(q)``, the bound widens as the tail probability falls
+      and collapses onto the mean at ``q = 0.5``. Changing
+      ``config.utility.downside_quantile`` therefore changes the decision: that knob
+      is the reader this quantity was missing;
+    * a *thinly observed* user has a large ``U`` and therefore a bound far below the
+      mean, while a well-observed one has a bound close to it. Caution is the model's
+      uncertainty, not a constant;
+    * with **no observations at all** the bound is real but unused in the default
+      configuration: a cold-start prediction carries ``U ~ 0.8``, so the bound sits
+      far below the mean, yet :func:`decide` only applies it above
+      ``config.utility.conservative_risk_threshold`` and the cold-start
+      ``boundary_risk`` prior is around ``0.20`` - below that threshold, because the
+      model deliberately starts neutral about boundaries rather than suspicious (see
+      ``test_cold_start_prediction_is_neutral_and_uncertain``). A brand-new user is
+      therefore *not* priced at the pessimistic bound and the character is still
+      allowed normal contact; the bound starts to bite once the model has actually
+      learned that a boundary exists, or once the situation features themselves say
+      the user is busy.
+
+    Args:
+        prediction: Prediction to bound.
+        quantile: Tail probability; see :func:`normal_quantile_z`.
+        target: Which predicted probability to bound.
+
+    Returns:
+        The lower quantile, clamped into ``[0, P]`` so it can never exceed the mean.
+    """
+    probability = clamp(float(getattr(prediction, target)), 0.0, 1.0)
+    uncertainty = clamp(float(prediction.uncertainty), 0.0, 1.0 - 1e-9)
+    mean_error = -math.log(max(1e-9, 1.0 - uncertainty)) / USER_MODEL_UNCERTAINTY_SCALE
+    bounded = sigmoid(logit(probability) - normal_quantile_z(quantile) * mean_error * 0.5)
+    return clamp(min(bounded, probability))
+
+
+def user_outcome_probabilities(prediction: Prediction) -> tuple[float, float, float]:
+    """Return ``(P_good, P_neutral, P_bad)`` conditional on the user replying.
+
+    Design §46 asks for ``V_user = sum_y P(y | i) r(y)`` over the outcomes of the
+    behaviour, but :class:`Prediction` carries two conditional heads rather than a
+    full outcome distribution: ``positive_probability`` ("given a reply, is it
+    positive") and ``continue_probability`` ("given a reply, does the exchange
+    continue"). The three outcomes are the partition induced by those two:
+
+    * ``P_good = P_pos`` - the reply is positive, whether or not it continues;
+    * ``P_neutral = (1 - P_pos) * P_cont`` - the reply is not positive but the
+      exchange goes on: polite filler, answered without being welcomed;
+    * ``P_bad = (1 - P_pos) * (1 - P_cont)`` - the reply is not positive *and* the
+      exchange stops: the message landed badly enough to end it.
+
+    The three sum to 1 by construction, so nothing needs renormalising. The boundary
+    dimension is deliberately *not* folded in here: an explicit breach is already
+    priced by ``C_boundary``, ``C_interrupt`` and ``C_risk``, and counting it a fourth
+    time would make one mistake cost four times.
+
+    Args:
+        prediction: Prediction to decompose.
+
+    Returns:
+        ``(P_good, P_neutral, P_bad)``, each in ``[0, 1]``.
+    """
+    positive = clamp(float(prediction.positive_probability))
+    continues = clamp(float(prediction.continue_probability))
+    not_positive = 1.0 - positive
+    return positive, not_positive * continues, not_positive * (1.0 - continues)
+
+
+def user_outcome_confidence(prediction: Prediction) -> float:
+    """Return how much of the predicted outcome distribution should be believed.
+
+    ``confidence = 1 - prediction.uncertainty``: the model's own ``uncertainty`` is a
+    calibrated statement about how far its estimate can be trusted, so its complement
+    is the weight the two outcome *costs* below are charged at.
+
+    Why the costs are discounted and the good-outcome reward is not: with no
+    observations the outcome heads are a prior, not a prediction. Charging a cold
+    model the full price of the harm it merely imagines makes the character mute
+    exactly when the design (§31) wants cheap, low-risk exploration - the
+    ``test_scenario_2d_a_less_restrained_character_does_reach_out`` margin is 0.04
+    utility, and a full-strength penalty consumes it. A model that *has* observed the
+    user is believed at close to full weight, which is the case the outcome costs
+    exist for. Note that this is the same statement as the conservative bound, read in
+    the other direction: the bound makes an unreliable estimate of a *good* outcome
+    less attractive, and this keeps an unreliable estimate of a *bad* outcome from
+    being treated as fact.
+
+    Args:
+        prediction: Prediction to weigh.
+
+    Returns:
+        A factor in ``[0, 1]``; ``0`` when the model is maximally uncertain.
+    """
+    return clamp(1.0 - float(prediction.uncertainty))
+
+
 def candidate_utility(
     *,
     candidate: CandidateIntent,
@@ -165,9 +390,23 @@ def candidate_utility(
 
     ``U_i = V_internal + V_user + V_relation - C_boundary - C_interrupt - C_repeat - C_risk``
 
-    For boundary-risky candidates the user benefit uses a conservative lower
-    quantile instead of the mean, so thin data makes risky behaviour cautious
-    automatically.
+    with the user-side value priced over all three reply outcomes rather than only the
+    good one:
+
+    ``V_user = g_u * P_R * [0.55 P_good + 0.45 P_cont - c * (w_neu P_neutral + w_neg P_bad)]``
+
+    ``P_good/P_neutral/P_bad`` come from :func:`user_outcome_probabilities` and ``c``
+    is :func:`user_outcome_confidence`. The first two reward terms are the previous
+    formula, unchanged, so the calibrated scale of a good exchange is preserved:
+    ``0.45 P_cont`` rewards a continuing exchange on top of a positive one. The two new
+    terms are costs with documented weights (:data:`USER_NEUTRAL_OUTCOME_WEIGHT`,
+    :data:`USER_NEGATIVE_OUTCOME_WEIGHT`), so a predicted bad landing subtracts value
+    instead of merely failing to add any - charged at the model's confidence, because
+    an unobserved outcome distribution is a prior rather than a prediction.
+
+    For boundary-risky candidates ``P_R`` is replaced by a conservative lower quantile
+    (:func:`conservative_bound`) instead of the mean, so thin data makes risky
+    behaviour cautious automatically. The bound is never allowed above the mean.
 
     Args:
         candidate: Candidate under evaluation.
@@ -180,7 +419,8 @@ def candidate_utility(
         emotion_alignment: How well the candidate matches the current emotion.
         blocked: Whether a hard constraint already removed the candidate.
         block_reason: Reason for blocking.
-        conservative_reply: Lower quantile of the reply probability.
+        conservative_reply: Lower quantile of the reply probability; ``None`` prices
+            the candidate at the predicted mean.
 
     Returns:
         A :class:`UtilityBreakdown`.
@@ -206,11 +446,19 @@ def candidate_utility(
         + 0.20 * clamp(emotion_alignment)
     ) + urgency
     reply_mean = prediction.reply_probability
-    reply = conservative_reply if conservative_reply is not None else reply_mean
-    if prediction.boundary_risk > 0.25 and conservative_reply is not None:
-        reply = min(reply, reply_mean)
-    user = settings.user_gain * (
-        reply * (0.55 * prediction.positive_probability + 0.45 * prediction.continue_probability)
+    # The downside bound is a *lower* bound: a caller that hands in something larger
+    # than the mean is clamped, never trusted.
+    reply = reply_mean if conservative_reply is None else min(float(conservative_reply), reply_mean)
+    good, neutral_outcome, bad_outcome = user_outcome_probabilities(prediction)
+    confidence = user_outcome_confidence(prediction)
+    user = settings.user_gain * reply * (
+        0.55 * good
+        + 0.45 * prediction.continue_probability
+        - confidence
+        * (
+            USER_NEUTRAL_OUTCOME_WEIGHT * neutral_outcome
+            + USER_NEGATIVE_OUTCOME_WEIGHT * bad_outcome
+        )
     )
     relation = settings.relation_gain * (
         0.5 * values.relationship_maintenance * clamp(candidate.unfinished_relevance + 0.35)
@@ -567,6 +815,13 @@ def decide(
 ) -> MotivationResult:
     """Run one motivational round and decide whether to act.
 
+    Candidates whose predicted ``boundary_risk`` exceeds
+    ``config.utility.conservative_risk_threshold`` are priced at
+    :func:`conservative_bound` at the configured ``config.utility.downside_quantile``
+    instead of at their mean reply probability; every other candidate is priced at the
+    mean. Hard boundaries are still applied before any of this, as blocks rather than
+    as costs.
+
     Args:
         inputs: Assembled inputs.
         config: Runtime configuration.
@@ -626,7 +881,18 @@ def decide(
 
         conservative = None
         if prediction.boundary_risk > config.utility.conservative_risk_threshold:
-            conservative = _conservative_reply(candidate, prediction)
+            # §47: a boundary-risky candidate is priced at its lower quantile at the
+            # configured tail probability, using the user model's own uncertainty.
+            conservative = conservative_bound(
+                prediction, quantile=config.utility.downside_quantile
+            )
+            LOGGER.debug(
+                "Candidate %s is boundary-risky (%.3f); pricing reply probability at Q%.4f = %.4f",
+                candidate.candidate_id,
+                prediction.boundary_risk,
+                config.utility.downside_quantile,
+                conservative,
+            )
 
         breakdown = candidate_utility(
             candidate=candidate,
@@ -696,33 +962,6 @@ def decide(
     outcome.selected_probability = weights[index]
     outcome.next_wake_at = now + timedelta(hours=6)
     return MotivationResult(outcome=outcome, assessments=assessments)
-
-
-def _conservative_reply(
-    candidate: CandidateIntent, prediction: Prediction, *, z: float = 0.12
-) -> float:
-    """Return a conservative reply bound for a risky candidate.
-
-    The bound is an approximate lower quantile: it widens with model uncertainty
-    and with how boundary-sensitive the behaviour class is, so thin data makes
-    risky behaviour cautious automatically.
-
-    Args:
-        candidate: Candidate under evaluation.
-        prediction: Prediction to bound.
-        z: Base quantile width.
-
-    Returns:
-        The lower quantile of the reply probability.
-    """
-    probability = prediction.reply_probability
-    if candidate.type in {"contact", "check_in"}:
-        type_factor = 2.0
-    elif candidate.type in {"follow_up", "repair"}:
-        type_factor = 1.4
-    else:
-        type_factor = 1.0
-    return clamp(probability - z * type_factor * (0.5 + prediction.uncertainty))
 
 
 def _next_wake(

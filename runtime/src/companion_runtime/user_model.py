@@ -23,11 +23,23 @@ Implementation notes (intentionally simplified, structurally faithful):
   conservative lower quantile (used for boundary-risky candidates);
 * slow drift ``Theta_t ~ N(Theta_{t-1}, Q dt)`` implemented as exponential
   forgetting of precision, so stale knowledge loses confidence instead of
-  disappearing.
+  disappearing. Drift now runs on two paths: :meth:`UserInteractionModel.tick_drift`
+  ages the parameters by the number of seconds that actually elapsed (the Runtime
+  calls it from its time passage), and the older per-observation nudge in
+  :meth:`UserInteractionModel._apply_drift` is unchanged, so a Runtime that never
+  ticks still ages its beliefs instead of freezing them;
+* reply speed is judged *relative to this user's own habit*: an exponential moving
+  average of ``log1p(reply_delay_seconds)``, persisted alongside the other
+  parameters, is the baseline and each observed delay becomes a z-score against it.
+  Until :data:`REPLY_DELAY_BASELINE_MIN_SAMPLES` delays have been seen the baseline
+  is not trusted and the absolute ``default_reply_delay_seconds`` is used instead.
+  Reply *length* and turn count are still compared against absolute thresholds.
 
 Crucially, an observation is *not* an attribution: "6 hours without a reply" is
 recorded as ``reply_delay = 21600`` and gets a tiny weight, never as
-``feedback = negative``.
+``feedback = negative``. A *late* reply is weaker positive evidence, not negative
+evidence: the relative-delay term can only take back the bonus the other signals
+earned, it can never push the positive target below neutral.
 """
 
 from __future__ import annotations
@@ -105,6 +117,48 @@ TYPE_TO_BEHAVIOUR: Mapping[str, str] = {
     "apology": "repair",
     "reply": "reply",
 }
+
+# --------------------------------------------------------------------------------------
+# Relative reply-delay scoring (§29)
+#
+# These are module constants rather than ``UserModelConfig`` fields because the two
+# defects being fixed here must not touch ``config.py``; they are reported so the
+# config owner can promote them to real knobs with the same defaults.
+# --------------------------------------------------------------------------------------
+
+#: Minimum number of observed reply delays before the per-user baseline is used for
+#: scoring. With fewer samples the baseline is still being learned (one sample would
+#: simply echo the observation back and teach nothing), so scoring falls back to the
+#: absolute ``config.user_model.default_reply_delay_seconds`` reference instead.
+REPLY_DELAY_BASELINE_MIN_SAMPLES = 3
+
+#: Weight of the newest sample in the exponential moving average of
+#: ``log1p(reply_delay_seconds)``. 0.25 makes the baseline roughly the mean of the
+#: last four replies: fast enough to follow a real change of habit within a day or
+#: two of chatting, slow enough that one unusual reply does not redefine "normal".
+REPLY_DELAY_BASELINE_ALPHA = 0.25
+
+#: Floor for the baseline's log-space standard deviation. A metronomic user has a
+#: spread near zero and would otherwise register an enormous z-score for a difference
+#: of a few seconds. ``0.34`` means "anything inside a factor of ~1.4 counts as the
+#: same speed".
+REPLY_DELAY_MIN_LOG_STDEV = 0.34
+
+#: Spread assumed while the fallback (absolute) reference is in use. ``0.7`` is
+#: roughly "a factor of two either way", i.e. the fallback reacts to order-of-magnitude
+#: differences only - it is a prior, not a measurement.
+REPLY_DELAY_FALLBACK_LOG_STDEV = 0.7
+
+#: z-score magnitude at which the relative-delay signal saturates at +-1. Two log-space
+#: standard deviations ("this reply is far outside their normal rhythm") is the most
+#: the delay term is allowed to say.
+REPLY_DELAY_Z_SCALE = 2.0
+
+#: Largest absolute contribution of the relative-delay term to the
+#: ``positive_probability`` target. 0.10 is the same order as the reply-length term
+#: already in :meth:`UserInteractionModel._target_rewards`, so speed informs the
+#: update without drowning the other observation channels.
+REPLY_DELAY_TARGET_WEIGHT = 0.10
 
 
 @dataclass(slots=True)
@@ -340,6 +394,13 @@ def default_parameter_block(prior_precision: float = 1.0) -> tuple[dict[str, Any
     """
     params: dict[str, Any] = {name: list(values) for name, values in DEFAULT_THETA.items()}
     params["delta"] = {}
+    # A fresh model has seen no reply delays yet: ``samples`` is 0, which is exactly
+    # the state in which scoring falls back to the absolute reference delay.
+    params["reply_delay_baseline"] = {
+        "log_mean": 0.0,
+        "log_variance": 0.0,
+        "samples": 0,
+    }
     precision = {name: [prior_precision] * len(FEATURE_NAMES) for name in TARGET_NAMES}
     return params, precision
 
@@ -366,6 +427,13 @@ class UserInteractionModel:
         self._class_counts: dict[str, int] = {}
         self._observations = 0
         self._effective_count = 0.0
+        #: Reply-delay baseline, in log space: ``log1p(delay)`` is heavy-tailed (10
+        #: minutes and 8 hours are the same "kind" of event to a user's habit), so the
+        #: mean and variance are kept as ``log1p`` values and converted back only for
+        #: display. ``_delay_samples`` is how many observed delays they are built from.
+        self._delay_log_mean = 0.0
+        self._delay_log_variance = 0.0
+        self._delay_samples = 0
         self._summary: dict[str, Any] | None = None
         self._load()
 
@@ -396,6 +464,7 @@ class UserInteractionModel:
                 for name in TARGET_NAMES
             }
             self._delta = {}
+            self._reset_reply_delay_baseline()
             self._observations = 0
             self._effective_count = 0.0
             return
@@ -422,9 +491,44 @@ class UserInteractionModel:
             for cls in BEHAVIOUR_CLASSES
         }
         self._class_counts = self._load_class_counts(params)
+        self._load_reply_delay_baseline(params)
         self._observations = int(stored.get("observations") or 0)
         self._effective_count = float(stored.get("effective_count") or 0.0)
         self._summary = stored.get("last_summary_json") or None
+
+    def _reset_reply_delay_baseline(self) -> None:
+        """Forget the reply-delay baseline (fresh model, or a malformed stored row)."""
+        self._delay_log_mean = 0.0
+        self._delay_log_variance = 0.0
+        self._delay_samples = 0
+
+    def _load_reply_delay_baseline(self, params: Mapping[str, Any]) -> None:
+        """Restore the persisted reply-delay baseline, when the row has one.
+
+        A row written before this field existed has none, which reads as the
+        cold-start state (no samples, absolute fallback) rather than as an error.
+        Malformed or non-finite values are discarded, because a corrupted baseline
+        would silently mis-score every later reply.
+        """
+        self._reset_reply_delay_baseline()
+        raw = params.get("reply_delay_baseline")
+        if not isinstance(raw, Mapping):
+            return
+        try:
+            samples = max(0, int(raw.get("samples") or 0))
+            mean = float(raw.get("log_mean") or 0.0)
+            variance = max(0.0, float(raw.get("log_variance") or 0.0))
+        except (TypeError, ValueError):
+            LOGGER.warning("Discarding malformed reply-delay baseline")
+            return
+        if samples <= 0:
+            return
+        if not (math.isfinite(mean) and math.isfinite(variance)):
+            LOGGER.warning("Discarding non-finite reply-delay baseline")
+            return
+        self._delay_log_mean = mean
+        self._delay_log_variance = variance
+        self._delay_samples = samples
 
     @staticmethod
     def _load_class_counts(params: Mapping[str, Any]) -> dict[str, int]:
@@ -461,6 +565,11 @@ class UserInteractionModel:
         params["class_counts"] = {
             cls: count for cls, count in self._class_counts.items() if count
         }
+        params["reply_delay_baseline"] = {
+            "log_mean": self._delay_log_mean,
+            "log_variance": self._delay_log_variance,
+            "samples": self._delay_samples,
+        }
         self._projection.upsert_params(
             connection,
             params=params,
@@ -469,6 +578,107 @@ class UserInteractionModel:
             effective_count=self._effective_count,
             summary=self._summary,
         )
+
+    # ------------------------------------------------- relative reply-delay baseline
+
+    @property
+    def reply_delay_baseline_samples(self) -> int:
+        """Return how many observed reply delays the baseline is built from."""
+        return int(self._delay_samples)
+
+    @property
+    def reply_delay_baseline_seconds(self) -> float | None:
+        """Return this user's own typical reply delay in seconds, or ``None``.
+
+        The baseline is an exponential moving average in ``log1p`` space, so this
+        converts it back with ``expm1``; it is a *typical* delay (closer to a median
+        than to an arithmetic mean), not an average of the raw seconds. ``None``
+        means no reply delay has been observed yet - it does not mean zero seconds.
+        """
+        if self._delay_samples <= 0:
+            return None
+        return math.expm1(self._delay_log_mean)
+
+    def delay_reference(self) -> tuple[float, float, bool]:
+        """Return ``(reference, spread, baseline_trusted)`` for delay scoring.
+
+        ``reference`` is what an observed delay is compared against, expressed in
+        ``log1p`` seconds, and ``spread`` is the log-space standard deviation used to
+        turn that comparison into a z-score. Until
+        :data:`REPLY_DELAY_BASELINE_MIN_SAMPLES` delays have been observed the two
+        are the absolute fallback (``default_reply_delay_seconds`` and
+        :data:`REPLY_DELAY_FALLBACK_LOG_STDEV`) and ``baseline_trusted`` is ``False``.
+        """
+        if self._delay_samples >= REPLY_DELAY_BASELINE_MIN_SAMPLES:
+            spread = max(REPLY_DELAY_MIN_LOG_STDEV, math.sqrt(max(0.0, self._delay_log_variance)))
+            return self._delay_log_mean, spread, True
+        default = max(1.0, float(self._config.user_model.default_reply_delay_seconds))
+        return math.log1p(default), REPLY_DELAY_FALLBACK_LOG_STDEV, False
+
+    def relative_delay_signal(self, reply_delay_seconds: float) -> float:
+        """Return how fast one reply was *for this user*, in ``[-1, 1]``.
+
+        ``+1`` means "far faster than this user normally replies", ``0`` means "about
+        their usual speed", ``-1`` means "far slower". The score is a z-score of
+        ``log1p(delay)`` against the baseline in :meth:`delay_reference`, divided by
+        :data:`REPLY_DELAY_Z_SCALE` and clamped.
+
+        Args:
+            reply_delay_seconds: Measured delay; negative values are read as 0.
+
+        Returns:
+            The relative-speed signal. This is the exact number
+            :meth:`_target_rewards` folds into the positive-probability target, so a
+            diagnostic can explain an update without re-deriving it.
+        """
+        reference, spread, _ = self.delay_reference()
+        observed = math.log1p(max(0.0, float(reply_delay_seconds)))
+        z = (observed - reference) / max(1e-6, spread)
+        return clamp(-z / REPLY_DELAY_Z_SCALE, -1.0, 1.0)
+
+    def reply_delay_baseline_view(self) -> dict[str, Any]:
+        """Return the reply-delay baseline and what scoring compares against.
+
+        Additive diagnostic view (also embedded in :meth:`numeric_view`).
+        ``mean_seconds`` is ``None`` until a reply delay has been observed;
+        ``reference_seconds`` is the value currently used for scoring, which is the
+        absolute fallback until the baseline has
+        :data:`REPLY_DELAY_BASELINE_MIN_SAMPLES` samples.
+        """
+        reference, spread, trusted = self.delay_reference()
+        return {
+            "samples": self._delay_samples,
+            "min_samples": REPLY_DELAY_BASELINE_MIN_SAMPLES,
+            "mean_seconds": (
+                None if self._delay_samples <= 0 else round(math.expm1(self._delay_log_mean), 3)
+            ),
+            "reference_seconds": round(math.expm1(reference), 3),
+            "log_stdev": round(spread, 6),
+            "trusted": trusted,
+        }
+
+    def _learn_reply_delay(self, reaction: BehaviourReaction) -> None:
+        """Fold one observed reply delay into the per-user baseline.
+
+        Only actual replies teach the baseline: a missing reply says nothing about how
+        fast this user normally answers, and counting it would let a week of silence
+        redefine "normal speed". A negative or absent delay is treated as unknown.
+        """
+        delay = reaction.reply_delay_seconds
+        if not reaction.replied or delay is None or delay < 0.0:
+            return
+        sample = math.log1p(float(delay))
+        if self._delay_samples <= 0:
+            self._delay_log_mean = sample
+            self._delay_log_variance = 0.0
+            self._delay_samples = 1
+            return
+        deviation = sample - self._delay_log_mean
+        self._delay_log_mean += REPLY_DELAY_BASELINE_ALPHA * deviation
+        self._delay_log_variance += REPLY_DELAY_BASELINE_ALPHA * (
+            deviation * deviation - self._delay_log_variance
+        )
+        self._delay_samples += 1
 
     # ---------------------------------------------------------------- prediction
 
@@ -637,8 +847,15 @@ class UserInteractionModel:
         )
         self._projection.record_observation(connection, observation.to_dict() | {"applied": False})
 
+        # The delay is scored against the baseline as it stands *before* this
+        # observation and folded in afterwards: scoring it against a baseline that
+        # already contains it would compare the reply with itself and detect nothing.
         targets = self._target_rewards(reaction)
-        self._update(connection, action, context, targets, weight.total, learning_rate)
+        self._learn_reply_delay(reaction)
+        if not self._update(connection, action, context, targets, weight.total, learning_rate):
+            # ``_update`` skips a zero-weight observation; the baseline still moved,
+            # so it is persisted on its own rather than waiting for the next update.
+            self._persist(connection)
         self._projection.mark_observation_applied(connection, observation.observation_id)
         return observation
 
@@ -647,6 +864,10 @@ class UserInteractionModel:
 
         A non-reply produces *no* positive-probability target at all: absence of a
         reply is not evidence of a negative reaction.
+
+        When the user did reply, how fast they replied is scored relative to their own
+        baseline (:meth:`relative_delay_signal`) instead of an absolute threshold. The
+        reply-length and turn-count terms are still absolute.
         """
         targets: dict[str, float] = {"reply_probability": 1.0 if reaction.replied else 0.0}
         target_busy = clamp(reaction.busy_probability)
@@ -663,12 +884,39 @@ class UserInteractionModel:
             positive += 0.12 if reaction.continued_topic else -0.05
             positive += 0.08 if reaction.asked_back else -0.05
             positive += 0.10 if reaction.reply_length >= 20 else (-0.05 if reaction.reply_length <= 4 else 0.0)
+            positive += self._relative_delay_delta(reaction, positive)
         targets["positive_probability"] = clamp(positive)
         targets["continue_probability"] = clamp(
             0.2 + 0.6 * (1.0 if reaction.continued_topic else 0.0) + 0.1 * min(3, reaction.turns) / 3.0
         )
         targets["boundary_risk"] = 1.0 if reaction.boundary_touched else 0.0
         return targets
+
+    def _relative_delay_delta(self, reaction: BehaviourReaction, positive: float) -> float:
+        """Return the signed adjustment the relative reply delay contributes.
+
+        ``+REPLY_DELAY_TARGET_WEIGHT`` for a reply far faster than this user's own
+        baseline, down to ``-REPLY_DELAY_TARGET_WEIGHT`` for one far slower. The
+        negative side is capped at the bonus the other signals already earned
+        (``positive - 0.5``): arriving late makes the reply *weaker positive* evidence,
+        it never turns a reply into negative evidence, which is the same invariant
+        that keeps "no reply" from becoming a label.
+
+        Args:
+            reaction: The observed reaction.
+            positive: The positive-probability target accumulated so far.
+
+        Returns:
+            The adjustment to add to ``positive`` (``0.0`` when speed is unknown).
+        """
+        if not reaction.replied or reaction.reply_delay_seconds is None:
+            return 0.0
+        delta = REPLY_DELAY_TARGET_WEIGHT * self.relative_delay_signal(
+            reaction.reply_delay_seconds
+        )
+        if delta >= 0.0:
+            return delta
+        return -min(-delta, max(0.0, positive - 0.5))
 
     def _update(
         self,
@@ -678,10 +926,15 @@ class UserInteractionModel:
         targets: Mapping[str, float],
         weight: float,
         learning_rate: float | None,
-    ) -> None:
-        """Apply one weighted online Bayesian update to the parameters."""
+    ) -> bool:
+        """Apply one weighted online Bayesian update to the parameters.
+
+        Returns:
+            ``True`` when the update was applied and persisted, ``False`` when a
+            zero-weight observation was skipped (nothing changed, nothing written).
+        """
         if weight <= 0.0:
-            return
+            return False
         features = extract_features(action=action, context=context, config=self._config.user_model)
         vector = _vector(features)
         behaviour_class = behaviour_class_of(action)
@@ -721,6 +974,7 @@ class UserInteractionModel:
         self._class_counts[behaviour_class] = self.behaviour_evidence(behaviour_class) + 1
         self._apply_drift()
         self._persist(connection)
+        return True
 
     def _apply_drift(self) -> None:
         """Model slow preference drift by forgetting precision over evidence.
@@ -728,6 +982,12 @@ class UserInteractionModel:
         ``Theta_t ~ N(Theta_{t-1}, Q dt)`` is approximated by shrinking the
         precision of every parameter toward the prior, so old knowledge keeps its
         mean but loses confidence.
+
+        This is the *per-observation* nudge: it uses ``forgetting_rate`` as a plain
+        fraction, which is how the knob was originally defined, and it is what keeps a
+        Runtime that never ticks from freezing its beliefs forever. The decay that is a
+        function of elapsed time is :meth:`tick_drift`; the two are independent and
+        both pull precision toward the same prior.
         """
         rate = self._config.user_model.forgetting_rate
         for target in TARGET_NAMES:
@@ -735,6 +995,68 @@ class UserInteractionModel:
                 current = self._precision[target][index]
                 decayed = current - rate * max(0.0, current - self._config.user_model.prior_precision)
                 self._precision[target][index] = max(1e-6, decayed)
+
+    def tick_drift(
+        self, dt_seconds: float, *, connection: sqlite3.Connection | None = None
+    ) -> bool:
+        """Age the learned beliefs by ``dt_seconds`` of elapsed time (§28).
+
+        ``Theta_t ~ N(Theta_{t-1}, Q dt)`` is implemented as exponential forgetting of
+        the precision *in excess of the prior*: the mean stays where the evidence put
+        it, while confidence relaxes toward the cold-start level. Because the retention
+        factor is ``exp(-rate * dt)``, the result depends only on the total elapsed
+        time - ten one-day ticks leave the same state as one ten-day tick - and the
+        call is a strict no-op for ``dt_seconds <= 0``, so an idle or repeated tick
+        costs nothing and cannot double-count an interval.
+
+        ``config.user_model.drift_half_life_hours`` is the timescale (a week by
+        default): a silence that long halves the confidence accumulated on top of the
+        prior. It is deliberately *not* ``forgetting_rate``, which is the
+        per-observation nudge applied when a new observation lands and is a plain
+        fraction rather than a rate - one knob carrying two units is how the
+        time-based path came to be missing in the first place.
+
+        Observation counts and the means themselves are deliberately untouched: they
+        are historical facts, not beliefs. What changes is how certain the model is, so
+        the effect shows up as a larger ``Prediction.uncertainty`` and a lower
+        :meth:`conservative_bound`.
+
+        Args:
+            dt_seconds: Elapsed time to integrate. Values ``<= 0`` are ignored.
+            connection: Write connection used to persist the decayed precision through
+                the user-model projection. Without it the decay is applied in memory
+                only and is lost when the model is reloaded, so the Runtime passes the
+                connection of the tick it is already inside.
+
+        Returns:
+            ``True`` when precision moved (and, with a connection, was persisted).
+        """
+        if not math.isfinite(dt_seconds) or dt_seconds <= 0.0:
+            return False
+        half_life_hours = float(self._config.user_model.drift_half_life_hours)
+        if half_life_hours <= 0.0:
+            return False
+        rate = math.log(2.0) / (half_life_hours * 3600.0)
+        if rate <= 0.0:
+            return False
+        retention = exponential_decay(rate, dt_seconds)
+        if retention >= 1.0:
+            return False
+        prior = float(self._config.user_model.prior_precision)
+        changed = False
+        for target in TARGET_NAMES:
+            for index in range(len(FEATURE_NAMES)):
+                current = self._precision[target][index]
+                excess = current - prior
+                if excess <= 0.0:
+                    continue
+                decayed = prior + excess * retention
+                if decayed < current:
+                    self._precision[target][index] = max(1e-6, decayed)
+                    changed = True
+        if changed and connection is not None:
+            self._persist(connection)
+        return changed
 
     # ------------------------------------------------------------------- summary
 
@@ -783,11 +1105,16 @@ class UserInteractionModel:
         }
 
     def numeric_view(self) -> dict[str, Any]:
-        """Return the numeric view used by the heartbeat and motivation layers."""
+        """Return the numeric view used by the heartbeat and motivation layers.
+
+        Every key the previous version returned is still here and still has the same
+        shape; ``reply_delay_baseline`` is additive.
+        """
         view: dict[str, Any] = {
             "observations": self._observations,
             "effective_count": round(self._effective_count, 3),
             "class_evidence": {cls: self.behaviour_evidence(cls) for cls in BEHAVIOUR_CLASSES},
+            "reply_delay_baseline": self.reply_delay_baseline_view(),
             "behaviour_offsets": {
                 behaviour_class: {
                     target: [round(value, 4) for value in vector]

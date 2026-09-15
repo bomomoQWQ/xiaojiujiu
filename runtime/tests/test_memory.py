@@ -436,7 +436,16 @@ def test_recent_recall_is_penalised() -> None:
 
 
 def test_activation_pool_decays_and_is_bounded() -> None:
-    """Activation decays over time and the pool stays bounded."""
+    """Activation decays over time and the pool stays bounded.
+
+    The cue used to share a single bigram with every memory, and a memory no cue
+    actually recalled is not activated at all (``_was_brought_to_mind``). The pool
+    therefore stayed empty: ``len(...) <= 2`` was ``0 <= 2`` and the decay loop ran
+    zero iterations, so neither half of the docstring was tested. The cues below are
+    genuine recalls, so the pool is populated and both halves assert a consequence.
+    """
+    from companion_runtime.utility import exponential_decay
+
     db = Database(":memory:")
     db.migrate()
     projection = MemoryProjection(db)
@@ -445,20 +454,48 @@ def test_activation_pool_decays_and_is_bounded() -> None:
     try:
         _seed_memories(projection, db, config)
         store = memory_module.MemoryStore(projection, config)
-        hits = store.retrieve(
-            memory_module.RetrievalCue(query_text="面试 咖啡 追问", now=BASE_TIME),
-            limit=3,
-            rng=random.Random(2),
-        )
-        with db.transaction() as conn:
-            store.activate(conn, hits, now=BASE_TIME)
-        assert len(projection.list_activated(limit=10)) <= 2
-        before = {item.memory_id: item.activation for item in projection.list_activated(limit=10)}
+
+        def recall(text: str):
+            """Retrieve on a real cue and fold the recall into the pool."""
+            hits = store.retrieve(
+                memory_module.RetrievalCue(query_text=text, now=BASE_TIME),
+                limit=3,
+                rng=random.Random(2),
+            )
+            with db.transaction() as conn:
+                return store.activate(conn, hits, now=BASE_TIME)
+
+        # A real recall puts exactly that memory on the character's mind.
+        assert [item.memory_id for item in recall("面试 准备")] == ["mem_interview"]
+        pool = {item.memory_id: item.activation for item in projection.list_activated(limit=10)}
+        assert pool == {"mem_interview": pytest.approx(1.0, abs=0.01)}
+
+        # ...and it decays between recalls, in proportion to the elapsed time.
+        before = dict(pool)
         with db.transaction() as conn:
             store.decay_pool(conn, dt_seconds=6 * 3600.0)
         after = {item.memory_id: item.activation for item in projection.list_activated(limit=10)}
+        assert set(after) == set(before)
         for memory_id, value in after.items():
             assert value < before[memory_id]
+        assert after["mem_interview"] == pytest.approx(
+            before["mem_interview"]
+            * exponential_decay(config.memory.activation_decay_rate, 6 * 3600.0),
+            rel=1e-6,
+        )
+
+        # The pool is bounded: three recalled memories with a pool size of two leave
+        # exactly two, and the one crowded out leaves the working set for good.
+        recall("追问 不喜欢")
+        recall("咖啡 喜欢")
+        final = {item.memory_id: item.activation for item in projection.list_activated(limit=10)}
+        assert len(final) == 2, final
+        crowded_out = {"mem_interview", "mem_interrogation", "mem_coffee"} - set(final)
+        assert len(crowded_out) == 1, final
+        assert (
+            projection.get_memory(crowded_out.pop()).status
+            != MemoryStatus.ACTIVE.value
+        ), "a memory outside the bounded pool is no longer in the working set"
     finally:
         db.close()
 

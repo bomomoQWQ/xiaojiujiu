@@ -173,19 +173,52 @@ class TestTwoTimeScaleContract:
             runtime.close()
 
     def test_unresolved_events_do_not_leak_into_the_block_as_facts(self) -> None:
+        """The deferral must be visible as a deferral, not as an interpretation.
+
+        The old second assertion scanned the inference rows for the literal "失望",
+        which no situation row can ever contain: after a deferred message there is no
+        inference row at all, and the only inference writers store
+        ``关系信号：<signal>``. It therefore stayed green even if the deferral path
+        started writing inferences. The consequences are asserted directly, with a
+        settled control so the assertions cannot pass because nothing is ever written.
+        """
         from companion_runtime import context as context_module
 
         runtime = Runtime(config=build_config())
         try:
-            runtime.process_user_message(content="算了，也没什么。", timestamp=BASE_TIME)
+            outcome = runtime.process_user_message(content="算了，也没什么。", timestamp=BASE_TIME)
             bundle = context_module.build(runtime=runtime, now=BASE_TIME)
             facts = " ".join(bundle.situation.get("facts", []))
             assert "算了" in facts, "the raw fact is still recorded"
-            # ...but it must not be presented as an understood emotional state.
-            assert not any(
-                "失望" in item.get("content", "")
+            # ...but nothing was interpreted: no inference row, no emotion, no
+            # emotional after-effect.
+            assert (
+                [
+                    item
+                    for item in runtime.projections.situation.list_active()
+                    if item["kind"] == "inference"
+                ]
+                == []
+            ), "a deferred event must not be presented as an understood state"
+            assert runtime.projections.emotion.list_active() == []
+            assert outcome.emotion_event_ids == []
+
+            # Control: the settled path writes both, so the assertions above are not
+            # passing because these projections are simply never written.
+            settled_relation = runtime.process_user_message(
+                content="我今晚想自己待着", timestamp=BASE_TIME + timedelta(minutes=1)
+            )
+            assert [
+                item
                 for item in runtime.projections.situation.list_active()
                 if item["kind"] == "inference"
+            ], "a settled relation signal must produce an inference"
+            settled_distress = runtime.process_user_message(
+                content="我今天很难过。", timestamp=BASE_TIME + timedelta(minutes=2)
+            )
+            assert settled_relation.event.event_id != settled_distress.event.event_id
+            assert runtime.projections.emotion.list_active(), (
+                "a settled distress event must produce an emotion"
             )
         finally:
             runtime.close()

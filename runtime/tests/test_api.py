@@ -113,7 +113,7 @@ def test_append_event_requires_a_type(client: TestClient) -> None:
     assert client.post("/events", json={"content": "hi"}).status_code == 422
 
 
-def test_read_events_and_one_event(client: TestClient) -> None:
+def test_read_events_and_one_event(client: TestClient, runtime: Runtime) -> None:
     """Events are readable individually and as a filtered list."""
     created = client.post(
         "/events",
@@ -125,7 +125,25 @@ def test_read_events_and_one_event(client: TestClient) -> None:
     single = client.get(f"/events/{created['event_id']}")
     assert single.status_code == 200
     assert single.json()["event"]["content"] == "在吗"
+    # Nothing has interpreted this event yet...
     assert single.json()["interpretations"] == []
+    # ...and once a version exists the endpoint must expose it. Without this half an
+    # endpoint that always returned ``[]`` would keep the whole suite green.
+    with runtime.db.transaction() as conn:
+        runtime.projections.interpretations.add_version(
+            conn,
+            target_kind="event",
+            target_id=created["event_id"],
+            content="这句问候后面可能还有话",
+            confidence=0.5,
+            source_version=runtime.version(),
+            source_event_ids=[created["event_id"]],
+        )
+    after = client.get(f"/events/{created['event_id']}").json()
+    assert [item["content"] for item in after["interpretations"]] == [
+        "这句问候后面可能还有话"
+    ]
+    assert after["interpretations"][0]["interpretation_version"] == 1
     assert client.get("/events/evt_missing").status_code == 404
 
 
@@ -154,12 +172,21 @@ def test_context_and_render_block(client: TestClient) -> None:
 # --------------------------------------------------------------------------------------
 
 
-def test_tick_endpoint_advances_time(client: TestClient) -> None:
-    """POST /tick runs lazy_tick explicitly."""
+def test_tick_endpoint_advances_time(client: TestClient, runtime: Runtime) -> None:
+    """POST /tick runs lazy_tick explicitly.
+
+    Every write to the state row bumps its version, so ``version >= before`` was
+    true even for a tick that advanced zero seconds. The tick report the endpoint
+    returns is what shows the three hours really moved the clock.
+    """
     before = client.get("/health").json()["state_version"]
     response = client.post("/tick", json={"now": (BASE_TIME + timedelta(hours=3)).isoformat()})
     assert response.status_code == 200
-    assert response.json()["version"] >= before
+    body = response.json()
+    assert body["version"] > before
+    assert body["dt_seconds"] == pytest.approx(3 * 3600.0)
+    assert body["changed"] is True
+    assert runtime.state().last_tick_at == BASE_TIME + timedelta(hours=3)
 
 
 def test_endogenous_endpoint_returns_a_decision(client: TestClient) -> None:

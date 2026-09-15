@@ -603,13 +603,29 @@ def test_checkpoint_rejects_an_unknown_mode(tmp_path: Path) -> None:
 
 
 def test_checkpoint_works_on_an_in_memory_database() -> None:
-    """The in-memory case is a no-op rather than an error."""
+    """The in-memory case is a no-op rather than an error.
+
+    Both byte counts are the function's own literals for a non-file store
+    (``... else 0``), so comparing them to zero measured nothing. What matters is
+    that the call is harmless: the checkpoint reports its mode and the store is
+    still usable afterwards.
+    """
     db = Database(":memory:")
     db.migrate()
     try:
         result = checkpoint(db)
+        assert result.mode == "TRUNCATE"
         assert result.wal_bytes_before == 0
         assert result.wal_bytes_after == 0
+        with db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO schema_meta(key, value, updated_at) VALUES(?, ?, ?)",
+                ("checkpoint_smoke", "1", "now"),
+            )
+        row = db.query_one(
+            "SELECT value FROM schema_meta WHERE key = ?", ("checkpoint_smoke",)
+        )
+        assert row is not None and row["value"] == "1"
     finally:
         db.close()
 

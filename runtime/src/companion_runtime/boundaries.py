@@ -24,11 +24,25 @@ from datetime import datetime, timedelta
 from typing import Sequence
 
 from .config import RuntimeConfig
+from .memory import DEDUPE_MIN_SHARED_TOKENS
 from .projections import BoundaryProjection
-from .typing import Boundary, BoundaryType, EventType, RawEvent, RuntimeState, new_id
-from .utility import clamp, utcnow
+from .typing import (
+    Boundary,
+    BoundaryType,
+    EventType,
+    RawEvent,
+    RuntimeState,
+    UnfinishedMatter,
+    new_id,
+)
+from .utility import clamp, summarize_text, topic_tokens, utcnow
 
 LOGGER = logging.getLogger("companion_runtime.boundaries")
+
+#: The scopes that are *about something* rather than about contact in general. Only
+#: these carry a bound referent (:attr:`~companion_runtime.typing.Boundary.subject`),
+#: and only these are enforced against individual candidates.
+TOPIC_SCOPES = ("topic_avoid", "repeated_interrogation")
 
 
 @dataclass(slots=True)
@@ -111,8 +125,15 @@ BOUNDARY_PATTERNS: tuple[BoundaryPattern, ...] = (
         note="user asked not to be contacted proactively",
     ),
     BoundaryPattern(
+        # ``(再)?`` after the negative particle is load-bearing, not decoration: the most
+        # natural Chinese phrasing of this instruction is "别再追问我在干嘛", and without
+        # it the particle branch (别/不要/不要再/不许) could not consume the 再, so the
+        # rule matched "别一直问我这个" and *missed* "别再追问我在干嘛" - i.e. the
+        # ``repeated_interrogation`` scope, and with it §52's topic-level gate for this
+        # pattern, was unreachable from ordinary language. Found by asking whether a
+        # real sentence declares a boundary, not by reading the regex.
         _compile(
-            r"(别|不要|不要再|不许)\s*(一直|老是|总是|反复)?\s*"
+            r"(别|不要|不许)\s*(再)?\s*(一直|老是|总是|反复)?\s*"
             r"(问|追问|打听)\s*(我)?\s*(这个|这件事|在干嘛|在哪|在做什么)"
         ),
         BoundaryType.TOPIC.value,
@@ -164,6 +185,7 @@ def detect_boundaries(
     state: RuntimeState,
     config: RuntimeConfig,
     now: datetime | None = None,
+    referent: str | None = None,
 ) -> list[Boundary]:
     """Detect explicit boundaries declared by one event.
 
@@ -172,6 +194,10 @@ def detect_boundaries(
         state: Current runtime state; ``boundary_respect`` scales the window.
         config: Runtime configuration.
         now: Reference time, defaults to the event timestamp.
+        referent: What a deictic instruction is about, when the caller could work it
+            out (:func:`referent_for`). It is attached only to the *topic* scopes: a
+            boundary about a topic without a topic is only a category, and the decision
+            gate has nothing to compare a candidate against.
 
     Returns:
         Newly declared boundaries (possibly empty).
@@ -202,6 +228,7 @@ def detect_boundaries(
             expires_at=expires,
             source_event_id=event.event_id,
             note=rule.note,
+            subject=referent if rule.scope in TOPIC_SCOPES else None,
         )
         strength = _rule_strength(rule, hours)
         current = found.get(rule.scope)
@@ -211,6 +238,117 @@ def detect_boundaries(
         if current is None or strength > current[0]:
             found[rule.scope] = (strength, candidate)
     return [boundary for _strength, boundary in found.values()]
+
+
+def referent_for(
+    *,
+    previous_events: Sequence[RawEvent],
+    matters: Sequence[UnfinishedMatter],
+) -> str | None:
+    """Return what a deictic instruction ("暂时不要跟我说这个") is about.
+
+    The boundary rules match the *instruction*, never its object: "这个" points at
+    whatever was being discussed. Three sources are consulted, most precise first:
+
+    1. **the open matter built from that very message** - a matter records the events
+       it came from, so event identity settles it without any text comparison. This is
+       the common case and the one text overlap gets wrong: "我明天下午三点面试，结束了
+       告诉你" and the matter title "等待面试结果" share exactly one bigram;
+    2. **an open matter whose title overlaps what was said** - for a referent that was
+       discussed rather than just promised;
+    3. **the last thing the user said** - used verbatim (truncated) as a last resort.
+
+    With nothing to go on the answer is ``None``, and every caller must treat that as
+    "do not guess": an unbound topic boundary constrains nothing until it expires,
+    which is the conservative direction. Guessing here would silence a subject the user
+    never named, and the delivery-time gate still stops anything that would mention the
+    avoided topic by name.
+
+    Args:
+        previous_events: Earlier user messages, newest first.
+        matters: Open unfinished matters.
+
+    Returns:
+        The subject text, or ``None`` when it cannot be established.
+    """
+    for event in previous_events:
+        text = (event.content or "").strip()
+        if not text:
+            continue
+        for matter in matters:
+            title = (matter.title or "").strip()
+            if not title:
+                continue
+            if event.event_id in set(matter.source_event_ids or ()):
+                return title
+        for matter in matters:
+            title = (matter.title or "").strip()
+            if not title:
+                continue
+            if len(topic_tokens(text) & topic_tokens(title)) >= DEDUPE_MIN_SHARED_TOKENS:
+                return title
+        return summarize_text(text, 40)
+    return None
+
+
+#: Candidate types that *ask the user something*. This is the boundary layer's view of
+#: "question-shaped", used by :func:`blocks_candidate` for the
+#: ``repeated_interrogation`` scope: "别再一直追问我在干嘛" is an instruction about being
+#: interrogated, not about one subject, so what it rules out is the shape of the
+#: candidate rather than its topic.
+QUESTION_CANDIDATE_TYPES = ("follow_up", "curious_question")
+
+
+def blocks_candidate(
+    boundaries: Sequence[Boundary],
+    *,
+    now: datetime,
+    subject: str,
+    is_question: bool,
+) -> tuple[str, str] | None:
+    """Return ``(boundary_id, reason)`` when a topic boundary forbids one candidate.
+
+    Topic boundaries carry ``allow_proactive=True`` - being told "don't bring *this*
+    up" is not being told to fall silent - so they cannot be enforced by the
+    proactivity gate that :func:`evaluate` implements. They are enforced here, on the
+    candidate, *before* the utility comparison: a candidate the user has ruled out must
+    not be weighed against the others at all, because weighing it is what spends the
+    decision on something that can never be sent.
+
+    Two scopes are handled, and only these two:
+
+    * ``topic_avoid`` - a candidate about the same thing as the bound subject is
+      blocked. Without a bound subject nothing is blocked (see :func:`referent_for`);
+    * ``repeated_interrogation`` - a *question-shaped* candidate about the same thing as
+      the bound subject is blocked. Both halves matter: the instruction is about being
+      interrogated *on that subject*, and blocking every question for the window - the
+      first version of this - silenced legitimate follow-ups about everything else. That
+      was measured, not theorised: it stopped the autonomous round from queuing any
+      render work at all in the resilience simulation.
+
+    Args:
+        boundaries: Boundaries currently in force.
+        now: Reference time.
+        subject: The candidate's subject text (its target and intent).
+        is_question: Whether the candidate would ask the user something.
+
+    Returns:
+        The blocking boundary's identifier and a stable reason string, or ``None``.
+    """
+    candidate_tokens = topic_tokens(subject)
+    for boundary in boundaries:
+        if not boundary.is_active(now):
+            continue
+        if boundary.scope not in TOPIC_SCOPES:
+            continue
+        bound = (boundary.subject or "").strip()
+        if not bound:
+            continue
+        if boundary.scope == "repeated_interrogation" and not is_question:
+            continue
+        if len(candidate_tokens & topic_tokens(bound)) >= DEDUPE_MIN_SHARED_TOKENS:
+            return boundary.boundary_id, boundary.scope
+    return None
 
 
 def _rule_strength(rule: BoundaryPattern, hours: float | None) -> int:
