@@ -51,8 +51,8 @@
   真插件钩子，12 个阶段 69 项检查，只依据**用户可见事实**（聊天记录、宿主回复、公开 HTTP 面）
   断言：不刷屏、边界即静默、不重复、不泄漏内部标记与凭据、会话隔离、重启与重放不打扰。
   自带 `--fault` 注错，用来证明每条检查真的会失败。
-  0.2.0 时点：**68 通过 / 1 失败**（失败项即上面第 2 条），
-  复现：`python scripts/blackbox_user_simulation.py --base-dir <dir>`。
+  0.2.0 时点：**69 / 69 全部通过**，
+  复现：`python scripts/blackbox_user_simulation.py --base-dir <dir>`（退出码 0）。
 - **高仿真故障恢复验证** `scripts/e2e_resilience_simulation.py`：335 项检查，覆盖并发上报、
   租约过期、断网恢复、重启续跑、队列 >150 行、多会话路由。
 - **Docker 部署**：`Dockerfile`（非 root、状态全在 `/data` 卷、内置 healthcheck）与
@@ -77,16 +77,19 @@
    现在已了结的义务会在一个窗口内**保留其主体**（`unfinished.subject_guards()`），
    窗口内的任何提及都不算新承诺，窗口之后的新承诺仍然可以正常开新事。
    （`test_obligation_subject_and_routing.py`）
-2. **在一个会话里形成的义务被投递到另一个会话**（部分修复，仍有 1 条未过）：
-   候选意图的来源是 `unfinished:<id>` 而不是事件 id，路由把它当事件查、查不到，
-   就退化成"谁最后说话就发给谁"。`Runtime._event_ids_behind()` 现在会把
-   `unfinished:` / `memory:` 解析回真正的事件来源，若来源事件存在则会话就正确；
-   **但黑盒仿真的第 11 阶段仍报 1 条失败**：私聊里说定的考试
-   （未尽之事 `unf_aa476b5651bd`，来源事件确实属于 `webchat:FriendMessage:10001`）
-   仍有 4 条 send 行被投递到 `webchat:GroupMessage:20002`。
-   候选的 `sources_json` 入库/出库是完整的（`_to_candidate` 映射正确），
-   所以下一步要查的是"这些 commit 是在什么情况下让 `_event_ids_behind` 返回空、
-   从而落到 newest-user-message 兜底"——复现命令与现象见下。
+2. **在一个会话里形成的义务被投递到另一个会话**（已修复）：候选意图的来源是
+   `unfinished:<id>` 而不是事件 id，路由把它当事件查、查不到，就退化成"谁最后说话就发给谁"。
+   `Runtime._event_ids_behind()` 现在会把 `unfinished:` / `memory:` 解析回真正的事件来源。
+   （`test_obligation_subject_and_routing.py`）
+3. **跨会话回复归属**（已修复）：`_attribute_user_reply()` 用的是全局"最新一条已发出"，
+   于是 A 会话里的一句话会结算掉发给 B 会话的主动消息——归属会消费 attempt，真实回复
+   再也无法结算它，用户模型还会从"用户没看到过的消息"上学习。
+   现在按回复到达的会话过滤（`_newest_sent_attempt(conversation_id=...)`）。
+   （同上文件 `TestAReplyBelongsToItsOwnChat`，做过变异验证）
+4. **仿真窗口假设**（非产品缺陷，已澄清）：`0.2.0` 过程中第 11 阶段曾报一条失败，
+   原因是脚本给第二个会话只开了 48 小时窗口，而它承诺出的未尽之事能活 72 小时。
+   已给"同一个仍未回答的承诺"补后续窗口，断言未被放宽。
+   同一条提交里对"考试被发到群聊"的诊断是错的：发往群聊的每一行都属于群聊自己的未尽之事。
 
 ### 已知边界（未变）
 

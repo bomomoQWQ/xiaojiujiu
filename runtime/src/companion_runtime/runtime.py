@@ -91,6 +91,12 @@ PERMISSION_MARKERS = ("多主动", "随时找我", "可以找我", "欢迎找我
 #: transaction-protected place as every other piece of state.
 LAST_DEEP_REFRESH_META_KEY = "last_deep_refresh_at"
 
+#: How many delivered attempts reply attribution scans when it has to find the one
+#: belonging to a specific conversation. Delivered attempts accumulate forever (a
+#: ``sent`` attempt is never expired), so the lookup is bounded; the newest few are
+#: the only ones a reply can plausibly be answering.
+ATTRIBUTION_SCAN_LIMIT = 20
+
 
 @dataclass(slots=True)
 class TickReport:
@@ -1795,18 +1801,47 @@ class Runtime:
 
     # ------------------------------------------------------------------ helpers
 
-    def _newest_sent_attempt(self) -> Any:
+    def _newest_sent_attempt(self, *, conversation_id: str | None = None) -> Any:
         """Return the most recent attempt whose message has been delivered.
 
         Ordering matters: ``list_by_state`` is oldest-first, so asking for one row
         in that order returns the *oldest* outstanding intention. Attribution must
         use the newest, otherwise a reply to the message the user just received
         trains the user model on a message from hours ago.
+
+        ``conversation_id`` scopes the search to one chat, and attribution always
+        passes the conversation the reply arrived in. Attribution *consumes* the
+        attempt, so a global lookup lets a message in one chat resolve an intention
+        the user never saw in another: the real answer can then never be attributed
+        to it, and the user model learns from a reply to something that was never
+        delivered there. An attempt whose row cannot be found is skipped for the
+        same reason - its conversation is unknown, so it cannot be the message the
+        user is answering.
+
+        Args:
+            conversation_id: Only consider attempts delivered in this conversation.
+
+        Returns:
+            The newest matching attempt, or ``None``.
         """
         sent = self.projections.attempts.list_by_state(
-            [AttemptState.SENT.value], limit=1, newest_first=True
+            [AttemptState.SENT.value], limit=ATTRIBUTION_SCAN_LIMIT, newest_first=True
         )
-        return sent[0] if sent else None
+        if conversation_id is None:
+            return sent[0] if sent else None
+        for attempt in sent:
+            if self._attempt_conversation(attempt) == conversation_id:
+                return attempt
+        return None
+
+    def _attempt_conversation(self, attempt: Any) -> str | None:
+        """Return the conversation an attempt's message was delivered into."""
+        outbox_id = getattr(attempt, "outbox_id", None)
+        if not outbox_id:
+            return None
+        row = self.projections.outbox.get(outbox_id)
+        conversation = getattr(row, "conversation_id", None)
+        return str(conversation) if conversation else None
 
     def _attribute_user_reply(
         self,
@@ -1843,7 +1878,7 @@ class Runtime:
         Returns:
             ``(observation_id, attributed_attempt_id)``; either may be ``None``.
         """
-        attempt = self._newest_sent_attempt()
+        attempt = self._newest_sent_attempt(conversation_id=event.conversation_id)
         if attempt is None:
             if reason is None:
                 return None, None

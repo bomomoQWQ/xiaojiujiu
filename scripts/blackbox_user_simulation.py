@@ -2324,6 +2324,22 @@ def phase_isolation(story: Story, ctx: "Context") -> None:
             note="a promise made in the group chat",
         )
     )
+    # The same promise, still unanswered. The design lets an unfinished matter live
+    # for days (``unfinished.default_expiry_hours`` is 168 h) and the character may
+    # gently follow up while the daily cap and the cooldown still hold, so the
+    # reminders that arrive after the first two days are not messages "out of
+    # nowhere" - they belong to this window, which exists so the timeline audit can
+    # tell them apart from speaking during silence or long after the matter lapsed.
+    story.open_window(
+        Window(
+            name="the second chat's promise is still unanswered",
+            session=session_b,
+            start=b_turn_at + 2 * DAY,
+            end=b_turn_at + 3 * DAY,
+            proactive_allowed=True,
+            note="the same open promise, one day later",
+        )
+    )
     # The first chat says something unrelated while the second chat's promise is
     # pending: whatever happens next must respect the session it belongs to.
     story.advance(6 * HOUR, label="both chats quiet")
@@ -2347,7 +2363,7 @@ def phase_isolation(story: Story, ctx: "Context") -> None:
         "the second chat gets its own unprompted message",
         len(b_proactives) >= 1,
         f"expected>=1 actual={len(b_proactives)} window={window_b.start.isoformat()}.."
-        f"{(b_turn_at + 2 * DAY).isoformat()}",
+        f"{window_b.end.isoformat()}",
     )
     a_messages = story.recorder.between(a_quiet_start, story.clock.now(), SESSION_A)
     a_proactives = [turn for turn in a_messages if turn.kind == "proactive"]

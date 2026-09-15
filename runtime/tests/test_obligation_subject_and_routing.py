@@ -603,3 +603,82 @@ class TestAnObligationFindsItsOwnChat:
             assert item is not None and item.conversation_id == SESSION_A
         finally:
             runtime.close()
+
+
+def deliver(runtime: Runtime, *, attempt_id: str, render_id: str, now: datetime) -> str:
+    """Render and deliver an attempt's message, leaving the attempt ``sent``."""
+    runtime.reducer.complete_render(outbox_id=render_id, text="体检结果怎么样啦？", now=now)
+    sends = runtime.projections.outbox.find_for_attempt(attempt_id, kind="send")
+    assert len(sends) == 1, [row.outbox_id for row in sends]
+    runtime.reducer.mark_delivered(outbox_id=sends[0].outbox_id, now=now, success=True)
+    return sends[0].outbox_id
+
+
+class TestAReplyBelongsToItsOwnChat:
+    """A reply may only consume a message the user could actually have seen.
+
+    Attribution *resolves* the attempt, so a global lookup lets a message in one
+    chat retire an intention that was delivered into another: the user's real
+    answer can never be attributed to it afterwards, and the user model learns
+    from a reply to something that was never sent there.
+    """
+
+    def _delivered_in_b(self, runtime: Runtime, clock: SimulatedClock) -> str:
+        """Open B's promise, deliver its follow-up into B, and return the attempt id."""
+        matter = TestAnObligationFindsItsOwnChat()._two_chats(runtime, clock)
+        follow_up = TestAnObligationFindsItsOwnChat()._follow_up(
+            runtime, matter, now=BASE_TIME + timedelta(hours=2)
+        )
+        attempt_id, render_id = commit(runtime, follow_up, now=BASE_TIME + timedelta(hours=2))
+        sent_at = BASE_TIME + timedelta(hours=3)
+        deliver(runtime, attempt_id=attempt_id, render_id=render_id, now=sent_at)
+        attempt = runtime.projections.attempts.get(attempt_id)
+        assert attempt is not None and attempt.state == "sent"
+        return attempt_id
+
+    def test_a_reply_in_another_chat_leaves_the_message_outstanding(
+        self, clock: SimulatedClock
+    ) -> None:
+        """Session A's message must not consume session B's delivered message."""
+        runtime = build_runtime()
+        try:
+            attempt_id = self._delivered_in_b(runtime, clock)
+
+            say(
+                runtime,
+                clock,
+                "对了，我下周要考试，考完跟你说。",
+                at=BASE_TIME + timedelta(hours=4),
+                session=SESSION_A,
+            )
+
+            attempt = runtime.projections.attempts.get(attempt_id)
+            assert attempt is not None
+            assert attempt.state == "sent", (
+                "a reply in another chat consumed a message that was delivered to "
+                "a different chat; the user's real answer can no longer resolve it"
+            )
+            assert runtime.projections.user_model.observation_for_attempt(attempt_id) is None
+        finally:
+            runtime.close()
+
+    def test_a_reply_in_that_chat_does_resolve_it(self, clock: SimulatedClock) -> None:
+        """The scoping must not turn into "never attribute anything"."""
+        runtime = build_runtime()
+        try:
+            attempt_id = self._delivered_in_b(runtime, clock)
+
+            say(
+                runtime,
+                clock,
+                "体检结果出来了，一切正常。",
+                at=BASE_TIME + timedelta(hours=4),
+                session=SESSION_B,
+            )
+
+            attempt = runtime.projections.attempts.get(attempt_id)
+            assert attempt is not None and attempt.state == "resolved"
+            observation = runtime.projections.user_model.observation_for_attempt(attempt_id)
+            assert observation is not None, "the reply in the right chat was not attributed"
+        finally:
+            runtime.close()

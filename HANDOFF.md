@@ -90,27 +90,23 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 
 | 项目 | 结果 |
 |---|---|
-| Runtime 离线测试 | 824 passed |
+| Runtime 离线测试 | 826 passed |
 | 插件离线测试 | 143 passed + 13 subtests |
 | 高仿真故障恢复 | 335/335 |
-| 用户黑盒仿真 | **68 / 69**（1 项未过，见下） |
+| 用户黑盒仿真 | **69 / 69**（退出码 0） |
 | 版本 | Runtime 0.2.0；插件 0.1.0 |
 | 许可证 | GPL-3.0-or-later |
 
-**接手的第一个任务（已知未完成项）**：黑盒仿真第 11 阶段有一条失败——
-"每条主动消息都落在剧本里本该发生的窗口内"。现象是：私聊里说定的考试
-（未尽之事 `unf_aa476b5651bd`，其来源事件确实属于 `webchat:FriendMessage:10001`）
-仍有 4 条 send 行被投递到 `webchat:GroupMessage:20002`。
+**接手的第一个任务（已知未完成项）**：主动消息的 prompt 会列出**所有**会话的未尽之事
+（`context.py` 的 `- 未尽之事：{title}`），没有按会话过滤——所以在一个会话里提醒时，
+措辞可能提到只在另一个会话说过的事。黑盒仿真的隔离检查只覆盖了反方向，所以没抓到。
+建议：给 `select_matters` 之类的选择逻辑加会话作用域，并在黑盒仿真里补一条正向断言
+（"提醒的措辞不得提到只属于另一个会话的主题"）。
 
 ```bash
-python scripts/blackbox_user_simulation.py --base-dir ./bb        # 复现，退出码 1
-# 产物里 <base-dir>/scenario/runtime.sqlite3 可以直接查：
-#   SELECT title,status,source_event_ids FROM unfinished_matters;
-#   SELECT kind,status,conversation_id FROM outbox WHERE payload_json LIKE '%考试%';
-# 已知：候选的 sources_json 入库/出库是完整的（projections._to_candidate 映射正确），
-#       所以问题在"这些 commit 为什么让 Runtime._event_ids_behind() 返回空"，
-#       从而退化成"谁最后说话就发给谁"的兜底。切入点：runtime.py 的 _commit_attempt /
-#       _conversation_for，以及候选是从数据库重新载入还是当场生成的。
+python scripts/blackbox_user_simulation.py --base-dir ./bb        # 69/69，退出码 0
+python scripts/blackbox_user_simulation.py --base-dir ./bb --fault leak   # 注错：证明检查会咬人
+```
 
 发布状态：
 
