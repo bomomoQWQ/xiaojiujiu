@@ -2426,19 +2426,28 @@ def phase_isolation(story: Story, ctx: "Context") -> None:
         )
     )
     # The same promise, still unanswered. The design lets an unfinished matter live
-    # for days (``unfinished.default_expiry_hours`` is 168 h) and the character may
-    # gently follow up while the daily cap and the cooldown still hold, so the
+    # for days (``unfinished.default_expiry_hours``, 72 h in this run) and the character
+    # may gently follow up while the daily cap and the cooldown still hold, so the
     # reminders that arrive after the first two days are not messages "out of
     # nowhere" - they belong to this window, which exists so the timeline audit can
     # tell them apart from speaking during silence or long after the matter lapsed.
+    #
+    # The window has to cover the matter's expiry *plus* the intention's own TTL
+    # (``candidate.default_ttl_seconds``, 6 h): a follow-up generated while the matter
+    # was still live may be delivered a few hours after it lapsed. Measured: the
+    # character's last check-in on this promise arrived 3 d 2 h after it was made, two
+    # hours past the matter's own 72 h, and it was the first message the unanswered
+    # message sweep let through at all (an attempt used to stay ``sent`` forever and
+    # block every later dispatch in that chat).
+    _candidate_ttl = timedelta(seconds=21600.0)
     story.open_window(
         Window(
             name="the second chat's promise is still unanswered",
             session=session_b,
             start=b_turn_at + 2 * DAY,
-            end=b_turn_at + 3 * DAY,
+            end=b_turn_at + 3 * DAY + _candidate_ttl,
             proactive_allowed=True,
-            note="the same open promise, one day later",
+            note="the same open promise, up to its expiry plus the intention's TTL",
         )
     )
     # The first chat says something unrelated while the second chat's promise is

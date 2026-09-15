@@ -107,6 +107,11 @@ class TickReport:
     new_matters_due: list[str] = field(default_factory=list)
     expired_matters: list[str] = field(default_factory=list)
     expired_attempts: list[str] = field(default_factory=list)
+    #: Delivered messages that were never answered, recorded as weak evidence once
+    #: they age past ``user_model.silence_after_hours`` (design §22.3). Without a
+    #: producer here the ``no_reply_weight`` path never fires and the model only ever
+    #: learns from replies, i.e. it can never learn that it is being ignored.
+    absent_replies: list[str] = field(default_factory=list)
     released_leases: int = 0
     mood: dict[str, float] = field(default_factory=dict)
     drive: dict[str, float] = field(default_factory=dict)
@@ -121,6 +126,7 @@ class TickReport:
             "new_matters_due": list(self.new_matters_due),
             "expired_matters": list(self.expired_matters),
             "expired_attempts": list(self.expired_attempts),
+            "absent_replies": list(self.absent_replies),
             "released_leases": self.released_leases,
             "mood": {k: round(v, 6) for k, v in self.mood.items()},
             "drive": {k: round(v, 6) for k, v in self.drive.items()},
@@ -519,13 +525,128 @@ class Runtime:
                 state = self._apply_time_passage(conn, state=state, now=stamp, dt_seconds=dt, report=report)
                 report.released_leases = self.projections.outbox.reclaim_expired(conn, stamp)
                 report.expired_attempts = self._close_stalled_attempts(conn, now=stamp)
+                report.absent_replies = self._record_absent_replies(conn, now=stamp)
                 # Closing a stalled attempt bumps the version inside this same
                 # transaction (a nested savepoint), so the tick commits on the
                 # version actually stored rather than on the one it read before.
                 state.version = max(state.version, self.projections.runtime.read().version)
                 version = self.projections.runtime.write(state, conn, expect_version=state.version)
                 report.version = version
+        if report.absent_replies:
+            # The user model was updated inside the tick's transaction; rebuild the
+            # in-memory instance from the committed rows so callers do not read a
+            # model that predates the evidence they can see in the database.
+            self.reload_user_model()
         return report
+
+    def _record_absent_replies(self, conn: Any, *, now: datetime) -> list[str]:
+        """Record "the user did not answer" as weak evidence (design §22.3).
+
+        Only the *positive* half of the feedback loop had a producer: a reply is
+        attributed (and consumed) when the user speaks next, so the user model learned
+        exclusively from answers. A message that was delivered and then ignored left no
+        trace at all, and the ``no_reply_weight`` path in
+        :func:`~companion_runtime.user_model.evidence_weight` was unreachable in
+        production - the character could not learn that it was being ignored, whatever
+        the user did.
+
+        A delivered attempt older than ``user_model.silence_after_hours`` with no
+        observation of its own is therefore closed as ``no_reply`` and recorded as
+        ``BehaviourReaction(replied=False, reply_delay_seconds=<waited>)``. The evidence
+        is deliberately weak (``no_reply_weight``, damped by ``1 - P(busy)``) and it is
+        *not* a rejection: "6 hours without a reply" must not read as negative feedback.
+
+        Args:
+            conn: Open write transaction (this runs inside the tick).
+            now: Reference time.
+
+        Returns:
+            Identifiers of the observations recorded by this pass.
+        """
+        horizon = self.config.user_model.silence_after_hours * 3600.0
+        if horizon <= 0:
+            return []
+        recorded: list[str] = []
+        for attempt in self.projections.attempts.list_by_state(
+            [AttemptState.SENT.value], limit=ATTRIBUTION_SCAN_LIMIT, newest_first=True
+        ):
+            reference = attempt.updated_at or attempt.created_at
+            if reference is None:
+                continue
+            waited = delta_seconds(now, reference)
+            if waited < horizon:
+                continue
+            if self.projections.user_model.observation_for_attempt(attempt.attempt_id) is not None:
+                continue
+            state = self.projections.runtime.ensure()
+            busy = self.user_model.busy_probability(
+                hours_since_contact=delta_seconds(now, state.last_contact_at) / 3600.0,
+                replied_recently=False,
+            )
+            candidate = (
+                self.projections.candidates.get(attempt.candidate_id)
+                if attempt.candidate_id
+                else None
+            )
+            reaction = BehaviourReaction(replied=False, reply_delay_seconds=waited)
+            reaction.busy_probability = busy
+            observation = self.user_model.observe(
+                conn,
+                action={
+                    "type": candidate.type if candidate else "contact",
+                    "proactive": True,
+                    "question": bool(candidate and "?" in (candidate.intent or "")),
+                },
+                context=self._situation_context(now),
+                reaction=reaction,
+                now=now,
+                observed_at=now,
+                source_event_ids=[],
+                attempt_id=attempt.attempt_id,
+                busy_probability=busy,
+            )
+            self.events.append(
+                EventType.INTERACTION_OBSERVATION,
+                actor=Actor.RUNTIME,
+                content=None,
+                conversation_id=self.config.conversation_id,
+                metadata={
+                    "observation_id": observation.observation_id,
+                    "weight": observation.weight,
+                    "reaction": reaction.to_dict(),
+                    "attempt_id": attempt.attempt_id,
+                    "reason": "no_reply",
+                },
+                source_event_ids=[],
+                timestamp=now,
+                runtime_version=self.projections.runtime.read().version,
+                connection=conn,
+            )
+            # The attempt is consumed exactly like a reply would consume it: the
+            # attribution path uses the same "one user message closes the attempt"
+            # rule, so consuming it here is what keeps a later message from being
+            # folded into a conversation that has moved on.
+            action_module.resolve(
+                self.projections.attempts, conn, attempt, reason="no_reply", now=now
+            )
+            self.projections.outbox.cancel_for_attempt(
+                conn, attempt.attempt_id, reason="attempt_resolved"
+            )
+            if candidate is not None:
+                self.projections.candidates.set_status(
+                    conn,
+                    candidate.candidate_id,
+                    CandidateStatus.RESOLVED.value,
+                    reason="no_reply",
+                )
+            recorded.append(observation.observation_id)
+            LOGGER.info(
+                "recorded %s as unanswered after %.1f h (weight %.3f)",
+                attempt.attempt_id,
+                waited / 3600.0,
+                observation.weight,
+            )
+        return recorded
 
     def _close_stalled_attempts(self, conn: Any, *, now: datetime) -> list[str]:
         """Close action attempts that can no longer be delivered.
