@@ -1,4 +1,4 @@
-﻿param(
+param(
   [string]$Source = "F:\理解痞老板",
   [string]$Destination = "E:\companion_runtime_backup"
 )
@@ -8,7 +8,7 @@ New-Item -ItemType Directory -Force -Path $Destination | Out-Null
 $staging = Join-Path $Destination ".staging-$stamp"
 $final = Join-Path $Destination "snapshot-$stamp"
 New-Item -ItemType Directory -Force -Path $staging | Out-Null
-$items = @("runtime", "training", "astrbot_plugin_companion_runtime", "内源主动型长期陪伴AI_Runtime_完整架构设计.md", ".gitignore")
+$items = @("runtime", "training", "astrbot_plugin_companion_runtime", "scripts", "archive", "RECOVERY.md", "README.md", "内源主动型长期陪伴AI_Runtime_完整架构设计.md", ".gitignore")
 foreach ($item in $items) {
   $src = Join-Path $Source $item
   if (Test-Path $src) { Copy-Item -LiteralPath $src -Destination $staging -Recurse -Force }

@@ -6,7 +6,7 @@ This workspace is designed to survive an unexpected Windows restart or blue scre
 
 - Source code and architecture documents are versioned by the workspace Git repository.
 - `AstrBot/` is an independent upstream checkout and must remain unmodified.
-- `scripts/backup.ps1` creates an atomic snapshot on `E:\companion_runtime_backup` and retains the five newest snapshots.
+- `scripts/backup.ps1` creates an atomic snapshot on `E:\companion_runtime_backup` and retains the five newest snapshots. Each snapshot copies `runtime/`, `astrbot_plugin_companion_runtime/`, `scripts/`, `archive/`, the top-level documents and `.gitignore`, writes a `SHA256.json` manifest, and bundles the whole Git history as `workspace.bundle` (verify with `git bundle verify <snapshot>\workspace.bundle`).
 - The abandoned local-model material (`archive/local_model_training/`, `archive/local_model/`) is archival only: it is not imported, packaged or tested. Its datasets and checkpoints are excluded from Git and are **not** worth copying to a new machine — `archive/README.md` records why the route was dropped. SQLite backups must still be copied separately.
 - DeepSeek credentials are environment-only and must never appear in source, logs, checkpoints, or backups.
 
