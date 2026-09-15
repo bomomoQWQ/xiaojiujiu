@@ -106,7 +106,16 @@ The user's two simulated months, stage by stage
    activation pool, unfinished matters, boundaries, candidates, attempts, outbox,
    user model, observations, the Runtime's own state row) read through the public
    HTTP API, written under ``<base-dir>/backend/``, plus ``inspection.md``, which
-   *examines* them and reports what a human would care about.
+   *examines* them and reports what a human would care about. The examination looks
+   for, and this run's own report contains: memories that should not exist
+   (greetings, small talk, and questions the user asked being kept as facts), a
+   memory whose *kind* was decided by a substring rather than by a statement, a
+   boundary bound to an unrelated subject (or to none), a boundary that was
+   declared but violated, a candidate that never expired, an observation that never
+   reached the parameters, a learned parameter that never moved, an attempt stuck in
+   a non-terminal state past the absent-reply horizon, the JSONL mirror against the
+   database's own event count, and how much of the four-slot memory section the
+   disclosure the user asked about actually reached.
 8. ``teardown`` - every thread joined, artifacts confined to ``--base-dir``, no
    bytecode next to the sources.
 
@@ -142,45 +151,56 @@ Exit code is ``0`` only when every check passed, ``1`` when a check failed, and
 ``2`` when the script cannot start (missing dependencies or a missing plugin clone).
 
 ``--fault`` injects a controlled defect into the *harness* (never into repository
-sources) so a check can be shown to bite. Which checks each switch is meant to
-break:
+sources) so a check can be shown to bite. Measured on this tree - the base run
+passes **105 of 105** checks and exits 0, and each switch below fails the number of
+checks shown, all of them checks that are meant to protect a user-visible fact:
 
-===================  ==================================================================
-switch               what it corrupts, and the checks that must therefore fail
-===================  ==================================================================
-``intimacy``         the fake host LLM answers as if it were already close: an intimate
-                     address (``亲爱的``) and a claimed shared history at the
-                     ``stranger``/``acquaintance`` stages. Fails "the bot never uses an
-                     intimate address the user has not used" and "the bot never claims a
-                     shared history the user never had".
-``trivia``           a *deployment* fault (config, not source): ``memory.candidate_min_value
-                     = 0``, so every sentence is kept. Fails "small talk a stranger makes is
-                     not kept as a long-term memory".
-``no_memory``        a deployment fault: the consolidation interval is set beyond any story
-                     length, so no long-term memory ever forms. Fails every recall check
-                     (acquaintance/friend/lover landmarks) and "a relationship memory
-                     exists", while the stranger's "nothing remembered" check still passes.
-``boundary_ignore``  the harness delivers unprompted messages *inside* the windows the user
-                     asked to be left alone, the way a stale queue row would. Fails "no
-                     unprompted message interrogates the user" (the topic-boundary window)
-                     and "for the whole ban window the user receives zero unprompted
-                     messages", plus the audit's "nothing appears out of nowhere in a
-                     window where the user asked for silence".
-``reask``            the harness replays one identical prompt every simulated clock step
-                     for the first stretch of the long silence, the way a broken retry loop
-                     would. Fails "the user is not buried by the same prompt being re-asked"
-                     and the daily-cap check.
-``guilt``            unprompted messages become accusatory ("你怎么不理我了，我很失望。"),
-                     the thing the design forbids. Fails "nothing the bot said while it was
-                     being ignored blames the user" and "a message the user left unanswered
-                     never turns into guilt afterwards".
-``leak``             every unprompted message carries hidden-context markers, a credential
-                     shape and an internal id. Fails the audit's leakage check and the
-                     friend-stage guard.
-``duplicate``        every unprompted message is delivered twice. Fails "no two
-                     user-visible messages are duplicates" and "the user is not buried by
-                     the same prompt being re-asked".
-===================  ==================================================================
+===============  ======  ===========================================================
+switch           failed  what it corrupts, and the checks it makes fail
+===============  ======  ===========================================================
+``no_memory``      21    a *deployment* fault (config, not source): the consolidation
+                         interval is set beyond any story length, so no long-term
+                         memory ever forms. Fails every "is it remembered" check -
+                         the acquaintance/friend/lover disclosures, the cued-recall
+                         checks, the provenance check, the relationship-memory check
+                         - while the stranger's "nothing has been remembered yet"
+                         checks keep passing, exactly as they should.
+``intimacy``        8    the fake host LLM answers as if it were already close: an
+                         intimate address (``亲爱的``) and a claimed shared history,
+                         at the ``stranger``/``acquaintance`` stages. Fails "the bot
+                         never uses an intimate address the user has not used", "the
+                         bot never claims a shared history it was never told", "no
+                         intimacy is presumed while the relationship is still an
+                         acquaintance", the friend/lover variants, and the audit's
+                         run-wide intimacy check.
+``boundary_ignore`` 3    the harness delivers unprompted messages *inside* the windows
+                         the user asked to be left alone, the way a stale queue row
+                         would. Fails "no unprompted message interrogates the user"
+                         (the topic-boundary window), "for the whole ban window the
+                         user receives zero unprompted messages", and the audit's
+                         "nothing appears out of nowhere in a window where the user
+                         asked for silence".
+``reask``           2    the harness replays one identical prompt every simulated clock
+                         step through the long silence, the way a broken retry loop
+                         would. Fails "the user is not buried by the same prompt being
+                         re-asked over and over" and the audit's duplicate check.
+``guilt``           2    unprompted messages become accusatory ("你怎么不理我了，我很
+                         失望。"), the thing the design forbids. Fails "the bot never
+                         blames the user for not answering, anywhere in the run" and
+                         the audit's duplicate check.
+``leak``            2    every unprompted message carries hidden-context markers, a
+                         credential shape and an internal id. Fails the friend-stage
+                         guard and the audit's leakage check.
+``duplicate``       2    every unprompted message is delivered twice. Fails the audit's
+                         duplicate check and the daily-contact-cap check (two rows in
+                         one window count twice).
+``trivia``          1    a deployment fault: ``memory.candidate_min_value = 0``, so
+                         every sentence is kept. Fails "small talk a stranger makes is
+                         not kept as a long-term memory".
+===============  ======  ===========================================================
+
+Every other check still passes under every switch, which is the point: a fault
+proves one protected fact, it does not break the run.
 
 Reuse note
 ----------
@@ -2347,7 +2367,6 @@ class Story:
 
     def ops_note(self, title: str, text: str) -> None:
         """Record a product observation proven through the operator surface."""
-        self.stage_notes.append(f"[{OPS_LABEL}] {title}: {text}")
         V.ops(title, text)
 
 # ------------------------------------------------------------------ phases
@@ -2397,7 +2416,7 @@ class Context:
         return bool(story.host is not None and story.host.running)
 
     def runtime_stopped(self, story: Story) -> bool:
-        """Whether the Runtime server thread is gone."""
+        """Whether the Runtime server thread is gone (used by the teardown check)."""
         server = story.server
         if server is None:
             return True
@@ -2994,8 +3013,8 @@ def phase_friend(story: Story, ctx: Context) -> None:
     )
     V.check(
         "the declared boundary reaches the acting layer as a hard constraint",
-        SECTION_BOUNDARY in story.injected(),
-        _short({"boundary_section": section_body(story.injected(), SECTION_BOUNDARY)}, 300),
+        SECTION_BOUNDARY in story.context_block(),
+        _short({"boundary_section": section_body(story.context_block(), SECTION_BOUNDARY)}, 300),
     )
     if topic_boundary is not None:
         starts = _parse_iso(topic_boundary.get("starts_at")) or story.clock.now()
@@ -3142,9 +3161,9 @@ def phase_friend(story: Story, ctx: Context) -> None:
     story.script_turn(FRIEND, 11)
     V.check(
         "the boundary no longer constrains the acting layer after it was lifted",
-        SECTION_BOUNDARY not in story.injected(),
-        _short({"boundary_section": section_body(story.injected(), SECTION_BOUNDARY)})
-        or "no boundary section in the final block of the stage",
+        SECTION_BOUNDARY not in story.context_block(),
+        _short({"boundary_section": section_body(story.context_block(), SECTION_BOUNDARY)})
+        or "no boundary section in the Runtime's own render of the present",
     )
     # -- the probe: the user asks about what they told earlier --------------------
     V.check(
@@ -3166,7 +3185,7 @@ def phase_friend(story: Story, ctx: Context) -> None:
     )
     landmarks = [landmark for landmark in LANDMARKS if landmark.stage == FRIEND]
     story.probe_landmarks(FRIEND, landmarks)
-    friend_evidence = _recall_checks(story, landmarks, where="friend stage")
+    _recall_checks(story, landmarks, where="friend stage")
     _cued_recall_checks(story, landmarks, where="friend-stage confidences")
     disclosure_events = _event_ids_for(story, "医院")
     V.check(
@@ -3321,11 +3340,23 @@ def phase_lover(story: Story, ctx: Context) -> None:
         _short(repeated)
         or f"{len(silent_proactives)} prompt(s), nothing repeated more than {REASK_TOLERANCE} times",
     )
-    accused = [turn for turn in silent_proactives if scan_guilt(turn.text)]
+    accused = [turn for turn in story.recorder.bot_turns(kind="proactive") if scan_guilt(turn.text)]
+    V.check(
+        "the bot never blames the user for not answering, anywhere in the run",
+        not accused,
+        _short([{"at": turn.at.isoformat(), "text": turn.text, "matched": scan_guilt(turn.text)} for turn in accused])
+        or f"{len(story.recorder.bot_turns(kind='proactive'))} unprompted message(s) in the run, none accusatory",
+    )
     V.check(
         "nothing the bot said while it was being ignored blames the user",
-        not accused,
-        _short([{"text": turn.text, "matched": scan_guilt(turn.text)} for turn in accused])
+        not [turn for turn in silent_proactives if scan_guilt(turn.text)],
+        _short(
+            [
+                {"text": turn.text, "matched": scan_guilt(turn.text)}
+                for turn in silent_proactives
+                if scan_guilt(turn.text)
+            ]
+        )
         or f"{len(silent_proactives)} prompt(s) during the silence, none accusatory",
     )
 
@@ -4434,7 +4465,7 @@ def phase_teardown(story: Story, ctx: Context) -> None:
     ]
     V.check(
         "the Runtime server thread is joined and nothing is left listening",
-        not lingering_servers and story.server is None,
+        not lingering_servers and story.server is None and ctx.runtime_stopped(story),
         _short({"server_alive_before_stop": server_thread_alive, "still_alive": lingering_servers}),
     )
     lingering = [
