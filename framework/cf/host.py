@@ -415,7 +415,14 @@ class AstrBotHost:
 
     # ------------------------------------------------------- the message paths
 
-    def user_turn(self, text: str, *, session: str = SESSION_DEFAULT, at: datetime | None = None) -> str:
+    def user_turn(
+        self,
+        text: str,
+        *,
+        session: str = SESSION_DEFAULT,
+        at: datetime | None = None,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> str:
         """Drive one user turn through the real AstrBot hook order.
 
         The order mirrors AstrBot: observe the message, inject the Runtime's
@@ -431,6 +438,10 @@ class AstrBotHost:
             text: What the user typed.
             session: Session the message arrived in.
             at: When it happened, on the caller's clock.
+            on_delta: Called with each fragment of the reply as it arrives, so a
+                caller can show the answer while it is still being written. The
+                proactive render path never streams: the character composing a
+                message the user has not received yet has no audience.
 
         Returns:
             The reply the host pipeline produced.
@@ -457,7 +468,8 @@ class AstrBotHost:
             # The main LLM is called on the host loop, exactly where the plugin's
             # own render path calls it.
             reply = self.loop.call(
-                self.loop_llm_generate(session=session, prompt=prompt), timeout=180.0
+                self.loop_llm_generate(session=session, prompt=prompt, on_delta=on_delta),
+                timeout=180.0,
             )
 
             event._result_text = reply
@@ -480,9 +492,16 @@ class AstrBotHost:
             )
         return reply
 
-    async def loop_llm_generate(self, *, session: str, prompt: str) -> str:
+    async def loop_llm_generate(
+        self, *, session: str, prompt: str, on_delta: Callable[[str], None] | None = None
+    ) -> str:
         """Call the main LLM from the host loop."""
-        return await self.llm.generate(provider_id=f"framework-provider::{session}", prompt=prompt, session=session)
+        return await self.llm.generate(
+            provider_id=f"framework-provider::{session}",
+            prompt=prompt,
+            session=session,
+            on_delta=on_delta,
+        )
 
     @staticmethod
     def _injected_text(request: Any) -> str:

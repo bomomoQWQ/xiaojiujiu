@@ -43,7 +43,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .clock import ControllableClock, install_process_clock, parse_duration, parse_when
 from .control import ControlServer
@@ -677,7 +677,12 @@ class Harness:
         self.host.start()
         self.platform.open(SESSION_DEFAULT)
 
-    def user_turn(self, text: str, session: str = SESSION_DEFAULT) -> str:
+    def user_turn(
+        self,
+        text: str,
+        session: str = SESSION_DEFAULT,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> str:
         """Send one user message through the host and return the reply.
 
         This is the whole deployed path: platform -> plugin hooks -> Runtime
@@ -685,7 +690,7 @@ class Harness:
         """
         if self.host is None:
             raise RuntimeError("the AstrBot host is not running (use_host=False?)")
-        return self.host.user_turn(text, session=session, at=self.clock.now())
+        return self.host.user_turn(text, session=session, at=self.clock.now(), on_delta=on_delta)
 
     def last_variables(self) -> dict[str, Any]:
         """Return the most recent variable snapshot, for a status line."""

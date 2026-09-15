@@ -8,6 +8,7 @@ wrong. Testing those through a real terminal would add noise, not coverage.
 from __future__ import annotations
 
 import io
+import threading
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 
@@ -21,19 +22,30 @@ START = datetime(2026, 9, 15, 9, 0, tzinfo=timezone.utc)
 
 
 class FakeSend:
-    """Records what the TUI sent and returns a canned reply."""
+    """Records what the TUI sent and returns a canned reply.
 
-    def __init__(self, reply: str = "在的。") -> None:
+    ``stream`` makes it behave like a streaming actor: the reply is handed over in
+    fragments through ``on_delta`` before being returned, which is what the real
+    client does when somebody is watching.
+    """
+
+    def __init__(self, reply: str = "在的。", *, stream: bool = False, pieces: int = 3) -> None:
         """Store the reply to return."""
         self.reply = reply
+        self.stream = stream
+        self.pieces = pieces
         self.calls: list[tuple[str, str]] = []
         self.raises: Exception | None = None
 
-    def __call__(self, text: str, session: str) -> str:
-        """Record one turn."""
+    def __call__(self, text: str, session: str, on_delta=None) -> str:
+        """Record one turn, optionally streaming the reply out first."""
         self.calls.append((text, session))
         if self.raises is not None:
             raise self.raises
+        if on_delta is not None and self.stream and self.reply:
+            size = max(1, len(self.reply) // max(1, self.pieces))
+            for start in range(0, len(self.reply), size):
+                on_delta(self.reply[start : start + size])
         return self.reply
 
 
@@ -141,6 +153,174 @@ class TestSending:
             tui._say("在吗")
         assert "这一轮失败了" in buffer.getvalue()
         assert "宿主炸了" in buffer.getvalue()
+
+
+class TestStreaming:
+    """Watching the answer arrive, rather than waiting for all of it."""
+
+    @pytest.fixture()
+    def streaming_window(self):
+        """A window whose sender streams its reply in fragments."""
+        platform = Platform()
+        clock = ControllableClock(START, scale=0.0)
+        send = FakeSend("你好呀，今天怎么样？", stream=True, pieces=4)
+        tui = ChatTUI(platform=platform, clock=clock, send=send, status_provider=lambda: {}, tty=True)
+        # TTY mode is exercised for the streaming path; the writes go to a buffer.
+        tui._print_lock = threading.RLock()
+        return tui, platform, send
+
+    def test_fragments_are_printed_as_they_arrive(self, streaming_window) -> None:
+        """Each fragment reaches the screen; the header appears once."""
+        tui, _, _ = streaming_window
+        tui._stream_open = True  # pretend the header is already up
+        tui._on_delta("你好")
+        tui._on_delta("呀")
+        assert tui._streamed == "你好呀"
+
+    def test_the_header_opens_on_the_first_fragment(self, streaming_window) -> None:
+        """The message header is written once, not per fragment."""
+        tui, _, _ = streaming_window
+        tui._on_delta("第一段")
+        assert tui._stream_open is True
+        tui._on_delta("第二段")
+        assert tui._streamed == "第一段第二段"
+
+    def test_close_finishes_the_line(self, streaming_window) -> None:
+        """Closing the stream ends the message and resets the flag."""
+        tui, _, _ = streaming_window
+        tui._on_delta("一句话")
+        tui._close_stream()
+        assert tui._stream_open is False
+
+    def test_the_streamed_reply_is_not_printed_twice(self, streaming_window) -> None:
+        """The delivery callback must skip the reply it already displayed.
+
+        Regression risk: the host reports the delivered message back through the
+        platform, so a streamed answer would otherwise appear twice -- once as it
+        was written and once, whole, immediately afterwards.
+        """
+        tui, platform, _ = streaming_window
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            tui._on_delta("你好")
+            tui._on_delta("呀")
+            platform.open(SESSION_DEFAULT)
+            platform.deliver(SESSION_DEFAULT, "你好呀", kind="reply", at=START)
+        # Printed once, by the stream -- not a second time by the callback.
+        assert buffer.getvalue().count("你好") == 1
+        assert buffer.getvalue().count("呀") == 1
+        assert tui._streamed == "", "the guard did not consume the streamed text"
+
+    def test_a_different_reply_is_still_printed(self, streaming_window) -> None:
+        """Only the streamed text is suppressed; anything else shows normally."""
+        tui, platform, _ = streaming_window
+        with redirect_stdout(io.StringIO()):
+            tui._on_delta("这个不是刚流的那句")
+        platform.open(SESSION_DEFAULT)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            platform.deliver(SESSION_DEFAULT, "另一句话", kind="reply", at=START)
+        assert "另一句话" in buffer.getvalue()
+
+    def test_proactive_messages_are_never_suppressed(self, streaming_window) -> None:
+        """A proactive message that happens to match is still shown: it was not streamed."""
+        tui, platform, _ = streaming_window
+        with redirect_stdout(io.StringIO()):
+            tui._on_delta("巧合")
+        platform.open(SESSION_DEFAULT)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            platform.deliver(SESSION_DEFAULT, "巧合", kind="proactive", at=START)
+        assert "巧合" in buffer.getvalue()
+
+    def test_non_tty_collects_without_printing_partials(self) -> None:
+        """A piped session keeps the transcript readable: no half-written lines."""
+        tui = ChatTUI(
+            platform=Platform(),
+            clock=ControllableClock(START, scale=0.0),
+            send=FakeSend("完整回复", stream=True),
+            status_provider=lambda: {},
+            tty=False,
+        )
+        tui._on_delta("完整")
+        tui._on_delta("回复")
+        assert tui._streamed == "完整回复"
+        assert tui._stream_open is False
+        assert tui._stream_shown is False, "nothing was printed, so nothing may be suppressed"
+
+    def test_non_tty_still_prints_the_finished_reply(self) -> None:
+        """Regression: the dedup guard used to swallow the only copy shown.
+
+        A piped session collects fragments silently, so the delivery callback is
+        still the one place the reply reaches the transcript. Suppressing it there
+        made `printf ... | cf chat` print no answers at all.
+        """
+        platform = Platform()
+        tui = ChatTUI(
+            platform=platform,
+            clock=ControllableClock(START, scale=0.0),
+            send=FakeSend("完整回复", stream=True),
+            status_provider=lambda: {},
+            tty=False,
+        )
+        platform.open(SESSION_DEFAULT)
+        tui._on_delta("完整回复")
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            platform.deliver(SESSION_DEFAULT, "完整回复", kind="reply", at=START)
+        assert "完整回复" in buffer.getvalue()
+
+
+class TestThinkingIndicator:
+    """A chat that shows nothing between Enter and the answer reads as broken."""
+
+    def test_indicator_is_terminal_only(self) -> None:
+        """A piped session gets no spinner; nobody is watching it."""
+        tui = ChatTUI(
+            platform=Platform(),
+            clock=ControllableClock(START, scale=0.0),
+            send=FakeSend(),
+            status_provider=lambda: {},
+            tty=False,
+        )
+        tui._begin_thinking()
+        assert tui._thinking.is_set() is False
+        assert tui._think_thread is None
+
+    def test_indicator_starts_and_stops(self) -> None:
+        """In a terminal it runs until the reply retires it."""
+        tui = ChatTUI(
+            platform=Platform(),
+            clock=ControllableClock(START, scale=0.0),
+            send=FakeSend(),
+            status_provider=lambda: {},
+            tty=True,
+        )
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            tui._begin_thinking()
+            assert tui._thinking.is_set() is True
+            tui._end_thinking()
+        assert tui._thinking.is_set() is False
+        assert tui._think_thread is None
+
+
+class TestStatusDeduplication:
+    """Reprinting an unchanged status line buries the conversation."""
+
+    def test_unchanged_status_is_not_reprinted(self, window) -> None:
+        """The second identical read returns nothing."""
+        tui, _, _, _ = window
+        assert tui._status_if_changed() != ""
+        assert tui._status_if_changed() == ""
+
+    def test_a_change_is_reported(self, window) -> None:
+        """When a number moves, the line comes back."""
+        tui, _, clock, _ = window
+        first = tui._status_if_changed()
+        assert first != ""
+        clock.set_scale(60.0)
+        assert tui._status_if_changed() != ""
 
 
 class TestProactiveDisplay:

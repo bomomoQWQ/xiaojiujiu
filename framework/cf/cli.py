@@ -509,7 +509,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
     tui = ChatTUI(
         platform=harness.platform,
         clock=harness.clock,
-        send=lambda text, umo: harness.user_turn(text, umo),
+        send=lambda text, umo, on_delta=None: harness.user_turn(text, umo, on_delta),
         status_provider=harness.last_variables,
         control={
             "beat": lambda _arg: "心跳完成",

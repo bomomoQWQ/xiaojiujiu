@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Mapping
@@ -70,7 +71,8 @@ class ChatTUI:
         platform: The fake platform; its delivery callback is how proactive
             messages reach the screen.
         clock: The virtual clock, exposed through ``/time`` and friends.
-        send: Called with the user's text; returns the character's reply.
+        send: Called with ``(text, session, on_delta)``; returns the reply.
+            ``on_delta`` may be ignored by a sender that cannot stream.
         status_provider: Returns the latest variable snapshot, or ``{}``.
         control: Optional mapping of slash-command name to handler, so the CLI
             can expose the harness's own operations (host/endogenous/refresh).
@@ -83,7 +85,7 @@ class ChatTUI:
         *,
         platform: Platform,
         clock: Any,
-        send: Callable[[str, str], str],
+        send: Callable[..., str],
         status_provider: Callable[[], Mapping[str, Any]] | None = None,
         control: Mapping[str, Callable[[str], str]] | None = None,
         session_name: str = "default",
@@ -98,6 +100,17 @@ class ChatTUI:
         self.session = Session(name=session_name, umo=f"webchat:FriendMessage:{session_name}")
         self._print_lock = threading.RLock()
         self._stop = threading.Event()
+        self._last_status = ""
+        self._streamed = ""
+        #: Whether the streamed fragments actually reached the screen. A piped
+        #: session collects them silently, and must therefore still print the
+        #: finished reply through the delivery callback -- otherwise the guard
+        #: below suppresses the only copy that would ever have been shown.
+        self._stream_shown = False
+        self._stream_open = False
+        self._thinking = threading.Event()
+        self._think_thread: threading.Thread | None = None
+        self._think_started = 0.0
         self.tty = sys.stdout.isatty() if tty is None else tty
         self.turns = 0
         self._readline: Any = None
@@ -122,23 +135,134 @@ class ChatTUI:
                 sys.stdout.write(CLEAR_LINE)
             sys.stdout.write(text + "\n")
             if self.tty:
-                sys.stdout.write(self._prompt_line())
+                sys.stdout.write(self._prompt_line(force_status=True))
             sys.stdout.flush()
 
-    def _prompt_line(self) -> str:
-        """Return the prompt plus whatever the user has typed so far."""
+    def _status_if_changed(self) -> str:
+        """Return the status line, or an empty string when it is unchanged.
+
+        The status is redrawn above every prompt, so printing an identical line
+        turn after turn buries the conversation under repetition. Only a change is
+        worth a line; the number that moved is the one worth looking at.
+        """
+        line = self.status_line()
+        if line == self._last_status:
+            return ""
+        self._last_status = line
+        return line
+
+    def _prompt_line(self, *, force_status: bool = False) -> str:
+        """Return the prompt block: the status line (when it changed) plus the prompt."""
         typed = ""
         if self._readline is not None:
             try:
                 typed = self._readline.get_line_buffer()
             except Exception:  # noqa: BLE001 - cosmetic only
                 typed = ""
-        return f"{self.status_line()}\n{PROMPT}{typed}"
+        status = self.status_line() if force_status else self._status_if_changed()
+        if status:
+            self._last_status = status
+        return f"{status}\n{PROMPT}{typed}" if status else f"{PROMPT}{typed}"
+
+    def _begin_thinking(self, label: str = "小九九 正在输入") -> None:
+        """Show that a reply is on its way, with a running clock.
+
+        A chat that shows nothing between Enter and the answer reads as broken,
+        and the acting layer is a network call: a second is typical, several are
+        possible on a longer turn. The elapsed count is there so a slow answer
+        looks slow rather than hung.
+
+        Terminal only. A piped session has nobody waiting, and an indicator would
+        just be noise in the captured transcript.
+        """
+        if not self.tty:
+            return
+        self._think_started = time.monotonic()
+        self._thinking.set()
+        self._think_thread = threading.Thread(
+            target=self._think_loop, args=(label,), name="cf-thinking", daemon=True
+        )
+        self._think_thread.start()
+
+    def _think_loop(self, label: str) -> None:
+        """Repaint the waiting line until the reply arrives."""
+        frames = "·∙•"
+        tick = 0
+        while self._thinking.is_set():
+            elapsed = time.monotonic() - self._think_started
+            frame = frames[tick % len(frames)]
+            with self._print_lock:
+                if not self._thinking.is_set():
+                    break
+                sys.stdout.write(f"\r{CLEAR_LINE}{DIM}{label}{frame} {elapsed:.1f}s{RESET}")
+                sys.stdout.flush()
+            tick += 1
+            time.sleep(0.2)
+
+    def _end_thinking(self) -> None:
+        """Stop the indicator and clear its line."""
+        if not self.tty:
+            return
+        self._thinking.clear()
+        thread = self._think_thread
+        self._think_thread = None
+        if thread is not None:
+            thread.join(timeout=1.0)
+        with self._print_lock:
+            sys.stdout.write(CLEAR_LINE)
+            sys.stdout.flush()
+
+    def _on_delta(self, piece: str) -> None:
+        """Show one fragment of a reply while it is still being written.
+
+        Called from the LLM's worker thread, so it takes the same print lock as
+        everything else. The first fragment retires the waiting indicator and
+        opens the message header; the rest just append.
+        """
+        if not piece:
+            return
+        if not self.tty:
+            # A piped session has no one watching, and interleaving partial writes
+            # into a transcript only makes it harder to read afterwards.
+            self._streamed += piece
+            return
+        self._streamed += piece
+        with self._print_lock:
+            if not self._stream_open:
+                self._end_thinking()
+                stamp = f"{self.clock.now():%m-%d %H:%M}"
+                sys.stdout.write(
+                    f"{CLEAR_LINE}{BOLD}◆ 小九九(回复) {stamp}{RESET}\n"
+                )
+                self._stream_open = True
+            sys.stdout.write(piece)
+            sys.stdout.flush()
+        self._stream_shown = True
+
+    def _close_stream(self) -> None:
+        """Finish a streamed message, if one is open."""
+        if self._stream_open:
+            with self._print_lock:
+                sys.stdout.write("\n")
+                if self.tty:
+                    sys.stdout.write(self._prompt_line(force_status=True))
+                sys.stdout.flush()
+            self._stream_open = False
 
     def _on_delivered(self, message: Delivered) -> None:
         """Show a message that arrived on its own (called from the host thread)."""
         if message.kind == "user":
             return  # the operator just typed it; echoing it twice is noise
+        if (
+            message.kind == "reply"
+            and self._stream_shown
+            and self._streamed.strip() == message.text.strip()
+        ):
+            # This is the reply that was already printed fragment by fragment.
+            # Showing it again would double every answer.
+            self._streamed = ""
+            self._stream_shown = False
+            return
         style = BOLD if self.tty else ""
         reset = RESET if self.tty else ""
         label = "主动" if message.kind == "proactive" else "回复"
@@ -204,8 +328,10 @@ class ChatTUI:
         """Read, act, print -- until the operator leaves."""
         while not self._stop.is_set():
             try:
-                line = input(f"{self.status_line()}\n{PROMPT}")
+                status = self._status_if_changed()
+                line = input(f"{status}\n{PROMPT}" if status else PROMPT)
             except (EOFError, KeyboardInterrupt):
+                self._end_thinking()
                 self._write("")
                 break
             text = line.strip()
@@ -221,11 +347,18 @@ class ChatTUI:
     def _say(self, text: str) -> None:
         """Send one user message and show the reply."""
         self.turns += 1
+        self._streamed = ""
+        self._stream_shown = False
+        self._begin_thinking()
         try:
-            reply = self.send(text, self.session.umo)
+            reply = self.send(text, self.session.umo, self._on_delta)
         except Exception as exc:  # noqa: BLE001 - a failed turn must not end the chat
+            self._end_thinking()
+            self._close_stream()
             self._write(f"{YELLOW if self.tty else ''}[这一轮失败了] {type(exc).__name__}: {exc}{RESET if self.tty else ''}")
             return
+        self._end_thinking()
+        self._close_stream()
         if not reply:
             self._write(f"{YELLOW if self.tty else ''}[主 LLM 没有返回内容]{RESET if self.tty else ''}")
 

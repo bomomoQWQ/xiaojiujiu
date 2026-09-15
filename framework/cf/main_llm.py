@@ -40,7 +40,7 @@ import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol
 
 from .logbook import Logbook
 
@@ -75,8 +75,24 @@ class MainLLMError(Exception):
 class MainLLM(Protocol):
     """The acting layer's only method."""
 
-    async def generate(self, *, provider_id: str, prompt: str, session: str = "") -> str:
-        """Return the text the character says."""
+    async def generate(
+        self,
+        *,
+        provider_id: str,
+        prompt: str,
+        session: str = "",
+        on_delta: Callable[[str], None] | None = None,
+    ) -> str:
+        """Return the text the character says.
+
+        Args:
+            provider_id: Provider id the host resolved.
+            prompt: The prompt the host pipeline built.
+            session: Session the call belongs to.
+            on_delta: Called with each fragment as it arrives, when the caller
+                wants to show the answer while it is still being written. The
+                return value is still the complete text.
+        """
         ...
 
 
@@ -94,6 +110,9 @@ class LLMCall:
     reply: str = ""
     error: str = ""
     usage: dict[str, Any] = field(default_factory=dict)
+    #: Whether the text arrived incrementally, and how long the first fragment took.
+    streamed: bool = False
+    ttfb_ms: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable rendering."""
@@ -106,6 +125,8 @@ class LLMCall:
             "latency_ms": self.latency_ms,
             "usage": dict(self.usage),
             "error": self.error,
+            "streamed": self.streamed,
+            "ttfb_ms": self.ttfb_ms,
         }
 
 
@@ -149,6 +170,8 @@ class OpenAICompatibleMainLLM:
         self._transport = transport or self._http_transport
         self._api_key = api_key if api_key is not None else os.environ.get(API_KEY_ENV, "")
         self.calls: list[LLMCall] = []
+        #: How often a streaming request had to be redone without streaming.
+        self.stream_fallbacks = 0
 
     # ------------------------------------------------------------------ config
 
@@ -194,7 +217,14 @@ class OpenAICompatibleMainLLM:
 
     # ------------------------------------------------------------------- calls
 
-    async def generate(self, *, provider_id: str, prompt: str, session: str = "") -> str:
+    async def generate(
+        self,
+        *,
+        provider_id: str,
+        prompt: str,
+        session: str = "",
+        on_delta: Callable[[str], None] | None = None,
+    ) -> str:
         """Answer one prompt.
 
         The blocking HTTP call runs in a worker thread: the host pipeline calls
@@ -215,10 +245,22 @@ class OpenAICompatibleMainLLM:
             MainLLMError: Only when ``strict`` is set on the transport result.
         """
         del provider_id
-        return await asyncio.to_thread(self._generate_sync, prompt, session)
+        return await asyncio.to_thread(self._generate_sync, prompt, session, on_delta)
 
-    def _generate_sync(self, prompt: str, session: str) -> str:
-        """Perform the blocking call and record it."""
+    def _generate_sync(
+        self,
+        prompt: str,
+        session: str,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> str:
+        """Perform the blocking call and record it.
+
+        Streaming is used only when somebody is watching. A proactive render has
+        no audience by design -- the character is composing a message the user
+        has not been sent yet, and showing its half-finished sentences would be a
+        worse experience than a short pause. A user turn is the opposite: the
+        person is sitting there waiting for the answer.
+        """
         import time
 
         started = time.monotonic()
@@ -231,20 +273,45 @@ class OpenAICompatibleMainLLM:
             ],
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
-            "stream": False,
+            "stream": on_delta is not None,
         }
         error = ""
         text = ""
         usage: dict[str, Any] = {}
+        ttfb_ms: int | None = None
+        streamed = on_delta is not None
         try:
-            response = self._transport(
-                f"{self.base_url}/chat/completions", body, self.timeout_s, self._headers()
-            )
-            text = _first_message_text(response)
-            usage = dict(response.get("usage") or {}) if isinstance(response, Mapping) else {}
+            if streamed:
+                pieces: list[str] = []
+                for piece in self._transport_stream(
+                    f"{self.base_url}/chat/completions", body, self.timeout_s, self._headers()
+                ):
+                    if ttfb_ms is None:
+                        # Time to first token is the number that decides whether a
+                        # chat feels responsive; total latency hides it.
+                        ttfb_ms = int((time.monotonic() - started) * 1000)
+                    pieces.append(piece)
+                    try:
+                        on_delta(piece)
+                    except Exception:  # noqa: BLE001 - a display bug must not lose the reply
+                        LOGGER.debug("on_delta raised; continuing to collect", exc_info=True)
+                text = "".join(pieces)
+                if not text:
+                    raise MainLLMError("stream produced no content")
+            else:
+                response = self._transport(
+                    f"{self.base_url}/chat/completions", body, self.timeout_s, self._headers()
+                )
+                text = _first_message_text(response)
+                usage = dict(response.get("usage") or {}) if isinstance(response, Mapping) else {}
         except Exception as exc:  # noqa: BLE001 - the acting layer degrades, never crashes the chat
             error = f"{type(exc).__name__}: {exc}"
             LOGGER.warning("main LLM call failed: %s", error)
+            # A streaming failure that produced nothing is retried without
+            # streaming: some gateways reject stream=true, and losing the answer
+            # entirely because of a transport preference would be silly.
+            if streamed and not text:
+                return self._retry_without_stream(prompt, session, kind, started, error, on_delta)
 
         latency_ms = int((time.monotonic() - started) * 1000)
         call = LLMCall(
@@ -258,6 +325,8 @@ class OpenAICompatibleMainLLM:
             reply=text,
             error=error,
             usage=usage,
+            streamed=streamed and not error,
+            ttfb_ms=ttfb_ms,
         )
         self.calls.append(call)
         if self.logbook is not None:
@@ -272,6 +341,8 @@ class OpenAICompatibleMainLLM:
                     "reply_chars": call.reply_chars,
                     "usage": usage,
                     "error": error,
+                    "streamed": call.streamed,
+                    "ttfb_ms": ttfb_ms,
                     # The full prompt and reply are kept: without them there is no
                     # way to tell "the Runtime injected nothing" apart from "the
                     # model ignored what it injected".
@@ -280,7 +351,9 @@ class OpenAICompatibleMainLLM:
                 },
                 message=(
                     f"[llm {kind}] {latency_ms}ms prompt={call.prompt_chars}c "
-                    f"reply={call.reply_chars}c" + (f" ERROR {error}" if error else "")
+                    f"reply={call.reply_chars}c"
+                    + (f" ttfb={ttfb_ms}ms" if ttfb_ms is not None else "")
+                    + (f" ERROR {error}" if error else "")
                 ),
             )
         return text
@@ -302,6 +375,83 @@ class OpenAICompatibleMainLLM:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
             return json.loads(response.read().decode("utf-8"))
 
+    def _transport_stream(
+        self, url: str, body: dict[str, Any], timeout: float, headers: dict[str, str]
+    ) -> Iterator[str]:
+        """Yield content fragments from a streaming chat completion.
+
+        The wire format is handled by :func:`sse_content`, which is a separate
+        function so it can be tested against a list of lines instead of a socket.
+        """
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={**headers, "Accept": "text/event-stream"},
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            yield from sse_content(raw.decode("utf-8", "replace") for raw in response)
+
+    def _retry_without_stream(
+        self,
+        prompt: str,
+        session: str,
+        kind: str,
+        started: float,
+        first_error: str,
+        on_delta: Callable[[str], None] | None,
+    ) -> str:
+        """Re-request the same prompt with ``stream: false`` after a stream failure."""
+        import time
+
+        LOGGER.info("retrying without streaming after: %s", first_error)
+        self.stream_fallbacks += 1
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream": False,
+        }
+        text = ""
+        error = ""
+        usage: dict[str, Any] = {}
+        try:
+            response = self._transport(
+                f"{self.base_url}/chat/completions", body, self.timeout_s, self._headers()
+            )
+            text = _first_message_text(response)
+            usage = dict(response.get("usage") or {}) if isinstance(response, Mapping) else {}
+        except Exception as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"
+            LOGGER.warning("main LLM retry also failed: %s", error)
+        latency_ms = int((time.monotonic() - started) * 1000)
+        self.calls.append(
+            LLMCall(
+                session=session,
+                kind=kind,
+                model=self.model,
+                prompt_chars=len(prompt or ""),
+                reply_chars=len(text),
+                latency_ms=latency_ms,
+                prompt=prompt or "",
+                reply=text,
+                error=error or f"stream_failed_then_retried: {first_error}",
+                usage=usage,
+                streamed=False,
+            )
+        )
+        if text and on_delta is not None:
+            # The answer is complete and was never shown; hand it over in one go so
+            # the caller's display still ends up correct.
+            try:
+                on_delta(text)
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("on_delta raised on the non-streamed fallback", exc_info=True)
+        return text
+
     # ------------------------------------------------------------------ report
 
     def stats(self) -> dict[str, Any]:
@@ -316,6 +466,8 @@ class OpenAICompatibleMainLLM:
             "calls": len(self.calls),
             "by_kind": by_kind,
             "errors": errors,
+            "streamed": sum(1 for call in self.calls if call.streamed),
+            "stream_fallbacks": self.stream_fallbacks,
             "endpoint": self.base_url,
             "model": self.model,
         }
@@ -362,7 +514,14 @@ class ScriptedMainLLM:
             by_kind[call.kind] = by_kind.get(call.kind, 0) + 1
         return {"calls": len(self.calls), "by_kind": by_kind, "errors": 0, "model": "scripted"}
 
-    async def generate(self, *, provider_id: str, prompt: str, session: str = "") -> str:
+    async def generate(
+        self,
+        *,
+        provider_id: str,
+        prompt: str,
+        session: str = "",
+        on_delta: Callable[[str], None] | None = None,
+    ) -> str:
         """Return the next scripted reply, or one derived from the prompt."""
         del provider_id
         kind = "render" if RENDER_MARKER in (prompt or "") else "reply"
@@ -384,6 +543,13 @@ class ScriptedMainLLM:
                 reply=text,
             )
         )
+        if on_delta is not None and text:
+            # Delivered in one piece: the stand-in has nothing to stream, but the
+            # caller's display path must still be exercised.
+            try:
+                on_delta(text)
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("on_delta raised for the stand-in", exc_info=True)
         if self.logbook is not None:
             self.logbook.event(
                 "main_llm_call",
@@ -393,6 +559,7 @@ class ScriptedMainLLM:
                     "model": "scripted",
                     "prompt": prompt or "",
                     "reply": text,
+                    "streamed": False,
                 },
                 message=f"[llm {kind}] scripted",
             )
@@ -412,6 +579,48 @@ def _render_from_prompt(prompt: str) -> str:
             if intent:
                 return f"刚才忽然想起{intent}，现在怎么样了？"
     return "在忙吗？忽然想起你了。"
+
+
+def sse_content(lines: Iterable[str]) -> Iterator[str]:
+    """Yield the content fragments from server-sent-event lines.
+
+    One JSON object per ``data:`` line, terminated by ``data: [DONE]``. Anything
+    else -- blank separators, ``:`` keep-alive comments, a frame that does not
+    decode, a choice with no delta -- is skipped rather than fatal. A gateway that
+    emits a comment in the middle of a stream is not a reason to lose the answer,
+    and an SSE reader that raises on the first unexpected line is a reader that
+    fails for reasons its caller cannot act on.
+
+    Args:
+        lines: Raw lines, with or without their trailing newline.
+
+    Yields:
+        Each non-empty content fragment, in arrival order.
+    """
+    for raw in lines:
+        line = str(raw).strip()
+        if not line or line.startswith(":"):
+            continue
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:") :].strip()
+        if payload == "[DONE]":
+            return
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(chunk, Mapping):
+            continue
+        for choice in chunk.get("choices") or []:
+            if not isinstance(choice, Mapping):
+                continue
+            delta = choice.get("delta") or choice.get("message") or {}
+            if not isinstance(delta, Mapping):
+                continue
+            piece = delta.get("content")
+            if isinstance(piece, str) and piece:
+                yield piece
 
 
 def _first_message_text(response: Any) -> str:

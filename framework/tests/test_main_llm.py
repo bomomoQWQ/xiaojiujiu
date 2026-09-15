@@ -13,6 +13,7 @@ import pytest
 from cf.logbook import Logbook
 from cf.main_llm import (
     RENDER_MARKER,
+    sse_content,
     ScriptedMainLLM,
     _first_message_text,
     _render_from_prompt,
@@ -192,6 +193,157 @@ class TestCallKinds:
         assert record["reply"] == "好的"
 
 
+class StreamTransport:
+    """Replays an SSE stream, and records the request body."""
+
+    def __init__(self, chunks: list[str], *, fail: bool = False) -> None:
+        """Store the fragments to emit."""
+        self.chunks = list(chunks)
+        self.fail = fail
+        self.requests: list[dict] = []
+
+    def __call__(self, url, body, timeout, headers):
+        """Not used: streaming goes through ``stream``."""
+        raise AssertionError("the streaming tests must use the stream transport")
+
+    def stream(self, url, body, timeout, headers):
+        """Yield content fragments, which is what ``_transport_stream`` yields.
+
+        Not SSE frames: the wire format is parsed inside the real transport, and
+        substituting a fake that emitted frames would be testing a different
+        contract than the one the client depends on.
+        """
+        self.requests.append({"url": url, "body": body, "headers": headers})
+        if self.fail:
+            raise ConnectionError("stream refused")
+        for piece in self.chunks:
+            if piece is None:
+                return
+            yield piece
+
+
+def streamed_client(transport, **kwargs):
+    """Build a client whose streaming transport is the fake."""
+    client = OpenAICompatibleMainLLM(DEEPSEEK, model="m", **kwargs)
+    client._transport_stream = transport.stream
+    return client
+
+
+class TestStreaming:
+    """Showing the answer while it is still being written."""
+
+    def test_fragments_arrive_in_order(self) -> None:
+        """Every fragment reaches the callback, and the return value is the whole text."""
+        transport = StreamTransport(["你", "好", "呀", None])
+        client = streamed_client(transport)
+        seen: list[str] = []
+        text = asyncio.run(
+            client.generate(provider_id="p", prompt="hi", session="s", on_delta=seen.append)
+        )
+        assert seen == ["你", "好", "呀"]
+        assert text == "你好呀"
+
+    def test_streaming_is_requested_only_when_someone_is_watching(self) -> None:
+        """No callback means a plain request: a render has no audience."""
+        transport = StreamTransport(["x", None])
+        client = streamed_client(transport)
+        asyncio.run(client.generate(provider_id="p", prompt="hi", session="s"))
+        assert transport.requests == [], "stream was requested with no observer"
+
+    def test_the_body_asks_for_a_stream(self) -> None:
+        """``stream: true`` goes on the wire."""
+        transport = StreamTransport(["x", None])
+        client = streamed_client(transport)
+        asyncio.run(client.generate(provider_id="p", prompt="hi", session="s", on_delta=lambda _p: None))
+        assert transport.requests[0]["body"]["stream"] is True
+
+    def test_time_to_first_token_is_recorded(self, tmp_path) -> None:
+        """TTFB is the number that decides whether a chat feels responsive."""
+        book = Logbook(tmp_path, echo=False)
+        transport = StreamTransport(["x", "y", None])
+        client = streamed_client(transport, logbook=book)
+        asyncio.run(client.generate(provider_id="p", prompt="hi", session="s", on_delta=lambda _p: None))
+        book.close()
+        record = book.read_trace(kinds=("main_llm_call",))[-1]
+        assert record["streamed"] is True
+        assert isinstance(record["ttfb_ms"], int)
+        assert record["ttfb_ms"] <= record["latency_ms"]
+
+    def test_a_failing_callback_does_not_lose_the_reply(self) -> None:
+        """A display bug must not cost the answer."""
+        transport = StreamTransport(["好", "的", None])
+        client = streamed_client(transport)
+
+        def explode(_piece: str) -> None:
+            raise RuntimeError("display broke")
+
+        text = asyncio.run(
+            client.generate(provider_id="p", prompt="hi", session="s", on_delta=explode)
+        )
+        assert text == "好的"
+
+    def test_a_failed_stream_falls_back_to_a_plain_request(self) -> None:
+        """A gateway that refuses ``stream=true`` must not cost the answer.
+
+        The fallback keeps the plumbing honest: an endpoint that cannot stream is
+        still usable, it just arrives all at once.
+        """
+        failing = StreamTransport([], fail=True)
+        client = streamed_client(failing)
+        client._transport = FakeTransport([completion("整条回复")])
+        seen: list[str] = []
+        text = asyncio.run(
+            client.generate(provider_id="p", prompt="hi", session="s", on_delta=seen.append)
+        )
+        assert text == "整条回复"
+        assert seen == ["整条回复"], "the fallback must still hand the text to the display"
+        assert client.stream_fallbacks == 1
+
+    def test_an_empty_stream_also_falls_back(self) -> None:
+        """A stream that yields nothing usable is retried, not reported as silence."""
+        client = streamed_client(StreamTransport([None]))
+        client._transport = FakeTransport([completion("重试得到的回复")])
+        text = asyncio.run(client.generate(provider_id="p", prompt="hi", session="s", on_delta=lambda _p: None))
+        assert text == "重试得到的回复"
+
+    def test_malformed_frames_are_skipped(self) -> None:
+        """A keep-alive or a truncated frame mid-stream is not fatal."""
+        pieces = list(
+            sse_content(
+                [
+                    "data: {not json",
+                    ": keep-alive comment",
+                    "",
+                    'data: {"choices": [{"delta": {"content": "好"}}]}',
+                    'data: {"choices": [{"delta": {}}]}',
+                    'data: {"choices": []}',
+                    "data: 42",
+                    'data: {"choices": [{"delta": {"content": "的"}}]}',
+                    "data: [DONE]",
+                    'data: {"choices": [{"delta": {"content": "after-done"}}]}',
+                ]
+            )
+        )
+        assert pieces == ["好", "的"], pieces
+
+    def test_a_stream_with_no_content_yields_nothing(self) -> None:
+        """An immediately-terminated stream is empty, not an error."""
+        assert list(sse_content(["data: [DONE]"])) == []
+
+    def test_frames_without_a_trailing_newline_still_parse(self) -> None:
+        """The reader tolerates lines with and without their terminator."""
+        assert list(sse_content(['data: {"choices":[{"delta":{"content":"x"}}]}'])) == ["x"]
+
+    def test_stats_count_streamed_calls(self) -> None:
+        """The stats block says how many calls actually streamed."""
+        transport = StreamTransport(["x", None])
+        client = streamed_client(transport)
+        asyncio.run(client.generate(provider_id="p", prompt="a", session="s", on_delta=lambda _p: None))
+        stats = client.stats()
+        assert stats["streamed"] == 1
+        assert stats["stream_fallbacks"] == 0
+
+
 class TestScriptedStandIn:
     """The no-endpoint mode must be usable but never mistakable for a model."""
 
@@ -222,3 +374,11 @@ class TestScriptedStandIn:
         asyncio.run(llm.generate(provider_id="p", prompt="a", session="s"))
         asyncio.run(llm.generate(provider_id="p", prompt=f"{RENDER_MARKER}x", session="s"))
         assert llm.stats()["by_kind"] == {"reply": 1, "render": 1}
+
+    def test_it_honours_on_delta(self) -> None:
+        """The stand-in calls the callback too, so the display path is exercised."""
+        llm = ScriptedMainLLM(replies=["一整句"])
+        seen: list[str] = []
+        text = asyncio.run(llm.generate(provider_id="p", prompt="a", session="s", on_delta=seen.append))
+        assert seen == ["一整句"]
+        assert text == "一整句"
