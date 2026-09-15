@@ -890,6 +890,12 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
 
     app.include_router(router)
 
+    # Protocol-v1 compatibility surface for the thin AstrBot adapter. It is a
+    # separate router under the ``/v1`` prefix, so no v0 route changes.
+    from .api_v1 import create_v1_router
+
+    app.include_router(create_v1_router(runtime, settings))
+
     @app.exception_handler(ValueError)
     async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
         """Translate validation errors from the cognitive layer into 422s."""

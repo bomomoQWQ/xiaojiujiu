@@ -954,6 +954,53 @@ class Runtime:
                         outcome.version = commit_state.version
                 return outcome
 
+    def _conversation_for(self, chosen: CandidateIntent, *, now: datetime) -> str:
+        """Return the conversation a proactive action belongs to.
+
+        A proactive message must be delivered to the conversation the character
+        formed the intention *in*. Falling back to the configured default would
+        mean a multi-session deployment sends every unprompted message to a
+        session that may not exist - the plugin then cannot resolve the address
+        and the delivery silently fails.
+
+        Resolution order, most precise first:
+
+        1. the candidate's own source events, when they name real events (the
+           evidence the intention was built on already carries the conversation);
+        2. the conversation of the most recent user message, which is simply the
+           conversation the character is currently living in - most candidates are
+           generated from internal signals such as an approach-drive anchor and
+           therefore have no event sources at all;
+        3. the configured default, so a commit can never fail for this reason.
+
+        Args:
+            chosen: The candidate that won the motivational game.
+            now: Reference time, unused today but kept for future weighting.
+
+        Returns:
+            A conversation identifier suitable for the host's addressing scheme.
+        """
+        identifiers = [str(item) for item in (chosen.sources or []) if item]
+        if identifiers:
+            try:
+                events = self.events.get_many(identifiers)
+            except Exception:  # noqa: BLE001 - a lookup failure must not fail the commit
+                events = []
+            with_conversation = [event for event in events if event.conversation_id]
+            if with_conversation:
+                newest = max(with_conversation, key=lambda event: event.timestamp)
+                return str(newest.conversation_id)
+
+        try:
+            recent = self.events.read(
+                EventQuery(event_types=[EventType.USER_MESSAGE.value], limit=1, newest_first=True)
+            )
+        except Exception:  # noqa: BLE001 - fall through to the configured default
+            recent = []
+        if recent and recent[0].conversation_id:
+            return str(recent[0].conversation_id)
+        return self.config.conversation_id
+
     def _commit_attempt(
         self,
         conn: Any,
@@ -969,11 +1016,14 @@ class Runtime:
         action_module.commit(
             self.projections.attempts, conn, attempt, now=now, reason="motivational_game"
         )
+        # The action belongs to the conversation the intention was formed in, not
+        # to whatever the process default happens to be.
+        conversation_id = self._conversation_for(chosen, now=now)
         self.events.append(
             EventType.PROACTIVE_COMMITTED,
             actor=Actor.RUNTIME,
             content=chosen.intent,
-            conversation_id=self.config.conversation_id,
+            conversation_id=conversation_id,
             metadata={"attempt": attempt.to_dict(), "goal": chosen.goal},
             source_event_ids=[s for s in chosen.sources],
             timestamp=now,
@@ -1001,7 +1051,7 @@ class Runtime:
             available_at=now,
             created_at=now,
             max_attempts=self.config.outbox.max_attempts,
-            conversation_id=self.config.conversation_id,
+            conversation_id=conversation_id,
         )
         self.projections.outbox.enqueue(conn, item)
         attempt.outbox_id = item.outbox_id

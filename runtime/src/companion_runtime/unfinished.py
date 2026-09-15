@@ -156,9 +156,13 @@ def detect(
         match = pattern.search(text)
         if match is None:
             continue
-        topics = [match.group(0)]
+        # The patterns are alternative readings of the *same* sentence, not
+        # independent obligations: "明天下午面试，结束告诉你结果。" matches both
+        # the interview pattern and the generic follow-up pattern. So the first
+        # match decides, and a match that is already covered ends the search -
+        # otherwise the same sentence would open a second, vaguer matter.
         if any(_same_subject(title, existing_matter.title) for existing_matter in existing):
-            continue
+            break
         proposals.append(
             UnfinishedProposal(
                 title=title,
@@ -166,28 +170,68 @@ def detect(
                 waiting_until=_expected_completion(event, text),
                 priority=priority * (0.8 + 0.4 * priority),
                 resolution_conditions=["用户主动告知后续结果"],
-                topics=topics,
+                topics=[match.group(0)],
             )
         )
         break
     return proposals
 
 
+#: Words that appear in every follow-up title and therefore carry no subject.
+#: They are stripped before two titles are compared, because the titles are built
+#: from a template ("等待{subjects}结果") and only the subject is distinctive.
+_TITLE_TEMPLATE_WORDS: tuple[str, ...] = (
+    "等待",
+    "用户",
+    "结果",
+    "告知",
+    "关心",
+    "后续",
+    "是否",
+    "顺利",
+    "消息",
+)
+
+
+def _subject_core(title: str) -> str:
+    """Return the distinctive part of a follow-up title.
+
+    Titles are assembled from a template, so comparing them directly (or by
+    single characters) produces false matches: "等待面试结果" and "等待考试结果"
+    share the character 试 and the whole tail 试结果, yet they are different
+    subjects. Removing the template words leaves exactly the subject.
+
+    Args:
+        title: A matter title.
+
+    Returns:
+        The title with template words removed; empty when nothing distinctive
+        remains, which makes the caller fall back to a strict comparison.
+    """
+    core = title or ""
+    for word in _TITLE_TEMPLATE_WORDS:
+        core = core.replace(word, "")
+    return core.strip()
+
+
 def _same_subject(candidate_title: str, existing_title: str) -> bool:
     """Return whether two matter titles refer to the same subject.
 
-    The follow-up titles are natural language ("等待面试结果" vs "等待用户告知结果"),
-    so a shared content token is the right granularity: the point is to avoid
-    opening a second matter about the interview, not to compare strings.
+    Splitting on the template leaves the subject alone ("面试" vs "考试"), which
+    is the granularity that matters: the point is to avoid opening a second matter
+    about the *same* interview, not to avoid opening one about a different exam.
+    When neither title has a distinctive core, the comparison falls back to a
+    bigram overlap, which is stricter than single characters.
     """
-    from .utility import tokenize
-
-    generic = {"等待", "用户", "结果", "告知", "关心", "后续"}
-    left = {token for token in tokenize(candidate_title)} - generic
-    right = {token for token in tokenize(existing_title)} - generic
-    if not left or not right:
+    left = _subject_core(candidate_title)
+    right = _subject_core(existing_title)
+    if left and right:
+        return left == right or left in right or right in left
+    if not left and not right:
         return candidate_title == existing_title
-    return bool(left & right)
+    # One side is pure template; only treat it as the same subject when the other
+    # side is empty of meaning too.
+    return False
 
 
 def detect_resolution(
