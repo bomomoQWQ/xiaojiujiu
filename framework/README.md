@@ -316,7 +316,7 @@ quiet_hours                                      是否落在免打扰时段
 ```bash
 cd framework
 PY="$(cd ../runtime && pwd)/.venv/bin/python"
-"$PY" -m pytest tests          # 176 passed
+"$PY" -m pytest tests          # 178 passed
 ```
 
 | 文件 | 覆盖 | 需要原程序 |

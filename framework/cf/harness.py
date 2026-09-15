@@ -110,6 +110,9 @@ class HarnessConfig:
     time_scale: float = 1.0
     step: str | None = None
     heartbeat_interval_s: float = 1.0
+    #: How often the variables behind the status line are re-read, in real
+    #: seconds. Independent of the heartbeat on purpose; ``<= 0`` disables it.
+    status_interval_s: float = 2.0
     seed: int | None = 20260915
     use_mock_semantics: bool = True
     config_path: str | None = None
@@ -178,6 +181,8 @@ class Harness:
         self.program: ProgramClient | None = None
         self._rebound = 0
         self._last_variables: dict[str, Any] = {}
+        self._last_errors: dict[str, str] = {}
+        self._refresh_thread: threading.Thread | None = None
         #: The instant the world begins: the declared ``--start-time``, else the
         #: clock's reading when :meth:`start` was called. The program's creation
         #: epoch is set from this, so scenario timestamps can be compared to it.
@@ -248,6 +253,12 @@ class Harness:
         self.program = ProgramClient(self.base_url)
         self._start_control()
         self._start_host()
+        # Observation is not the same concern as time passing. The heartbeat drives
+        # ``lazy_tick``; the status line only needs to *look*. Tying the two together
+        # meant that disabling the beat (which a caller stepping the clock by hand
+        # wants) also blanked every variable on screen -- a dashboard that goes dark
+        # because you turned off the engine.
+        self._start_variable_refresh()
         self._start_heartbeat()
         self.logbook.event(
             "harness_ready",
@@ -509,6 +520,36 @@ class Harness:
         )
         self.control.start()
 
+    def _start_variable_refresh(self) -> None:
+        """Poll the read-only surface on its own cadence, independent of the beat.
+
+        A non-positive ``status_interval_s`` disables it, in which case the
+        variables only move when something else happens to take a snapshot.
+        """
+        interval = self.config.status_interval_s
+        if interval <= 0:
+            return
+        thread = threading.Thread(target=self._refresh_loop, name="cf-variables", daemon=True)
+        thread.start()
+        self._refresh_thread = thread
+
+    def _refresh_loop(self) -> None:
+        """Refresh the cached variable snapshot until asked to stop."""
+        while not self._stop.wait(self.config.status_interval_s):
+            try:
+                self.refresh_variables()
+            except Exception as exc:  # noqa: BLE001 - observation must never end the run
+                LOGGER.debug("variable refresh failed: %s", exc)
+
+    def refresh_variables(self) -> dict[str, Any]:
+        """Take one variable snapshot and cache it for the status line."""
+        if self._probe is None:
+            return {}
+        snapshot = self._probe.snapshot()
+        self._last_variables = dict(snapshot.variables)
+        self._last_errors = dict(snapshot.errors)
+        return self._last_variables
+
     def _start_heartbeat(self) -> None:
         """Start the beat that makes time pass and records the variables.
 
@@ -687,6 +728,7 @@ class Harness:
             "llm_stats": self.llm.stats() if hasattr(self.llm, "stats") else {},
             "host": self.host.stats() if self.host is not None else {},
             "variables": dict(self._last_variables),
+            "probe_errors": dict(self._last_errors),
             "rebound_bindings": self._rebound,
             "run_dir": str(self.run_dir),
             "trace": str(self.logbook.trace_path),
@@ -723,6 +765,9 @@ class Harness:
             central promise).
         """
         self._stop.set()
+        if self._refresh_thread is not None:
+            self._refresh_thread.join(timeout=timeout)
+            self._refresh_thread = None
         if self._heartbeat is not None:
             self._heartbeat.join(timeout=timeout)
             self._heartbeat = None

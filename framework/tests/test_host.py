@@ -315,6 +315,67 @@ class TestLiveHost:
 
 
 @requires_program
+class TestVariableObservation:
+    """Watching the Runtime is a different concern from making time pass."""
+
+    def test_variables_are_available_with_the_heartbeat_disabled(self, tmp_path) -> None:
+        """Disabling the beat must not blank the status line.
+
+        Regression: the variables behind the status bar used to be refreshed only
+        as a side effect of a heartbeat, so ``--heartbeat-interval 0`` -- which a
+        caller stepping the clock by hand wants -- left every field as a dash.
+        """
+        from cf.harness import Harness, HarnessConfig
+
+        harness = Harness(
+            HarnessConfig(
+                run_dir=tmp_path / "observe",
+                program_src=PROGRAM_SRC,
+                start_time="2026-09-15T09:00:00Z",
+                time_scale=0.0,
+                heartbeat_interval_s=0,
+                status_interval_s=0.2,
+                echo_logs=False,
+            )
+        )
+        harness.start()
+        try:
+            deadline = time.monotonic() + 15
+            variables: dict = {}
+            while time.monotonic() < deadline:
+                variables = harness.last_variables()
+                if variables:
+                    break
+                time.sleep(0.2)
+            assert variables, "the status variables never refreshed"
+            assert "mood_valence" in variables
+            assert "next_wake_at" in variables
+            assert variables["allow_proactive"] in (True, False)
+            # The beat really is off, so this came from the observer alone.
+            assert harness.status()["beats"] == 0
+        finally:
+            harness.stop()
+
+    def test_the_refresher_stops_with_the_harness(self, tmp_path) -> None:
+        """Teardown joins the observer thread rather than leaking it."""
+        from cf.harness import Harness, HarnessConfig
+
+        harness = Harness(
+            HarnessConfig(
+                run_dir=tmp_path / "observe-stop",
+                program_src=PROGRAM_SRC,
+                start_time="2026-09-15T09:00:00Z",
+                heartbeat_interval_s=0,
+                status_interval_s=0.2,
+                echo_logs=False,
+            )
+        )
+        harness.start()
+        harness.stop()
+        assert harness._refresh_thread is None
+
+
+@requires_program
 class TestValueAxes:
     """The eight axes are the personality; leaving them unset must be visible."""
 

@@ -436,6 +436,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
         time_scale=args.time_scale,
         step=args.step,
         heartbeat_interval_s=args.heartbeat_interval,
+        status_interval_s=args.status_interval,
         seed=args.seed,
         use_mock_semantics=True,
         echo_logs=False,
@@ -633,7 +634,10 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--start-time", default=None, help="虚拟起始时间（ISO-8601）")
     chat.add_argument("--time-scale", type=float, default=1.0, help="虚拟秒 / 真实秒")
     chat.add_argument("--step", default=None, help="每个心跳推进的时长，如 30m")
-    chat.add_argument("--heartbeat-interval", type=float, default=1.0)
+    chat.add_argument("--heartbeat-interval", type=float, default=1.0,
+                      help="心跳间隔（真实秒）；0 = 关掉，由 /advance 手动推进")
+    chat.add_argument("--status-interval", type=float, default=2.0,
+                      help="状态栏变量刷新间隔（真实秒），与心跳无关")
     chat.add_argument("--seed", type=int, default=20260915)
     chat.add_argument("--llm-base-url", default="", help="主 LLM 端点（默认读 CF_MAIN_LLM_BASE_URL）")
     chat.add_argument("--llm-model", default="", help="主 LLM 模型名（默认读 CF_MAIN_LLM_MODEL）")
