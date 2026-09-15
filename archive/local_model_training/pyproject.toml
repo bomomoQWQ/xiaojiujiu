@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "qboss-training"
 version = "0.1.0"
-description = "理解痞老板 Runtime 的 2B 模型训练工程：纯文本事件评价与情绪解释"
+description = "小九九 Runtime 的 2B 模型训练工程：纯文本事件评价与情绪解释"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }

@@ -96,7 +96,7 @@ LOGGER = logging.getLogger("qboss_training.cli")
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="qboss",
-        description="理解痞老板 Runtime 的 2B 模型训练工程（事件评价 + 情绪解释）",
+        description="小九九 Runtime 的 2B 模型训练工程（事件评价 + 情绪解释）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
