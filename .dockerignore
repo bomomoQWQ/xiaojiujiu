@@ -39,6 +39,10 @@ scripts
 # Test suites are not shipped in the image
 runtime/tests
 
+# The adapter is a separate repository; compose bind-mounts it at run time, so it
+# has no business being in the build context either.
+astrbot_plugin_companion_runtime
+
 # Environment files must never enter an image layer
 .env
 .env.*

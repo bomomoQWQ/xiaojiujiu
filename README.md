@@ -173,8 +173,7 @@ healthcheck 打 `/health`；`docker ps` 里的 `healthy` 就是可信的存活�
 
 插件在**独立仓库**里维护：<https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime>。
 
-推荐直接在 AstrBot WebUI 的「插件市场」搜索 `companion_runtime` 安装（市场从插件仓库取包）。
-也可以手动克隆到 AstrBot 的插件目录：
+克隆到 AstrBot 的插件目录即可（本插件尚未提交到 AstrBot 插件市场，所以市场里搜不到）：
 
 ```powershell
 git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git `
