@@ -70,17 +70,18 @@ xiaojiujiu/                       ← 主项目
 
 ```bash
 cd framework
-# 用绝对路径：相对路径会让 Python 打两条 "Unexpected value in sys.prefix" 的
-# RuntimeWarning（sys.prefix 与解释器路径对不上）。无害，但很吵。
-PY="$(cd ../runtime && pwd)/.venv/bin/python"
+# 装进原程序的 venv（框架要用它的 uvicorn/fastapi）。装完 `cf` 就是普通命令，
+# 可以在任何目录、对着任何配置文件跑。
+PY="$(cd ../runtime && pwd)/.venv/bin/python"     # 绝对路径，避免 sys.prefix 噪音警告
+"$PY" -m pip install -e .
 
 # 接真模型：key 只走环境变量，不要写进任何文件
-export CF_MAIN_LLM_BASE_URL=https://api.deepseek.com/v1
-export CF_MAIN_LLM_MODEL=deepseek-chat
 export CF_MAIN_LLM_API_KEY=<你的 key>
+# base_url / model 写在配置文件里（见 §6），也可以用 CF_MAIN_LLM_BASE_URL / MODEL 覆盖
 
-# 开聊（推荐入口）
-"$PY" -m cf chat --run-dir runs/demo --start-time 2026-09-15T09:00:00Z
+# 生成配置 → 开聊（推荐入口）
+cf config init cf.toml
+cf chat --config cf.toml
 
 # 或者只要一个后台 harness（无界面，用别的命令驱动）
 "$PY" -m cf run --run-dir runs/demo --start-time 2026-09-15T09:00:00Z
@@ -233,6 +234,16 @@ cf run --script 'json:{"reinterpretations":[]}'
 
 ## 6. 客户端配置与人格
 
+### 6.0 安装
+
+```bash
+cd framework && "$(cd ../runtime && pwd)/.venv/bin/python" -m pip install -e .
+```
+
+装完 `cf` 是普通命令。不装也能用（`cd framework && python -m cf ...`），
+但只有装过才能**在任意目录**、对着**任意位置**的配置文件跑——配置文件的用途正是
+放在实验旁边，而不是放在框架目录里。
+
 ### 6.1 生成并查看
 
 ```bash
@@ -272,8 +283,10 @@ boundary_respect = 0.96
 conflict_directness = 0.15
 ```
 
-* `system_prompt_file` 相对**配置文件所在目录**解析，不是相对当前工作目录——
-  只在某个目录下能用的配置，做成服务就会坏。
+* **配置文件里所有相对路径都相对配置文件本身解析**，不是当前工作目录
+  （`system_prompt_file` / `program_src` / `plugin_root` / `run_dir` 都是）。
+  一条规则，而且是唯一能在换目录后还成立的规则。
+  `cf config init` 会按目标目录**算出**正确的相对路径，所以生成到哪一层都能直接用。
 * **未被启用的档案缺提示词文件不会阻塞启动**，只有你真的切到它才报错。
   一个没写完的人格不该让你连好用的那个都用不了。
 * 轴名打错会**列出全部可用轴**；数值超出 0..1 直接拒绝。
@@ -431,6 +444,9 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"
 * **危险率是逐拍抽样的**，一次跳 30 小时只是抽了一次。要演"离开两天"就分成小步走
   （黑盒仿真用约 1.4 小时/步），否则你会以为它不主动，其实只是样本太少。
 * **价值观参数只在创建运行时那一行时写入**，见 §7。
+* **用管道喂输入时场景会跑得比插件上报还快。** 插件的上报是排队的（最多 0.5 秒
+  冲刷一次），人和它对话时感觉不到，但 `printf ... | cf chat` 会在几毫秒内把整段
+  脚本灌进去。要脚本化跑剧情就加一点延迟（或用 `cf tick` / `cf say` 分步驱动）。
 
 ---
 

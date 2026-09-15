@@ -327,9 +327,17 @@ def _build(data: Mapping[str, Any], *, base: Path) -> ClientConfig:
         status_interval_s=float(clock_table.get("status_interval_s", 2.0)),
     )
     harness = HarnessSettings(
-        run_dir=str(harness_table.get("run_dir") or ""),
-        program_src=str(harness_table.get("program_src") or HarnessSettings.program_src),
-        plugin_root=str(harness_table.get("plugin_root") or HarnessSettings.plugin_root),
+        # Every relative path in this file is resolved against the file, never
+        # against the shell's cwd. One rule, and it is the only one that survives
+        # being run from a different directory -- which is exactly what happens
+        # when the config lives beside the experiment it describes.
+        run_dir=_resolve_relative(harness_table.get("run_dir"), base),
+        program_src=_resolve_relative(
+            harness_table.get("program_src") or HarnessSettings.program_src, base
+        ),
+        plugin_root=_resolve_relative(
+            harness_table.get("plugin_root") or HarnessSettings.plugin_root, base
+        ),
         seed=_optional_int(harness_table.get("seed"), default=20260915),
         semantics=str(harness_table.get("semantics") or "main_llm").lower(),
         session=str(harness_table.get("session") or "default"),
@@ -369,6 +377,23 @@ def _parse_personas(table: Mapping[str, Any], *, base: Path) -> dict[str, Person
             raise ConfigError(f"[persona.profiles.{name}] must be a table")
         personas[str(name)] = _parse_persona(str(name), body, base=base)
     return personas
+
+
+def _resolve_relative(value: Any, base: Path) -> str:
+    """Resolve a config-supplied path against the config file's directory.
+
+    Absolute paths and the empty string pass through untouched. A path that only
+    resolves from one working directory is a path that breaks the moment the
+    config is used from anywhere else -- and "the config sits next to the
+    experiment" is the normal layout, not the exception.
+    """
+    text = _optional_str(value)
+    if not text:
+        return ""
+    candidate = Path(text).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+    return str((base / candidate).resolve())
 
 
 def _parse_persona(name: str, body: Mapping[str, Any], *, base: Path) -> Persona:
@@ -466,15 +491,51 @@ def _optional_int(value: Any, *, default: int | None) -> int | None:
 # ------------------------------------------------------------------------ example
 
 
-def example_toml() -> str:
+#: Where the framework's own defaults point, derived from this file's location.
+#: ``cf/config.py`` -> ``cf/`` -> the framework root -> the repo root.
+FRAMEWORK_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = FRAMEWORK_ROOT.parent
+DEFAULT_PROGRAM_SRC_ABS = REPO_ROOT / "runtime" / "src"
+DEFAULT_PLUGIN_ROOT_ABS = REPO_ROOT / "astrbot_plugin_companion_runtime"
+
+
+def default_relative_paths(destination: Path) -> tuple[str, str]:
+    """Return ``(program_src, plugin_root)`` relative to a config's directory.
+
+    A template can only hard-code a relative path if it knows where it will be
+    written. ``../runtime/src`` is right for a config sitting in ``framework/``
+    and wrong for one in ``framework/scratch/`` -- and because every relative path
+    in the file resolves against the file, "wrong" means the first command the
+    new user runs fails. Computing the hop removes the guesswork.
+    """
+    base = destination.resolve()
+
+    def hop(target: Path) -> str:
+        """Return ``target`` relative to ``base``, or the absolute path if that is shorter."""
+        try:
+            return os.path.relpath(target, base)
+        except ValueError:  # pragma: no cover - different drives on Windows
+            return str(target)
+
+    return hop(DEFAULT_PROGRAM_SRC_ABS), hop(DEFAULT_PLUGIN_ROOT_ABS)
+
+
+def example_toml(*, program_src: str = "", plugin_root: str = "") -> str:
     """Return a commented example configuration, ready to edit.
 
     Written as a literal rather than generated from the dataclasses so the
     comments -- which are most of the value -- survive.
+
+    Args:
+        program_src: Value for ``[harness].program_src``; defaults to the path
+            that is correct for a config written into the framework directory.
+        plugin_root: Likewise for ``[harness].plugin_root``.
     """
     axes = "\n".join(
         f"# {name} = {default}   # {doc}" for name, (default, doc) in VALUE_AXES.items()
     )
+    program_src = program_src or os.path.relpath(DEFAULT_PROGRAM_SRC_ABS, FRAMEWORK_ROOT)
+    plugin_root = plugin_root or os.path.relpath(DEFAULT_PLUGIN_ROOT_ABS, FRAMEWORK_ROOT)
     return f'''\
 # 小九九外接框架 · 客户端配置
 #
@@ -501,10 +562,11 @@ time_scale = 1.0                          # 虚拟秒 / 真实秒；0 = 时间�
 heartbeat_interval_s = 1.0                # 心跳间隔（真实秒）；0 = 关掉，手动 /advance
 status_interval_s = 2.0                   # 状态栏刷新间隔，与心跳无关
 
+# 这个文件里所有相对路径都相对**本文件所在目录**解析，不是当前工作目录。
 [harness]
 run_dir = "runs/chat"
-program_src = "../runtime/src"
-plugin_root = "../astrbot_plugin_companion_runtime"
+program_src = "{program_src}"
+plugin_root = "{plugin_root}"
 seed = 20260915                           # 固定种子 → 可复现
 semantics = "main_llm"                    # main_llm | mock | disabled
 session = "default"
@@ -601,7 +663,10 @@ def write_example(path: str | Path, *, force: bool = False) -> Path:
     if target.exists() and not force:
         raise ConfigError(f"{target} already exists; pass --force to overwrite")
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(example_toml(), encoding="utf-8")
+    program_src, plugin_root = default_relative_paths(target.parent)
+    target.write_text(
+        example_toml(program_src=program_src, plugin_root=plugin_root), encoding="utf-8"
+    )
     for relative, body in EXAMPLE_PROMPTS.items():
         prompt_path = target.parent / relative
         if prompt_path.exists() and not force:

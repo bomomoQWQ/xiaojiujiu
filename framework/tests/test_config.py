@@ -8,6 +8,7 @@ credential pasted into the file are all worse than a loud failure.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -266,6 +267,39 @@ class TestHarnessSettings:
         assert load_client_config(path).harness.seed == 0
 
 
+class TestPathsAreRelativeToTheConfig:
+    """One rule for every path in the file, and it is not "the shell's cwd"."""
+
+    def test_harness_paths_resolve_against_the_config(self, tmp_path) -> None:
+        """Regression: these used to resolve against the cwd.
+
+        The config sits beside the experiment it describes, so a relative
+        ``program_src`` that only works from one directory fails the first time
+        the framework is started from anywhere else.
+        """
+        nested = tmp_path / "exp"
+        nested.mkdir()
+        path = write(
+            nested,
+            "cf.toml",
+            '[harness]\nprogram_src = "../runtime/src"\nplugin_root = "plug"\nrun_dir = "out"\n',
+        )
+        config = load_client_config(path)
+        assert config.harness.program_src == str((nested / "../runtime/src").resolve())
+        assert config.harness.plugin_root == str((nested / "plug").resolve())
+        assert config.harness.run_dir == str((nested / "out").resolve())
+
+    def test_absolute_paths_pass_through(self, tmp_path) -> None:
+        """An absolute path is left exactly as written."""
+        path = write(tmp_path, "cf.toml", '[harness]\nprogram_src = "/opt/prog/src"\n')
+        assert load_client_config(path).harness.program_src == "/opt/prog/src"
+
+    def test_absent_paths_stay_empty(self, tmp_path) -> None:
+        """An omitted ``run_dir`` is empty, which the CLI reads as "pick a timestamp"."""
+        path = write(tmp_path, "cf.toml", "[harness]\n")
+        assert load_client_config(path).harness.run_dir == ""
+
+
 class TestReporting:
     """``cf config show`` is how an operator checks the layering."""
 
@@ -303,6 +337,20 @@ class TestExample:
         assert config.persona.name == "gentle"
         assert config.persona.system_prompt.strip()
         assert set(config.personas) == {"gentle", "guarded"}
+
+    def test_generated_paths_are_correct_for_the_destination(self, tmp_path) -> None:
+        """A template written into a subdirectory must still point at the program.
+
+        Regression: the template hard-coded ``../runtime/src``, which is right for
+        ``framework/cf.toml`` and wrong one level deeper -- and since every relative
+        path resolves against the file, "wrong" meant the new user's very first
+        command failed.
+        """
+        nested = tmp_path / "sub" / "deeper"
+        write_example(nested / "cf.toml")
+        config = load_client_config(nested / "cf.toml")
+        assert (Path(config.harness.program_src) / "companion_runtime").is_dir()
+        assert (Path(config.harness.plugin_root) / "main.py").is_file()
 
     def test_scaffolding_keeps_existing_prompts(self, tmp_path) -> None:
         """Editing a persona prompt is not undone by re-running ``init``."""
