@@ -1,0 +1,132 @@
+"""The question-frame decision, as executable acceptance criteria.
+
+The product owner decided how a user's *question* should be treated by long-term memory,
+and this file is that decision written down where it cannot rot:
+
+1. the **proposition** inside the question is what gets stored - the interrogative frame
+   ("你还记得…吗？") is removed from the summary, so the fact is readable as a fact;
+2. the **frame is kept as its own relationship evidence** - a user checking whether the
+   character remembers is evidence about the relationship, and the owner wants it kept;
+3. that evidence must **not compete for the four slots** of the 必要记忆 section, because
+   question memories share their characters with each other by construction and were
+   measured filling 4 of 10 probe turns while the disclosure the user asked about - which
+   retrieval *did* return, rank 4 of 10 - lost the budget.
+
+All three are marked ``xfail(strict=True)`` because none of them holds today. That is
+deliberate: the marker turns into a failure the moment the behaviour is implemented, which
+forces the implementer to delete it, so an "expected failure" cannot outlive the work. The
+reason strings record what was measured, not what was assumed.
+
+Why this is not implemented yet, honestly: `MemoryCandidate` has no ``structured`` field
+and candidates are persisted (`MemoryProjection.upsert_candidate`), so keeping the raw
+frame alongside the proposition means threading one field through four layers - the
+candidate type, its persistence, `memory.consolidate`, and the prompt selection in
+`context.select_memories`. A half-change there would leave the frame unrecoverable, which
+is exactly what the owner said not to do.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+
+import pytest
+
+from companion_runtime import context as context_module
+from companion_runtime.runtime import Runtime
+
+from conftest import BASE_TIME
+
+#: A question that carries a fact, with the frame in the middle.
+QUESTION_WITH_FACT = "我喜欢你这件事情，你还记得我说过吗？"
+#: A question that carries an update, frame at the end.
+QUESTION_WITH_UPDATE = "我妈身体好一些了，你还记得我每周跑医院那阵子吗？"
+#: A disclosure with no frame at all: it must pass through untouched.
+PLAIN_DISCLOSURE = "我以前养过一只猫，叫团子，后来送人了，我现在还经常想起它。"
+#: The frame with nothing before it - stripping must not produce an empty summary.
+FRAME_ONLY = "你还记得我跟你讲过它吗？"
+
+
+def _summaries(runtime: Runtime) -> list[str]:
+    """Return every stored memory summary."""
+    return [memory.summary for memory in runtime.projections.memory.list_memories(limit=50)]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="decided but not implemented: the frame must be stripped from the stored summary",
+)
+def test_a_question_is_stored_as_its_proposition(runtime: Runtime) -> None:
+    """The fact survives without the interrogative frame riding along with it."""
+    runtime.process_user_message(content=QUESTION_WITH_FACT, timestamp=BASE_TIME)
+    runtime.consolidate(now=BASE_TIME + timedelta(hours=2))
+    summaries = _summaries(runtime)
+
+    assert summaries, "the sentence carried a fact and should have been remembered"
+    assert "我喜欢你" in " ".join(summaries), "the fact must survive the stripping"
+    for summary in summaries:
+        assert "你还记得" not in summary, f"the frame is still stored as a fact: {summary!r}"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="decided but not implemented: the frame must move out of the summary and into the record",
+)
+def test_the_frame_is_kept_as_relationship_evidence(runtime: Runtime) -> None:
+    """Removing it from the summary must not remove it from the record.
+
+    Both halves are asserted deliberately, because either one alone is satisfiable today:
+    the frame is *in* the summary right now, so "the frame is somewhere in the record" is
+    already true and would be a vacuous acceptance test. The pair - gone from the summary,
+    still present in the memory's own record - is what only the decided shape satisfies.
+    """
+    import json
+
+    runtime.process_user_message(content=QUESTION_WITH_UPDATE, timestamp=BASE_TIME)
+    runtime.consolidate(now=BASE_TIME + timedelta(hours=2))
+    memories = list(runtime.projections.memory.list_memories(limit=50))
+    assert memories
+
+    summaries = " ".join(memory.summary for memory in memories)
+    records = json.dumps(
+        [memory.structured for memory in memories], ensure_ascii=False, default=str
+    )
+    assert "你还记得" not in summaries, f"the frame is still a fact: {summaries!r}"
+    assert "你还记得" in records, (
+        "the frame was dropped instead of kept as relationship evidence"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="decided but not implemented: question memories must not take the four slots",
+)
+def test_question_memories_do_not_crowd_out_a_disclosure(runtime: Runtime) -> None:
+    """The measured defect: four of ten sections were filled by the user's own questions."""
+    for index, content in enumerate(
+        [
+            "你还记得我跟你讲过它吗？",
+            "我说过我喜欢你，你还记得吗？",
+            "你还记得我每周跑医院那阵子吗？",
+            "我讲过团子的事，你还记得吗？",
+        ]
+    ):
+        runtime.process_user_message(
+            content=content, timestamp=BASE_TIME + timedelta(minutes=index)
+        )
+    runtime.process_user_message(
+        content=PLAIN_DISCLOSURE, timestamp=BASE_TIME + timedelta(minutes=10)
+    )
+    runtime.consolidate(now=BASE_TIME + timedelta(hours=2))
+    runtime.lazy_tick(BASE_TIME + timedelta(hours=3))
+
+    selected = context_module.select_memories(
+        runtime.projections,
+        limit=4,
+        cue="团子最近怎么样？",
+        store=runtime.memory_store,
+        now=BASE_TIME + timedelta(hours=3),
+    )
+    shown = " ".join(getattr(item, "summary", "") for item in selected)
+    assert "你还记得" not in shown, (
+        f"a question memory took one of the four slots: {shown!r}"
+    )
