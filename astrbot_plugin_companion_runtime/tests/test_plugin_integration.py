@@ -62,18 +62,22 @@ class StubMessageEvent:
         session: str = SESSION,
         wake: bool = True,
         result_text: str = "",
+        message_type: str = "FriendMessage",
     ) -> None:
         self.unified_msg_origin = session
         self.message_str = text
         self.message_obj = SimpleNamespace(message_id="msg-1")
         self.is_at_or_wake_command = wake
         self._result_text = result_text
+        #: AstrBot's real enum values ("FriendMessage", "GroupMessage", ...), not
+        #: the plain scope words the Runtime protocol uses.
+        self._message_type = message_type
 
     def get_platform_name(self) -> str:
         return "webchat"
 
     def get_message_type(self) -> Any:
-        return SimpleNamespace(value="private")
+        return SimpleNamespace(value=self._message_type)
 
     def get_sender_id(self) -> str:
         return "user-1"
@@ -106,12 +110,21 @@ class StubMessageEvent:
 class StubContext:
     """Stand-in for the AstrBot ``Context`` handed to the plugin."""
 
-    def __init__(self, *, provider_id: str = "openai/gpt-4o", completion: str = "主动消息") -> None:
+    def __init__(
+        self,
+        *,
+        provider_id: str = "openai/gpt-4o",
+        completion: str = "主动消息",
+        send_delay_s: float = 0.0,
+    ) -> None:
         self.provider_id = provider_id
         self.completion = completion
+        #: Lets a test hold a delivery in flight while it terminates the plugin.
+        self.send_delay_s = send_delay_s
         self.sent: list[tuple[str, Any]] = []
         self.generated: list[dict[str, Any]] = []
         self.provider_lookups: list[str] = []
+        self.send_started = asyncio.Event()
 
     async def get_current_chat_provider_id(self, umo: str | None = None) -> str:
         self.provider_lookups.append(str(umo))
@@ -124,6 +137,9 @@ class StubContext:
         return LLMResponse(self.completion)
 
     async def send_message(self, session: Any, chain: Any) -> bool:
+        self.send_started.set()
+        if self.send_delay_s:
+            await asyncio.sleep(self.send_delay_s)
         self.sent.append((str(session), chain))
         return True
 
@@ -166,6 +182,8 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         if self.plugin is not None:
             await self.plugin.terminate()
         self.main.AiohttpRuntimeTransport = self._original_transport
+        # The scope filter instance is shared module state; a test that leaves it
+        # widened would silently change AstrBot's pipeline for the next one.
         self.main._ObservationScopeFilter.observe_all = False
 
     async def _plugin(self, **config_overrides: Any) -> Any:
@@ -244,7 +262,7 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.main.AiohttpRuntimeTransport = ExplodingTransport
         plugin = self.main.CompanionRuntimePlugin(
             context=self.context,
-            config={"runtime_base_url": "http://127.0.0.1:8799"},
+            config={"runtime_base_url": "http://127.0.0.1:8799", "observe_mode": "all"},
         )
         self.plugin = plugin
         handler = self._handler("on_message_observed")
@@ -255,7 +273,11 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         # Three attempts, then the adapter stays quiet instead of logging on
         # every single message.
         self.assertEqual(ExplodingTransport.calls, 3)
-        self.assertTrue(plugin._started)
+        self.assertTrue(plugin._gave_up)
+        # Giving up is not a running state, and it must not keep AstrBot's own
+        # pipeline widened for an adapter that never came up.
+        self.assertFalse(plugin._started)
+        self.assertFalse(self.main._ObservationScopeFilter.observe_all)
 
     async def test_scope_filter_never_wakes_a_sleeping_bot(self) -> None:
         await self._plugin()
@@ -270,6 +292,53 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         scope_filter = self.filters.registration_for("on_message_observed").filter_instance
 
         self.assertTrue(scope_filter.filter(StubMessageEvent(wake=False), {}))
+
+    async def test_disabled_adapter_never_widens_the_host_pipeline(self) -> None:
+        """``observe_all`` on a disabled plugin would wake every group message.
+
+        The filter instance is created once per module and shared by every event,
+        so a stale ``True`` left behind by an earlier instance, or published by a
+        plugin that is switched off, keeps AstrBot marking non-wake messages as
+        wake events on nobody's behalf.
+        """
+        scope_filter = self.filters.registration_for("on_message_observed").filter_instance
+        self.main._ObservationScopeFilter.observe_all = True
+
+        plugin = await self._plugin(enabled=False, observe_mode="all")
+
+        self.assertIsNone(plugin._queue)
+        self.assertFalse(self.main._ObservationScopeFilter.observe_all)
+        self.assertFalse(scope_filter.filter(StubMessageEvent(wake=False), {}))
+        self.assertTrue(scope_filter.filter(StubMessageEvent(wake=True), {}))
+
+    async def test_terminate_resets_the_observation_scope(self) -> None:
+        plugin = await self._plugin(observe_mode="all")
+        scope_filter = self.filters.registration_for("on_message_observed").filter_instance
+        self.assertTrue(scope_filter.filter(StubMessageEvent(wake=False), {}))
+
+        await plugin.terminate()
+
+        self.assertFalse(scope_filter.filter(StubMessageEvent(wake=False), {}))
+
+    async def test_message_type_uses_the_runtime_vocabulary(self) -> None:
+        """AstrBot reports chat *classes*; the Runtime needs private/group/other."""
+        plugin = await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+
+        for raw, expected in (
+            ("FriendMessage", "private"),
+            ("GroupMessage", "group"),
+            ("OtherMessage", "other"),
+        ):
+            with self.subTest(message_type=raw):
+                transport.event_bodies.clear()
+                await self._handler("on_message_observed")(
+                    plugin,
+                    StubMessageEvent(text="hi", message_type=raw),
+                )
+                self.assertTrue(await wait_until(lambda: len(transport.event_bodies) == 1))
+                record = transport.event_bodies[0]["events"][0]
+                self.assertEqual(record["message_type"], expected)
 
     async def test_assistant_message_is_reported(self) -> None:
         await self._plugin()
@@ -357,6 +426,9 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session, SESSION)
         self.assertEqual(chain.get_plain_text(), "在忙吗")
         self.assertEqual(transport.authorize_requests[0].action_id, "act_1")
+        # The message is delivered before the result is reported, so wait for the
+        # report rather than assuming it lands in the same loop iteration.
+        self.assertTrue(await wait_until(lambda: bool(transport.report_bodies), timeout_s=3.0))
         report = transport.report_bodies[0]
         self.assertEqual(report["status"], "ok")
         self.assertTrue(report["result"]["sent"])
@@ -430,6 +502,66 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(plugin._transport)
         self.assertTrue(transport.closed)
         await plugin.terminate()  # second call must be a no-op
+        self.assertTrue(plugin._stopped)
+
+    async def test_terminate_lets_an_authorized_send_finish_and_report(self) -> None:
+        """The bounded graceful window is what keeps unload from duplicating a send.
+
+        A delivery that the Runtime already authorized is irreversible: cancelling
+        it mid-flight leaves a message that may have reached the user with no
+        result report, and the Runtime -- which only knows what the adapter tells
+        it -- would eventually hand the same action out again.
+        """
+        self.context.send_delay_s = 0.3
+        plugin = await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+        transport.actions = [_leased(ACTION_SEND, payload={"text": "在忙吗"})]
+        transport.authorize_decision = AuthorizeDecision(authorized=True)
+
+        self.assertTrue(await wait_until(lambda: self.context.send_started.is_set(), timeout_s=3.0))
+
+        await plugin.terminate()
+
+        self.assertEqual(len(self.context.sent), 1, "an authorized delivery must not be cancelled")
+        self.assertTrue(transport.report_bodies, "the finished delivery must be reported")
+        self.assertEqual(transport.report_bodies[0]["status"], "ok")
+        self.assertEqual(transport.report_bodies[0]["result"]["sent"], True)
+
+    async def test_terminate_never_revives_the_adapter(self) -> None:
+        """A hook that arrives after unload must not start new workers.
+
+        AstrBot keeps dispatching to a plugin until the reload completes, so a
+        late message used to be able to wire up a fresh transport and outbox loop
+        *after* terminate had already cleared them: background work that nothing
+        would ever cancel again.
+        """
+        plugin = await self._plugin()
+        await plugin.terminate()
+        created = len(StubRuntimeTransport.instances)
+
+        await self._handler("on_message_observed")(plugin, StubMessageEvent())
+        request = SimpleNamespace(extra_user_content_parts=[])
+        await self._handler("on_llm_request")(plugin, StubMessageEvent(), request)
+        await self._handler("on_after_message_sent")(
+            plugin,
+            StubMessageEvent(result_text="我在听"),
+        )
+
+        self.assertEqual(len(StubRuntimeTransport.instances), created)
+        self.assertIsNone(plugin._queue)
+        self.assertIsNone(plugin._bridge)
+        self.assertIsNone(plugin._transport)
+        self.assertIsNone(plugin._outbox)
+        self.assertEqual(plugin._tasks, [])
+        self.assertEqual(request.extra_user_content_parts, [])
+
+    async def test_status_reports_a_terminated_adapter_as_terminated(self) -> None:
+        plugin = await self._plugin()
+        await plugin.terminate()
+
+        text = await plugin._status_text()
+
+        self.assertIn("state: terminated", text)
 
     async def test_status_text_reports_counters_without_the_token(self) -> None:
         plugin = await self._plugin(runtime_token="top-secret-token")

@@ -62,7 +62,12 @@ TASK_SENSITIVITY: Mapping[str, str] = {
 }
 
 #: How many versions may pass before a result of a given sensitivity must be
-#: rebased rather than applied directly.
+#: rebased rather than applied directly. The budget is the count of *tolerable*
+#: gaps: a result is still fresh for gaps ``0 .. budget - 1``, and a gap that
+#: reaches the budget is already stale. ``critical`` (0) therefore tolerates no
+#: drift at all, while its gap of 0 -- dispatched against the very version that
+#: is current -- is currency rather than drift and stays APPLY. See
+#: :func:`staleness_threshold`, which turns these numbers into that boundary.
 STALENESS_BUDGET: Mapping[str, int] = {
     "low": 50,
     "medium": 6,
@@ -134,6 +139,31 @@ def sensitivity_of(task_type: str) -> str:
     return TASK_SENSITIVITY.get(task_type, "medium")
 
 
+def staleness_threshold(sensitivity: str) -> int:
+    """Return the version gap at which a sensitivity class counts as stale.
+
+    One boundary, used by everything that asks "is this result still current?",
+    so the protocol can never answer APPLY and DISCARD for the same gap:
+
+    * the returned value is the *inclusive* rebase boundary -- a gap equal to it
+      is stale and the result must be re-coordinated (``gap >= threshold``),
+      while every smaller gap applies as-is;
+    * it is never below 1, because a gap of 0 is not drift: the result was
+      dispatched against the version that is still current, and re-coordinating
+      it would rebase work that is exactly as fresh as the state it targets.
+      That is what keeps the ``critical`` budget of 0 meaningful (any real drift
+      rebases) without making it self-defeating (a current draft still applies).
+
+    Args:
+        sensitivity: A sensitivity class name (``low``/``medium``/``high``/
+        ``critical``); an unknown class falls back to the ``medium`` budget.
+
+    Returns:
+        The smallest version gap that is not fresh.
+    """
+    return max(1, STALENESS_BUDGET.get(sensitivity, STALENESS_BUDGET["medium"]))
+
+
 def _looks_like_retraction(text: str) -> bool:
     """Return whether a user message retracts an earlier statement."""
     return any(pattern.search(text or "") for pattern in RETRACTION_PATTERNS)
@@ -162,8 +192,13 @@ def classify(
     1. a missing source event means the premise has no evidence left -> DISCARD;
     2. a newer user message that retracts the premise of the source events ->
        DISCARD;
-    3. a version gap inside the sensitivity budget -> APPLY;
+    3. a version gap *inside* the sensitivity budget (strictly below
+       :func:`staleness_threshold`) -> APPLY;
     4. otherwise -> REBASE, with notes explaining what must be recomputed.
+
+    Rule 3 is inclusive of gap 0 for every sensitivity, including the
+    ``critical`` one whose budget is 0: a gap equal to the budget is already
+    stale, but "no drift at all" is never stale.
 
     Args:
         proposal: The submitted result.
@@ -206,8 +241,11 @@ def classify(
             classification.rebase_notes.append(f"retracted by {event.event_id}")
             return classification
 
-    budget = STALENESS_BUDGET.get(sensitivity, 6)
-    if gap > budget:
+    # A gap that reaches the sensitivity's threshold is stale; a smaller one is
+    # inside the budget. ``critical`` (threshold 1) is what makes this a
+    # threshold rather than a plain budget comparison: its own gap of 0 still
+    # applies, any real drift does not.
+    if gap >= staleness_threshold(sensitivity):
         classification.action = ProtocolAction.REBASE.value
         classification.reason = f"stale_by_{gap}_versions"
         classification.rebase_notes.append("recompute effects against current state")
@@ -370,7 +408,7 @@ def _satisfies(text: str, candidate_type: str) -> bool:
     """Return whether a user message already answers a follow-up style intent."""
     from .unfinished import RESOLUTION_PATTERNS
 
-    for pattern, _reason in RESOLUTION_PATTERNS:
+    for pattern, _reason, _topics in RESOLUTION_PATTERNS:
         if pattern.search(text):
             return True
     return False
@@ -496,5 +534,15 @@ def expired_explanation(created_at: datetime | None, now: datetime, ttl_seconds:
 
 
 def should_discard_explanation(proposal: Proposal, *, current_version: int) -> bool:
-    """Return whether a psychological explanation must be thrown away."""
-    return sensitivity_of(proposal.task_type) == "high" and current_version - proposal.based_on_version >= 2
+    """Return whether a psychological explanation must be thrown away.
+
+    The explanation is the most perishable result the Runtime holds, so it is not
+    merely re-coordinated when the world moves: it is dropped. The boundary is
+    the *same* one :func:`classify` applies to its staleness decision (a gap that
+    reaches the ``high`` threshold), because an explanation that ``classify``
+    would refuse to apply as fresh must not survive as a cached one -- two
+    disagreeing boundaries is how a stale explanation keeps being served after
+    the protocol has already decided it is out of date.
+    """
+    gap = max(0, int(current_version) - int(proposal.based_on_version))
+    return sensitivity_of(proposal.task_type) == "high" and gap >= staleness_threshold("high")

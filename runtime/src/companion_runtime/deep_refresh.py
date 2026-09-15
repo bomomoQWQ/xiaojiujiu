@@ -21,11 +21,14 @@ sources first; anything that fails is dropped and reported.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Mapping, Sequence
 
 from .utility import isoformat
+
+LOGGER = logging.getLogger("companion_runtime.deep_refresh")
 
 __all__ = [
     "GroundedOperation",
@@ -130,7 +133,9 @@ def evaluate_triggers(
     proactive_grounded: bool = True,
     history_suspect: bool = False,
     user_evidence_overturns: bool = False,
-    hours_since_last_refresh: float = 0.0,
+    hours_since_last_refresh: float | None = None,
+    has_previous_refresh: bool = True,
+    has_material: bool = True,
     config: Any = None,
 ) -> RefreshTrigger:
     """Decide whether a deep refresh is warranted, and why.
@@ -151,7 +156,21 @@ def evaluate_triggers(
         proactive_grounded: Whether that intent has a resolvable semantic basis.
         history_suspect: An earlier interpretation may be wrong.
         user_evidence_overturns: New user evidence contradicts a stored reading.
-        hours_since_last_refresh: Time since the previous refresh.
+        hours_since_last_refresh: Time since the previous refresh. ``None`` means
+            "never refreshed", which is *not* the same as zero: a Runtime that has
+            never spent must not be paced by an interval it has not yet started.
+            A negative value is treated as unknown for the same reason - it would
+            otherwise read as "just refreshed" and stall the rule forever.
+        has_previous_refresh: Whether a refresh has actually been attempted before,
+            which is what gives the minimum-interval guard a real baseline. It
+            defaults to ``True`` because a caller that measures elapsed time is by
+            definition describing a previous refresh; a caller with no baseline
+            passes ``False`` and is not paced by an interval it never started.
+        has_material: Whether there is anything for a refresh to reason about - open
+            matters or unresolved events. When there is nothing, the speculative
+            ``idle_refresh`` rule is disarmed: a Runtime that has never been spoken
+            to has been idle since its creation epoch, and "idle" must not be read
+            as "worth spending a request to rediscover that nothing has happened".
         config: A :class:`~companion_runtime.config.SemanticConfig`, or any object
             exposing the same attribute names. ``None`` uses the documented
             defaults so the function is usable from tests without a Runtime.
@@ -164,15 +183,24 @@ def evaluate_triggers(
     idle_hours = float(getattr(config, "deep_refresh_idle_hours", 12.0))
     min_interval = float(getattr(config, "deep_refresh_min_interval_seconds", 3600.0))
 
+    elapsed = hours_since_last_refresh
+    if elapsed is not None and elapsed < 0.0:
+        # A negative interval is nonsense rather than a measurement; refusing to
+        # use it is safer than clamping it to the smallest possible value, which
+        # would mean "we refreshed a moment ago" and disable the whole feature.
+        LOGGER.warning("Ignoring negative hours_since_last_refresh=%r", hours_since_last_refresh)
+        elapsed = None
+
     # A refresh is never allowed to run back to back regardless of the reason:
-    # the cost is real and the backlog does not change that fast.
-    if hours_since_last_refresh > 0.0 and hours_since_last_refresh * 3600.0 < min_interval:
+    # the cost is real and the backlog does not change that fast. The rule needs a
+    # genuine baseline - a caller that has never refreshed has nothing to pace.
+    if has_previous_refresh and elapsed is not None and elapsed * 3600.0 < min_interval:
         return RefreshTrigger(
             False,
             "min_interval_not_elapsed",
             priority=99,
             unresolved_count=unresolved_count,
-            detail=f"{hours_since_last_refresh:.2f}h since the last refresh",
+            detail=f"{elapsed:.2f}h since the last refresh",
         )
 
     checks: tuple[tuple[str, bool], ...] = (
@@ -183,7 +211,7 @@ def evaluate_triggers(
         ("proactive_without_grounding", wants_proactive and not proactive_grounded),
         ("history_may_be_wrong", history_suspect),
         ("user_evidence_overturns", user_evidence_overturns),
-        ("idle_refresh", hours_since_last_refresh >= idle_hours),
+        ("idle_refresh", has_material and elapsed is not None and elapsed >= idle_hours),
     )
     for reason, matched in checks:
         if matched:

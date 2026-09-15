@@ -52,7 +52,7 @@ from .companion_runtime.protocol import (
     truncate_error,
 )
 from .companion_runtime.retry_queue import BoundedRetryQueue, QueueItem
-from .companion_runtime.settings import OBSERVE_MODE_ALL, Settings
+from .companion_runtime.settings import OBSERVE_MODE_ALL, SHUTDOWN_GRACE_S, Settings
 
 try:  # the documented import path for provider-facing content parts
     from astrbot.api.event.filter import CustomFilter
@@ -74,6 +74,16 @@ LAST_EVENT_ID_CACHE = 64
 #: How many times a failing start is retried before the adapter gives up quietly.
 MAX_START_ATTEMPTS = 3
 
+#: AstrBot's ``MessageType`` values mapped onto the plain vocabulary the Runtime
+#: protocol documents. The enum's raw values (``FriendMessage`` and friends) are
+#: AstrBot's spelling of platform message classes, not a chat scope, so passing
+#: them through would leave the Runtime with nothing it can reason about.
+MESSAGE_TYPE_NAMES = {
+    "friendmessage": "private",
+    "groupmessage": "group",
+    "othermessage": "other",
+}
+
 
 class _ObservationScopeFilter(CustomFilter):
     """Pass only for messages AstrBot itself already treats as wake events.
@@ -84,8 +94,12 @@ class _ObservationScopeFilter(CustomFilter):
     ordinary group message into a wake event, nor push non-wake traffic through
     the remaining pipeline stages.
 
-    ``observe_all`` is flipped by the plugin instance when the operator explicitly
-    opts in to observing every message; see ``observe_mode`` in ``README.md``.
+    ``observe_all`` is published by the *live* adapter instance (see
+    ``CompanionRuntimePlugin._apply_observation_scope``). It stays ``False``
+    whenever no adapter is running -- never started, disabled, unable to start,
+    or already terminated -- because this filter is the one thing that can widen
+    AstrBot's own pipeline, and widening it for a dead adapter would be a
+    behaviour change nobody asked for. See ``observe_mode`` in ``README.md``.
     """
 
     observe_all: bool = False
@@ -98,13 +112,22 @@ class _ObservationScopeFilter(CustomFilter):
 
 
 def _message_type_name(event: AstrMessageEvent) -> str:
-    """Return a plain string message type such as ``group`` or ``private``."""
+    """Return ``private`` / ``group`` / ``other`` for an event's message type.
+
+    Args:
+        event: The AstrBot event being reported.
+
+    Returns:
+        The protocol's plain chat-scope word, or the raw (lowercased) value when
+        AstrBot reports a message class this adapter does not know.
+    """
     try:
         message_type = event.get_message_type()
     except Exception:
         return ""
     value = getattr(message_type, "value", message_type)
-    return as_str(value).lower()
+    raw = as_str(value).strip().lower()
+    return MESSAGE_TYPE_NAMES.get(raw, raw)
 
 
 class CompanionRuntimePlugin(Star):
@@ -116,6 +139,10 @@ class CompanionRuntimePlugin(Star):
         self.config = config or {}
         self._settings = Settings.from_mapping(self.config)
         self._started = False
+        self._stopped = False
+        """Set by ``terminate``: the adapter is finished and never starts again."""
+        self._gave_up = False
+        """Set when worker construction failed too often to keep retrying."""
         self._start_failures = 0
         self._transport: AiohttpRuntimeTransport | None = None
         self._queue: BoundedRetryQueue | None = None
@@ -125,6 +152,10 @@ class CompanionRuntimePlugin(Star):
         self._tasks: list[asyncio.Task[None]] = []
         self._last_event_ids: OrderedDict[str, str] = OrderedDict()
         self._injection_warnings: set[str] = set()
+        # Take ownership of the shared scope filter straight away: a previous
+        # instance may have left it widened, and AstrBot only reloads plugin
+        # instances, it never resets module level state for them.
+        self._apply_observation_scope()
         for issue in self._settings.issues:
             self.logger.warning("companion_runtime config: %s", issue)
 
@@ -139,10 +170,33 @@ class CompanionRuntimePlugin(Star):
     async def terminate(self) -> None:
         """Stop background workers and release resources.
 
-        Called when the plugin is disabled, unloaded, or reloaded. Idempotent, and
-        safe to call even if :meth:`initialize` never ran.
+        Called when the plugin is disabled, unloaded, or reloaded. Idempotent,
+        safe to call even if :meth:`initialize` never ran, and terminal: once it
+        returns, a message hook that arrives late can no longer start workers,
+        because AstrBot keeps dispatching to a plugin it has already unloaded
+        until the reload finishes.
         """
+        self._stopped = True
         self._started = False
+        self._apply_observation_scope()
+
+        outbox, self._outbox = self._outbox, None
+        if outbox is not None:
+            # Bounded graceful stop. Leases that are already in flight are still
+            # the Runtime's actions, and cancelling one *after* the Runtime
+            # authorized an irreversible send is exactly how the same proactive
+            # message ends up delivered twice, so give them a short window to
+            # finish and report before the tasks are cancelled.
+            outbox.request_stop()
+            if not await outbox.wait_idle(SHUTDOWN_GRACE_S):
+                self.logger.warning(
+                    "companion_runtime stopped with actions still in flight after %.0fs; "
+                    "an authorized delivery that was already on the wire may finish "
+                    "unreported, and the Runtime can then only recover it from its own "
+                    "lease deadline",
+                    SHUTDOWN_GRACE_S,
+                )
+
         tasks, self._tasks = self._tasks, []
         for task in tasks:
             task.cancel()
@@ -152,7 +206,6 @@ class CompanionRuntimePlugin(Star):
         queue, self._queue = self._queue, None
         bridge, self._bridge = self._bridge, None
         transport, self._transport = self._transport, None
-        self._outbox = None
         self._executor = None
         self._last_event_ids.clear()
 
@@ -166,14 +219,32 @@ class CompanionRuntimePlugin(Star):
         except Exception:
             self.logger.warning("companion_runtime shutdown was not clean", exc_info=True)
 
+    def _apply_observation_scope(self) -> None:
+        """Publish this adapter's observation mode to the shared scope filter.
+
+        The filter instance is created once by AstrBot while the decorator runs
+        and is shared by every event, so the flag has to be written on every state
+        change rather than only on a successful start: a stale ``True`` would keep
+        widening AstrBot's own pipeline -- every non-wake group message would be
+        marked as a wake event -- on behalf of an adapter that is disabled, has
+        failed to start, or is already gone.
+        """
+        _ObservationScopeFilter.observe_all = bool(
+            self._started
+            and not self._stopped
+            and self._settings.usable
+            and self._settings.observe_mode == OBSERVE_MODE_ALL,
+        )
+
     def _start(self) -> None:
         """Wire up workers. Synchronous and idempotent.
 
         Synchronous on purpose: observers and hooks must be able to lazily start
         the adapter without awaiting anything on the message path. Construction
-        happens before any task is created, so a failure here leaks nothing.
+        happens before any task is created, so a failure here leaks nothing. A
+        terminated adapter is never revived.
         """
-        if self._started:
+        if self._started or self._stopped or self._gave_up:
             return
         self._started = True
         if not self._settings.usable:
@@ -219,7 +290,7 @@ class CompanionRuntimePlugin(Star):
         self._queue = queue
         self._bridge = bridge
         self._outbox = outbox
-        _ObservationScopeFilter.observe_all = self._settings.observe_mode == OBSERVE_MODE_ALL
+        self._apply_observation_scope()
 
         try:
             if outbox is not None:
@@ -252,11 +323,15 @@ class CompanionRuntimePlugin(Star):
 
         Retrying forever would mean a broken adapter logging on every single
         message, so after ``MAX_START_ATTEMPTS`` the plugin stays quiet until
-        AstrBot reloads it.
+        AstrBot reloads it. "Gave up" is its own state: the adapter is neither
+        running nor merely not started yet, and it must never widen AstrBot's
+        pipeline.
         """
+        self._started = False
         self._start_failures += 1
-        if self._start_failures >= MAX_START_ATTEMPTS:
-            self._started = True
+        self._gave_up = self._start_failures >= MAX_START_ATTEMPTS
+        self._apply_observation_scope()
+        if self._gave_up:
             self.logger.error(
                 "companion_runtime %s; adapter disabled after %d attempts "
                 "(reload the plugin after fixing the config)",
@@ -264,7 +339,6 @@ class CompanionRuntimePlugin(Star):
                 self._start_failures,
             )
             return
-        self._started = False
         self.logger.warning(
             "companion_runtime %s (attempt %d/%d)",
             message,
@@ -532,9 +606,17 @@ class CompanionRuntimePlugin(Star):
         chat even if one were ever added.
         """
         settings = self._settings
+        if self._stopped:
+            state = "terminated"
+        elif self._gave_up:
+            state = "unavailable (worker start failed)"
+        elif self._started:
+            state = "running"
+        else:
+            state = "inactive"
         lines = [
             "companion Runtime adapter",
-            f"- state: {'running' if self._started and settings.usable else 'inactive'}",
+            f"- state: {state}",
             f"- adapter_id: {settings.adapter_id}",
             f"- runtime: {settings.base_url or '<unset>'}",
             f"- token: {'configured' if settings.token else 'not configured'}",
@@ -562,7 +644,8 @@ class CompanionRuntimePlugin(Star):
                 "- actions: "
                 f"{stats.leased} leased, {stats.rendered} rendered, {stats.sent} sent, "
                 f"{stats.rejected} rejected, {stats.failed} failed, "
-                f"{stats.skipped} skipped, {stats.replayed} replayed",
+                f"{stats.skipped} skipped, {stats.replayed} replayed, "
+                f"{stats.deferred} deferred (unreported, left to lease expiry)",
             )
         queue = self._queue
         if queue is not None:

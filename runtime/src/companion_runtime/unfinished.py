@@ -25,7 +25,7 @@ from typing import Sequence
 from .config import RuntimeConfig
 from .projections import UnfinishedProjection
 from .typing import EventType, RawEvent, UnfinishedMatter, UnfinishedStatus, new_id
-from .utility import isoformat, parse_datetime, utcnow
+from .utility import isoformat, parse_datetime, topic_tokens, utcnow
 
 LOGGER = logging.getLogger("companion_runtime.unfinished")
 
@@ -44,26 +44,73 @@ _DAY_PARTS: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"晚上|今晚|夜里|evening|night"), 21),
 )
 
-#: Topics that create an obligation to follow up.
+#: Topics that create an obligation to follow up. The order matters: the rules are
+#: alternative readings of one sentence and the first *applicable* match decides, so
+#: the specific subjects come first. "明天要出差，落地告诉你" mentions both a trip and a
+#: promise to report, and the trip reading is the more informative one - it names the
+#: subject instead of filing a generic "wait for the user to tell me something".
 FOLLOW_UP_PATTERNS: tuple[tuple[re.Pattern[str], str, float], ...] = (
     (re.compile(r"(面试|面谈|interview)"), "等待面试结果", 0.78),
     (re.compile(r"(考试|笔试|测验|exam)"), "等待考试结果", 0.74),
     (re.compile(r"(体检|检查结果|报告)"), "等待检查结果", 0.72),
+    (re.compile(r"(出差|旅行|起飞|落地|到(?!家了|了))"), "关心行程是否顺利", 0.58),
     (re.compile(r"(结果|通知|答复|回复我|告诉你)"), "等待用户告知结果", 0.60),
-    (re.compile(r"(出差|旅行|起飞|落地|到(家|了))"), "关心行程是否顺利", 0.58),
     (re.compile(r"(明天|后天).{0,6}(给我|告诉你|说)"), "等待用户的后续消息", 0.55),
 )
 
-RESOLUTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+#: Words that turn a travel mention into a promise to report back. Without one of
+#: these, a trip mention is *not* an obligation: "我到家了" reports that something
+#: finished, so reading it as "care whether the trip goes well" would invent an
+#: obligation out of its own resolution - and would do so on every arrival.
+FOLLOW_UP_MARKERS: tuple[str, ...] = (
+    "告诉你",
+    "给你说",
+    "跟你说",
+    "说一声",
+    "告诉我",
+    "通知你",
+    "汇报",
+    "发消息",
+    "联系你",
+)
+
+#: The travel rule above additionally requires one of :data:`FOLLOW_UP_MARKERS`.
+#: Every other rule is an obligation on its own terms (an exam has a result, a
+#: report is expected), so the requirement is expressed per pattern.
+PATTERNS_REQUIRING_A_PROMISE = frozenset({"关心行程是否顺利"})
+
+#: Resolution rules, each scoped to the subject it can actually settle.
+#:
+#: ``topics`` is what makes resolution subject-aware. An empty tuple means "this
+#: statement settles whatever is open" - a completed exam result settles the exam
+#: matter. A non-empty tuple means the matter must be *about* one of those
+#: subjects. Without that scoping, "到家了" resolved every open matter, including
+#: an interview the user had not heard back from.
+RESOLUTION_PATTERNS: tuple[tuple[re.Pattern[str], str, tuple[str, ...]], ...] = (
     (
         re.compile(
             r"(结果|通过|过[啦了]|成功了|失败|没过|挂了|录取|offer|拿到)", re.IGNORECASE
         ),
         "result_reported",
+        (),
     ),
-    (re.compile(r"(我回来了|到家了|落地了|回来了)", re.IGNORECASE), "arrived"),
-    (re.compile(r"(搞定了|解决了|完成了|做完了|没事了)", re.IGNORECASE), "settled"),
-    (re.compile(r"(i (passed|got it|made it)|results? (are )?(out|in))", re.IGNORECASE), "result_reported"),
+    (
+        re.compile(r"(我回来了|到家了|落地了|回来了)", re.IGNORECASE),
+        "arrived",
+        ("行程", "出差", "旅行", "落地", "到家", "回来", "起飞", "顺利"),
+    ),
+    (
+        re.compile(r"(搞定了|解决了|完成了|做完了|没事了)", re.IGNORECASE),
+        "settled",
+        ("事", "任务", "问题", "工作"),
+    ),
+    (
+        re.compile(
+            r"(i (passed|got it|made it)|results? (are )?(out|in))", re.IGNORECASE
+        ),
+        "result_reported",
+        (),
+    ),
 )
 
 
@@ -134,6 +181,7 @@ def detect(
     *,
     config: RuntimeConfig,
     existing: Sequence[UnfinishedMatter] = (),
+    resolved_topics: Sequence[str] = (),
 ) -> list[UnfinishedProposal]:
     """Detect follow-up obligations created by one event.
 
@@ -141,6 +189,9 @@ def detect(
         event: Candidate event.
         config: Runtime configuration.
         existing: Currently live matters, used to avoid duplicates.
+        resolved_topics: Subjects this same event just settled. A completion
+            statement must not re-open an obligation about the thing it finished,
+            so these subjects are skipped even when the text looks like a promise.
 
     Returns:
         Proposed matters (possibly empty).
@@ -156,6 +207,14 @@ def detect(
         match = pattern.search(text)
         if match is None:
             continue
+        # A travel mention is an obligation only when the user promises to report
+        # back. "我到家了" is the completion of a trip, not a new promise about it.
+        if title in PATTERNS_REQUIRING_A_PROMISE and not any(
+            marker in text for marker in FOLLOW_UP_MARKERS
+        ):
+            break
+        if resolved_topics and _mentions_any(match.group(0), resolved_topics):
+            break
         # The patterns are alternative readings of the *same* sentence, not
         # independent obligations: "明天下午面试，结束告诉你结果。" matches both
         # the interview pattern and the generic follow-up pattern. So the first
@@ -239,6 +298,13 @@ def detect_resolution(
 ) -> list[tuple[str, str]]:
     """Return ``(unfinished_id, reason)`` pairs resolved by an event.
 
+    Resolution is *subject-aware*. A completion statement settles the matters it is
+    actually about, and never the whole open set: "到家了" closes a matter about a
+    trip and leaves "等待面试结果" open, because the user has said nothing about the
+    interview. The price of the narrower rule is a missed early settlement, which
+    the deep refresh can still pick up; the price of the broad rule was silently
+    closing obligations the user never addressed.
+
     Args:
         event: Candidate event.
         live: Live matters to test.
@@ -249,13 +315,156 @@ def detect_resolution(
     if event.event_type != EventType.USER_MESSAGE.value or not live:
         return []
     text = event.content or ""
-    reasons: list[str] = []
-    for pattern, reason in RESOLUTION_PATTERNS:
-        if pattern.search(text):
-            reasons.append(reason)
-    if not reasons:
+    resolved: list[tuple[str, str]] = []
+    for pattern, reason, topics in RESOLUTION_PATTERNS:
+        match = pattern.search(text)
+        if match is None:
+            continue
+        # The matched phrase is the *evidence*, so it is consumed before the subject
+        # is looked for: otherwise "我到家了" would be read as being about "到家",
+        # which the sibling rule already lists as a subject, and it would close a
+        # matter about a trip by quoting the very words that ended one.
+        remainder = text[: match.start()] + text[match.end() :]
+        scope = _resolution_scope(topics, remainder=remainder, live=live)
+        if scope is None:
+            continue
+        for matter in live:
+            if not _settles(matter, remainder=remainder, subjects=scope):
+                continue
+            pair = (matter.unfinished_id, reason)
+            if pair not in resolved:
+                resolved.append(pair)
+    return resolved
+
+
+#: Words that carry no subject in a short completion statement, and are therefore
+#: ignored when the subject of "结果出来了" is worked out.
+_SUBJECT_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "我", "你", "他", "她", "它", "我们", "你们", "他们",
+        "的", "了", "啦", "呀", "吧", "吗", "呢", "啊", "嘛", "哦", "诶",
+        "已经", "终于", "结果", "通知", "答复", "回复", "告诉", "说", "一声",
+        "出来", "果出", "回来", "过来", "到了", "有了", "拿到", "过啦", "过了",
+        "搞定", "解决", "完成", "做完", "没事", "我回", "到家", "落地",
+        "ok", "done", "already", "the", "it", "is", "are",
+    }
+)
+
+#: Subjects that belong to *a* resolution rule. A subject named in a message that
+#: belongs to one rule must not be allowed to authorise a different one, which is
+#: what `面试到家了` would otherwise do to the arrival rule.
+_ALL_RESOLUTION_SUBJECTS: frozenset[str] = frozenset(
+    token for _pattern, _reason, topics in RESOLUTION_PATTERNS for token in topics
+)
+
+#: Scope token that cannot occur in any matter title or message. It expresses "this
+#: rule applies but no subject was named", which must settle nothing.
+_NO_SUBJECT = "\x00no_subject"
+
+
+def _subject_tokens(text: str) -> list[str]:
+    """Return the subjects ``text`` names.
+
+    CJK bigrams are used rather than single characters: single characters are far too
+    common to mean a shared subject (every sentence has 我 in it), while a bigram
+    survives punctuation boundaries that would split a longer phrase apart.
+    """
+    return [token for token in sorted(topic_tokens(text)) if _is_subject_token(token)]
+
+
+def _is_subject_token(token: str) -> bool:
+    """Return whether a token can stand for a subject in a completion statement.
+
+    Single CJK characters and short Latin words are function words ("我", "的",
+    "out") rather than subjects, and every subject a rule owns is excluded here so
+    that naming one subject cannot authorise a different rule.
+    """
+    if token in _SUBJECT_STOPWORDS or token in _ALL_RESOLUTION_SUBJECTS:
+        return False
+    if token.isascii():
+        return len(token) > 3
+    return len(token) > 1
+
+
+def _resolution_scope(
+    topics: Sequence[str], *, remainder: str, live: Sequence[UnfinishedMatter]
+) -> tuple[str, ...] | None:
+    """Return the subjects a resolution rule may settle for this message.
+
+    The subject is read from the part of the message *around* the resolving phrase,
+    which is what stops a completion statement from supplying its own subject. A rule
+    that declares no subjects of its own ("a result came out", which settles whatever
+    is open) is scoped by the subject the message names.
+
+    Args:
+        topics: The rule's declared subjects; empty means "the rule owns none".
+        remainder: The message with the resolving phrase removed.
+        live: Live matters, used only to answer "does this rule own anything here".
+
+    Returns:
+        The subjects to match on, or ``None`` when the rule does not apply to this
+        message at all - a rule that owns subjects must not settle on the strength of
+        a message about a subject it knows nothing about ("面试到家了" is not an
+        arrival).
+    """
+    declared = tuple(topics)
+    named = tuple(_subject_tokens(remainder))
+    if not declared:
+        # A rule with no subjects of its own (a reported *result*) is scoped by the
+        # subject the message names. When it names none, nothing is settled: an
+        # unrestricted fallback here would let "结果出来了" close every open matter,
+        # which is the exact over-reach the subject scoping exists to prevent.
+        return named or (_NO_SUBJECT,)
+    if _mentions_any(remainder, declared):
+        return declared
+    if any(_mentions_any(matter.title, declared) for matter in live):
+        # The rule owns something live, so it applies; the subject it may settle is
+        # narrowed to what the message actually named, if anything.
+        return named or declared
+    return None
+
+
+def resolved_topics(event: RawEvent, pairs: Sequence[tuple[str, str]]) -> list[str]:
+    """Return the subjects an event settled, for the obligation detector.
+
+    The subjects are read from the resolving rule rather than from the text, so the
+    sentence that finishes a subject cannot immediately re-open an obligation about
+    the very thing it finished.
+    """
+    if not pairs:
         return []
-    return [(matter.unfinished_id, reasons[0]) for matter in live]
+    reasons = {reason for _identifier, reason in pairs}
+    subjects: list[str] = []
+    for pattern, reason, topics in RESOLUTION_PATTERNS:
+        if reason not in reasons or not pattern.search(event.content or ""):
+            continue
+        subjects.extend(topics)
+    return subjects
+
+
+def _settles(
+    matter: UnfinishedMatter, *, remainder: str, subjects: Sequence[str] | None
+) -> bool:
+    """Return whether a resolution statement applies to one matter.
+
+    Args:
+        matter: The live matter being tested.
+        remainder: The message with the resolving phrase removed. The subject is
+            looked for here rather than in the whole message, so the resolving words
+            themselves cannot supply the subject they resolve.
+        subjects: Subjects this rule may settle; ``None`` means "any subject".
+    """
+    if subjects is None:
+        return True
+    if not subjects:
+        # The rule owns subjects and the message names a different one.
+        return False
+    return _mentions_any(remainder, subjects) or _mentions_any(matter.title, subjects)
+
+
+def _mentions_any(text: str, tokens: Sequence[str]) -> bool:
+    """Return whether ``text`` mentions any of ``tokens``."""
+    return any(token and token in (text or "") for token in tokens)
 
 
 def create(

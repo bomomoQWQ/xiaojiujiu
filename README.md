@@ -57,13 +57,13 @@ Runtime 负责"这一刻过去以后留下什么"。
 .
 ├── runtime/                          # ★ 持久认知 sidecar（独立进程，Python 3.11+）
 │   ├── src/companion_runtime/        #   29 个模块（含协议 v1 兼容层 api_v1.py）
-│   ├── tests/                        #   628 项离线测试
+│   ├── tests/                        #   807 项离线测试
 │   ├── docs/PATCH_V0.2_MAPPING.md    #   设计章节 → 代码位置 → 状态（含诚实缺口清单）
 │   └── README.md                     #   操作者手册（配置 / API / 蓝屏恢复 / 降级）
 │
 ├── astrbot_plugin_companion_runtime/ # ★ AstrBot 薄插件（宿主侧唯一改动）
 │   ├── main.py                       #   监听 / 临时注入 / outbox 消费
-│   └── tests/                        #   127 项离线测试（带 AstrBot 桩）
+│   └── tests/                        #   143 项离线测试（另含 13 个子测试，带 AstrBot 桩）
 │
 ├── AstrBot/                          # 上游 AstrBot 4.28.1，**零修改**
 │
@@ -73,7 +73,8 @@ Runtime 负责"这一刻过去以后留下什么"。
 ├── scripts/                          # 运维与验证脚本
 │   ├── backup.ps1                    #   跨盘原子快照（蓝屏防护）
 │   ├── runtime_bench.py              #   关键路径延迟基准
-│   └── e2e_patch_v02.py              #   真机端到端验证（起真实 HTTP 服务）
+│   ├── e2e_patch_v02.py              #   28 项基础真机验证
+│   └── e2e_resilience_simulation.py  #   高仿真并发、重启与故障恢复验证
 │
 ├── 内源主动型长期陪伴AI_Runtime_完整架构设计.md   # 原始设计（97 节）
 ├── PATCH_v0.2_即时演出与持久认知分离...md        # 现行架构补丁
@@ -97,7 +98,7 @@ uv venv .venv --python 3.12
 uv pip install --python .venv\Scripts\python.exe -e ".[test]"
 
 # 自检
-.venv\Scripts\python.exe -m pytest tests -q          # 期望 603 passed
+.venv\Scripts\python.exe -m pytest tests -q          # 期望 807 passed
 
 # 起服务（默认 127.0.0.1:8787）
 .venv\Scripts\python.exe -m companion_runtime.cli serve --db runtime\data\companion.db
@@ -113,8 +114,8 @@ uv pip install --python .venv\Scripts\python.exe -e ".[test]"
 Copy-Item -Recurse astrbot_plugin_companion_runtime AstrBot\data\plugins\ -Force
 ```
 
-然后在 AstrBot WebUI 里把插件的 `runtime_base_url` 指向 Runtime 地址（默认
-`http://127.0.0.1:8720` 与 Runtime 默认端口不同，**这一步必须改**），重启 AstrBot。
+然后在 AstrBot WebUI 里确认插件的 `runtime_base_url` 指向 Runtime 地址（插件与
+Runtime 的当前默认值均为 `http://127.0.0.1:8787`）；若 Runtime 改过监听地址，再同步修改该项并重启 AstrBot。
 
 > **多会话部署必做**：把 Runtime 的 `conversation_id` 设成会话的
 > `unified_msg_origin`（如 `aiocqhttp:FriendMessage:10001`）。
@@ -253,14 +254,16 @@ companion-runtime recover --db runtime\data\companion.db    # 给出恢复建议
 
 ```powershell
 cd runtime
-.venv\Scripts\python.exe -m pytest tests -q          # 628 passed
+.venv\Scripts\python.exe -m pytest tests -q          # 807 passed
 
 cd ..\astrbot_plugin_companion_runtime
 $env:PYTHONPATH="$PWD\tests\stubs;$PWD\.."
-..\.venv-dev\Scripts\python.exe -m pytest tests -q   # 127 passed
+..\.venv-dev\Scripts\python.exe -m pytest tests -q   # 143 passed + 13 subtests
 
 cd ..
-python scripts\e2e_patch_v02.py                      # 28 项真机检查
+python scripts\e2e_patch_v02.py                      # 28 项基础真机检查
+python scripts\e2e_resilience_simulation.py --base-dir E:\companion_runtime_backup\resilience-final
+                                                     # 335 项高仿真检查（并发 / 重启 / 断网恢复）
 ```
 
 测试覆盖的重点不是行数，而是**几类容易悄悄坏掉的东西**：
@@ -274,7 +277,17 @@ python scripts\e2e_patch_v02.py                      # 28 项真机检查
   - 主动消息必须投递回**形成该意图的会话**，而不是进程默认会话；
   - 未尽之事的去重按主题而非单字，否则「面试」和「考试」会因共用「试」而被合并；
   - 插件状态命令读的字段名必须与 Runtime 实际返回的一致
-    （这条曾因测试桩用了另一个名字而漏过）。
+    （这条曾因测试桩用了另一个名字而漏过）；
+  - `serve` 必须真的把内源调度跑起来（曾经只监听了 HTTP，角色在标准部署下永不醒来）；
+  - 一条主动消息只算一次当日接触，且只在**投递成功**时计；
+  - 用户的回复只结算**最新一条已发出**的 attempt，且只结算一次；
+  - 授权环节断网（拿不到裁决）不能被当成"业务拒绝"而把意图判死；
+  - `POST /rendered` 在积压超过 100 行时仍要找到本次 attempt 的行，而不是退化成直接路径；
+  - 报表重复、并发重复、进程重启都必须是幂等的。
+
+`scripts/e2e_resilience_simulation.py` 用真实 uvicorn + 真实文件 SQLite(WAL) + 真实插件
+传输层跑 335 项检查，覆盖并发上报、租约过期、断网恢复、多会话路由与重启续跑——
+单元测试证明"这条路径对"，它证明"这套部署在坏天气下也对"。
 
 `runtime/docs/PATCH_V0.2_MAPPING.md` 把设计文档的每一节映射到代码位置与状态，
 并**如实列出未实现的部分**——那份清单比测试数量更能说明现在到哪了。
@@ -293,6 +306,9 @@ python scripts\e2e_patch_v02.py                      # 28 项真机检查
 | `user_model_evidence` 只存为解释版本 | 不并入数值用户模型——那只能由真实交互观测训练，否则模型猜测会覆盖实测行为 |
 | 无 Prometheus 导出 | 运维需自己抓 `/health` |
 | 单租户全局状态 | 多会话共用一个 `runtime_state`，`conversation_id` 已贯穿全表，拆分留给后续 |
+| 「平台已发出」与「结果已上报」之间存在崩溃窗口 | 插件在发出前不写结果，若恰好在两步之间被杀，Runtime 只能靠租约到期重投，理论上会重复一条主动消息；真正消除需要平台投递回执或宿主持久化幂等日志 |
+| 授权环节断网时插件保持沉默 | 不写任何结果（fail-closed 也 fail-silent），靠 Runtime 的租约到期回收重投；这会把长时间断网消耗在 attempt 预算上，预算耗尽后按设计终止 |
+| 逾期未回复的 `sent` attempt 不做过期清理 | `sent→resolved` 是唯一合法迁移，超时会凭空捏造历史；它只由用户回复或边界关闭 |
 
 ---
 

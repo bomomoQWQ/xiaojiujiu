@@ -51,7 +51,6 @@ from .authorize import AuthorizeRequest, authorize
 from .config import RuntimeConfig, redact
 from .typing import (
     Actor,
-    AttemptState,
     EventType,
     OutboxStatus,
     Priority,
@@ -59,7 +58,7 @@ from .typing import (
     new_id,
 )
 from .user_model import BehaviourReaction
-from .utility import clamp, ensure_aware, isoformat, parse_datetime, utcnow
+from .utility import clamp, ensure_aware, isoformat, parse_aware_datetime, utcnow
 
 LOGGER = logging.getLogger("companion_runtime.api")
 
@@ -69,14 +68,39 @@ LOGGER = logging.getLogger("companion_runtime.api")
 # --------------------------------------------------------------------------------------
 
 
-def _optional_datetime(value: Any) -> datetime | None:
-    """Parse an optional ISO-8601 value into an aware datetime."""
+def _optional_datetime(value: Any, field: str = "timestamp") -> datetime | None:
+    """Parse an optional ISO-8601 value into an aware datetime.
+
+    A value that carries no explicit UTC offset is refused with a 422 instead of
+    being read as UTC. A bare ``"2026-03-01T09:00:00"`` means 09:00 on the
+    caller's clock, and the Runtime cannot know which clock that is: reading it
+    as UTC would shift every fact the caller reports, invisibly and permanently.
+    Callers must send ``Z`` or ``+HH:MM``; omitting the field entirely keeps the
+    previous behaviour (the Runtime uses its own clock).
+
+    Args:
+        value: The raw JSON value, or ``None``.
+        field: Name of the offending request field, used in the error detail.
+
+    Returns:
+        An aware UTC datetime, or ``None`` when the field is absent or empty.
+
+    Raises:
+        HTTPException: 422 when the value is not a usable ISO-8601 timestamp.
+    """
     if value in (None, ""):
         return None
     try:
-        return parse_datetime(value)
+        return parse_aware_datetime(value, field=field)
     except ValueError as exc:
+        # NaiveTimestampError is a ValueError: both an ambiguous stamp and an
+        # unparsable one are client errors, and the message says which it was.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _payload_datetime(payload: Mapping[str, Any], key: str = "now") -> datetime | None:
+    """Parse one optional timestamp field of a request body, naming it in errors."""
+    return _optional_datetime(payload.get(key), key)
 
 
 def _require(payload: Mapping[str, Any], key: str) -> Any:
@@ -84,6 +108,42 @@ def _require(payload: Mapping[str, Any], key: str) -> Any:
     if key not in payload or payload[key] in (None, ""):
         raise HTTPException(status_code=422, detail=f"missing required field: {key}")
     return payload[key]
+
+
+def _lease_owner_from(payload: Mapping[str, Any]) -> str | None:
+    """Return the lease owner a caller claims, or ``None`` when it claims none.
+
+    ``owner`` is the canonical field (it is what ``/outbox/claim`` takes);
+    ``lease_owner`` is accepted as well because that is the name the leased row
+    itself exposes, and a caller echoing the row back should not be refused for
+    using the Runtime's own word. An absent or empty value means "no claim" and
+    leaves the row's ownership unvalidated, which is what keeps callers written
+    before this field existed working unchanged.
+    """
+    for key in ("owner", "lease_owner"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _ack_conflict_detail(runtime: Any, outbox_id: str, owner: str | None) -> str:
+    """Explain a refused ack/nack from the row's *actual* state.
+
+    A bare "not leased" is unhelpful when the real cause is a lease held by
+    somebody else, which is exactly the case a worker needs to distinguish from
+    "my lease already expired".
+    """
+    item = runtime.projections.outbox.get(outbox_id)
+    if item is None:
+        return "unknown outbox row"
+    if item.status == OutboxStatus.LEASED.value:
+        if owner:
+            return (
+                f"row is leased to {item.lease_owner or 'another worker'}, not to {owner}"
+            )
+        return "row is not leased to this worker"
+    return f"row is {item.status}, not leased"
 
 
 def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
@@ -145,12 +205,18 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
 
         A ``user_message`` goes through the full foreground path; other event
         types are appended verbatim (they are facts, not triggers).
+
+        A caller-supplied ``event_id`` that already exists is a redelivery: the
+        recorded event is returned with ``duplicate=true`` instead of raising the
+        uniqueness violation that used to surface as a 500. The check runs inside
+        the same transaction as the insert, so a retried request cannot append a
+        second copy of the same fact (and cannot run the foreground path twice).
         """
         event_type = str(_require(payload, "event_type"))
         actor = str(payload.get("actor") or Actor.USER.value)
         content = payload.get("content")
         conversation_id = payload.get("conversation_id") or settings.conversation_id
-        timestamp = _optional_datetime(payload.get("timestamp"))
+        timestamp = _payload_datetime(payload, "timestamp")
         metadata = payload.get("metadata") or {}
         event_id = payload.get("event_id")
 
@@ -166,10 +232,21 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
                 metadata=metadata,
                 reason=reaction,
             )
-            return {"kind": "user_message", "outcome": outcome.to_dict()}
+            body: dict[str, Any] = {"kind": "user_message", "outcome": outcome.to_dict()}
+            if outcome.duplicate:
+                body["duplicate"] = True
+            return body
 
         with runtime.db.transaction() as conn:
             state = runtime.state()
+            if event_id:
+                recorded = runtime.events.get(str(event_id))
+                if recorded is not None:
+                    return {
+                        "kind": "event",
+                        "duplicate": True,
+                        "event": recorded.to_dict(),
+                    }
             event = runtime.events.append(
                 event_type,
                 actor=actor,
@@ -249,7 +326,7 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
         ``ran=false`` response as normal operation, not as an error.
         """
         return runtime.deep_refresh(
-            now=_optional_datetime(payload.get("now")),
+            now=_payload_datetime(payload),
             force=bool(payload.get("force", False)),
             trigger_context={
                 key: payload[key]
@@ -288,7 +365,7 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
         text = str(_require(payload, "text"))
         try:
             result = runtime.reducer.complete_render(
-                outbox_id=outbox_id, text=text, now=_optional_datetime(payload.get("now"))
+                outbox_id=outbox_id, text=text, now=_payload_datetime(payload)
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -300,7 +377,7 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
         outbox_id = str(_require(payload, "outbox_id"))
         error = str(payload.get("error") or "render_failed")
         ok = runtime.reducer.fail_render(
-            outbox_id=outbox_id, error=error, now=_optional_datetime(payload.get("now"))
+            outbox_id=outbox_id, error=error, now=_payload_datetime(payload)
         )
         if not ok:
             raise HTTPException(status_code=404, detail="outbox row not found")
@@ -348,7 +425,7 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
         kinds = payload.get("kinds")
         items = runtime.reducer.claim_outbox(
             owner=owner,
-            now=_optional_datetime(payload.get("now")),
+            now=_payload_datetime(payload),
             limit=clamp(limit, 1, settings.outbox.max_batch),
             kinds=kinds,
         )
@@ -361,11 +438,20 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
 
     @router.post("/outbox/{outbox_id}/ack", tags=["outbox"])
     def ack_outbox(outbox_id: str, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-        """Acknowledge a leased outbox row."""
-        ok = runtime.reducer.ack_outbox(outbox_id, now=_optional_datetime(payload.get("now")))
+        """Acknowledge a leased outbox row.
+
+        ``owner`` (also accepted as ``lease_owner``) is optional and validated
+        when supplied: the row must be leased to that worker. Existing callers
+        that send no owner keep the old behaviour, because the owner is the one
+        piece of lease information a legacy caller may never have received.
+        """
+        owner = _lease_owner_from(payload)
+        ok = runtime.reducer.ack_outbox(
+            outbox_id, now=_payload_datetime(payload), owner=owner
+        )
         if not ok:
-            raise HTTPException(status_code=409, detail="row is not leased to this worker")
-        return {"ok": True, "outbox_id": outbox_id}
+            raise HTTPException(status_code=409, detail=_ack_conflict_detail(runtime, outbox_id, owner))
+        return {"ok": True, "outbox_id": outbox_id, "owner": owner}
 
     @router.post("/outbox/{outbox_id}/nack", tags=["outbox"])
     def nack_outbox(outbox_id: str, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
@@ -373,17 +459,21 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
 
         The row is claimable again immediately unless ``retry_delay_seconds`` is
         given, so a caller that retries at once is not silently given nothing.
+        ``owner`` (also accepted as ``lease_owner``) is validated when supplied,
+        so a worker cannot release work leased to another.
         """
         delay = payload.get("retry_delay_seconds")
+        owner = _lease_owner_from(payload)
         ok = runtime.reducer.nack_outbox(
             outbox_id,
             error=str(payload.get("error") or "unspecified"),
             terminal=bool(payload.get("terminal", False)),
-            now=_optional_datetime(payload.get("now")),
+            now=_payload_datetime(payload),
             retry_delay_seconds=None if delay is None else float(delay),
+            owner=owner,
         )
         if not ok:
-            raise HTTPException(status_code=409, detail="row is not leased")
+            raise HTTPException(status_code=409, detail=_ack_conflict_detail(runtime, outbox_id, owner))
         item = runtime.projections.outbox.get(outbox_id)
         return {
             "ok": True,
@@ -404,7 +494,7 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
             text=payload.get("text"),
             is_proactive=bool(payload.get("is_proactive", True)),
             scope=payload.get("scope"),
-            now=_optional_datetime(payload.get("now")),
+            now=_payload_datetime(payload),
         )
         runtime.lazy_tick(request.now)
         verdict = authorize(
@@ -429,61 +519,92 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
 
     @router.post("/rendered", tags=["delivery"])
     def rendered(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        """Report a rendered message: attach text and queue it for sending."""
+        """Report a rendered message: attach text and queue it for sending.
+
+        The report is resolved against the attempt, never against a page of the
+        outbox: the render row is looked up by ``attempt_id`` in the database
+        (``OutboxProjection.find_for_attempt``), so a busy queue with more than a
+        hundred unrelated rows cannot hide it and route the call down the direct
+        path by accident.
+
+        Two paths exist and both end in a queued send:
+
+        * ``path="outbox"`` -- a ``render`` row for this attempt exists, so the
+          text is attached through :meth:`Reducer.complete_render`, which
+          acknowledges that row and enqueues the ``send`` row;
+        * ``path="direct"`` -- the attempt was created outside the outbox flow, so
+          :meth:`Reducer.complete_render_for_attempt` attaches the text and
+          enqueues the ``send`` row itself.
+
+        Authorization is asked for this attempt's *render* step. The commit that
+        created the attempt has already taken the contact-budget decision (it
+        started the cooldown and counted the contact), so that budget is not
+        applied a second time here -- see :func:`authorize.authorize`. Hard
+        boundaries still deny, and a denial is reported as ``accepted=false``
+        with the boundary identifiers.
+
+        A report for an attempt that cannot take the render answers explicitly:
+        a replay of an absorbed render is ``accepted=true`` with
+        ``duplicate=true`` and ``applied=false`` (so a retrying client converges),
+        while an attempt that was never committed is a 409 with the reason. The
+        whole handler runs in one transaction, so the verdict, the row lookup and
+        the write cannot disagree about which state they were taken against.
+        """
         attempt_id = str(_require(payload, "attempt_id"))
         text = str(_require(payload, "text"))
-        now = _optional_datetime(payload.get("now"))
+        now = _payload_datetime(payload)
         runtime.lazy_tick(now)
-        attempt = runtime.projections.attempts.get(attempt_id)
-        if attempt is None:
-            raise HTTPException(status_code=404, detail="attempt not found")
 
-        verdict = authorize(
-            AuthorizeRequest(action="render", attempt_id=attempt_id, text=text, now=now),
-            projections=runtime.projections,
-            config=settings,
-            state=runtime.state(),
-            now=now,
-        )
-        if not verdict.allowed and verdict.reason not in {"attempt_not_rendered", "attempt_still_rendering"}:
-            return {
-                "accepted": False,
-                "reason": verdict.reason,
-                "constraints": verdict.constraints,
-            }
+        with runtime.db.transaction():
+            attempt = runtime.projections.attempts.get(attempt_id)
+            if attempt is None:
+                raise HTTPException(status_code=404, detail="attempt not found")
 
-        outbox_items = runtime.projections.outbox.list_items(status=None, limit=100)
-        render_rows = [
-            item
-            for item in outbox_items
-            if item.payload.get("attempt_id") == attempt_id and item.kind == "render"
-        ]
-        if render_rows:
-            result = runtime.reducer.complete_render(
-                outbox_id=render_rows[0].outbox_id, text=text, now=now
+            verdict = authorize(
+                AuthorizeRequest(action="render", attempt_id=attempt_id, text=text, now=now),
+                projections=runtime.projections,
+                config=settings,
+                state=runtime.state(),
+                now=now,
             )
-            return {"accepted": True, "path": "outbox"} | result.to_dict()
+            if not verdict.allowed and verdict.reason not in {
+                "attempt_not_rendered",
+                "attempt_still_rendering",
+            }:
+                return {
+                    "accepted": False,
+                    "reason": verdict.reason,
+                    "constraints": verdict.constraints,
+                }
 
-        # No render row (the attempt was created outside the outbox): go straight
-        # through the state machine and queue the send.
-        from . import action as action_module
-
-        with runtime.db.transaction() as conn:
-            state = runtime.state()
-            if attempt.state == AttemptState.COMMITTED.value:
-                action_module.mark_rendering(runtime.projections.attempts, conn, attempt, now=now)
-            try:
-                action_module.mark_ready(runtime.projections.attempts, conn, attempt, text=text, now=now)
-            except (ValueError, action_module.IllegalTransition) as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            runtime.projections.runtime.write(state, conn, expect_version=state.version)
-        return {"accepted": True, "path": "direct", "attempt": attempt.to_dict()}
+            render_rows = runtime.projections.outbox.find_for_attempt(
+                attempt_id, kind="render"
+            )
+            if render_rows:
+                result = runtime.reducer.complete_render(
+                    outbox_id=render_rows[0].outbox_id, text=text, now=now
+                )
+            else:
+                # No render row (the attempt was created outside the outbox): go
+                # straight through the state machine and queue the send.
+                result = runtime.reducer.complete_render_for_attempt(
+                    attempt_id=attempt_id, text=text, now=now
+                )
+            path = "outbox" if render_rows else "direct"
+            if not result.applied and not result.duplicate:
+                # The render cannot be used and there is no earlier outcome to
+                # return: say so instead of reporting success for a message that
+                # will never be queued.
+                raise HTTPException(
+                    status_code=409, detail=result.reason or "render_not_applied"
+                )
+            return {"accepted": True, "path": path} | result.to_dict()
 
     @router.post("/delivery", tags=["delivery"])
     def delivery(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         """Report a delivery result for a send outbox row."""
         outbox_id = str(_require(payload, "outbox_id"))
-        now = _optional_datetime(payload.get("now"))
+        now = _payload_datetime(payload)
         reaction = payload.get("reaction")
         behaviour = BehaviourReaction(**(reaction or {})) if reaction else None
         try:
@@ -517,7 +638,7 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
             based_on_version=int(payload.get("based_on_version") or 0),
             payload=dict(payload.get("payload") or {}),
             source_event_ids=list(payload.get("source_event_ids") or []),
-            created_at=_optional_datetime(payload.get("created_at")),
+            created_at=_payload_datetime(payload, "created_at"),
         )
         result = runtime.reducer.process_proposal(proposal)
         return result.to_dict()
@@ -537,7 +658,7 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
     @router.post("/reconcile", tags=["protocol"])
     def reconcile(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         """Re-coordinate in-flight attempts after new user events."""
-        now = _optional_datetime(payload.get("now"))
+        now = _payload_datetime(payload)
         if payload.get("attempt_id"):
             attempt = runtime.projections.attempts.get(str(payload["attempt_id"]))
             if attempt is None:
@@ -558,14 +679,14 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
     @router.post("/tick", tags=["scheduler"])
     def tick(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         """Run ``lazy_tick`` explicitly (advance the Runtime to a moment)."""
-        report = runtime.lazy_tick(_optional_datetime(payload.get("now")))
+        report = runtime.lazy_tick(_payload_datetime(payload))
         return report.to_dict()
 
     @router.post("/endogenous", tags=["scheduler"])
     def endogenous(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         """Run one endogenous wake-up round and return the decision."""
         outcome = runtime.endogenous_round(
-            now=_optional_datetime(payload.get("now")),
+            now=_payload_datetime(payload),
             force=bool(payload.get("force", False)),
             create_attempt=bool(payload.get("create_attempt", True)),
         )
@@ -575,7 +696,7 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
     def schedule(hazard_wake_at: str | None = None) -> dict[str, Any]:
         """Return the next endogenous wake-up plan."""
         signals = scheduler_module.collect_signals(
-            runtime=runtime, now=utcnow(), hazard_wake_at=_optional_datetime(hazard_wake_at)
+            runtime=runtime, now=utcnow(), hazard_wake_at=_optional_datetime(hazard_wake_at, "hazard_wake_at")
         )
         plan = scheduler_module.plan(signals, config=settings, rng=runtime.rng)
         allowed, reason = scheduler_module.should_dispatch(
@@ -599,7 +720,7 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
     def record_observation(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         """Record a user reaction (with or without an attempt)."""
         reaction = BehaviourReaction(**(payload.get("reaction") or {}))
-        now = _optional_datetime(payload.get("now"))
+        now = _payload_datetime(payload)
         if payload.get("attempt_id"):
             result = runtime.observe_reply(
                 attempt_id=str(payload["attempt_id"]),
@@ -648,7 +769,7 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
             for item in (payload.get("operations") or [])
         ]
         result = runtime.apply_candidate_operations(
-            operations, now=_optional_datetime(payload.get("now")), source="http"
+            operations, now=_payload_datetime(payload), source="http"
         )
         return result.to_dict()
 
@@ -696,7 +817,7 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
         proposal = unfinished_module.UnfinishedProposal(
             title=str(_require(payload, "title")),
             source_event_ids=list(payload.get("source_event_ids") or []),
-            waiting_until=_optional_datetime(payload.get("waiting_until")),
+            waiting_until=_payload_datetime(payload, "waiting_until"),
             priority=clamp(float(payload.get("priority", settings.unfinished.default_priority))),
             resolution_conditions=list(payload.get("resolution_conditions") or []),
         )
@@ -872,7 +993,7 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
         from .context import _optional_explanation_provider
         from .emotion import EmotionExplainer
 
-        now = _optional_datetime(payload.get("now")) or utcnow()
+        now = _payload_datetime(payload) or utcnow()
         runtime.lazy_tick(now)
         explainer = EmotionExplainer(
             runtime.projections.emotion,

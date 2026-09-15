@@ -8,8 +8,8 @@
   "runtime_base_url": {
     "description": "Runtime 基础地址",
     "type": "string",
-    "default": "http://127.0.0.1:8720",
-    "hint": "Runtime HTTP API 根地址，必须包含 http:// 或 https://，不要以 / 结尾。插件的 /companion_runtime 状态命令会可选地查询该地址上的 GET /health，只打印两行白名单字段：semantic_provider（disabled 是标准配置，可选值只有 remote_api）与 semantics.unresolved（未解释事件数属正常状态）；查询失败时只显示一行 cognition: unavailable，不影响其它输出。本地模型路线已被放弃，Runtime 默认不接任何模型。"
+    "default": "http://127.0.0.1:8787",
+    "hint": "Runtime HTTP API 根地址（默认与 Runtime 自身的默认端口 8787 一致），必须包含 http:// 或 https://，不要以 / 结尾。插件的 /companion_runtime 状态命令会可选地查询该地址上的 GET /health，只打印两行白名单字段：semantic_provider（disabled 是标准配置，可选值只有 remote_api）与 semantics.unresolved（未解释事件数属正常状态）；查询失败时只显示一行 cognition: unavailable，不影响其它输出。本地模型路线已被放弃，Runtime 默认不接任何模型。"
   },
   "runtime_token": {
     "description": "Runtime 访问令牌（可选）",

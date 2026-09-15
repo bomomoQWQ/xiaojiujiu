@@ -24,7 +24,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 from .utility import ensure_aware, isoformat, parse_datetime
 
@@ -430,6 +430,10 @@ class Database:
     The Runtime is a single-writer system, but FastAPI may serve requests from
     several threads, so access is serialised through a re-entrant lock while
     SQLite itself runs in autocommit-explicit transaction mode.
+
+    Side effects that live outside SQLite - the raw-event JSONL mirror, for
+    instance - are attached with :meth:`post_commit` so they can only ever
+    describe committed state.
     """
 
     def __init__(self, path: str | Path, busy_timeout_ms: int = 5000, wal: bool = True) -> None:
@@ -457,12 +461,34 @@ class Database:
             self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA synchronous = NORMAL")
         self._depth = 0
+        #: One callback frame per open :meth:`transaction` level, outermost first.
+        #: Frames are consumed by COMMIT and thrown away by ROLLBACK, which is what
+        #: keeps a post-commit hook from ever observing a row that was rolled back.
+        self._txn_frames: list[list[Callable[[], None]]] = []
+        #: Per-level :meth:`on_rollback` callbacks: they run when their level (or an
+        #: enclosing one) rolls back, and are dropped unrun when it commits.
+        self._rollback_frames: list[list[Callable[[], None]]] = []
+        #: Per-level :meth:`on_release` callbacks: they run when their level ends
+        #: well by handing its work to the parent (a savepoint that released),
+        #: which is neither a commit of the whole transaction nor a rollback.
+        self._release_frames: list[list[Callable[[], None]]] = []
 
     # ------------------------------------------------------------------ context
 
     @contextmanager
     def transaction(self, immediate: bool = True) -> Iterator[sqlite3.Connection]:
         """Run a block inside a transaction, nesting via savepoints.
+
+        Hooks registered with :meth:`post_commit` inside the block run once, in
+        registration order, after the outermost transaction has committed. Hooks
+        registered with :meth:`on_rollback` run only when a transaction actually
+        rolls back, and :meth:`on_release` hooks run when a savepoint releases
+        into its parent. Each kind is buffered per level: a rollback - of the
+        whole transaction or of one savepoint - discards the hooks registered
+        inside the part that was rolled back, so a hook never observes a row that
+        is no longer there, while a level that ended well keeps its hooks queued
+        for the commit. Hook failures are logged, never raised: the commit itself
+        has already happened and must not be undone.
 
         Args:
             immediate: Acquire a write lock up front (``BEGIN IMMEDIATE``),
@@ -478,22 +504,128 @@ class Database:
             else:
                 self._conn.execute(f"SAVEPOINT sp_{self._depth}")
             self._depth += 1
+            self._txn_frames.append([])
+            self._rollback_frames.append([])
+            self._release_frames.append([])
             try:
                 yield self._conn
             except BaseException:
                 self._depth -= 1
+                self._txn_frames.pop()
+                rollbacks = self._rollback_frames.pop()
+                self._release_frames.pop()
                 if outermost:
                     self._conn.execute("ROLLBACK")
                 else:
                     self._conn.execute(f"ROLLBACK TO sp_{self._depth}")
                     self._conn.execute(f"RELEASE sp_{self._depth}")
+                self._run_hooks(rollbacks)
                 raise
             else:
                 self._depth -= 1
+                hooks = self._txn_frames.pop()
+                rollbacks = self._rollback_frames.pop()
+                releases = self._release_frames.pop()
+                try:
+                    if outermost:
+                        self._conn.execute("COMMIT")
+                    else:
+                        self._conn.execute(f"RELEASE sp_{self._depth}")
+                except BaseException:
+                    # The statements did not commit, so every hook registered
+                    # under this transaction is dropped rather than run.
+                    LOGGER.warning(
+                        "Transaction commit failed; discarding %d post-commit hook(s)",
+                        len(hooks) + sum(len(frame) for frame in self._txn_frames),
+                        exc_info=True,
+                    )
+                    self._txn_frames.clear()
+                    self._rollback_frames.clear()
+                    self._release_frames.clear()
+                    raise
                 if outermost:
-                    self._conn.execute("COMMIT")
+                    self._run_hooks(hooks)
                 else:
-                    self._conn.execute(f"RELEASE sp_{self._depth}")
+                    # A released savepoint is part of its parent transaction:
+                    # post-commit hooks wait for the outermost commit, and rollback
+                    # hooks must still fire if an enclosing level rolls back. The
+                    # release hooks are this level's own result and run now.
+                    self._txn_frames[-1].extend(hooks)
+                    self._rollback_frames[-1].extend(rollbacks)
+                    self._run_hooks(releases)
+
+    def post_commit(self, callback: Callable[[], None]) -> None:
+        """Register ``callback`` to run after the current transaction commits.
+
+        Outside a transaction the callback runs immediately, because the
+        autocommit write it documents is already durable. Inside one it is
+        buffered on the innermost level: it runs after the outermost ``COMMIT``
+        and is dropped if that part of the transaction rolls back. This is what
+        makes an external mirror (see
+        :mod:`companion_runtime.eventlog`) unable to record an event that the
+        database itself never kept.
+
+        Args:
+            callback: Zero-argument callable.
+        """
+        with self._lock:
+            if self._depth:
+                self._txn_frames[self._depth - 1].append(callback)
+            else:
+                self._run_hooks([callback])
+
+    def on_rollback(self, callback: Callable[[], None]) -> None:
+        """Register ``callback`` to run only if the transaction rolls back.
+
+        Used by buffered side effects that must drop the state belonging to a
+        level that rolled back. The callback is paired with the innermost
+        transaction level and runs - after the SQLite ``ROLLBACK`` - only when
+        that level, or a level enclosing it, actually rolls back. A level that
+        ends well discards it unrun and never fires it on the way out, because
+        releasing a savepoint is a success, not a rollback; a released level's
+        surviving state is handed over through :meth:`on_release` instead. Like a
+        failing post-commit hook it cannot fail the caller. Outside a transaction
+        there is nothing to discard, so the callback is not kept.
+
+        Args:
+            callback: Zero-argument callable.
+        """
+        with self._lock:
+            if self._depth:
+                self._rollback_frames[self._depth - 1].append(callback)
+
+    def on_release(self, callback: Callable[[], None]) -> None:
+        """Register ``callback`` to run when its savepoint releases into its parent.
+
+        A released savepoint has neither committed the transaction nor rolled
+        back: its rows are now part of the enclosing transaction, and their fate
+        is decided there. Buffered side effects use this to hand their state to
+        the parent instead of writing it early (which a later outer rollback would
+        have to undo) or dropping it (which would lose committed work). The
+        callback runs right after the SQLite ``RELEASE``; a top-level transaction
+        never releases, so a callback registered there is simply discarded with
+        its frame. Like the other hook kinds it cannot fail the caller.
+
+        Args:
+            callback: Zero-argument callable.
+        """
+        with self._lock:
+            if self._depth:
+                self._release_frames[self._depth - 1].append(callback)
+
+    @staticmethod
+    def _run_hooks(hooks: Sequence[Callable[[], None]]) -> None:
+        """Run post-commit hooks, logging and swallowing any failure.
+
+        The transaction has already committed by the time a hook runs, so a
+        failing hook must not turn valid database state into a failed call. The
+        same tolerance is applied to rollback hooks, which share this runner.
+        """
+        for hook in hooks:
+            try:
+                hook()
+            except Exception:
+                LOGGER.warning("Post-commit hook failed", exc_info=True)
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
@@ -517,6 +649,16 @@ class Database:
         """Execute a query and return the first row, or ``None``."""
         with self._lock:
             return self._conn.execute(sql, params).fetchone()
+
+    def in_transaction(self) -> bool:
+        """Return whether this thread is currently inside :meth:`transaction`."""
+        with self._lock:
+            return self._depth > 0
+
+    def transaction_depth(self) -> int:
+        """Return the current nesting depth: ``0`` outside any transaction."""
+        with self._lock:
+            return self._depth
 
     def close(self) -> None:
         """Close the underlying connection."""

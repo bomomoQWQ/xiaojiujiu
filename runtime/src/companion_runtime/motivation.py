@@ -1,4 +1,4 @@
-﻿"""Motivational game: utility, silence, hazard and softmax selection.
+"""Motivational game: utility, silence, hazard and softmax selection.
 
 This layer answers the only question that matters before the main LLM runs:
 *do I actually act, and if so, which of my candidate thoughts wins?*
@@ -38,9 +38,12 @@ from .typing import (
     UtilityBreakdown,
 )
 from .user_model import Prediction
-from .utility import clamp, sigmoid, softmax, softplus, utcnow
+from .utility import clamp, local_day_key, max_datetime, sigmoid, softmax, softplus, utcnow
 
 LOGGER = logging.getLogger("companion_runtime.motivation")
+
+#: ``runtime_state.meta`` key holding the local day the contact counter belongs to.
+CONTACT_DAY_META_KEY = "contact_day"
 
 
 @dataclass(slots=True)
@@ -493,6 +496,11 @@ def release_after_contact(state: RuntimeState, *, config: RuntimeConfig, now: da
     ``I <- (1 - rho_I) I``, ``P <- (1 - rho_P) P`` and ``R <- min(1, R + rho_R)``,
     plus a cooldown so the character does not immediately speak again.
 
+    The two time anchors written here are monotone: a delayed report about a
+    contact that happened earlier than the one already recorded must not move
+    ``last_contact_at`` or ``cooldown_until`` backwards, or the absence term and
+    the cooldown would both be recomputed as if the newer contact never happened.
+
     Args:
         state: Runtime state to mutate.
         config: Runtime configuration.
@@ -502,8 +510,33 @@ def release_after_contact(state: RuntimeState, *, config: RuntimeConfig, now: da
     state.approach_impulse = clamp(state.approach_impulse * (1.0 - settings.impulse_release))
     state.pressure = clamp(state.pressure * (1.0 - settings.pressure_release))
     state.restraint = clamp(state.restraint + settings.restraint_boost)
-    state.cooldown_until = now + timedelta(seconds=settings.cooldown_seconds)
-    state.last_contact_at = now
+    state.cooldown_until = max_datetime(
+        state.cooldown_until, now + timedelta(seconds=settings.cooldown_seconds)
+    )
+    state.last_contact_at = max_datetime(state.last_contact_at, now)
+
+
+def rollover_contact_day(state: RuntimeState, *, now: datetime) -> bool:
+    """Reset the daily proactive-contact counter when the local day changes.
+
+    The counter is a *daily* budget, so it has to be cleared on the local
+    calendar boundary before anything reads or increments it - otherwise the
+    first delivery of a new day is added to yesterday's total and the character
+    silently stops speaking once the budget appears exhausted.
+
+    Args:
+        state: Runtime state to mutate.
+        now: Reference time.
+
+    Returns:
+        ``True`` when this call crossed into a new day and reset the counter.
+    """
+    day_key = local_day_key(now)
+    if state.meta.get(CONTACT_DAY_META_KEY) == day_key:
+        return False
+    state.meta = dict(state.meta) | {CONTACT_DAY_META_KEY: day_key}
+    state.contact_count_today = 0
+    return True
 
 
 def cooldown_remaining(state: RuntimeState, now: datetime) -> float:

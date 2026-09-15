@@ -26,6 +26,10 @@ class SettingsDefaultsTests(unittest.TestCase):
         self.assertTrue(settings.inject_enabled)
         self.assertTrue(settings.outbox_enabled)
 
+    def test_default_base_url_targets_the_runtime_default_port(self) -> None:
+        """The Runtime serves 8787 by default; a wrong default fails invisibly."""
+        self.assertEqual(DEFAULT_BASE_URL, "http://127.0.0.1:8787")
+
     def test_bool_disable_is_respected(self) -> None:
         settings = Settings.from_mapping({"enabled": "false"})
         self.assertFalse(settings.enabled)
@@ -88,7 +92,7 @@ class SettingsClampTests(unittest.TestCase):
 
 class SettingsValidationTests(unittest.TestCase):
     def test_invalid_base_url_disables_runtime_calls(self) -> None:
-        settings = Settings.from_mapping({"runtime_base_url": "127.0.0.1:8720"})
+        settings = Settings.from_mapping({"runtime_base_url": "127.0.0.1:8787"})
         self.assertEqual(settings.base_url, "")
         self.assertFalse(settings.usable)
         self.assertTrue(any("runtime_base_url" in issue for issue in settings.issues))

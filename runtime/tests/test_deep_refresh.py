@@ -377,6 +377,7 @@ class TestRefreshOrchestration:
 
     def test_the_interpretation_cache_is_updated_and_reused(self) -> None:
         runtime = _runtime()
+        stored_at = BASE_TIME + timedelta(minutes=5)
         try:
             event = runtime.process_user_message(content="算了，也没什么。", timestamp=BASE_TIME)
             runtime.semantic_provider = _StubProvider(
@@ -395,14 +396,66 @@ class TestRefreshOrchestration:
                     ],
                 )
             )
-            runtime.deep_refresh(now=BASE_TIME + timedelta(minutes=5), force=True)
+            runtime.deep_refresh(now=stored_at, force=True)
             active = runtime.projections.emotion.list_active()
             from companion_runtime.emotion import EmotionExplainer
 
             key = EmotionExplainer.cache_key(runtime.state(), active)
-            cached = runtime.projections.emotion.cached_explanation(key, BASE_TIME, 3600)
+            # The entry is stamped with the refresh's own clock, so it is read back
+            # with that same ``now``. Querying at an earlier instant would make the
+            # entry look like it came from the future - which the cache refuses, as
+            # ``test_a_cache_entry_stamped_after_the_reference_time_is_rejected``
+            # pins separately.
+            cached = runtime.projections.emotion.cached_explanation(key, stored_at, 3600)
             assert cached is not None
             assert "偏沉" in cached["experience"]
+            # Reading it again later, still inside the TTL, reuses the same entry.
+            later = runtime.projections.emotion.cached_explanation(
+                key, stored_at + timedelta(minutes=30), 3600
+            )
+            assert later is not None and later["experience"] == cached["experience"]
+        finally:
+            runtime.close()
+
+    def test_a_cache_entry_stamped_after_the_reference_time_is_rejected(self) -> None:
+        """A future-dated explanation must never be served as permanently fresh.
+
+        The freshness test is ``age > ttl``, and a future stamp makes ``age``
+        negative - smaller than any TTL. Without an explicit non-negative-age check,
+        a clock step, a replayed timeline or a hand-edited row would be treated as
+        valid forever. This is the projection-level contract; the refresh path above
+        depends on it when it reads back an entry it stored at its own clock time.
+        """
+        runtime = _runtime()
+        stored_at = BASE_TIME + timedelta(minutes=5)
+        try:
+            runtime.process_user_message(content="算了，也没什么。", timestamp=BASE_TIME)
+            active = runtime.projections.emotion.list_active()
+            from companion_runtime.emotion import EmotionExplainer
+
+            key = EmotionExplainer.cache_key(runtime.state(), active)
+            with runtime.db.transaction() as conn:
+                runtime.projections.emotion.store_explanation(
+                    conn,
+                    cache_key=key,
+                    payload={"experience": "写在未来的一条解释。"},
+                    source="deep_refresh",
+                    now=stored_at,
+                )
+            cache = runtime.projections.emotion
+            # Before its own timestamp: rejected rather than served.
+            assert cache.cached_explanation(key, BASE_TIME, 3600) is None
+            assert cache.cached_explanation(key, stored_at - timedelta(seconds=1), 3600) is None
+            # At and after it, inside the TTL: served.
+            assert cache.cached_explanation(key, stored_at, 3600) is not None
+            assert (
+                cache.cached_explanation(key, stored_at + timedelta(minutes=1), 3600)
+                is not None
+            )
+            # Past the TTL: expired as usual, so the guard did not disable expiry.
+            assert (
+                cache.cached_explanation(key, stored_at + timedelta(hours=2), 3600) is None
+            )
         finally:
             runtime.close()
 

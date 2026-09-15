@@ -28,13 +28,21 @@ SESSION_B = "aiocqhttp:GroupMessage:20002"
 
 
 def _runtime(**overrides: Any) -> Runtime:
-    """Build an in-memory Runtime on the simulated timeline."""
+    """Build an in-memory Runtime on the simulated timeline.
+
+    The RNG is seeded. These tests exercise *routing* - which session a leased
+    action reports - and an endogenous round that refused to act is a missing
+    precondition, not a routing result: the motivational layer draws its hazard
+    from real entropy, so an unseeded Runtime makes the scenario decline to
+    commit roughly once in 160 rounds and the test fails for a reason unrelated
+    to its subject. The seed matches the one ``conftest`` uses.
+    """
     config = build_config()
     config.semantic.deep_refresh_enabled = False
     config.conversation_id = "default"
     for key, value in overrides.items():
         setattr(config, key, value)
-    return Runtime(config=config, created_at=BASE_TIME)
+    return Runtime(config=config, seed=1234, created_at=BASE_TIME)
 
 
 class TestProactiveRouting:
@@ -52,7 +60,9 @@ class TestProactiveRouting:
             outcome = runtime.endogenous_round(
                 now=matter.waiting_until + timedelta(hours=1), force=True
             )
-            assert outcome.attempt_id is not None, "the round should have committed"
+            assert outcome.attempt_id is not None, (
+                f"the round should have committed: {outcome.decision}"
+            )
             attempt = runtime.projections.attempts.get(outcome.attempt_id)
             assert attempt is not None and attempt.outbox_id
             item = runtime.projections.outbox.get(attempt.outbox_id)
@@ -169,9 +179,24 @@ class TestProactiveRouting:
 class TestV1LeaseReportsTheSession:
     """The adapter learns the target session only from the lease response."""
 
-    def test_the_lease_payload_exposes_the_right_session(self) -> None:
+    def test_the_lease_payload_exposes_the_right_session(self, monkeypatch) -> None:
+        """The leased render action names the session the intention came from.
+
+        The lease endpoint is driven by the *machine* clock (it ticks and claims
+        with ``utcnow()``), while everything this scenario sets up lives on the
+        simulated timeline: the committed row carries ``available_at`` equal to the
+        round's instant, ``matter.waiting_until + 1h`` - about ``2026-03-02T11:00Z``.
+        A claim only sees rows whose ``available_at`` has passed, so as written this
+        test silently required the machine clock to be *after* that instant: on a
+        clock just before it the lease came back empty (the reported "no action
+        after the endogenous round") and on a clock just after it the suite looked
+        healthy. Pinning the endpoint's clock to the simulated timeline removes the
+        dependency on when or where the suite runs, and keeps the real v1 handler
+        under test.
+        """
         from fastapi.testclient import TestClient
 
+        from companion_runtime import api_v1
         from companion_runtime.api import create_app
 
         runtime = _runtime()
@@ -194,8 +219,11 @@ class TestV1LeaseReportsTheSession:
                 },
             )
             matter = runtime.projections.unfinished.list_open()[0]
-            runtime.endogenous_round(now=matter.waiting_until + timedelta(hours=1), force=True)
+            round_at = matter.waiting_until + timedelta(hours=1)
+            runtime.endogenous_round(now=round_at, force=True)
 
+            # One minute after the round committed, on the simulated timeline.
+            monkeypatch.setattr(api_v1, "utcnow", lambda: round_at + timedelta(minutes=1))
             leased = client.post(
                 "/v1/outbox/lease",
                 json={
@@ -221,12 +249,19 @@ class TestV1LeaseReportsTheSession:
                 timestamp=BASE_TIME,
             )
             matter = runtime.projections.unfinished.list_open()[0]
-            runtime.endogenous_round(now=matter.waiting_until + timedelta(hours=1), force=True)
-            attempt = next(
+            outcome = runtime.endogenous_round(
+                now=matter.waiting_until + timedelta(hours=1), force=True
+            )
+            committed = [
                 item
                 for item in runtime.projections.attempts.list_all(limit=20)
                 if item.outbox_id
-            )
+            ]
+            # The precondition is asserted explicitly, with the decision attached:
+            # a bare ``StopIteration`` here says "no attempt" without saying whether
+            # the round declined, found no candidate or never ran at all.
+            assert committed, f"the round must commit an intention: {outcome.decision}"
+            attempt = committed[0]
             item = runtime.projections.outbox.get(attempt.outbox_id)
             assert item is not None and item.conversation_id == session
         finally:

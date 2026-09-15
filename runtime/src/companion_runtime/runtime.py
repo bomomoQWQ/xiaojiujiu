@@ -23,12 +23,13 @@ from __future__ import annotations
 import ast
 import logging
 import random
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from . import action as action_module
 from . import boundaries as boundary_module
@@ -54,6 +55,7 @@ from .typing import (
     Memory,
     OutboxItem,
     OutboxKind,
+    OutboxStatus,
     Priority,
     RawEvent,
     ReconcileAction,
@@ -63,7 +65,16 @@ from .typing import (
     new_id,
 )
 from .user_model import BehaviourReaction, Prediction, UserInteractionModel
-from .utility import clamp, delta_seconds, ensure_aware, isoformat, local_now, utcnow
+from .utility import (
+    clamp,
+    delta_seconds,
+    ensure_aware,
+    isoformat,
+    local_now,
+    max_datetime,
+    parse_datetime,
+    utcnow,
+)
 
 LOGGER = logging.getLogger("companion_runtime.runtime")
 
@@ -71,6 +82,14 @@ LOGGER = logging.getLogger("companion_runtime.runtime")
 BUSY_MARKERS = ("工作很多", "很忙", "没时间", "忙", "busy", "开会", "加班")
 #: Types of user message that indicate explicit permission for proactive contact.
 PERMISSION_MARKERS = ("多主动", "随时找我", "可以找我", "欢迎找我", "you can message me")
+
+#: Key under which the last attempted deep refresh is stored in ``RuntimeState.meta``.
+#:
+#: The pacing of a deep refresh is a *durable* fact, not a process-local one: a
+#: sidecar that restarts would otherwise forget that it refreshed a minute ago and
+#: spend again immediately. Storing it in the runtime row also keeps it in the same
+#: transaction-protected place as every other piece of state.
+LAST_DEEP_REFRESH_META_KEY = "last_deep_refresh_at"
 
 
 @dataclass(slots=True)
@@ -116,6 +135,14 @@ class MessageOutcome:
     emotion_event_ids: list[str] = field(default_factory=list)
     memory_candidate_id: str | None = None
     observation_id: str | None = None
+    #: The sent attempt this reply was attributed to, when there was one. The
+    #: attempt is resolved by the same call, so this is reported to the caller
+    #: rather than left to be discovered afterwards.
+    attributed_attempt_id: str | None = None
+    #: Re-coordination decisions applied to attempts that had not been delivered
+    #: yet (see :meth:`Reducer.reconcile_pending_attempts`), one entry per
+    #: re-coordinated attempt. Empty when nothing was in flight.
+    reconcile_decisions: list[dict[str, Any]] = field(default_factory=list)
     reply_blocked: bool = False
     proactive_paused_until: datetime | None = None
     #: Which appraiser produced the emotional reading: ``coarse_rule`` (an explicit
@@ -129,18 +156,27 @@ class MessageOutcome:
     #: ``unresolved``.
     potential_relevance: str = "low"
     narrative: str = ""
+    #: Set when the message was already in the raw history: the identifier was
+    #: seen before, so this call appended nothing and ran no foreground pass.
+    #: Every other field then describes the *existing* event, which is what makes
+    #: a redelivered envelope (a retried HTTP call, a replayed adapter batch)
+    #: converge instead of overwriting history or raising a uniqueness error.
+    duplicate: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable rendering."""
         return {
             "event": self.event.to_dict(),
             "version": self.version,
+            "duplicate": self.duplicate,
             "boundary_ids": list(self.boundary_ids),
             "unfinished_created": list(self.unfinished_created),
             "unfinished_resolved": list(self.unfinished_resolved),
             "emotion_event_ids": list(self.emotion_event_ids),
             "memory_candidate_id": self.memory_candidate_id,
             "observation_id": self.observation_id,
+            "attributed_attempt_id": self.attributed_attempt_id,
+            "reconcile_decisions": [dict(item) for item in self.reconcile_decisions],
             "reply_blocked": self.reply_blocked,
             "proactive_paused_until": isoformat(self.proactive_paused_until),
             "appraisal_source": self.appraisal_source,
@@ -167,6 +203,72 @@ def _parse_counts(text: str) -> dict[str, int]:
     if not isinstance(parsed, dict):
         return {}
     return {str(key): int(value) for key, value in parsed.items() if isinstance(value, int)}
+
+
+#: The six collection fields of a deep-refresh suggestion set. Used to recognise a
+#: bare mapping as an unwrapped suggestion set.
+_SUGGESTION_FIELDS: tuple[str, ...] = (
+    "reinterpretations",
+    "psychological_interpretation",
+    "candidate_intent_operations",
+    "memory_suggestions",
+    "unfinished_matter_suggestions",
+    "user_model_evidence_suggestions",
+)
+
+
+def _coerce_suggestions(suggestions: Any, *, provider_name: str) -> Any:
+    """Normalise whatever a provider returned into a suggestion object or ``None``.
+
+    A provider is third-party code reached over a wire contract: it may hand back a
+    :class:`~companion_runtime.providers.DeepRefreshSuggestions`, a plain mapping, a
+    ``suggestions`` envelope, a list or a string. A mapping is parsed through
+    :func:`~companion_runtime.providers.parse_deep_refresh`, so a malformed reply
+    degrades exactly the way a malformed HTTP body does, and anything unrecognisable
+    is reported as absent rather than being allowed to raise further down.
+
+    Args:
+        suggestions: Raw return value of ``provider.deep_refresh``.
+        provider_name: Name of the calling provider, used for provenance.
+
+    Returns:
+        A suggestion object, or ``None`` when the value carries no suggestion set.
+    """
+    if suggestions is None:
+        return None
+    if isinstance(suggestions, Mapping):
+        from .providers import parse_deep_refresh
+
+        return parse_deep_refresh(dict(suggestions), provider=provider_name)
+    if any(hasattr(suggestions, name) for name in _SUGGESTION_FIELDS):
+        return suggestions
+    LOGGER.warning(
+        "Deep refresh provider %s returned %s, which carries no suggestions; ignoring",
+        provider_name,
+        type(suggestions).__name__,
+    )
+    return None
+
+
+def _suggestion_field(suggestions: Any, name: str, default: Any = "") -> Any:
+    """Read one field from a suggestion object or mapping, defensively."""
+    if isinstance(suggestions, Mapping):
+        return suggestions.get(name, default)
+    return getattr(suggestions, name, default)
+
+
+def _is_empty_suggestions(suggestions: Any) -> bool:
+    """Return whether a suggestion set carries nothing, tolerating its shape."""
+    checker = getattr(suggestions, "is_empty", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:  # noqa: BLE001 - a broken checker means "assume empty"
+            return True
+    for name in _SUGGESTION_FIELDS:
+        if _suggestion_field(suggestions, name, None):
+            return False
+    return True
 
 
 @dataclass(slots=True)
@@ -295,9 +397,9 @@ class Runtime:
         from .providers import build_provider
 
         self.semantic_provider = build_provider(self.config)
-        #: Timestamp of the last *attempted* deep refresh. Used both to pace the
-        #: "idle refresh" trigger and to enforce the minimum interval, so a
-        #: long-running Runtime does not refresh on every heartbeat.
+        #: In-memory mirror of :data:`LAST_DEEP_REFRESH_META_KEY`. The persisted
+        #: value in ``state.meta`` is authoritative; this cache only avoids a state
+        #: read on the hot path.
         self._last_deep_refresh_at: datetime | None = None
         self.reducer = Reducer(
             db=self._db,
@@ -378,14 +480,28 @@ class Runtime:
             # process started. The supplied clock is clamped to be no earlier than
             # the epoch, so driving a simulated timeline stays monotonic instead of
             # producing a negative elapsed time that silently clamps to zero.
-            base = ensure_aware(state.epoch_at) or stamp
-            if stamp < base:
+            epoch = ensure_aware(state.epoch_at)
+            if epoch is not None and stamp < epoch:
                 LOGGER.warning(
                     "lazy_tick called with a time earlier than the creation epoch; "
                     "using the epoch as the base clock"
                 )
-                stamp = base
-            last = state.last_tick_at or base
+                stamp = epoch
+            last = state.last_tick_at or epoch or stamp
+            # A *delayed* caller may hand in a timestamp older than the last tick
+            # (a batch of events replayed out of order, a clock that stepped back).
+            # Letting the tick move ``last_tick_at`` backwards would make the next
+            # forward tick integrate the same interval twice - extra hazard
+            # exposure the character never lived through. Time is therefore
+            # monotone: an earlier timestamp can never undo a tick that happened.
+            if stamp < last:
+                LOGGER.warning(
+                    "lazy_tick called with %s, earlier than the last tick %s; "
+                    "keeping the clock monotone",
+                    stamp.isoformat(),
+                    last.isoformat(),
+                )
+                stamp = last
             dt = delta_seconds(stamp, last)
             report.dt_seconds = dt
             report.changed = dt > 0.0
@@ -393,9 +509,68 @@ class Runtime:
             with self._db.transaction() as conn:
                 state = self._apply_time_passage(conn, state=state, now=stamp, dt_seconds=dt, report=report)
                 report.released_leases = self.projections.outbox.reclaim_expired(conn, stamp)
+                report.expired_attempts = self._close_stalled_attempts(conn, now=stamp)
+                # Closing a stalled attempt bumps the version inside this same
+                # transaction (a nested savepoint), so the tick commits on the
+                # version actually stored rather than on the one it read before.
+                state.version = max(state.version, self.projections.runtime.read().version)
                 version = self.projections.runtime.write(state, conn, expect_version=state.version)
                 report.version = version
         return report
+
+    def _close_stalled_attempts(self, conn: Any, *, now: datetime) -> list[str]:
+        """Close action attempts that can no longer be delivered.
+
+        Two independent leaks are swept here, both of which used to leave an
+        attempt in flight forever - blocking every later endogenous dispatch:
+
+        1. **Failed delivery rows.** A row whose lease expired with its attempt
+           budget exhausted, or that a worker failed terminally, can never be
+           completed. The attempt it belongs to is failed and its sibling rows are
+           cancelled.
+        2. **Orphaned attempts.** An attempt that is still pre-send but has no
+           pending or leased outbox row has nothing left that could ever deliver
+           it (its rows were cancelled, or it was rendered outside the queue), so
+           once the send window has elapsed it is expired.
+
+        Args:
+            conn: Open write transaction.
+            now: Reference time.
+
+        Returns:
+            Identifiers of the attempts closed by this pass.
+        """
+        closed = self.reducer.close_settled_outbox_attempts(now=now)
+        live_rows: set[str] = set()
+        for item in self.projections.outbox.list_items(status=None, limit=500):
+            if item.status not in {OutboxStatus.PENDING.value, OutboxStatus.LEASED.value}:
+                continue
+            attempt_id = str(item.payload.get("attempt_id") or "")
+            if attempt_id:
+                live_rows.add(attempt_id)
+        window = timedelta(seconds=self.config.action.send_expiry_seconds)
+        for attempt in self.projections.attempts.list_by_state(
+            list(action_module.PRE_SEND_STATES)
+        ):
+            if attempt.attempt_id in live_rows or attempt.attempt_id in closed:
+                continue
+            reference = attempt.updated_at or attempt.created_at
+            if reference is None or now - reference <= window:
+                continue
+            if attempt.state == AttemptState.PROPOSED.value:
+                action_module.abort(
+                    self.projections.attempts, conn, attempt, reason="proposal_orphaned", now=now
+                )
+            else:
+                action_module.expire(
+                    self.projections.attempts,
+                    conn,
+                    attempt,
+                    reason="no_deliverable_outbox_row",
+                    now=now,
+                )
+            closed.append(attempt.attempt_id)
+        return closed
 
     def _apply_time_passage(
         self,
@@ -532,21 +707,53 @@ class Runtime:
         with self.write_session():
             state = self.projections.runtime.ensure()
             with self._db.transaction() as conn:
-                event = self.events.append(
-                    EventType.USER_MESSAGE,
-                    actor=Actor.USER,
-                    content=content,
-                    conversation_id=conversation_id or self.config.conversation_id,
-                    metadata=metadata,
-                    timestamp=stamp,
-                    runtime_version=state.version,
-                    event_id=event_id,
-                    connection=conn,
-                )
+                # Idempotency is decided *inside* the transaction that would do the
+                # write: a caller-supplied identifier that already exists means the
+                # message is a redelivery, and the only correct answer is the
+                # outcome the first delivery produced (or, since the first
+                # delivery's derived effects are already recorded, an outcome
+                # referring to the same event). Running the foreground path twice
+                # would double-count the message: a second boundary, a second
+                # unfinished matter, a second user-model observation.
+                if event_id:
+                    existing = self.events.get(event_id)
+                    if existing is not None:
+                        LOGGER.info(
+                            "user message %s already ingested; returning the recorded event",
+                            event_id,
+                        )
+                        return MessageOutcome(
+                            event=existing, version=state.version, duplicate=True
+                        )
+                try:
+                    event = self.events.append(
+                        EventType.USER_MESSAGE,
+                        actor=Actor.USER,
+                        content=content,
+                        conversation_id=conversation_id or self.config.conversation_id,
+                        metadata=metadata,
+                        timestamp=stamp,
+                        runtime_version=state.version,
+                        event_id=event_id,
+                        connection=conn,
+                    )
+                except sqlite3.IntegrityError:
+                    # A concurrent writer appended this identifier between the
+                    # check above and this insert (two processes on one database
+                    # file). The invariant is the same, so the answer is too.
+                    existing = self.events.get(event_id) if event_id else None
+                    if existing is None:
+                        raise
+                    return MessageOutcome(
+                        event=existing, version=state.version, duplicate=True
+                    )
 
                 # Entry barrier: stop any new endogenous dispatch immediately.
-                state.foreground_pause_until = stamp + timedelta(
-                    seconds=self.config.scheduler.foreground_pause_seconds
+                # The pause is extended, never shortened: a delayed message must
+                # not cut short a barrier that a newer message put in place.
+                state.foreground_pause_until = max_datetime(
+                    state.foreground_pause_until,
+                    stamp + timedelta(seconds=self.config.scheduler.foreground_pause_seconds),
                 )
 
                 outcome = MessageOutcome(event=event)
@@ -594,10 +801,15 @@ class Runtime:
 
                 # --- unfinished matters resolved by this message.
                 # Resolution runs *before* the working situation is projected so
-                # that the projection already reflects the settled state.
+                # that the projection already reflects the settled state, and
+                # before new obligations are detected so that a completion
+                # statement ("到家了") cannot re-open the obligation it just met.
                 live_matters = self.projections.unfinished.list_open()
                 resolved_ids: list[str] = []
-                for unfinished_id, why in unfinished_module.detect_resolution(event, live=live_matters):
+                resolution_pairs = unfinished_module.detect_resolution(
+                    event, live=live_matters
+                )
+                for unfinished_id, why in resolution_pairs:
                     if unfinished_module.resolve(
                         self.projections.unfinished, conn, unfinished_id, note=why
                     ):
@@ -714,7 +926,14 @@ class Runtime:
 
                 # --- unfinished matters created by this message
                 proposals = unfinished_module.detect(
-                    event, config=self.config, existing=self.projections.unfinished.list_open()
+                    event,
+                    config=self.config,
+                    existing=self.projections.unfinished.list_open(),
+                    # A completion statement must not create the obligation it just
+                    # discharged, so the subjects this event settled are excluded.
+                    resolved_topics=unfinished_module.resolved_topics(
+                        event, resolution_pairs
+                    ),
                 )
                 for proposal in proposals:
                     matter = unfinished_module.create(
@@ -766,37 +985,44 @@ class Runtime:
                     outcome.narrative = proposal_memory.summary
 
                 # --- user interaction observation for the previous proactive act
-                if reason is not None or self._has_pending_observation():
-                    reaction = reason or BehaviourReaction(
-                        replied=True,
-                        reply_delay_seconds=self._reply_delay_seconds(stamp),
-                        reply_length=len(content),
-                    )
-                    reaction.busy_probability = busy
-                    context = self._last_proactive_context()
-                    observation = self.user_model.observe(
-                        conn,
-                        action=context.get("action", {"type": "reply", "proactive": False}),
-                        context=context.get("context", {}),
-                        reaction=reaction,
-                        now=stamp,
-                        observed_at=stamp,
-                        source_event_ids=[event.event_id],
-                        attempt_id=context.get("attempt_id"),
-                        busy_probability=busy,
-                    )
-                    outcome.observation_id = observation.observation_id
+                #
+                # A normal reply *is* the feedback signal the user model learns
+                # from, so it is attributed to the newest message that is still
+                # awaiting one - exactly once, because the attempt is resolved as
+                # part of the attribution and a resolved attempt can never be
+                # attributed again.
+                (
+                    outcome.observation_id,
+                    outcome.attributed_attempt_id,
+                ) = self._attribute_user_reply(
+                    conn,
+                    event=event,
+                    content=content,
+                    reason=reason,
+                    busy=busy,
+                    now=stamp,
+                    boundary_declared=bool(declared),
+                )
 
                 # --- invalidate candidates whose premises just died
                 self._invalidate_candidates(conn, now=stamp, user_message=content)
 
-                state.last_user_message_at = stamp
-                state.last_exchange_at = stamp
+                # The absence anchors are monotone: a delayed message carries an
+                # older timestamp than the one already recorded, and following it
+                # would make the Runtime believe contact happened later than it
+                # did - inflating silence pressure and re-arming the entry barrier.
+                state.last_user_message_at = max_datetime(state.last_user_message_at, stamp)
+                state.last_exchange_at = max_datetime(state.last_exchange_at, stamp)
+                state.foreground_pause_until = max_datetime(
+                    state.foreground_pause_until,
+                    stamp + timedelta(seconds=self.config.scheduler.foreground_pause_seconds),
+                )
                 # ``allow_proactive`` itself is not written here: it is derived on
                 # every tick from the live boundaries, so writing it would only
                 # create a second source of truth.
                 version = self.projections.runtime.write(state, conn, expect_version=state.version)
                 outcome.version = version
+                outcome.proactive_paused_until = state.foreground_pause_until
                 self.events.append(
                     EventType.SYSTEM,
                     actor=Actor.RUNTIME,
@@ -807,6 +1033,20 @@ class Runtime:
                     runtime_version=version,
                     connection=conn,
                 )
+
+            # --- re-coordination of intentions that have not left yet
+            #
+            # The user speaking first is exactly the situation the re-coordination
+            # protocol exists for, so it runs here rather than only when a caller
+            # remembers to call ``/reconcile``. An intention that is already
+            # delivered is deliberately excluded: its message is in the world, and
+            # only the reply above can close it.
+            decisions = self.reducer.reconcile_pending_attempts(
+                new_events=[event], now=stamp, states=list(action_module.PRE_SEND_STATES)
+            )
+            if decisions:
+                outcome.reconcile_decisions = decisions
+                outcome.version = self.projections.runtime.read().version
 
         self.user_model = UserInteractionModel(self.projections.user_model, self.config)
         return outcome
@@ -1033,8 +1273,14 @@ class Runtime:
         # The decision itself already changes the dynamics: impulse and pressure
         # are released the moment the character commits.
         motivation_module.release_after_contact(state, config=self.config, now=now)
-        state.contact_count_today += 1
-        self._rollover_contact_day(state, now)
+        # The daily contact budget is *not* charged here. ``committed`` is not
+        # ``sent``: this intention may still be re-coordinated, aborted or lost
+        # before it is delivered, and it is exactly this early increment that used
+        # to make one delivered message count twice, because ``mark_delivered``
+        # charges the same budget again when the message actually leaves. The
+        # counter is therefore owned by the delivery path alone; the day key is
+        # still refreshed so the row never serves a stale day.
+        motivation_module.rollover_contact_day(state, now=now)
 
         item = OutboxItem(
             outbox_id=new_id("outbox"),
@@ -1123,7 +1369,8 @@ class Runtime:
             return outcome
         # Record the attempt time before spending, so a provider that times out
         # still counts against the interval rather than being retried every tick.
-        self._last_deep_refresh_at = stamp
+        # The write is durable: a restart must not forget that this just happened.
+        self._record_deep_refresh(stamp)
 
         request = build_request(runtime=self, now=stamp, limit=config.max_operations_per_refresh)
         started = time.monotonic()
@@ -1133,14 +1380,22 @@ class Runtime:
             LOGGER.exception("Deep refresh provider raised; treating as unavailable")
             outcome.reason = "provider_error"
             return outcome
-        outcome.provider = getattr(suggestions, "provider", "") or self.semantic_provider.name
         outcome.latency_ms = int((time.monotonic() - started) * 1000)
+        # A provider that answers with a bare mapping is normalised through the same
+        # parser the wire format uses, so a malformed reply degrades instead of
+        # raising somewhere deeper in the pipeline.
+        suggestions = _coerce_suggestions(
+            suggestions, provider_name=self.semantic_provider.name
+        )
+        outcome.provider = _suggestion_field(suggestions, "provider") or (
+            self.semantic_provider.name
+        )
 
         if suggestions is None:
             outcome.reason = "no_suggestions"
             return outcome
-        outcome.degraded = bool(getattr(suggestions, "degraded", True))
-        if suggestions.is_empty():
+        outcome.degraded = bool(_suggestion_field(suggestions, "degraded", True) or False)
+        if _is_empty_suggestions(suggestions):
             outcome.reason = "empty_suggestions"
             return outcome
 
@@ -1158,7 +1413,9 @@ class Runtime:
         payload = {
             "operations": [operation.to_dict() for operation in operations],
         }
-        interpretation = dict(getattr(suggestions, "psychological_interpretation", {}) or {})
+        interpretation = dict(
+            _suggestion_field(suggestions, "psychological_interpretation", {}) or {}
+        )
         if interpretation:
             # The cached interpretation is carried inside the same proposal so it
             # passes the same protocol gate as every other suggested change.
@@ -1170,9 +1427,16 @@ class Runtime:
                 }
             )
 
-        source_event_ids = [
-            item["event_id"] for item in unresolved if item.get("event_id")
-        ][: config.max_operations_per_refresh]
+        # Provenance is *per operation*, not per refresh: the proposal claims only
+        # the entities its surviving operations actually referenced. Passing the
+        # whole backlog instead would claim that one reinterpretation rested on
+        # every open event - which is untrue, and which the reducer would then have
+        # to defend against when deciding what may be marked as understood.
+        source_event_ids = list(
+            dict.fromkeys(
+                source for operation in operations for source in operation.sources if source
+            )
+        )
         with self.write_session():
             state = self.projections.runtime.ensure(stamp)
             proposal = protocol_module.Proposal(
@@ -1198,6 +1462,41 @@ class Runtime:
                     outcome.settled_events = 0
         return outcome
 
+    def _record_deep_refresh(self, when: datetime) -> None:
+        """Persist the time of the last attempted deep refresh.
+
+        The attempt time is written before the provider is called and inside its own
+        transaction, so a provider that times out still counts against the minimum
+        interval. Persisting it (rather than keeping a process-local attribute)
+        matters because the pacing rule is about the *cost already paid*: a restart
+        that forgot the last refresh would spend again on its first heartbeat.
+        """
+        with self.write_session():
+            with self._db.transaction() as conn:
+                state = self.projections.runtime.ensure(when)
+                state.meta = dict(state.meta) | {LAST_DEEP_REFRESH_META_KEY: isoformat(when)}
+                self.projections.runtime.write(state, conn, expect_version=state.version)
+        self._last_deep_refresh_at = when
+
+    def _last_deep_refresh(self) -> datetime | None:
+        """Return when a deep refresh was last attempted, or ``None``.
+
+        The in-memory mirror is consulted first because it is written on the same
+        path; the persisted value is the authority and wins whenever both exist,
+        since it also survives a restart.
+        """
+        persisted = self.projections.runtime.read().meta.get(LAST_DEEP_REFRESH_META_KEY)
+        if isinstance(persisted, str):
+            try:
+                parsed = parse_datetime(persisted)
+            except (TypeError, ValueError):
+                # A corrupt field must not stall the pacing rule permanently; the
+                # in-memory mirror, or "never refreshed", is the honest fallback.
+                parsed = None
+            if parsed is not None:
+                return ensure_aware(parsed)
+        return self._last_deep_refresh_at
+
     def _refresh_signals(self, *, now: datetime) -> dict[str, Any]:
         """Return the deep-refresh trigger signals the Runtime can answer itself.
 
@@ -1209,6 +1508,12 @@ class Runtime:
         Runtime cannot make, and they default to ``False`` rather than being
         guessed at.
 
+        Elapsed time is measured from the last *attempted* refresh. When no refresh
+        has ever been attempted it is measured from the creation epoch, which is a
+        real timestamp rather than a sentinel meaning "unknown": the early version
+        of this method used the last tick as the anchor, so a heartbeat loop reset
+        the clock every round and the pacing rule could never fire.
+
         Args:
             now: Reference time.
 
@@ -1218,21 +1523,53 @@ class Runtime:
         active_candidates = self.projections.candidates.list_active(limit=50)
         matters = self.projections.unfinished.list_open()
         due = [item for item in matters if item.status == UnfinishedStatus.DUE.value]
+        last_refresh = self._last_deep_refresh()
+        hours_since = self._hours_since_refresh(now=now, last_refresh=last_refresh)
         # Every trigger below is only meaningful when there is something for a
         # refresh to reason about. On a brand-new Runtime the pool is empty and
-        # nothing is pending because nothing has happened yet, and firing then
-        # would spend a request to rediscover exactly that.
+        # nothing is pending because nothing has happened yet, and firing then would
+        # spend a request to rediscover exactly that.
         has_material = bool(matters) or self.projections.semantics.unresolved_count() > 0
         if not has_material:
-            return {"candidate_pool_size": None, "matter_due": False, "hours_since_last_refresh": 0.0}
+            # Nothing has happened, so nothing needs understanding: the idle rule is
+            # explicitly disarmed rather than merely unmatched. A fresh Runtime has
+            # been "idle" since its creation epoch, which would otherwise satisfy the
+            # idle threshold on its first heartbeat and spend a request to
+            # rediscover that no events exist. The elapsed time is still reported,
+            # because it is what the minimum-interval guard needs.
+            return {
+                "candidate_pool_size": None,
+                "matter_due": False,
+                "hours_since_last_refresh": hours_since,
+                "has_previous_refresh": last_refresh is not None,
+                "has_material": False,
+            }
 
-        baseline = self._last_deep_refresh_at or self.projections.runtime.read().last_tick_at
-        hours_since = (now - baseline).total_seconds() / 3600.0 if baseline else 0.0
         return {
             "candidate_pool_size": len(active_candidates),
             "matter_due": bool(due),
-            "hours_since_last_refresh": max(0.0, hours_since),
+            "hours_since_last_refresh": hours_since,
+            "has_previous_refresh": last_refresh is not None,
+            "has_material": True,
         }
+
+    def _hours_since_refresh(self, *, now: datetime, last_refresh: datetime | None) -> float:
+        """Return hours since the last attempted refresh, or since the epoch.
+
+        Args:
+            now: Reference time.
+            last_refresh: Time of the last attempted refresh, or ``None``.
+
+        Returns:
+            A non-negative number of hours. When nothing has been refreshed yet the
+            anchor is the creation epoch, so "has this Runtime been idle long
+            enough to deserve a speculative refresh" is answerable on the very
+            first round instead of being disabled by a zero sentinel.
+        """
+        baseline = last_refresh or self.state().epoch_at
+        if baseline is None:
+            return 0.0
+        return max(0.0, delta_seconds(now, baseline) / 3600.0)
 
     def _is_resolvable(self, identifier: str) -> bool:
         """Return whether a grounding identifier names something that exists.
@@ -1242,7 +1579,8 @@ class Runtime:
         operation carrying it be discarded before it can touch state.
 
         Args:
-            identifier: An event, memory, unfinished-matter, emotion or candidate id.
+            identifier: An event, memory candidate, memory, unfinished-matter,
+                emotion or candidate-intent id.
 
         Returns:
             ``True`` when the identifier resolves to a stored entity.
@@ -1257,6 +1595,12 @@ class Runtime:
                 return self.projections.memory.get_memory(identifier) is not None
             if prefix == "cnd":
                 return self.projections.candidates.get(identifier) is not None
+            if prefix == "mcd":
+                # A memory *candidate* is a real entity the Runtime holds, and a
+                # refresh is allowed to reason about it ("this pending candidate
+                # matters because ..."). Treating its ids as unresolvable discarded
+                # every such suggestion as if the model had invented it.
+                return self.projections.memory.get_candidate(identifier) is not None
         except Exception:  # noqa: BLE001 - a lookup failure is simply "not resolvable"
             return False
         # Unfinished matters and emotion events use generated ids that the
@@ -1333,9 +1677,20 @@ class Runtime:
                     attempt_id=attempt_id,
                     busy_probability=busy,
                 )
-                if attempt.state != AttemptState.RESOLVED.value:
+                # Only a delivered attempt can be resolved. An attempt that was
+                # aborted, expired or failed while the report was in flight is
+                # already closed, and ``resolve`` would be an illegal transition -
+                # the observation is still recorded, the history is left alone.
+                if attempt.state == AttemptState.SENT.value:
                     action_module.resolve(
-                        self.projections.attempts, conn, attempt, reason=outcome, now=stamp
+                        self.projections.attempts,
+                        conn,
+                        attempt,
+                        reason=outcome,
+                        now=stamp,
+                    )
+                    self.projections.outbox.cancel_for_attempt(
+                        conn, attempt.attempt_id, reason="attempt_resolved"
                     )
                 if candidate is not None:
                     self.projections.candidates.set_status(
@@ -1367,13 +1722,143 @@ class Runtime:
 
     # ------------------------------------------------------------------ helpers
 
+    def _newest_sent_attempt(self) -> Any:
+        """Return the most recent attempt whose message has been delivered.
+
+        Ordering matters: ``list_by_state`` is oldest-first, so asking for one row
+        in that order returns the *oldest* outstanding intention. Attribution must
+        use the newest, otherwise a reply to the message the user just received
+        trains the user model on a message from hours ago.
+        """
+        sent = self.projections.attempts.list_by_state(
+            [AttemptState.SENT.value], limit=1, newest_first=True
+        )
+        return sent[0] if sent else None
+
+    def _attribute_user_reply(
+        self,
+        conn: Any,
+        *,
+        event: RawEvent,
+        content: str,
+        reason: BehaviourReaction | None,
+        busy: float,
+        now: datetime,
+        boundary_declared: bool = False,
+    ) -> tuple[str | None, str | None]:
+        """Attribute one user reply to the newest sent attempt, exactly once.
+
+        A reply is the only real evidence the user model ever gets, so the two
+        failure modes are both expensive: attributing it to nothing (the model
+        never learns) and attributing it twice (one reply counts as two pieces of
+        evidence, biasing every learned parameter). The attempt is therefore
+        resolved as part of the attribution - a resolved attempt is no longer
+        ``sent``, so the next message cannot be folded into it again - and an
+        existing observation for the attempt is honoured as a hard stop.
+
+        Args:
+            conn: Write connection.
+            event: The user message being ingested.
+            content: Its verbatim text.
+            reason: An explicitly supplied reaction, when the host knows one.
+            busy: Belief that the user is busy, used as attribution damping.
+            now: Reference time.
+            boundary_declared: Whether this message declared a hard boundary. A
+                boundary is a reply, but it is negative evidence, and the user
+                model has a dedicated target for exactly that.
+
+        Returns:
+            ``(observation_id, attributed_attempt_id)``; either may be ``None``.
+        """
+        attempt = self._newest_sent_attempt()
+        if attempt is None:
+            if reason is None:
+                return None, None
+            # An explicit reaction with no outstanding proactive message is still
+            # worth recording; it simply belongs to no attempt.
+            reaction = reason
+            reaction.busy_probability = busy
+            observation = self.user_model.observe(
+                conn,
+                action={"type": "reply", "proactive": False},
+                context=self._situation_context(now),
+                reaction=reaction,
+                now=now,
+                observed_at=now,
+                source_event_ids=[event.event_id],
+                busy_probability=busy,
+            )
+            return observation.observation_id, None
+
+        candidate = (
+            self.projections.candidates.get(attempt.candidate_id) if attempt.candidate_id else None
+        )
+        observation_id: str | None = None
+        if self.projections.user_model.observation_for_attempt(attempt.attempt_id) is None:
+            reaction = reason or BehaviourReaction(
+                replied=True,
+                reply_delay_seconds=self._reply_delay_seconds(now),
+                reply_length=len(content),
+            )
+            reaction.busy_probability = busy
+            if boundary_declared:
+                reaction.boundary_touched = True
+            observation = self.user_model.observe(
+                conn,
+                action={
+                    "type": candidate.type if candidate else "contact",
+                    "proactive": True,
+                },
+                context=self._situation_context(now),
+                reaction=reaction,
+                now=now,
+                observed_at=now,
+                source_event_ids=[event.event_id],
+                attempt_id=attempt.attempt_id,
+                busy_probability=busy,
+            )
+            observation_id = observation.observation_id
+            self.events.append(
+                EventType.INTERACTION_OBSERVATION,
+                actor=Actor.RUNTIME,
+                content=None,
+                conversation_id=event.conversation_id,
+                metadata={
+                    "observation_id": observation.observation_id,
+                    "weight": observation.weight,
+                    "reaction": reaction.to_dict(),
+                    "attempt_id": attempt.attempt_id,
+                },
+                source_event_ids=[event.event_id],
+                timestamp=now,
+                runtime_version=self.projections.runtime.read().version,
+                connection=conn,
+            )
+
+        # The attempt is closed here, and this is the only closure a delivered
+        # message gets: it is what makes the attribution exactly-once and what
+        # frees the dispatch gate for the next endogenous round.
+        current = self.projections.attempts.get(attempt.attempt_id)
+        if current is None or current.state != AttemptState.SENT.value:
+            return observation_id, None
+        action_module.resolve(
+            self.projections.attempts, conn, current, reason="user_replied", now=now
+        )
+        self.projections.outbox.cancel_for_attempt(
+            conn, current.attempt_id, reason="attempt_resolved"
+        )
+        if candidate is not None:
+            self.projections.candidates.set_status(
+                conn,
+                candidate.candidate_id,
+                CandidateStatus.RESOLVED.value,
+                reason="user_replied",
+            )
+        return observation_id, current.attempt_id
+
     def _rollover_contact_day(self, state: RuntimeState, now: datetime) -> None:
         """Reset the daily contact counter when the local day changes."""
-        local = local_now(now)
-        day_key = local.strftime("%Y-%m-%d")
-        if state.meta.get("contact_day") != day_key:
-            state.meta = dict(state.meta) | {"contact_day": day_key}
-            state.contact_count_today = 0
+        motivation_module.rollover_contact_day(state, now=now)
 
     def _recent_contact_count(self, now: datetime, window_seconds: float | None = None) -> int:
         """Count proactive sends inside the repeat window."""
@@ -1428,15 +1913,13 @@ class Runtime:
 
     def _has_pending_observation(self) -> bool:
         """Return whether a sent proactive message is still awaiting an observation."""
-        sent = self.projections.attempts.list_by_state([AttemptState.SENT.value], limit=1)
-        return bool(sent)
+        return self._newest_sent_attempt() is not None
 
     def _last_proactive_context(self) -> dict[str, Any]:
         """Return the action/context of the most recent sent attempt."""
-        sent = self.projections.attempts.list_by_state([AttemptState.SENT.value], limit=1)
-        if not sent:
+        attempt = self._newest_sent_attempt()
+        if attempt is None:
             return {}
-        attempt = sent[-1]
         candidate = (
             self.projections.candidates.get(attempt.candidate_id) if attempt.candidate_id else None
         )

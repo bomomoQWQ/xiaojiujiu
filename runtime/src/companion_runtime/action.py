@@ -85,6 +85,19 @@ IN_FLIGHT_STATES: tuple[str, ...] = (
     AttemptState.SENT.value,
 )
 
+#: States in which nothing has left the Runtime yet.
+#:
+#: This is the set a user message may re-coordinate: an intention that has not
+#: been delivered can still be merged into the new message, rewritten or dropped.
+#: ``sent`` is deliberately excluded - the message is already in the world, and
+#: the only thing left for it is the user's reply.
+PRE_SEND_STATES: tuple[str, ...] = (
+    AttemptState.PROPOSED.value,
+    AttemptState.COMMITTED.value,
+    AttemptState.RENDERING.value,
+    AttemptState.READY_TO_SEND.value,
+)
+
 
 class IllegalTransition(RuntimeError):
     """Raised when a state transition is not permitted by the state machine."""
@@ -362,7 +375,14 @@ def expire_stale(
     config: RuntimeConfig,
     now: datetime,
 ) -> list[str]:
-    """Expire attempts that have been waiting beyond their deadlines.
+    """Expire attempts that have been waiting to be delivered for too long.
+
+    Only pre-send attempts are considered. A ``sent`` attempt is not waiting for
+    anything the Runtime controls: its message is already with the user, and the
+    only remaining event is the reply, which resolves it through the feedback
+    path. Expiring it here would both fabricate a history (the message *was*
+    sent) and destroy the record a reply still has to be attributed to, so the
+    state machine forbids it - and this function must therefore never try.
 
     Args:
         projection: Attempt storage.
@@ -371,11 +391,11 @@ def expire_stale(
         now: Reference time.
 
     Returns:
-        Identifiers of expired attempts.
+        Identifiers of expired (or aborted) attempts.
     """
     expired: list[str] = []
     limit = timedelta(seconds=config.action.send_expiry_seconds)
-    for attempt in projection.list_by_state(IN_FLIGHT_STATES):
+    for attempt in projection.list_by_state(PRE_SEND_STATES):
         reference = attempt.updated_at or attempt.created_at
         if reference is None:
             continue

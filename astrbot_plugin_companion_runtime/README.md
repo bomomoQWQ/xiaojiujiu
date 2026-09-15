@@ -140,7 +140,7 @@ AstrBot/
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
 | `enabled` | `true` | 关闭后不监听、不注入、不消费 outbox |
-| `runtime_base_url` | `http://127.0.0.1:8720` | Runtime HTTP 根地址 |
+| `runtime_base_url` | `http://127.0.0.1:8787` | Runtime HTTP 根地址（与 Runtime 自身默认端口一致） |
 | `runtime_token` | `""`（secret） | `Authorization: Bearer <token>`；可用环境变量 `COMPANION_RUNTIME_TOKEN` 代替，避免把密钥写进配置文件 |
 | `adapter_id` | `default` | 多个 AstrBot 实例接入同一 Runtime 时必须不同 |
 | `request_timeout_ms` | `1500` | 普通请求超时 |
@@ -181,6 +181,8 @@ AstrBot/
   最坏后果也只是这类消息继续流经后续管线阶段，而不会让机器人回复它们。
 - `all`：上报全部消息。代价是：AstrBot 会把这类消息标记为已唤醒（`is_wake=True`）并让它们继续
   流经限流、内容安全等后续管线阶段。这会改变宿主行为，仅在你清楚后果时开启。
+- 无论哪种模式，**只有适配器真正在运行时**这个开关才可能为真：插件被关闭、启动失败（3 次后放弃）
+  或已终止时都会把它复位为假，避免用一个已经不存在的适配器去放宽宿主管线（详见 §7）。
 
 ### 隐私：什么数据会离开宿主机
 
@@ -231,6 +233,9 @@ AstrBot/
 ```
 
 - `kind`：`user_message` | `assistant_message`。
+- `message_type`：`private` | `group` | `other`。AstrBot 的 `MessageType` 枚举值是平台消息类
+  （`FriendMessage` / `GroupMessage` / `OtherMessage`），插件把这三种映射成上面的会话范围词；
+  遇到未知取值时原样小写透传，便于排查而不是丢掉信息。
 - `preempts_proactive=true` 由设计 §60 入口屏障定义：用户消息一到，Runtime 应立即暂停新的内源主动派发。
 - 响应：任意 2xx。正文可忽略。
 
@@ -325,6 +330,13 @@ Runtime 会把这段使用说明和优先级顺序一并写进注入文本内部
 
 响应 `{"extended": true}`（或任意 2xx）。长时间 `render` 期间插件自动按 `lease_ttl/3`（最短 1s）续租。
 
+- **续租从租约到手的那一刻开始**，包括排在并发闸门（`outbox_max_concurrency`）后面等待的整批行动：
+  否则等待期间租约就会到期，Runtime 会把同一个行动再派给别的 worker，同一条主动消息就可能发两遍。
+- **`extended=false` 是「租约已不属于你」，不是可重试的故障**：插件立即停止该行动（渲染中的直接取消），
+  **不回报任何结果**（交由 Runtime 的租约到期恢复重派，见 §4.5），并且**不把这次续租计为成功**
+  （状态命令里的 `heartbeats` 只统计被确认的续租）。网络错误、超时等瞬时故障不算失去租约：
+  工作继续，但同样不计入成功。
+
 ### 4.5 `POST /v1/actions/{action_id}/authorize` — 发送前的现场授权
 
 ```json
@@ -340,8 +352,22 @@ Runtime 会把这段使用说明和优先级顺序一并写进注入文本内部
 - 语义：这是不可逆动作前的**最后一道闸门**；Runtime 应在此完成并发重协调
   （KEEP / MERGE / RERENDER / RESOLVED / ABORT）。`authorized=false` 时插件**不发送**，
   以 `rejected` 回报；`text` 非空则替换正文（RERENDER）。
-- **超时、网络错误、响应不可解析一律视为拒绝**（fail-closed）：宁可这条主动消息不发，
-  也不能在 Runtime 未知的情况下替它说话。这是本插件唯一 fail-closed 的地方。
+- **超时、网络错误、响应不可解析一律 fail-closed：不发**。这是本插件唯一 fail-closed 的地方。
+- 「没问到」和「被拒绝」必须分得开，而且**没问到时不写任何结果**：
+  - `authorized=false`（Runtime 明确否决，含边界拦截、`unknown_action`、`lease_expired` 等）
+    → `rejected`；
+  - 请求没送达 / 响应里没有结论 → **不发，也不回报任何状态**，把这一行交回 Runtime 自己的
+    租约到期恢复路径（见下）。原因：Runtime 对**任何**非 `ok` 的 send 结果都按终态处理
+    （`mark_delivered(success=False)` → `nack(terminal=True)`），而一条只是**租约到期**的行会被
+    `reclaim_expired` 收回成 `pending` 并重新派发。因此插件在这里保持沉默，是唯一能让「瞬时故障」
+    保持可重试的形态；报 `rejected` 或 `failed` 都等于替 Runtime 关掉一行它从未评判过的行动。
+  - 恢复代价（Runtime 侧契约）：最多等一个租约时长（`outbox.lease_seconds`，默认 45s）后由
+    tick（最短间隔 5s）回收并重新租约；行内 `attempts` 未达 `max_attempts`（默认 3）时才会重派，
+    用尽后仍会落 `failed` 终态。重复执行不会造成重复发送：这条消息从未发出。
+  - 因同理，**租约被 Runtime 收回时（续租返回 `extended=false`）插件也停止工作且不回报**：
+    Runtime 已经自己记录了这个决定，而一条来自失去租约方的终态结果会关掉它打算重派的行。
+    唯一例外是这份租约丢失时投递**已经开始**（Runtime 已授权、消息可能已在路上）：那就等它落地
+    并照实回报 —— 此时沉默会让 Runtime 重派一条可能已送达的消息（见 §7.1）。
 
 ### 4.6 `POST /v1/outbox/{action_id}/result` — 回报结果
 
@@ -355,15 +381,22 @@ Runtime 会把这段使用说明和优先级顺序一并写进注入文本内部
 | `status` | 含义 |
 | --- | --- |
 | `ok` | `render`：`result.text` 为渲染结果；`send`：`result.sent == true` 表示确实已投递 |
-| `failed` | 执行失败（`error` 为单行原因，超时/异常/平台未找到） |
-| `rejected` | 未获授权，未发送（`error` 含原因，如 `aborted_by_user_message`） |
+| `failed` | 执行失败（`error` 为单行原因：渲染/发送超时、异常、平台未找到、`delivery_failed`） |
+| `rejected` | Runtime 明确否决，未发送（`error` 含原因，如 `aborted_by_user_message`） |
 | `skipped` | 无法执行（`missing_session`、`unsupported_action_type:…`） |
+
+> **不是所有情况都会回报。** 两种情况下插件刻意不写结果，把行留给 Runtime 的租约到期恢复：
+> ① 发送授权没问到结论（§4.5）；② 续租被拒、租约已被 Runtime 收回且尚未开始投递（§4.4）。
+> 两者都没有产生任何投递，所以重派不会造成重复发送。它们计入状态命令里的 `deferred`。
+> 反过来，只要投递已经开始，插件一定回报真实结果（成功或失败）——那是防止重复发送的唯一手段。
 
 > 行动 id 总是出现在请求路径中；仅结果回报的请求体额外附带 `action_id`，便于 Runtime 实现直接对齐。
 
 - 设计 §69：`committed != sent`。只有 `status=ok` 且 `result.sent=true` 才算真正发出。
 - 回报是幂等的；失败时进入本地有界重试队列，最终由租约到期兜底。
 - 建议 Runtime 对 `rejected` 与 `skipped` 也落一条 `action_attempt` 终态，避免反复派发。
+- 由插件主动留空的那两种情形（§4.5 / §4.4）不经过本地队列：它们不是「回报失败」，而是
+  「不回报」，由 Runtime 自己的 `reclaim_expired` → `pending` → 重新租约来完成重试。
 
 ### 4.7 `GET /health` — 健康、语义 provider 与结算积压（v0.2）
 
@@ -436,7 +469,7 @@ companion Runtime adapter
 - semantic_provider: <name> (available=<bool>)              ← v0.2 新增
 - semantics: <N> unresolved (normal: the Runtime defers …)  ← v0.2 新增
 - context: N requests, N cache hits, N fetches, N timeouts, N errors, N stale fallbacks
-- actions: N leased, N rendered, N sent, N rejected, N failed, N skipped, N replayed
+- actions: N leased, N rendered, N sent, N rejected, N failed, N skipped, N replayed, N deferred (unreported, left to lease expiry)
 - queue: N pending, N delivered, N retried, N dropped (full …/failed …/expired …)
 - config issues: …
 ```
@@ -464,7 +497,7 @@ companion Runtime adapter
 > 想看得更完整就直接查询 Runtime：
 >
 > ```bash
-> curl -s http://127.0.0.1:8720/health | python -m json.tool
+> curl -s http://127.0.0.1:8787/health | python -m json.tool
 > ```
 
 ---
@@ -544,14 +577,43 @@ Runtime   ：跨轮持久连续性     —— 上看长期状态、下结算长�
 
 ## 7. 生命周期
 
-- `__init__`：只解析配置，**不做任何 I/O、不创建任务**。
+- `__init__`：只解析配置，**不做任何 I/O、不创建任务**；同时立刻接管
+  `_ObservationScopeFilter.observe_all`（该过滤器实例由装饰器创建、被所有事件共享，
+  可能被上一个实例留在放宽状态）。
 - `initialize()`：构建 transport / 队列 / bridge / outbox，随即启动队列 worker 与 outbox 消费者。
   幂等；配置不可用时直接进入“静默不做事”状态。
 - 消息路径上会在需要时惰性调用同一套启动逻辑（同步 `_start()`），因此即使宿主未调用 `initialize()` 也能工作。
-- `terminate()`：取消全部后台任务并 `await gather`、停止队列 worker、取消预热任务、关闭 HTTP 会话；
-  幂等，未启动时调用也安全。
+- `terminate()`：先**有界优雅停机**（最多 `SHUTDOWN_GRACE_S = 5s`）再取消后台任务并 `await gather`、
+  停止队列 worker、取消预热任务、关闭 HTTP 会话；幂等，未启动时调用也安全。
+  - 优雅窗口只等**已经在飞的租约**：Runtime 已授权的发送不可逆，中途取消会留下
+    「消息可能已经送达、而回报丢失」的局面，Runtime 只能按租约到期重派 → 同一条消息发两遍。
+  - 窗口耗尽后，已授权的 `send` 仍会吸收**一次**取消，等投递落地再收尾（第二次取消照常生效，
+    停机时间因此始终有界）。
+  - **终止是终态**：`terminate()` 之后到达的消息钩子不会再启动任何 worker
+    （AstrBot 在重载完成前仍会把事件派给旧实例）。
+- 观察范围（`observe_all`）只在适配器**真正运行**时才可能为 `true`：关闭、启动失败（3 次后放弃）、
+  已终止都会把它复位为 `false`，否则一条本插件不处理的群消息会被 AstrBot 标记为已唤醒。
 - 插件类**刻意不定义 `__del__`**：AstrBot 在插件类自身定义了 `__del__` 时会**跳过** `terminate()`，
   这条约束已由 `tests/test_packaging.py` 固化。
+
+### 7.1 无法从插件侧消除的发送/回报歧义（如实记录）
+
+`send` 的投递与回报是两个动作，中间必然存在窗口：`Context.send_message()` 已经返回（或仍在途中）、
+而 `/v1/outbox/{id}/result` 还没被 Runtime 收到时，进程崩溃、被强杀、或优雅窗口耗尽后仍被取消，
+都会留下**插件无法自证**的状态 —— 它无法知道平台到底有没有把消息发出去。
+
+- 插件侧能做到的：授权后不主动放弃投递（吸收一次取消）、把已完成的投递结果照实回报、
+  同进程内用结果缓存抑制重复执行；优雅窗口超时时打一条 warning。
+- 插件侧**做不到**的：跨进程崩溃、强杀，以及「窗口耗尽 + 投递已完成但回报丢失」。此时 Runtime
+  只能按租约到期重派，理论上存在重复发送。要彻底消除，需要 Runtime 侧「发送前预登记 + 幂等去重」
+  或平台侧可达性回执，超出本适配器的能力范围。
+- **这跟 §4.5 的「不回报」是两件事，不要混淆**：那里是「**确定没发出去**」，所以沉默=安全重试；
+  这里是「**可能已经发出去**」，所以插件一定回报真实结果（超时/异常也报 `failed`），
+  宁可由 Runtime 记一次失败，也不能沉默着让它重派一条可能已经送达的消息。
+- 另一处无法从插件侧消除的落差：Runtime 的授权闸门在**租约已过期**时也会回 `authorized=false`
+  （`reason` 形如 `lease_expired` / `stale_lease`），而插件按契约把它当明确否决回报 `rejected`，
+  Runtime 又会把这条 `rejected` 记成终态。要让这类**簿记性**理由也走「重派」路径，需要 Runtime
+  自己区分「否决」与「租约不对」；插件不解析 `reason` 的语义（架构约束：插件不解释语义）。
 
 ---
 
@@ -599,17 +661,17 @@ cd data/plugins/astrbot_plugin_companion_runtime
 python -m pytest tests -q          # 或：python -m unittest discover -s tests -t .
 ```
 
-覆盖内容（124 项，全部离线）：
+覆盖内容（143 项，全部离线）：
 
 | 文件 | 覆盖 |
 | --- | --- |
 | `tests/test_protocol.py` | 协议解析/序列化、非法输入降级、错误截断 |
-| `tests/test_settings.py` | 配置默认值、字符串强制转换、区间钳制、**2s 硬上限**、token 不进 repr、环境变量回退 |
+| `tests/test_settings.py` | 配置默认值（含 Runtime 默认端口 8787）、字符串强制转换、区间钳制、**2s 硬上限**、token 不进 repr、环境变量回退 |
 | `tests/test_retry_queue.py` | 去重、写满淘汰最旧、退避重试、超次放弃、超时丢弃、worker 启停 |
 | `tests/test_bridge.py` | 缓存命中、**超时放弃**、错误降级、过期缓存兜底、截断、版本号清洗、预热 |
-| `tests/test_outbox.py` | render 成功/失败/超时、send 授权通过与拒绝、**授权失败 fail-closed**、平台未找到、重复租约重放、续租心跳、轮询退避 |
-| `tests/test_plugin_integration.py` | 用 `tests/stubs/astrbot`（模拟 AstrBot 4.28 公开接口）验证 `main.py` 全链路：事件上报、`wake`/`all` 两种监听范围、临时 TextPart 注入、send 前授权、**状态命令打印 `semantic_provider` / `semantics` 两行且 `/health` 不可用时仍可用**、启动失败自限、初始化/终止清理 |
-| `tests/test_packaging.py` | schema 与 Settings 键一致、元数据字段与版本范围、**无内嵌凭据**、仅 import 白名单内的 AstrBot 模块、纯核心不 import AstrBot、`terminate` 可达 |
+| `tests/test_outbox.py` | render 成功/失败/超时、send 授权通过与拒绝、**授权没问到结论时不留终态且保持可重试**（含 Runtime 重新租约后重试成功）、平台未找到、重复租约重放、续租心跳（含**排队等待期间也续租**、**`extended=false` 停止工作/不回报/不计成功**、瞬时心跳错误不停止工作）、**租约丢失时已开始的投递仍照实回报**、取消不丢已授权投递的回报、`request_stop`/`wait_idle`、轮询退避 |
+| `tests/test_plugin_integration.py` | 用 `tests/stubs/astrbot`（模拟 AstrBot 4.28 公开接口）验证 `main.py` 全链路：事件上报、`wake`/`all` 两种监听范围（含**关闭/放弃/终止后不放宽宿主管线**）、`message_type` 映射为 private/group/other、临时 TextPart 注入、send 前授权、**状态命令打印 `semantic_provider` / `semantics` 两行且 `/health` 不可用时仍可用**、启动失败自限、**终止后不复活也不丢已在飞的发送**、初始化/终止清理 |
+| `tests/test_packaging.py` | schema 与 Settings 键一致（含 `runtime_base_url` 默认值一致且指向 8787）、元数据字段与版本范围、**无内嵌凭据**、仅 import 白名单内的 AstrBot 模块、纯核心不 import AstrBot、`terminate` 可达 |
 
 > 说明：`tests/stubs/astrbot/` 只是 AstrBot 公开接口的最小替身，用来在没有 AstrBot 的环境里验证插件**接线**；
 > 它不代表真实 AstrBot 行为。真实环境仍需在 AstrBot 中做一次加载 + 一次 render/send 联调。

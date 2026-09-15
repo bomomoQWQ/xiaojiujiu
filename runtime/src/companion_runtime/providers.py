@@ -338,9 +338,11 @@ def resolve_provider_name(config: Any = None, env: Mapping[str, str] | None = No
     silently getting no provider and no reason.
 
     Args:
-        config: Optional Runtime configuration or mapping; a
-            ``semantic_provider`` entry (or ``extras['semantic']['provider']``)
-            takes precedence over the environment.
+        config: Optional Runtime configuration or mapping. A
+            ``semantic_provider`` entry, ``config.semantic.provider`` (the field a
+            :class:`~companion_runtime.config.SemanticConfig` actually carries) or
+            ``extras['semantic']['provider']`` takes precedence over the
+            environment.
         env: Environment mapping, defaults to :data:`os.environ`.
 
     Returns:
@@ -350,7 +352,8 @@ def resolve_provider_name(config: Any = None, env: Mapping[str, str] | None = No
     """
     source = os.environ if env is None else env
     requested = _first_str(
-        _config_value(config, "semantic_provider", "provider"),
+        _safe_config_value(config, "semantic_provider", "provider"),
+        _safe_config_value(_safe_read(config, "semantic"), "provider", "semantic_provider"),
         source.get(PROVIDER_ENV_VAR),
     )
     name = requested.strip().lower()
@@ -424,6 +427,9 @@ class _OpenAICompatibleProvider:
         temperature: Sampling temperature; ``0`` keeps structured output stable.
         headers: Extra request headers.
         transport: Injectable transport used by tests.
+        cache_ttl_s: How long one explanation stays usable in the provider's own
+            cache. It is the same number the Runtime uses for its explanation
+            cache, so the two caches cannot disagree about what "stale" means.
     """
 
     def __init__(
@@ -440,6 +446,7 @@ class _OpenAICompatibleProvider:
         headers: Mapping[str, str] | None = None,
         transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]]
         | None = None,
+        cache_ttl_s: float = 900.0,
     ) -> None:
         """Store the endpoint settings and the transport seam."""
         self.name = name
@@ -476,7 +483,7 @@ class _OpenAICompatibleProvider:
             "cache_hits": 0,
         }
         self._cache: dict[str, tuple[float, dict[str, str]]] = {}
-        self._cache_ttl_s = 900.0
+        self._cache_ttl_s = max(0.0, float(cache_ttl_s))
 
     # ------------------------------------------------------------------ transport
 
@@ -714,13 +721,23 @@ class _OpenAICompatibleProvider:
     # -------------------------------------------------------------------- cache
 
     def _cache_get(self, key: str) -> dict[str, str] | None:
-        """Return a cached explanation when it is still fresh."""
+        """Return a cached explanation when it is still fresh.
+
+        An entry whose stored timestamp sits in the future is dropped rather than
+        served: a wall-clock jump (NTP step, a replayed timeline, a hand-edited
+        row) would otherwise make ``age`` negative, and a negative age is smaller
+        than any TTL - so a corrupt entry would be trusted forever.
+        """
         with self._lock:
             entry = self._cache.get(key)
             if entry is None:
                 return None
-            stored_at, value = entry
+            stored_at, stored_wall, value = entry
             if time.monotonic() - stored_at > self._cache_ttl_s:
+                self._cache.pop(key, None)
+                return None
+            skew = time.time() - stored_wall
+            if skew < -_FUTURE_SKEW_TOLERANCE_S:
                 self._cache.pop(key, None)
                 return None
             return dict(value)
@@ -728,7 +745,7 @@ class _OpenAICompatibleProvider:
     def _cache_put(self, key: str, value: Mapping[str, str]) -> None:
         """Store one explanation, bounding the cache size."""
         with self._lock:
-            self._cache[key] = (time.monotonic(), dict(value))
+            self._cache[key] = (time.monotonic(), time.time(), dict(value))
             while len(self._cache) > 128:
                 self._cache.pop(next(iter(self._cache)))
 
@@ -782,6 +799,9 @@ class RemoteAPIProvider(_OpenAICompatibleProvider):
         grammar: Inline GBNF grammar, only meaningful for self-hosted gateways.
         headers: Extra request headers.
         transport: Injectable transport used by tests.
+        cache_ttl_s: TTL of the provider's own explanation cache. Callers pass the
+            Runtime's configured interpretation age so the provider cannot serve
+            an explanation the Runtime already considers stale.
     """
 
     def __init__(
@@ -799,6 +819,7 @@ class RemoteAPIProvider(_OpenAICompatibleProvider):
         headers: Mapping[str, str] | None = None,
         transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]]
         | None = None,
+        cache_ttl_s: float = 900.0,
     ) -> None:
         """Store the endpoint settings; the key is read from the environment."""
         source = os.environ if env is None else env
@@ -815,6 +836,7 @@ class RemoteAPIProvider(_OpenAICompatibleProvider):
             temperature=temperature,
             headers=headers,
             transport=transport,
+            cache_ttl_s=cache_ttl_s,
         )
 
     def available(self) -> bool:
@@ -842,7 +864,8 @@ def build_provider(
 
     Selection order:
 
-    1. ``config.semantic_provider`` (or ``config.extras['semantic']['provider']``);
+    1. ``config.semantic_provider`` / ``config.semantic.provider`` (or
+       ``config.extras['semantic']['provider']``);
     2. ``CR_SEMANTIC_PROVIDER``;
     3. :data:`DISABLED_NAME`.
 
@@ -905,6 +928,10 @@ def _build_remote(
         env=env,
         timeout_s=_first_float(env.get("CR_SEMANTIC_TIMEOUT_S")) or 30.0,
         max_tokens=int(_first_float(env.get("CR_SEMANTIC_MAX_TOKENS")) or 1024),
+        # The provider's own explanation cache is paced by the same number the
+        # Runtime uses, so the two caches cannot disagree about staleness.
+        cache_ttl_s=_first_float(_read_semantic(config, "interpretation_max_age_seconds"))
+        or 900.0,
         transport=transport,
     )
 
@@ -923,11 +950,18 @@ def _config_value(config: Any, *names: str) -> str | None:
 
     Returns:
         The first non-empty string found, otherwise ``None``.
+
+    Raises:
+        ValueError: When reading one of the names raised. That is a broken
+            configuration rather than an absent setting, and the provider factory
+            turns it into its documented fallback.
     """
     if config is None:
         return None
     for name in names:
         value = _read_one(config, name)
+        if value is _UNREADABLE:
+            raise ValueError(f"configuration value {name!r} could not be read")
         if isinstance(value, str) and value.strip():
             return value.strip()
     extras = _read_one(config, "extras")
@@ -941,11 +975,65 @@ def _config_value(config: Any, *names: str) -> str | None:
     return None
 
 
+def _read_semantic(config: Any, name: str) -> Any:
+    """Read one non-string setting from the ``semantic`` section, or ``None``.
+
+    A helper rather than a call to :func:`_config_value`, which only ever returns
+    strings: numeric settings such as the interpretation age must keep their type.
+
+    Raises:
+        ValueError: When reading the setting raised.
+    """
+    semantic = _read_one(config, "semantic")
+    if semantic is _UNREADABLE:
+        raise ValueError("the semantic configuration section could not be read")
+    value = _read_one(semantic, name)
+    if value is _UNREADABLE:
+        raise ValueError(f"semantic.{name} could not be read")
+    if value is not None:
+        return value
+    extras = _safe_read(config, "extras")
+    if isinstance(extras, Mapping):
+        section = extras.get("semantic")
+        if isinstance(section, Mapping):
+            return section.get(name)
+    return None
+
+
 def _read_one(config: Any, name: str) -> Any:
-    """Return ``config[name]`` or ``config.name``, or ``None``."""
-    if isinstance(config, Mapping):
-        return config.get(name)
-    return getattr(config, name, None)
+    """Return ``config[name]`` or ``config.name``, or ``None``.
+
+    A raising lookup is reported as :data:`_UNREADABLE` rather than as absent: the
+    provider factory treats "this setting could not be read" as a construction
+    failure and falls back to the disabled provider, instead of building a remote
+    client pointed at nothing. :func:`resolve_provider_name` deliberately swallows
+    the marker, because picking a name must never raise.
+    """
+    try:
+        if isinstance(config, Mapping):
+            return config.get(name)
+        return getattr(config, name, None)
+    except Exception:  # noqa: BLE001 - report the failure, do not propagate it
+        return _UNREADABLE
+
+
+def _safe_read(config: Any, name: str) -> Any:
+    """Return a configuration value, or ``None`` when it cannot be read at all."""
+    value = _read_one(config, name)
+    return None if value is _UNREADABLE else value
+
+
+def _safe_config_value(config: Any, *names: str) -> str | None:
+    """Like :func:`_config_value`, but report an unreadable setting as absent.
+
+    Used by name resolution, which promises never to raise: the caller has not
+    asked for anything to be built yet, so "I could not read the name" is best
+    answered with the documented default.
+    """
+    try:
+        return _config_value(config, *names)
+    except ValueError:
+        return None
 
 
 def _first_str(*values: Any) -> str:
@@ -957,12 +1045,17 @@ def _first_str(*values: Any) -> str:
 
 
 def _first_float(value: Any) -> float | None:
-    """Return ``value`` as a float, or ``None`` when it is not numeric."""
+    """Return ``value`` as a float, or ``None`` when it is not numeric.
+
+    A raising attribute is treated as absent: the provider factory promises never to
+    raise, and a broken endpoint setting must degrade to the disabled provider
+    rather than propagate out of configuration resolution.
+    """
     if value is None:
         return None
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, AttributeError):
         return None
 
 
@@ -1023,6 +1116,18 @@ def extract_json(text: str) -> Any:
 
 #: Explanation fields a provider must return to be considered usable.
 EXPLANATION_FIELDS = ("experience", "focus", "conflict", "impulse", "inhibition", "expression")
+
+#: How far ahead of the local clock a cached explanation's timestamp may sit
+#: before it is treated as corrupt rather than as ordinary clock skew.
+_FUTURE_SKEW_TOLERANCE_S = 60.0
+
+#: Marker for a configuration read that raised instead of returning a value.
+#:
+#: The distinction matters: "the setting is absent" is a normal answer that means
+#: "use the default", while "reading the setting blew up" means the configuration
+#: is broken and the caller asked for something that cannot be built. Collapsing the
+#: two would silently start a provider with an endpoint that was never readable.
+_UNREADABLE = object()
 
 
 def parse_explanation(payload: Any) -> dict[str, str] | None:

@@ -26,6 +26,7 @@ veto over the anchor table.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,6 +37,8 @@ from .emotion import EmotionEvaluation
 from .typing import EmotionDirection
 from .utility import clamp, isoformat
 
+LOGGER = logging.getLogger("companion_runtime.semantic")
+
 __all__ = [
     "AmbiguityVeto",
     "CoarseSettlement",
@@ -44,6 +47,7 @@ __all__ = [
     "UnresolvedRecord",
     "band_to_intensity",
     "classify_event",
+    "is_negated",
     "potential_relevance",
     "settlement_to_evaluation",
 ]
@@ -255,8 +259,16 @@ ANCHORS: tuple[Anchor, ...] = (
         "explicit_repair",
     ),
     # --- major negative life events (facts, not moods)
+    #
+    # ``走了`` is deliberately absent from the death anchor. It is the ordinary
+    # Chinese way to say "I'm leaving" ("我先走了", "那我走了"), and reading that as
+    # a bereavement is exactly the kind of confident-but-wrong settlement this
+    # module exists to refuse: the miss costs one deferred event, the false
+    # positive permanently marks the character's history with a death that never
+    # happened. A death stated this way therefore stays unresolved and is left to
+    # the low-frequency deep refresh, which can read the surrounding context.
     Anchor(
-        ("去世", "走了", "过世", "葬礼"),
+        ("去世", "过世", "离世", "人没了", "不在了", "葬礼"),
         EmotionDirection.NEGATIVE.value,
         IntensityBand.HIGH.value,
         0.85,
@@ -305,6 +317,35 @@ ANCHORS: tuple[Anchor, ...] = (
 #: A refusal that names no object is still a refusal only when it is blunt enough;
 #: these are kept separate so the ambiguity veto stays meaningful.
 BLUNT_REFUSALS: tuple[str, ...] = ("不行", "不可以", "我拒绝", "不要这样")
+
+#: Every surface form the anchor table recognises. Negation is checked against this
+#: table rather than per anchor, so extending the table cannot leave a hole:
+#: ``test_every_anchor_needle_is_negation_checked`` pins the invariant.
+ANCHOR_NEEDLES: tuple[str, ...] = tuple(
+    dict.fromkeys(needle for anchor in ANCHORS for needle in anchor.needles)
+)
+
+#: Needles that also appear in the "strong anchor survives a hedge" list. A negated
+#: one of these must *not* survive the hedge veto, so it is checked separately.
+HALLUCINATION_SURVIVORS: tuple[str, ...] = (
+    "去世",
+    "过世",
+    "被辞",
+    "被裁",
+    "失业",
+    "分手",
+    "离婚",
+    "确诊",
+    "手术",
+    "谢谢你",
+    "对不起",
+    "抱歉",
+    "我喜欢你",
+    "我很开心",
+    "我很高兴",
+    "我很难过",
+    "我很失望",
+)
 
 #: Markers that make an event worth revisiting later even when it is unresolved.
 HIGH_RELEVANCE_HINTS: tuple[str, ...] = (
@@ -382,10 +423,78 @@ def _matched(text: str, needles: Iterable[str]) -> str:
     return ""
 
 
+def _matched_negated(text: str, needles: Iterable[str]) -> str:
+    """Return the first needle present in a negated position, or ``''``.
+
+    Only the *first* occurrence of each needle is examined, and only its position.
+    A negated phrase therefore cannot hide a later direct one, because the direct
+    occurrence is found by the ordinary match that runs afterwards.
+    """
+    return _first_negated(text, needles)
+
+
 def _matched_normalized(text: str, needles: Iterable[str]) -> str:
     """Match needles against the filler-stripped form of ``text``."""
     normalized = normalize_for_anchors(text)
     return _matched(normalized, needles)
+
+
+#: Negation markers. A bare substring match reads ``"我没觉得我喜欢你"`` as a
+#: declaration of affection, because the anchor ``我喜欢你`` is genuinely present -
+#: the ``没`` that reverses it is simply outside the needle. Since a settlement is
+#: permanent while staying unresolved costs only the chance to settle early, a
+#: negated anchor must fall through to ``unresolved`` rather than be guessed at.
+#:
+#: Neutralisation ("不难受", "不讨厌") is the same failure in the other direction
+#: and is treated identically: the coarse layer refuses rather than flips a sign.
+#: ``别提``/``别再`` are deliberately absent: they are refusals that the anchor
+#: table settles on their own terms.
+NEGATION_PATTERN = re.compile(
+    r"(?:"
+    r"不是|不会|不再|不用|不想|不愿|不爱|不喜欢|不觉得|没觉得|没有|没能|没"
+    r"|不|别|未|无"
+    r"|don't|doesn't|didn't|do not|does not|did not|not|never|no longer|hardly|barely"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+#: How many characters before a match are scanned for a negation marker.
+_NEGATION_WINDOW = 4
+
+
+def is_negated(text: str, index: int) -> bool:
+    """Return whether the token at ``index`` is negated by what precedes it.
+
+    Args:
+        text: The text the match was found in.
+        index: Start offset of the match.
+
+    Returns:
+        ``True`` when a negation marker sits immediately before the match.
+    """
+    if index <= 0:
+        return False
+    window = text[max(0, index - _NEGATION_WINDOW) : index]
+    return NEGATION_PATTERN.search(window) is not None
+
+
+def _first_negated(text: str, needles: Iterable[str]) -> str:
+    """Return the first needle occurring in a negated position, if any.
+
+    Args:
+        text: Raw event text.
+        needles: Candidate surface forms.
+
+    Returns:
+        The negated needle, or an empty string when every occurrence is direct.
+    """
+    for needle in needles:
+        if not needle:
+            continue
+        start = text.find(needle)
+        if start >= 0 and is_negated(text, start):
+            return needle
+    return ""
 
 
 def ambiguity_veto(text: str) -> AmbiguityVeto | None:
@@ -414,7 +523,8 @@ def classify_event(
     The contract is deliberately one-sided: a wrong settlement silently corrupts
     the character's long-term state, while an ``unresolved`` event costs only the
     opportunity to settle early and can always be revisited. So this function
-    answers ``None`` whenever the evidence is not explicit.
+    answers ``None`` whenever the evidence is not explicit - which includes every
+    anchor sitting in a negated position ("我没觉得我喜欢你" states no such thing).
 
     Args:
         text: Raw event text.
@@ -432,31 +542,21 @@ def classify_event(
     if actor == "system":
         return None
 
+    # An anchor that is negated carries an explicit polarity the coarse layer must
+    # not guess at, so it is checked before both the hedge veto and the table.
+    negated = _matched_negated(body, ANCHOR_NEEDLES)
+    hallucinated = _first_negated(body, HALLUCINATION_SURVIVORS)
+    if negated:
+        LOGGER.debug("Anchor %r is negated in %r; leaving the event unresolved", negated, body)
+        return None
+    if hallucinated:
+        LOGGER.debug("Strong anchor %r is negated in %r; leaving it unresolved", hallucinated, body)
+        return None
+
     # An explicit anchor is allowed to survive a hedge only when it is a strong,
     # unambiguous statement of fact or feeling. Everything else defers.
     veto = ambiguity_veto(body)
-    strong = _matched(
-        body,
-        (
-            "去世",
-            "过世",
-            "被辞",
-            "被裁",
-            "失业",
-            "分手",
-            "离婚",
-            "确诊",
-            "手术",
-            "谢谢你",
-            "对不起",
-            "抱歉",
-            "我喜欢你",
-            "我很开心",
-            "我很高兴",
-            "我很难过",
-            "我很失望",
-        ),
-    )
+    strong = _matched(body, HALLUCINATION_SURVIVORS)
     if veto is not None and not strong:
         return None
 

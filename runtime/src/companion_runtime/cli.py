@@ -232,6 +232,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
     from .api import create_app
+    from .scheduler import Scheduler
 
     config = _resolve_config(args)
     if args.host:
@@ -242,6 +243,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     runtime = Runtime(config, seed=args.seed)
     app = create_app(runtime, config)
+
+    # The sidecar is autonomous, not request-driven: without this loop a standard
+    # deployment would never run an endogenous round, so the character would only
+    # ever answer and never initiate. The scheduler owns *when* to wake; the
+    # round owns *what* to do, including its own foreground-pause and boundary
+    # checks.
+    scheduler = Scheduler(
+        config=config,
+        round_callback=runtime.endogenous_round,
+        rng=runtime.rng,
+        runtime=runtime,
+    )
 
     async def maintenance_loop() -> None:
         """Periodically checkpoint (and optionally back up) while serving."""
@@ -269,9 +282,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
         maintenance: asyncio.Task[Any] | None = None
         if args.maintenance_interval and args.maintenance_interval > 0:
             maintenance = asyncio.create_task(maintenance_loop(), name="runtime-maintenance")
+        await scheduler.start()
         try:
             await server.serve()
         finally:
+            await scheduler.stop()
             if maintenance is not None:
                 maintenance.cancel()
             # A clean shutdown folds the WAL back so the next start is fast and
@@ -283,10 +298,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
             runtime.close()
 
     LOGGER.info(
-        "Starting companion Runtime sidecar on http://%s:%d (database=%s)",
+        "Starting companion Runtime sidecar on http://%s:%d (database=%s, "
+        "endogenous interval %.0fs-%.0fs)",
         config.server.host,
         config.server.port,
         config.storage.database_path,
+        config.scheduler.min_interval_seconds,
+        config.scheduler.max_interval_seconds,
     )
     asyncio.run(run())
     return EXIT_OK

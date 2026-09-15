@@ -359,6 +359,11 @@ class UserInteractionModel:
         self._theta: dict[str, list[float]] = {}
         self._precision: dict[str, list[float]] = {}
         self._delta: dict[str, dict[str, list[float]]] = {}
+        #: How many observations have landed in each behaviour class. This is the
+        #: only honest answer to "how much evidence does this class have": the length
+        #: of a parameter vector is the number of *features*, which is a constant and
+        #: therefore says nothing about evidence at all.
+        self._class_counts: dict[str, int] = {}
         self._observations = 0
         self._effective_count = 0.0
         self._summary: dict[str, Any] | None = None
@@ -416,14 +421,46 @@ class UserInteractionModel:
             }
             for cls in BEHAVIOUR_CLASSES
         }
+        self._class_counts = self._load_class_counts(params)
         self._observations = int(stored.get("observations") or 0)
         self._effective_count = float(stored.get("effective_count") or 0.0)
         self._summary = stored.get("last_summary_json") or None
+
+    @staticmethod
+    def _load_class_counts(params: Mapping[str, Any]) -> dict[str, int]:
+        """Return the persisted per-class observation counts.
+
+        A model stored before this field existed has none, so the counts are
+        reconstructed from the behaviour offsets: an offset vector only exists once
+        at least one observation of that class was applied, which makes 1 the honest
+        lower bound and keeps an old database from claiming a class is well known.
+        """
+        raw = params.get("class_counts")
+        counts: dict[str, int] = {}
+        if isinstance(raw, Mapping):
+            for cls in BEHAVIOUR_CLASSES:
+                try:
+                    counts[cls] = max(0, int(raw.get(cls) or 0))
+                except (TypeError, ValueError):
+                    counts[cls] = 0
+        else:
+            offsets = params.get("delta") or {}
+            for cls in BEHAVIOUR_CLASSES:
+                present = offsets.get(cls) if isinstance(offsets, Mapping) else None
+                counts[cls] = 1 if isinstance(present, Mapping) and present else 0
+        return counts
+
+    def behaviour_evidence(self, behaviour_class: str) -> int:
+        """Return how many observations the model has for one behaviour class."""
+        return int(self._class_counts.get(behaviour_class, 0))
 
     def _persist(self, connection: sqlite3.Connection) -> None:
         """Persist the current parameters."""
         params: dict[str, Any] = {name: self._theta[name] for name in TARGET_NAMES}
         params["delta"] = {cls: self._delta.get(cls, {}) for cls in BEHAVIOUR_CLASSES if self._delta.get(cls)}
+        params["class_counts"] = {
+            cls: count for cls, count in self._class_counts.items() if count
+        }
         self._projection.upsert_params(
             connection,
             params=params,
@@ -448,12 +485,19 @@ class UserInteractionModel:
 
         Uses the diagonal precision as a Laplace approximation: the variance of
         the linear predictor is ``sum_i x_i^2 / precision_i``.
+
+        The precision of a behaviour class is its *own* evidence count, and the
+        class's observations contribute directly to every parameter's precision
+        rather than only to the parameters whose feature happened to be non-zero.
+        Both parts matter: an earlier version scaled the precision by the length of
+        the offset vector - that is, by the number of features, a constant - so a
+        behaviour class that had never been observed was reported as confidently as
+        one learned from dozens of observations, and the model never became less
+        uncertain as the evidence arrived.
         """
         base_precision = self._precision[target]
-        delta_count = len(self._delta.get(behaviour_class, {}).get(target) or [])
-        # The behaviour offset is learned from the same evidence, so its own
-        # precision grows with the number of observations in that class.
-        shrink = 1.0 + 0.5 * delta_count
+        # One unit of evidence per observation in this class, plus the offset basis.
+        shrink = 1.0 + float(self.behaviour_evidence(behaviour_class))
         variance = 0.0
         for index, value in enumerate(_vector(features)):
             precision = max(1e-6, base_precision[index] * shrink)
@@ -664,9 +708,17 @@ class UserInteractionModel:
                     # lower rate, which is what produces shrinkage toward the
                     # more general knowledge.
                     delta[index] += 0.5 * update
+            # One observation informs every parameter a little, including the ones
+            # whose feature was zero this time. Without this the diagonal precision
+            # only ever grew along the directions that happened to be active, so a
+            # class could accumulate dozens of observations and still report the
+            # uncertainty of one that had none.
+            for index in range(len(FEATURE_NAMES)):
+                self._precision[target][index] += 0.25 * weight
 
         self._observations += 1
         self._effective_count += weight
+        self._class_counts[behaviour_class] = self.behaviour_evidence(behaviour_class) + 1
         self._apply_drift()
         self._persist(connection)
 
@@ -735,6 +787,7 @@ class UserInteractionModel:
         view: dict[str, Any] = {
             "observations": self._observations,
             "effective_count": round(self._effective_count, 3),
+            "class_evidence": {cls: self.behaviour_evidence(cls) for cls in BEHAVIOUR_CLASSES},
             "behaviour_offsets": {
                 behaviour_class: {
                     target: [round(value, 4) for value in vector]

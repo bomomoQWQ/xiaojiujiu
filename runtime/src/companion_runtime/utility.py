@@ -184,6 +184,11 @@ def parse_datetime(value: str | datetime | None) -> datetime | None:
     """Parse an ISO-8601 string (or pass through a datetime) into aware UTC.
 
     A trailing ``Z`` and the common ``+0800`` form are both accepted.
+
+    A value with no offset is read as UTC. That is the right default for values
+    the Runtime itself wrote (SQLite hands back naive strings, and every one of
+    them is UTC by construction), but it is a *guess* for values that arrive from
+    outside; ingestion paths use :func:`parse_aware_datetime`, which refuses them.
     """
     if value is None or isinstance(value, datetime):
         return ensure_aware(value)
@@ -204,6 +209,68 @@ def parse_datetime(value: str | datetime | None) -> datetime | None:
         else:
             raise ValueError(f"unsupported datetime format: {value!r}") from None
     return ensure_aware(parsed)
+
+
+class NaiveTimestampError(ValueError):
+    """Raised when a timestamp carries no explicit UTC offset.
+
+    ``"2026-03-01T09:00:00"`` is 09:00 *somewhere*: a client's local clock, a
+    bare UTC assumption, or a truncated value. Reading it as UTC silently shifts
+    every fact that carries it, and nothing downstream can tell that a guess was
+    made. Ingestion paths therefore raise this instead of guessing, so the caller
+    can refuse the value or state exactly what it substituted for it.
+    """
+
+
+#: A trailing UTC designator (``Z``) or numeric offset (``+08:00`` / ``+0800``).
+_EXPLICIT_OFFSET = re.compile(r"(?:[Zz]|[+-]\d{2}:?\d{2})$")
+
+
+def _naive_timestamp_message(field: str, value: object) -> str:
+    """Return the refusal message for a timestamp that lacks an offset."""
+    return (
+        f"{field} must carry an explicit UTC offset (a trailing 'Z' or '+HH:MM'); "
+        f"{value!r} is naive and would otherwise be read as UTC"
+    )
+
+
+def parse_aware_datetime(
+    value: str | datetime | None, *, field: str = "timestamp"
+) -> datetime | None:
+    """Parse an ISO-8601 value that must carry an explicit UTC offset.
+
+    This is :func:`parse_datetime` for data that arrives over a wire, with one
+    deliberate difference: a value with no offset is refused rather than read as
+    UTC, because for an outside clock "no offset" means "unknown offset". Empty
+    input still yields ``None`` (an absent optional timestamp is not an error).
+
+    Args:
+        value: ISO-8601 string or datetime, or ``None``.
+        field: Name used in the error message, so a caller can point at the
+            offending field of its own request body.
+
+    Returns:
+        An aware UTC datetime, or ``None`` when ``value`` is empty.
+
+    Raises:
+        NaiveTimestampError: the value has no explicit UTC offset.
+        ValueError: the value is not a supported ISO-8601 datetime at all.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            raise NaiveTimestampError(_naive_timestamp_message(field, value))
+        return value.astimezone(timezone.utc)
+    if not isinstance(value, str):
+        raise ValueError(f"unsupported datetime format: {value!r}")
+    text = value.strip()
+    if not text:
+        return None
+    parsed = parse_datetime(text)
+    if not _EXPLICIT_OFFSET.search(text):
+        raise NaiveTimestampError(_naive_timestamp_message(field, value))
+    return parsed
 
 
 def to_epoch(value: datetime | None) -> float:
@@ -238,6 +305,20 @@ def min_datetime(*values: datetime | None) -> datetime | None:
     return min(ensure_aware(v) for v in present)
 
 
+def max_datetime(*values: datetime | None) -> datetime | None:
+    """Return the latest non-``None`` datetime.
+
+    The counterpart of :func:`min_datetime`, used for anchors that must never
+    move backwards: a delayed event carries an older timestamp than the one
+    already recorded, and an anchor that follows it would make the Runtime
+    believe that less time has passed than really has.
+    """
+    present = [v for v in values if v is not None]
+    if not present:
+        return None
+    return max(ensure_aware(v) for v in present)
+
+
 def hours(value: float) -> timedelta:
     """Return a timedelta of ``value`` hours (kept for readable config math)."""
     return timedelta(hours=value)
@@ -250,6 +331,16 @@ def local_now(now: datetime | None = None) -> datetime:
     """
     reference = ensure_aware(now) if now is not None else utcnow()
     return reference.astimezone()
+
+
+def local_day_key(now: datetime | None = None) -> str:
+    """Return the local calendar day of ``now`` as ``YYYY-MM-DD``.
+
+    Daily counters (the contact budget) are local-clock questions: "today" ends
+    at the user's midnight, not at UTC midnight. Sharing this helper keeps every
+    counter that rolls over on that boundary keyed identically.
+    """
+    return local_now(now).strftime("%Y-%m-%d")
 
 
 # --------------------------------------------------------------------------------------

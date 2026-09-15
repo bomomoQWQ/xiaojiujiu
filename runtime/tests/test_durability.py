@@ -9,6 +9,8 @@ both *intact* and *consistent*.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import sqlite3
 from datetime import timedelta
@@ -19,6 +21,7 @@ import pytest
 from companion_runtime import maintenance as maintenance_module
 from companion_runtime.config import RuntimeConfig, load_config, resolve_paths
 from companion_runtime.db import Database
+from companion_runtime.eventlog import EventLog
 from companion_runtime.maintenance import (
     backup,
     checkpoint,
@@ -36,7 +39,7 @@ from companion_runtime.maintenance import (
     wal_path,
 )
 from companion_runtime.runtime import Runtime
-from companion_runtime.typing import EventType
+from companion_runtime.typing import Actor, EventType
 
 from conftest import BASE_TIME, build_config
 
@@ -135,6 +138,319 @@ def test_a_cognitive_round_is_atomic(tmp_path: Path) -> None:
         assert runtime.state().mood_valence == 0.0
     finally:
         runtime.close()
+
+
+class ExplodingMirror:
+    """A mirror file object whose every write fails, as a full disk would."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self._path = args[0] if args else kwargs.get("file")
+
+    def __enter__(self) -> ExplodingMirror:
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
+
+    def write(self, _text: str) -> int:
+        raise OSError(28, "No space left on device", str(self._path))
+
+
+def mirror_lines(mirror: Path) -> list[str]:
+    """Return the non-empty lines currently in the JSONL mirror."""
+    if not mirror.exists():
+        return []
+    return [line for line in mirror.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_jsonl_mirror_never_records_a_rolled_back_event(tmp_path: Path) -> None:
+    """A rolled-back append leaves no mirror line, committed ones leave one.
+
+    The mirror is the disaster-recovery copy of history. Writing it inside the
+    transaction that owns the row would leave it describing an event SQLite
+    never kept, so it waits for the commit.
+    """
+    db = Database(":memory:")
+    db.migrate()
+    mirror = tmp_path / "raw_events.jsonl"
+    log = EventLog(db, mirror)
+    try:
+        with pytest.raises(RuntimeError):
+            with db.transaction() as conn:
+                log.append(
+                    EventType.USER_MESSAGE,
+                    actor=Actor.USER,
+                    content="never committed",
+                    timestamp=BASE_TIME,
+                    connection=conn,
+                )
+                raise RuntimeError("simulated failure inside a cognitive round")
+
+        assert log.count() == 0
+        assert mirror_lines(mirror) == []
+
+        log.append(EventType.USER_MESSAGE, actor=Actor.USER, content="committed", timestamp=BASE_TIME)
+        lines = mirror_lines(mirror)
+        assert len(lines) == 1
+        assert json.loads(lines[0])["content"] == "committed"
+    finally:
+        db.close()
+
+
+def test_jsonl_mirror_records_nested_and_batch_commits_once_in_order(tmp_path: Path) -> None:
+    """One committed transaction mirrors each event exactly once, in order.
+
+    Nested savepoints must not duplicate lines, and a savepoint that rolls back
+    must drop only the events appended inside it.
+    """
+    db = Database(":memory:")
+    db.migrate()
+    mirror = tmp_path / "raw_events.jsonl"
+    log = EventLog(db, mirror)
+    try:
+        with db.transaction() as conn:
+            log.append(
+                EventType.USER_MESSAGE,
+                actor=Actor.USER,
+                content="outer",
+                timestamp=BASE_TIME,
+                connection=conn,
+            )
+            with pytest.raises(RuntimeError):
+                with db.transaction():
+                    log.append(
+                        EventType.USER_MESSAGE,
+                        actor=Actor.USER,
+                        content="rolled back savepoint",
+                        timestamp=BASE_TIME + timedelta(seconds=1),
+                    )
+                    raise RuntimeError("savepoint boom")
+            assert mirror_lines(mirror) == [], "nothing may be mirrored before COMMIT"
+
+        assert [event.content for event in log.read()] == ["outer"]
+        assert [json.loads(line)["content"] for line in mirror_lines(mirror)] == ["outer"]
+
+        written = log.append_many(
+            [
+                {"event_type": EventType.USER_MESSAGE, "actor": Actor.USER, "content": "batch-1"},
+                {"event_type": EventType.ASSISTANT_MESSAGE, "actor": Actor.ASSISTANT, "content": "batch-2"},
+                {"event_type": EventType.USER_MESSAGE, "actor": Actor.USER, "content": "batch-3"},
+            ]
+        )
+        assert len(written) == 3
+        assert [json.loads(line)["content"] for line in mirror_lines(mirror)] == [
+            "outer",
+            "batch-1",
+            "batch-2",
+            "batch-3",
+        ]
+        assert log.count() == len(mirror_lines(mirror)) == 4
+    finally:
+        db.close()
+
+
+def test_jsonl_mirror_keeps_a_committed_savepoint_when_a_sibling_rolls_back(
+    tmp_path: Path,
+) -> None:
+    """A committed savepoint's lines survive a later sibling rollback, in order.
+
+    The nested lines were appended at a deeper level than ``outer-last``, so the
+    mirror may only be written once, at the outermost commit, and only with the
+    lines whose rows actually landed. Rolling the sibling back must not discard or
+    duplicate the savepoint that already succeeded.
+    """
+    db = Database(":memory:")
+    db.migrate()
+    mirror = tmp_path / "raw_events.jsonl"
+    log = EventLog(db, mirror)
+    try:
+        with db.transaction() as conn:
+            log.append(
+                EventType.USER_MESSAGE,
+                actor=Actor.USER,
+                content="outer",
+                timestamp=BASE_TIME,
+                connection=conn,
+            )
+            with db.transaction():
+                log.append(
+                    EventType.USER_MESSAGE,
+                    actor=Actor.USER,
+                    content="inner",
+                    timestamp=BASE_TIME + timedelta(seconds=1),
+                )
+            with pytest.raises(RuntimeError):
+                with db.transaction():
+                    log.append(
+                        EventType.USER_MESSAGE,
+                        actor=Actor.USER,
+                        content="discarded sibling",
+                        timestamp=BASE_TIME + timedelta(seconds=2),
+                    )
+                    raise RuntimeError("sibling boom")
+            assert mirror_lines(mirror) == [], "nothing may be mirrored before COMMIT"
+            log.append(
+                EventType.USER_MESSAGE,
+                actor=Actor.USER,
+                content="outer-last",
+                timestamp=BASE_TIME + timedelta(seconds=3),
+                connection=conn,
+            )
+
+        contents = [json.loads(line)["content"] for line in mirror_lines(mirror)]
+        assert contents == ["outer", "inner", "outer-last"]
+        assert contents == [event.content for event in log.read()]
+        assert log.count() == 3
+        assert log._mirror_frames == {}
+    finally:
+        db.close()
+
+
+def test_jsonl_mirror_records_deeply_nested_savepoints_in_order(tmp_path: Path) -> None:
+    """Released savepoints at several depths commit as one ordered mirror write."""
+    db = Database(":memory:")
+    db.migrate()
+    mirror = tmp_path / "raw_events.jsonl"
+    log = EventLog(db, mirror)
+    try:
+        with db.transaction() as conn:
+            log.append(
+                EventType.USER_MESSAGE,
+                actor=Actor.USER,
+                content="lvl1",
+                timestamp=BASE_TIME,
+                connection=conn,
+            )
+            with db.transaction():
+                log.append(
+                    EventType.USER_MESSAGE,
+                    actor=Actor.USER,
+                    content="lvl2",
+                    timestamp=BASE_TIME + timedelta(seconds=1),
+                )
+                with db.transaction():
+                    log.append(
+                        EventType.USER_MESSAGE,
+                        actor=Actor.USER,
+                        content="lvl3",
+                        timestamp=BASE_TIME + timedelta(seconds=2),
+                    )
+                log.append(
+                    EventType.USER_MESSAGE,
+                    actor=Actor.USER,
+                    content="lvl2b",
+                    timestamp=BASE_TIME + timedelta(seconds=3),
+                    connection=conn,
+                )
+
+        assert [json.loads(line)["content"] for line in mirror_lines(mirror)] == [
+            "lvl1",
+            "lvl2",
+            "lvl3",
+            "lvl2b",
+        ]
+        assert log._mirror_frames == {}
+    finally:
+        db.close()
+
+
+def test_jsonl_mirror_holds_a_released_savepoint_until_the_outer_commit(tmp_path: Path) -> None:
+    """A released savepoint is not a commit: its lines wait for the outermost one.
+
+    Releasing a savepoint only folds it into the enclosing transaction, so an
+    outer rollback must still leave the mirror untouched - including the events
+    appended inside savepoints that had already been released.
+    """
+    db = Database(":memory:")
+    db.migrate()
+    mirror = tmp_path / "raw_events.jsonl"
+    log = EventLog(db, mirror)
+    try:
+        with pytest.raises(RuntimeError):
+            with db.transaction() as conn:
+                log.append(
+                    EventType.USER_MESSAGE,
+                    actor=Actor.USER,
+                    content="outer",
+                    timestamp=BASE_TIME,
+                    connection=conn,
+                )
+                with db.transaction():
+                    log.append(
+                        EventType.USER_MESSAGE,
+                        actor=Actor.USER,
+                        content="released savepoint",
+                        timestamp=BASE_TIME + timedelta(seconds=1),
+                    )
+                assert mirror_lines(mirror) == [], "a released savepoint is not a commit"
+                raise RuntimeError("the outer round failed")
+
+        assert log.count() == 0
+        assert mirror_lines(mirror) == []
+
+        # And the same events do reach the mirror when the round succeeds.
+        with db.transaction() as conn:
+            log.append(
+                EventType.USER_MESSAGE,
+                actor=Actor.USER,
+                content="outer",
+                timestamp=BASE_TIME,
+                connection=conn,
+            )
+            with db.transaction():
+                log.append(
+                    EventType.USER_MESSAGE,
+                    actor=Actor.USER,
+                    content="released savepoint",
+                    timestamp=BASE_TIME + timedelta(seconds=1),
+                )
+        assert [json.loads(line)["content"] for line in mirror_lines(mirror)] == [
+            "outer",
+            "released savepoint",
+        ]
+        assert log.count() == 2
+    finally:
+        db.close()
+
+
+def test_jsonl_mirror_failure_does_not_invalidate_the_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """An unwritable mirror costs a warning, never a committed event."""
+    db = Database(":memory:")
+    db.migrate()
+    mirror = tmp_path / "raw_events.jsonl"
+    log = EventLog(db, mirror)
+    monkeypatch.setattr(Path, "open", ExplodingMirror)
+    try:
+        with caplog.at_level(logging.WARNING, logger="companion_runtime.eventlog"):
+            log.append(EventType.USER_MESSAGE, actor=Actor.USER, content="kept", timestamp=BASE_TIME)
+            with db.transaction() as conn:
+                log.append(
+                    EventType.USER_MESSAGE,
+                    actor=Actor.USER,
+                    content="also kept",
+                    timestamp=BASE_TIME + timedelta(seconds=1),
+                    connection=conn,
+                )
+            assert log._mirror_frames == {}, "a failed flush must not spin forever"
+            # The database accepted both events and stays writable.
+            with db.transaction() as conn:
+                conn.execute(
+                    "INSERT INTO raw_events(event_id, event_type, timestamp, actor, created_at) "
+                    "VALUES('direct', 'user_message', ?, 'user', ?)",
+                    (BASE_TIME.isoformat(), BASE_TIME.isoformat()),
+                )
+
+        assert log.count() == 3
+        assert log.exists(log.read()[0].event_id)
+        contents = {event.content for event in log.read()}
+        assert {"kept", "also kept"} <= contents
+        assert mirror_lines(mirror) == []
+        warnings = [record.getMessage() for record in caplog.records]
+        assert any("JSONL mirror" in message for message in warnings)
+    finally:
+        db.close()
 
 
 def test_wal_survives_process_kill_without_checkpoint(tmp_path: Path) -> None:

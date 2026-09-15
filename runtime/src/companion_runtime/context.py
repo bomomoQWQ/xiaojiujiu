@@ -24,7 +24,14 @@ from typing import Any, Sequence
 from . import candidate as candidate_module
 from .config import RuntimeConfig
 from .projections import Projections
-from .typing import ActionAttempt, AttemptState, CandidateIntent, RuntimeState, UnfinishedStatus
+from .typing import (
+    ActionAttempt,
+    AttemptState,
+    CandidateIntent,
+    MemoryStatus,
+    RuntimeState,
+    UnfinishedStatus,
+)
 from .utility import clamp, isoformat, local_now, utcnow
 
 LOGGER = logging.getLogger("companion_runtime.context")
@@ -193,13 +200,18 @@ def select_memories(
     *,
     limit: int = 4,
 ) -> list[dict[str, Any]]:
-    """Return the most activated memories as prompt-ready items."""
-    pool = projections.memory.list_activated(limit=limit)
+    """Return the most activated memories as prompt-ready items.
+
+    Archived memories are filtered out: archival is the Runtime's own statement that
+    a memory is no longer part of what the character knows, so re-injecting it into
+    the prompt would contradict the decision that produced it.
+    """
+    pool = projections.memory.list_activated_memories(limit=limit)
     memories = projections.memory.get_memories([item.memory_id for item in pool])
     selected: list[dict[str, Any]] = []
     for activated in pool:
         memory = memories.get(activated.memory_id)
-        if memory is None:
+        if memory is None or memory.status != MemoryStatus.ACTIVE.value:
             continue
         selected.append(
             {

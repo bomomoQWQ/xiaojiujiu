@@ -541,13 +541,20 @@ def test_v1_result_for_an_unknown_action_is_reported_not_raised(
 def test_v1_authorize_denies_a_send_under_a_boundary(
     client: TestClient, runtime: Runtime
 ) -> None:
-    """A hard boundary declared through v1 stops the irreversible send."""
-    attempt_id, _render_outbox_id = commit_attempt(runtime)
-    render_ok(client, lease(client)["items"][0], "面试怎么样啦？")
+    """A hard boundary in force stops the irreversible send.
 
+    The boundary is declared *before* the intention exists, so this exercises the
+    authorization gate itself. A boundary that arrives while a message is already
+    rendered is a different story: ingest re-coordinates that attempt immediately
+    and cancels its send row (covered by the Runtime lifecycle tests), so there
+    would be nothing left to lease and therefore nothing to authorize.
+    """
     boundary = post_events(client, [user_event("永远别联系我", "evt_boundary")])
     assert boundary["accepted"] == 1
     assert runtime.projections.boundaries.active(utcnow())
+
+    attempt_id, _render_outbox_id = commit_attempt(runtime)
+    render_ok(client, lease(client)["items"][0], "面试怎么样啦？")
 
     send_action = lease(client)["items"][0]
     assert send_action["action_type"] == "send"

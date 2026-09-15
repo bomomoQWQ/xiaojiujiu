@@ -6,7 +6,10 @@ ground truth. Semantic layers above it may be re-estimated, but the bytes writte
 here stay untouched.
 
 An optional JSONL mirror is written for cheap external inspection and for
-disaster recovery if the SQLite projection is ever rebuilt.
+disaster recovery if the SQLite projection is ever rebuilt. The mirror is
+deliberately *post-commit*: a line appears only after the transaction that holds
+the row has committed, and a mirror IO failure is logged rather than allowed to
+invalidate a commit that already succeeded.
 """
 
 from __future__ import annotations
@@ -39,6 +42,21 @@ class EventQuery:
     newest_first: bool = False
 
 
+@dataclass(slots=True)
+class _MirrorFrame:
+    """Mirror state for one open transaction level.
+
+    A savepoint that releases cleanly hands its frame to its parent
+    (:meth:`EventLog._release_frame`) instead of writing, so the mirror is only
+    ever written once, at the outermost ``COMMIT``, when every line in it is
+    known to have survived. ``events`` is ordered by global append sequence, which
+    is what keeps that single write in append order even though a batch may queue
+    at several levels.
+    """
+
+    events: dict[int, RawEvent]
+
+
 class EventLog:
     """Append-only access to ``raw_events``.
 
@@ -51,6 +69,12 @@ class EventLog:
         self._db = db
         self._mirror_path = Path(mirror_path) if mirror_path else None
         self._mirror_lock = threading.Lock()
+        #: Queued mirror lines, keyed by the transaction frame that owns them. A
+        #: frame is resolved by the outermost commit (written), by a rollback (its
+        #: own lines dropped) or by a released savepoint (handed to its parent).
+        self._mirror_frames: dict[int, _MirrorFrame] = {}
+        #: Monotonic append counter; mirror order follows it across levels.
+        self._mirror_seq = 0
         if self._mirror_path is not None:
             self._mirror_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -85,7 +109,9 @@ class EventLog:
             connection: Optional connection to reuse for a transaction.
 
         Returns:
-            The persisted :class:`RawEvent`.
+            The persisted :class:`RawEvent`. When a mirror is configured the
+            event also reaches it, but only after the transaction that carries
+            the row has committed.
         """
         event = RawEvent(
             event_id=event_id or new_id("event"),
@@ -121,14 +147,27 @@ class EventLog:
         else:
             with self._db.transaction() as conn:
                 conn.execute(sql, params)
-        self._mirror(event)
+        # The mirror is a side effect outside SQLite: it is recorded only once the
+        # transaction that owns the row has committed, and a mirror failure is
+        # logged instead of propagated, so it can never undo a valid commit.
+        self._mirror_after_commit(event)
         return event
 
-    def _mirror(self, event: RawEvent) -> None:
-        """Append the event to the JSONL mirror when enabled."""
+    def _mirror(self, events: Iterable[RawEvent]) -> None:
+        """Append ``events`` to the JSONL mirror, one line per event, in order."""
         if self._mirror_path is None:
             return
-        line = json.dumps(
+        lines = "".join(f"{self._encode_event(event)}\n" for event in events)
+        if not lines:
+            return
+        with self._mirror_lock:
+            with self._mirror_path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(lines)
+
+    @staticmethod
+    def _encode_event(event: RawEvent) -> str:
+        """Render one raw event as a single JSONL line (no trailing newline)."""
+        return json.dumps(
             {
                 "event_id": event.event_id,
                 "event_type": event.event_type,
@@ -142,9 +181,155 @@ class EventLog:
             },
             ensure_ascii=False,
         )
+
+    def _mirror_after_commit(self, event: RawEvent) -> None:
+        """Queue ``event`` for the mirror and flush it once its commit landed.
+
+        Outside a transaction the row is already committed when this runs, so the
+        mirror is written straight away and an append costs no added latency.
+        Inside one the line waits for the outermost ``COMMIT``: a rollback - of
+        the transaction or of a single savepoint - drops exactly the lines queued
+        under the level that was discarded, and a savepoint that releases cleanly
+        moves its lines into its parent instead of writing them early.
+        """
+        if self._mirror_path is None:
+            return
+        depth = self._db.transaction_depth()
+        if depth == 0:
+            # Already committed by autocommit, so it is mirrored right away; the
+            # write still cannot fail the append.
+            self._prune_frames()
+            self._write_mirror_or_warn([event], "1 event")
+            return
         with self._mirror_lock:
-            with self._mirror_path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(line + "\n")
+            frame = self._mirror_frames.get(depth)
+            if frame is None:
+                frame = _MirrorFrame(events={})
+                self._mirror_frames[depth] = frame
+            # One flush is queued per frame on its first event and picks up every
+            # later event of the batch, which is what keeps a batch to a single
+            # mirror write.
+            already_scheduled = bool(frame.events)
+            frame.events[self._next_mirror_seq()] = event
+        if already_scheduled:
+            return
+        # Buffered state and hooks are registered together; every hook closes over
+        # its own frame, so a level resolves exactly the lines it owns: the flush
+        # writes them at the outermost commit, the rollback hook drops them if the
+        # rows go away, and the release hook hands them up to the parent savepoint.
+        self._db.post_commit(lambda: self._flush_mirror(frame))
+        self._db.on_rollback(lambda: self._discard_frame(frame))
+        self._db.on_release(lambda: self._release_frame(frame))
+
+    def _flush_mirror(self, frame: _MirrorFrame) -> None:
+        """Write everything still queued once the outermost commit has landed.
+
+        Events are written in append order and only once, which is what keeps the
+        mirror a faithful prefix of the event log. A frame can own more than one
+        entry when savepoints handed their lines up to it.
+        """
+        with self._mirror_lock:
+            entries = self._collect_frame(frame)
+        if entries:
+            self._write_mirror_or_warn(
+                [event for _seq, event in entries], f"{len(entries)} event(s)"
+            )
+
+    def _release_frame(self, frame: _MirrorFrame) -> None:
+        """Hand a released savepoint's lines to its parent level.
+
+        A released savepoint is neither a commit nor a rollback: its rows now
+        belong to the enclosing transaction, so its lines must commit or roll back
+        with the parent instead of being written early or dropped. A frame with no
+        enclosing frame to adopt it simply drops its lines.
+        """
+        with self._mirror_lock:
+            # Resolve the parent *before* unregistering this frame: the parent is
+            # found by looking at the depths still holding this one.
+            parent = self._parent_frame(frame)
+            entries = self._collect_frame(frame)
+            if not entries or parent is None:
+                return
+            for event_seq, event in entries:
+                parent.events[event_seq] = event
+        # The parent needs a flush of its own for the adopted lines: its earlier
+        # one has already run or carries only its own events.
+        self._db.post_commit(lambda: self._flush_mirror(parent))
+
+    def _discard_frame(self, frame: _MirrorFrame) -> None:
+        """Drop a level's lines after its rows were rolled back.
+
+        Everything queued at that level or deeper goes with it: those savepoints
+        were inside the rolled-back transaction, so none of their lines survive,
+        and an orphaned frame from an earlier failure must not be resurrected
+        either.
+        """
+        with self._mirror_lock:
+            depths = self._frame_depths(frame)
+            if not depths:
+                return
+            for depth in [d for d in self._mirror_frames if d >= depths[0]]:
+                del self._mirror_frames[depth]
+
+    def _collect_frame(self, frame: _MirrorFrame) -> list[tuple[int, RawEvent]]:
+        """Remove every entry belonging to ``frame`` and return them in order."""
+        collected: list[tuple[int, RawEvent]] = []
+        for depth in self._frame_depths(frame):
+            collected.extend(self._mirror_frames.pop(depth).events.items())
+        collected.sort()
+        return collected
+
+    def _frame_depths(self, frame: _MirrorFrame) -> list[int]:
+        """Return the registered depths holding ``frame``, shallowest first."""
+        return sorted(
+            depth for depth, candidate in self._mirror_frames.items() if candidate is frame
+        )
+
+    def _next_mirror_seq(self) -> int:
+        """Return the next global append sequence number."""
+        self._mirror_seq += 1
+        return self._mirror_seq
+
+    def _parent_frame(self, frame: _MirrorFrame) -> _MirrorFrame | None:
+        """Return the frame of the immediately enclosing transaction level."""
+        depths = self._frame_depths(frame)
+        if not depths or depths[0] <= 1:
+            return None
+        return self._mirror_frames.get(depths[0] - 1)
+
+    def _prune_frames(self) -> None:
+        """Drop queued lines whose transaction can no longer resolve them.
+
+        A transaction abandoned without commit or rollback (a crash path, or a
+        connection closed mid-round) leaves its frames behind; the next append
+        starts from a clean depth map instead of resurrecting them.
+        """
+        with self._mirror_lock:
+            if self._db.transaction_depth() == 0 and self._mirror_frames:
+                LOGGER.warning(
+                    "Discarding %d stale JSONL mirror frame(s) from an unresolvable "
+                    "transaction",
+                    len(self._mirror_frames),
+                )
+                self._mirror_frames.clear()
+
+    def _write_mirror_or_warn(self, events: Sequence[RawEvent], count_label: str) -> None:
+        """Write ``events`` to the mirror, downgrading IO failures to a warning.
+
+        A mirror failure must never invalidate database state: by the time a
+        buffered batch is written, the transaction that owns those rows has
+        committed, so the failure is reported and dropped rather than raised.
+        """
+        try:
+            self._mirror(events)
+        except OSError:
+            LOGGER.warning(
+                "Could not write %s to the JSONL mirror %s; the database commit "
+                "stands and no mirror line was recorded",
+                count_label,
+                self._mirror_path,
+                exc_info=True,
+            )
 
     def append_many(self, events: Iterable[dict[str, Any]]) -> list[RawEvent]:
         """Append several events inside one transaction.

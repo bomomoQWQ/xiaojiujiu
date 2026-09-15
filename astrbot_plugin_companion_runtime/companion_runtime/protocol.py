@@ -301,7 +301,12 @@ class LeasedAction:
 
 @dataclass
 class LeaseHeartbeat:
-    """Lease extension for a long running action (``POST /v1/outbox/{id}/heartbeat``)."""
+    """Lease extension for a long running action (``POST /v1/outbox/{id}/heartbeat``).
+
+    The Runtime answers with ``extended``: ``false`` means the lease is gone
+    (expired, held by another adapter, or unknown), which the adapter reads as
+    "stop working on this action" rather than as a retryable error.
+    """
 
     adapter_id: str
     action_id: str

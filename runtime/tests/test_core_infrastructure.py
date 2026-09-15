@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -313,6 +314,139 @@ def test_nested_transaction_uses_savepoint() -> None:
                     raise RuntimeError("inner boom")
         assert db.query_one("SELECT 1 FROM raw_events WHERE event_id = 'a'") is not None
         assert db.query_one("SELECT 1 FROM raw_events WHERE event_id = 'b'") is None
+    finally:
+        db.close()
+
+
+def test_post_commit_hooks_follow_the_commit_boundary() -> None:
+    """A post-commit hook runs only when its transaction actually commits."""
+    db = Database(":memory:")
+    db.migrate()
+    try:
+        # Autocommit: there is nothing to wait for.
+        ran: list[str] = []
+        db.post_commit(lambda: ran.append("immediate"))
+        assert ran == ["immediate"]
+
+        # A rolled-back transaction drops its hooks.
+        with pytest.raises(RuntimeError):
+            with db.transaction():
+                db.post_commit(lambda: ran.append("rollback"))
+                raise RuntimeError("boom")
+        assert ran == ["immediate"]
+
+        # Nested levels commit together, in registration order, exactly once.
+        with db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO raw_events(event_id, event_type, timestamp, actor, created_at) "
+                "VALUES('a', 't', 'now', 'user', 'now')"
+            )
+            db.post_commit(lambda: ran.append("outer"))
+            assert ran == ["immediate"], "hooks must not run before COMMIT"
+            with db.transaction():
+                db.post_commit(lambda: ran.append("inner"))
+                assert ran == ["immediate"]
+            with pytest.raises(RuntimeError):
+                with db.transaction():
+                    db.post_commit(lambda: ran.append("discarded"))
+                    raise RuntimeError("savepoint boom")
+            db.post_commit(lambda: ran.append("outer-last"))
+        assert ran == ["immediate", "outer", "inner", "outer-last"]
+    finally:
+        db.close()
+
+
+def test_nested_commit_then_sibling_rollback_keeps_hook_order() -> None:
+    """A savepoint that committed keeps its hooks when a sibling rolls back.
+
+    Each level is buffered on its own, so rolling one savepoint back discards
+    only the hooks registered inside it. Hooks that already survived their own
+    savepoint stay queued, in registration order, for the outermost commit.
+    """
+    db = Database(":memory:")
+    db.migrate()
+    ran: list[str] = []
+    try:
+        with db.transaction():
+            db.post_commit(lambda: ran.append("outer"))
+            with db.transaction():
+                db.post_commit(lambda: ran.append("inner"))
+                with db.transaction():
+                    db.post_commit(lambda: ran.append("grand-inner"))
+                db.post_commit(lambda: ran.append("inner-last"))
+            with pytest.raises(RuntimeError):
+                with db.transaction():
+                    db.post_commit(lambda: ran.append("sibling"))
+                    raise RuntimeError("sibling boom")
+            assert ran == [], "nothing may run before the outermost COMMIT"
+            db.post_commit(lambda: ran.append("outer-last"))
+        assert ran == ["outer", "inner", "grand-inner", "inner-last", "outer-last"]
+    finally:
+        db.close()
+
+
+def test_rollback_hooks_only_fire_for_a_real_rollback() -> None:
+    """Release is a success: discard hooks are dropped, not fired."""
+    db = Database(":memory:")
+    db.migrate()
+    ran: list[str] = []
+    try:
+        # A released savepoint hands its work to the parent, so its discard hook
+        # must not run - the rows are still there.
+        with db.transaction():
+            with db.transaction():
+                db.on_rollback(lambda: ran.append("released-level"))
+                db.on_release(lambda: ran.append("released"))
+            assert ran == ["released"]
+        assert ran == ["released"]
+
+        # A discarded savepoint fires only its own discard hook.
+        with db.transaction():
+            with db.transaction():
+                db.on_rollback(lambda: ran.append("survivor"))
+                db.on_release(lambda: ran.append("survivor-release"))
+            assert ran == ["released", "survivor-release"]
+            with pytest.raises(RuntimeError):
+                with db.transaction():
+                    db.on_rollback(lambda: ran.append("discarded-level"))
+                    raise RuntimeError("boom")
+            assert ran == ["released", "survivor-release", "discarded-level"]
+        assert ran == ["released", "survivor-release", "discarded-level"]
+
+        # An outer rollback discards every level inside it.
+        with pytest.raises(RuntimeError):
+            with db.transaction():
+                with db.transaction():
+                    db.on_rollback(lambda: ran.append("inner-of-rollback"))
+                    db.on_release(lambda: ran.append("inner-release"))
+                raise RuntimeError("outer boom")
+        assert ran[-1] == "inner-of-rollback"
+        assert "inner-release" in ran
+    finally:
+        db.close()
+
+
+def test_post_commit_hook_failure_does_not_break_the_commit(caplog) -> None:
+    """A failing hook is logged; the committed write stays committed."""
+
+    def explode() -> None:
+        raise OSError("hook failed")
+
+    db = Database(":memory:")
+    db.migrate()
+    try:
+        with caplog.at_level(logging.WARNING, logger="companion_runtime.db"):
+            with db.transaction() as conn:
+                conn.execute(
+                    "INSERT INTO raw_events(event_id, event_type, timestamp, actor, created_at) "
+                    "VALUES('kept', 't', 'now', 'user', 'now')"
+                )
+                db.post_commit(explode)
+        assert db.query_one("SELECT 1 FROM raw_events WHERE event_id = 'kept'") is not None
+        assert any("Post-commit hook failed" in record.getMessage() for record in caplog.records)
+        # The connection is still usable afterwards.
+        with db.transaction():
+            pass
     finally:
         db.close()
 

@@ -18,7 +18,16 @@ from .coerce import as_bool, as_float, as_int, as_str, clamp
 #: never has to be written into the plugin config file.
 TOKEN_ENV_VAR = "COMPANION_RUNTIME_TOKEN"
 
-DEFAULT_BASE_URL = "http://127.0.0.1:8720"
+#: Must match the Runtime's own default (``RuntimeConfig.port``). A mismatch is
+#: invisible until an operator wonders why nothing ever arrives.
+DEFAULT_BASE_URL = "http://127.0.0.1:8787"
+
+#: How long plugin termination waits for leased actions that are already in
+#: flight before it cancels them. Delivery is irreversible, so cancelling an
+#: authorized send mid-flight is what makes a duplicate possible; this window is
+#: the adapter's only defence and stays short so unloading a plugin stays
+#: responsive. Not a config key: it is a lifecycle policy, not a preference.
+SHUTDOWN_GRACE_S = 5.0
 
 #: ``on_llm_request`` runs inside AstrBot's LLM request path. Its context fetch
 #: is capped at this hard upper bound regardless of what is configured.

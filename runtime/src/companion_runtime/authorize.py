@@ -125,11 +125,37 @@ def authorize(
             allow_reply=False,
         )
 
+    # --- attempt integrity, read before the budget so the budget can tell a
+    # *decision* apart from the *delivery* of a decision already taken.
+    attempt: ActionAttempt | None = None
+    if request.attempt_id is not None:
+        attempt = projections.attempts.get(request.attempt_id)
+        if attempt is None:
+            return _deny(
+                "unknown_attempt",
+                constraints=constraints,
+                blocking=blocking,
+                allow_reply=verdict.allow_reply,
+            )
+
     # --- contact budget.
     # A message that was already committed is in its *delivery* stage: the
-    # decision was made under the old conditions, so the cooldown and the daily
-    # budget no longer apply. Only boundaries can still stop it.
-    if request.is_proactive and request.action != "send":
+    # decision to reach out was made under the old conditions, so the cooldown
+    # and the daily budget must not be applied a second time. That exemption
+    # cannot be keyed on the action name alone: committing an attempt starts a
+    # cooldown, so gating the ``render`` step of that same attempt on the
+    # cooldown the commit just set would deadlock every proactive message the
+    # Runtime had already decided to send. Any request naming an attempt that has
+    # left ``proposed`` is therefore delivery-stage; only boundaries can still
+    # stop it.
+    #
+    # The daily budget itself counts *delivered* messages only (it is charged in
+    # ``Reducer.mark_delivered``), which is what makes this check mean "how many
+    # times have I actually reached out today".
+    delivery_stage = request.action == "send" or (
+        attempt is not None and attempt.state != AttemptState.PROPOSED.value
+    )
+    if request.is_proactive and not delivery_stage:
         if runtime_state.cooldown_until is not None and runtime_state.cooldown_until > stamp:
             return _deny(
                 "cooldown_active",
@@ -145,16 +171,8 @@ def authorize(
                 allow_reply=verdict.allow_reply,
             )
 
-    # --- attempt integrity
-    if request.attempt_id is not None:
-        attempt = projections.attempts.get(request.attempt_id)
-        if attempt is None:
-            return _deny(
-                "unknown_attempt",
-                constraints=constraints,
-                blocking=blocking,
-                allow_reply=verdict.allow_reply,
-            )
+    # --- attempt integrity (continued)
+    if attempt is not None:
         attempt_reason = _attempt_blocking_reason(attempt)
         if attempt_reason is not None:
             return _deny(

@@ -135,6 +135,21 @@ class ConfigSchemaTests(unittest.TestCase):
         self.assertTrue(field["secret"])
         self.assertEqual(field["default"], "")
 
+    def test_default_runtime_url_matches_the_settings_default(self) -> None:
+        """A schema default that disagrees with ``Settings`` is a silent outage.
+
+        The WebUI writes the schema default into the config, so the two drifting
+        apart means a fresh install talks to the wrong port and nothing anywhere
+        says so. 8787 is the Runtime's own default (``RuntimeConfig.port``).
+        """
+        from companion_runtime.settings import DEFAULT_BASE_URL
+
+        self.assertEqual(self.schema["runtime_base_url"]["default"], DEFAULT_BASE_URL)
+        self.assertTrue(
+            DEFAULT_BASE_URL.endswith(":8787"),
+            f"the Runtime listens on 8787 by default, not {DEFAULT_BASE_URL}",
+        )
+
     def test_token_is_never_logged(self) -> None:
         main_source = (PLUGIN_ROOT / "main.py").read_text(encoding="utf-8")
         for line in main_source.splitlines():

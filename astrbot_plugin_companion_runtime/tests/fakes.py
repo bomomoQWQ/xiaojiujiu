@@ -73,6 +73,7 @@ class FakeTransport:
         lease_error: Exception | None = None,
         authorize_error: Exception | None = None,
         heartbeat_error: Exception | None = None,
+        heartbeat_extended: bool = True,
         report_error: Exception | None = None,
         health: dict[str, Any] | None = None,
         health_error: Exception | None = None,
@@ -85,6 +86,9 @@ class FakeTransport:
         self.lease_error = lease_error
         self.authorize_error = authorize_error
         self.heartbeat_error = heartbeat_error
+        #: What the Runtime answers to a lease heartbeat. ``False`` means it
+        #: refused the extension, i.e. the lease is gone.
+        self.heartbeat_extended = heartbeat_extended
         self.report_error = report_error
         #: Advisory health payload used by the status command. ``None`` means the
         #: Runtime either predates patch v0.2 or is unreachable. The default
@@ -136,7 +140,7 @@ class FakeTransport:
         self.heartbeat_requests.append(request)
         if self.heartbeat_error is not None:
             raise self.heartbeat_error
-        return True
+        return self.heartbeat_extended
 
     async def authorize_action(self, request: Any, *, timeout_s: float) -> AuthorizeDecision:
         self.authorize_requests.append(request)

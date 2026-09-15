@@ -412,6 +412,42 @@ TEMPLATES_NEUTRAL = (
 )
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Return ``value`` as a finite float, or ``default``.
+
+    Cache keys are built from persisted numbers, and a key builder that raises
+    because one column holds ``nan`` or a string would take the whole turn down.
+    A non-finite value is not a state the explainer can describe, so it is
+    normalised rather than allowed to poison the key.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number or number in (float("inf"), float("-inf")):
+        return default
+    return number
+
+
+def _rounded(value: Any) -> float:
+    """Return one decimal of a persisted number, tolerating corrupt values."""
+    return round(_safe_float(value), 1)
+
+
+def _direction_token(dominant: EmotionEvent | None) -> str:
+    """Return a stable cache-key token for a dominant event's direction."""
+    if dominant is None:
+        return "none"
+    return str(dominant.direction or "none")
+
+
+def _label_token(dominant: EmotionEvent | None) -> str:
+    """Return a stable cache-key token for a dominant event's semantic label."""
+    if dominant is None:
+        return "none"
+    return str(dominant.semantic_label or "none")
+
+
 class EmotionExplainer:
     """Translates structured state into first-person psychological context.
 
@@ -432,18 +468,28 @@ class EmotionExplainer:
 
     @staticmethod
     def cache_key(state: RuntimeState, active: Sequence[EmotionEvent]) -> str:
-        """Return a coarse cache key that changes only on meaningful movement."""
-        top = max((e.intensity for e in active), default=0.0)
+        """Return a coarse cache key that changes only on meaningful movement.
+
+        The key carries the *identity* of the dominant emotion as well as its
+        intensity: an explanation is about one thing being felt, so replacing a
+        dominant negative event with a dominant positive one of the same magnitude
+        must invalidate the entry. Intensity alone did not - the two states produced
+        the same key and the old prose was served for the new feeling.
+        """
+        dominant = max(active, key=lambda event: event.intensity, default=None)
+        top = dominant.intensity if dominant is not None else 0.0
         sign = "+" if state.mood_valence >= 0 else "-"
         return "|".join(
             [
-                f"v{round(state.mood_valence, 1)}",
-                f"a{round(state.mood_arousal, 1)}",
-                f"i{round(state.approach_impulse, 1)}",
-                f"r{round(state.restraint, 1)}",
-                f"p{round(state.pressure, 1)}",
+                f"v{_rounded(state.mood_valence)}",
+                f"a{_rounded(state.mood_arousal)}",
+                f"i{_rounded(state.approach_impulse)}",
+                f"r{_rounded(state.restraint)}",
+                f"p{_rounded(state.pressure)}",
                 f"m{top:.1f}",
                 sign,
+                f"d{_direction_token(dominant)}",
+                f"l{_label_token(dominant)}",
             ]
         )
 
@@ -499,7 +545,7 @@ class EmotionExplainer:
                 return dict(cached) | {"cache_hit": True, "cache_key": key}
 
         payload = self._build_input(state, active)
-        result = self._render(payload, rng or random.Random(0))
+        result = self._render(payload, rng or random.Random(0), cache_key=key)
         result["source"] = "semantic" if self._semantic_available() else "template"
         result["cache_hit"] = False
         result["cache_key"] = key
@@ -581,6 +627,11 @@ class EmotionExplainer:
                 }
                 for e in sorted(active, key=lambda e: e.intensity, reverse=True)[:4]
             ],
+            # The peak over *every* active event, not just the four listed above.
+            # :meth:`cache_key_from_payload` derives the same value from it, so the
+            # provider-side key matches the Runtime-side key even when the active set
+            # is longer than the payload's list.
+            "max_intensity": round(dominant.intensity, 3) if dominant is not None else 0.0,
             "dominant": None
             if dominant is None
             else {
@@ -593,15 +644,29 @@ class EmotionExplainer:
             "pressure": round(state.pressure, 3),
         }
 
-    def _render(self, payload: dict[str, Any], rng: random.Random) -> dict[str, Any]:
+    def _render(
+        self,
+        payload: dict[str, Any],
+        rng: random.Random,
+        *,
+        cache_key: str | None = None,
+    ) -> dict[str, Any]:
         """Render the explanation, delegating to the provider when available.
 
         A provider is a *cache filler*, never a requirement: patch v0.2 keeps the
         deep interpretation optional and falls back to the deterministic template.
+
+        Args:
+            payload: Structured state handed to the provider.
+            rng: Random source used for template variety.
+            cache_key: The caller's own cache key. It is passed to the provider so
+                that its cache and the Runtime's cache are keyed by exactly the same
+                string; recomputing one from the payload would let the two disagree
+                and serve prose the Runtime considers stale.
         """
         if self._provider is not None and self._semantic_available():
             try:
-                provided = self._call_provider(payload)
+                provided = self._call_provider(payload, cache_key=cache_key)
                 required = {"experience", "impulse", "inhibition"}
                 if isinstance(provided, Mapping) and required.issubset(provided.keys()):
                     return {
@@ -623,11 +688,17 @@ class EmotionExplainer:
 
         return self._render_template(payload, rng)
 
-    def _call_provider(self, payload: dict[str, Any]) -> Any:
-        """Call the provider through whichever explanation interface it offers."""
+    def _call_provider(self, payload: dict[str, Any], *, cache_key: str | None = None) -> Any:
+        """Call the provider through whichever explanation interface it offers.
+
+        The relevant cache key is passed through rather than recomputed from the
+        payload, so a provider that caches internally cannot collide two states the
+        Runtime treats as distinct.
+        """
         explain_state = getattr(self._provider, "explain_state", None)
         if callable(explain_state):
-            return explain_state(payload, state_key=EmotionExplainer.cache_key_from_payload(payload))
+            key = cache_key or EmotionExplainer.cache_key_from_payload(payload)
+            return explain_state(payload, state_key=key)
         explain = getattr(self._provider, "explain", None)
         if callable(explain):
             return explain(payload)
@@ -637,18 +708,31 @@ class EmotionExplainer:
     def cache_key_from_payload(payload: Mapping[str, Any]) -> str:
         """Return a cache key for a raw explainer payload.
 
-        Used when the provider is invoked directly with the payload rather than
-        through :meth:`explain`, so the provider-side cache stays aligned with the
-        Runtime-side one.
+        Used when a provider is invoked with the payload but without a key, and by
+        the reducer when storing a provider-supplied interpretation. The segments
+        match :meth:`cache_key` exactly - including the dominant event's identity -
+        so a key built either way names the same state.
         """
         mood = payload.get("background_mood") or {}
+        dominant = payload.get("dominant") or {}
+        peak = payload.get("max_intensity")
+        if peak is None:
+            # A payload stored before ``max_intensity`` existed: the dominant entry is
+            # the best available source, and it is exact whenever the active set was
+            # short enough to be listed in full.
+            peak = dominant.get("intensity")
+        sign = "+" if _safe_float(mood.get("valence")) >= 0 else "-"
         return "|".join(
             [
-                f"v{round(float(mood.get('valence', 0.0)), 1)}",
-                f"a{round(float(mood.get('arousal', 0.0)), 1)}",
-                f"i{round(float(payload.get('approach_impulse', 0.0)), 1)}",
-                f"r{round(float(payload.get('restraint', 0.0)), 1)}",
-                f"p{round(float(payload.get('pressure', 0.0)), 1)}",
+                f"v{_rounded(mood.get('valence'))}",
+                f"a{_rounded(mood.get('arousal'))}",
+                f"i{_rounded(payload.get('approach_impulse'))}",
+                f"r{_rounded(payload.get('restraint'))}",
+                f"p{_rounded(payload.get('pressure'))}",
+                f"m{_safe_float(peak):.1f}",
+                sign,
+                f"d{dominant.get('direction') or 'none'}",
+                f"l{dominant.get('label') or 'none'}",
             ]
         )
 

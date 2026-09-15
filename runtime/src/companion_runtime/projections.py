@@ -411,7 +411,15 @@ class EmotionProjection:
         connection.execute("DELETE FROM active_emotion_events")
 
     def cached_explanation(self, cache_key: str, now: datetime, ttl_seconds: float) -> dict[str, Any] | None:
-        """Return a cached emotion explanation when it is still fresh."""
+        """Return a cached emotion explanation when it is still fresh.
+
+        The age is measured with the caller's ``now``, and an entry whose timestamp
+        lies in the future is rejected rather than served. A future timestamp makes
+        ``age`` negative, and a negative age is below every TTL - so a clock step, a
+        replayed timeline or a hand-edited row would have made a stale explanation
+        permanently valid. The caller's ``now`` is used (not the wall clock) so that
+        a caller driving a simulated timeline gets the same answer every time.
+        """
         row = self._db.query_one(
             "SELECT * FROM emotion_explanations WHERE cache_key = ? ORDER BY last_used_at DESC LIMIT 1",
             (cache_key,),
@@ -420,7 +428,13 @@ class EmotionProjection:
         if data is None:
             return None
         last_used = parse_datetime(data.get("last_used_at"))
-        if last_used is None or (ensure_aware(now) - last_used).total_seconds() > ttl_seconds:
+        if last_used is None:
+            return None
+        reference = ensure_aware(now)
+        if reference is None:
+            return None
+        age = (reference - last_used).total_seconds()
+        if age < 0.0 or age > max(0.0, float(ttl_seconds)):
             return None
         return data.get("payload_json") or None
 
@@ -821,6 +835,30 @@ class MemoryProjection:
         )
         return [self._to_activation(row) for row in rows]
 
+    def list_activated_memories(
+        self, status: str | Sequence[str] = MemoryStatus.ACTIVE.value, limit: int = 20
+    ) -> list[ActivatedMemory]:
+        """Return activation-pool entries whose memory is still in ``status``.
+
+        The activation pool is a working set, not a second retention state: archival
+        is how the Runtime says "this is no longer part of what I know", and an entry
+        left in the pool keeps that memory in every prompt. Filtering here rather
+        than at each call site means a forgotten memory cannot be re-injected by a
+        path that forgot to check.
+        """
+        statuses = [status] if isinstance(status, str) else [str(item) for item in status]
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        rows = self._db.query(
+            "SELECT a.* FROM activated_memories a "
+            "JOIN memories m ON m.memory_id = a.memory_id "
+            f"WHERE a.activation > 0 AND m.status IN ({placeholders}) "
+            "ORDER BY a.activation DESC LIMIT ?",
+            (*statuses, int(limit)),
+        )
+        return [self._to_activation(row) for row in rows]
+
     def upsert_activation(self, connection: sqlite3.Connection, activated: ActivatedMemory) -> None:
         """Insert or replace one activation row."""
         connection.execute(
@@ -1030,14 +1068,30 @@ class AttemptProjection:
         row = self._db.query_one("SELECT * FROM action_attempts WHERE attempt_id = ?", (attempt_id,))
         return self._to_attempt(row) if row is not None else None
 
-    def list_by_state(self, states: Sequence[str], limit: int = 50) -> list[ActionAttempt]:
-        """Return attempts in the given states, oldest first."""
+    def list_by_state(
+        self, states: Sequence[str], limit: int = 50, newest_first: bool = False
+    ) -> list[ActionAttempt]:
+        """Return attempts in the given states, oldest first by default.
+
+        Args:
+            states: Attempt states to include.
+            limit: Maximum number of rows.
+            newest_first: Order by ``created_at DESC`` instead of ``ASC``. A
+                caller that wants "the most recent intention" (attributing a
+                reply to the message that was just sent, for example) must ask
+                for this order explicitly, because ``limit=1`` on the default
+                order returns the *oldest* matching attempt.
+
+        Returns:
+            The matching attempts.
+        """
         if not states:
             return []
         placeholders = ",".join("?" for _ in states)
+        direction = "DESC" if newest_first else "ASC"
         rows = self._db.query(
             f"SELECT * FROM action_attempts WHERE state IN ({placeholders}) "
-            "ORDER BY created_at ASC LIMIT ?",
+            f"ORDER BY created_at {direction} LIMIT ?",
             (*states, int(limit)),
         )
         return [self._to_attempt(row) for row in rows]
@@ -1214,6 +1268,64 @@ class OutboxProjection:
         )
         return [self._to_item(row) for row in rows]
 
+    def find_for_attempt(
+        self,
+        attempt_id: str,
+        *,
+        kind: str | None = None,
+        statuses: Sequence[str] | None = None,
+    ) -> list[OutboxItem]:
+        """Return the outbox rows that reference ``attempt_id``, live rows first.
+
+        This is a **targeted lookup, not a page**: ``list_items`` is a paged
+        newest-first view used for inspection, so filtering its first page in
+        Python silently loses the row as soon as enough unrelated rows exist.
+        A caller that has to find *the* row for an attempt (``/rendered``) must
+        ask the database for it instead.
+
+        The candidate set is narrowed in SQL by kind and by a literal match on
+        the compact ``payload_json`` rendering, then verified in Python by
+        decoding the payload and comparing ``attempt_id`` exactly. The
+        verification matters because the SQL filter is a substring match: it is
+        used only as an index-friendly pre-filter, never as the answer.
+
+        Rows that can still be worked on come first (``pending``, then
+        ``leased``), because a re-coordination can leave an older settled row
+        behind a live one and the live row is the one a report belongs to.
+
+        Args:
+            attempt_id: Attempt whose rows are wanted.
+            kind: Optional restriction to one outbox kind.
+            statuses: Optional restriction to specific statuses.
+
+        Returns:
+            Matching rows, live-first and newest-first inside each group.
+        """
+        identifier = str(attempt_id or "")
+        if not identifier:
+            return []
+        clauses = ["payload_json LIKE ?"]
+        params: list[Any] = [f'%"{identifier}"%']
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        rows = self._db.query(
+            "SELECT * FROM outbox WHERE " + " AND ".join(clauses) +
+            " ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'leased' THEN 1 ELSE 2 END, "
+            "created_at DESC, rowid DESC",
+            tuple(params),
+        )
+        found: list[OutboxItem] = []
+        for row in rows:
+            item = self._to_item(row)
+            if str(item.payload.get("attempt_id") or "") == identifier:
+                found.append(item)
+        return found
+
     def reclaim_expired(self, connection: sqlite3.Connection, now: datetime) -> int:
         """Return expired leases to the pending pool or fail them.
 
@@ -1294,17 +1406,99 @@ class OutboxProjection:
                 claimed.append(item)
         return claimed
 
-    def ack(self, connection: sqlite3.Connection, outbox_id: str, now: datetime | None = None) -> bool:
+    def settle(
+        self,
+        connection: sqlite3.Connection,
+        outbox_id: str,
+        *,
+        status: str,
+        error: str | None = None,
+        now: datetime | None = None,
+        expect_owner: str | None = None,
+    ) -> bool:
+        """Record the Runtime's own outcome for a row that still expects work.
+
+        ``pending`` and ``leased`` are the only statuses that expect work, so they
+        are the only ones this touches; a row a worker already acknowledged, a
+        worker already failed, or a reconcile already cancelled is left exactly as
+        it is, which makes a repeated call a no-op rather than a rewrite.
+
+        This is deliberately **not** :meth:`ack`: ``ack`` is a worker's
+        acknowledgement of a lease it holds, and refusing an unleased row is what
+        makes ``POST /outbox/{id}/ack`` a meaningful 409. ``settle`` is the
+        Runtime recording an outcome it determined itself -- a render report can
+        legitimately arrive for a row nobody leased yet -- so it does not require
+        a lease.
+
+        Args:
+            connection: Write connection of the enclosing transaction.
+            outbox_id: Row to settle.
+            status: ``delivered`` (the work is done) or ``failed``.
+            error: Reason recorded in ``last_error`` when failing.
+            now: Acknowledgement time for ``delivered``.
+            expect_owner: When given, the stored lease owner must match.
+
+        Returns:
+            ``True`` when the row was transitioned.
+
+        Raises:
+            ValueError: If ``status`` is neither ``delivered`` nor ``failed``.
+        """
+        if status not in (OutboxStatus.DELIVERED.value, OutboxStatus.FAILED.value):
+            raise ValueError(f"cannot settle an outbox row as {status!r}")
+        if status == OutboxStatus.DELIVERED.value:
+            sql = (
+                "UPDATE outbox SET status = 'delivered', acked_at = COALESCE(acked_at, ?), "
+                "lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE outbox_id = ? AND status IN ('pending', 'leased')"
+            )
+            params: list[Any] = [isoformat(now or utcnow()), outbox_id]
+        else:
+            sql = (
+                "UPDATE outbox SET status = 'failed', last_error = COALESCE(?, last_error), "
+                "lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE outbox_id = ? AND status IN ('pending', 'leased')"
+            )
+            params = [error, outbox_id]
+        if expect_owner is not None:
+            sql += " AND lease_owner = ?"
+            params.append(expect_owner)
+        cursor = connection.execute(sql, tuple(params))
+        return bool(cursor.rowcount)
+
+    def ack(
+        self,
+        connection: sqlite3.Connection,
+        outbox_id: str,
+        now: datetime | None = None,
+        *,
+        expect_owner: str | None = None,
+    ) -> bool:
         """Mark a leased row as delivered.
+
+        Args:
+            connection: Write connection of the enclosing transaction.
+            outbox_id: Row to acknowledge.
+            now: Acknowledgement time.
+            expect_owner: When given, the stored lease owner must match. A caller
+                that knows which worker holds the lease (the API passes whatever
+                its client supplied) can therefore refuse to acknowledge work
+                another worker is still responsible for. Omitting it preserves
+                the historical behaviour exactly, which is what keeps existing
+                callers -- including the delivery worker -- working unchanged.
 
         Returns:
             ``True`` when a leased row was transitioned.
         """
-        cursor = connection.execute(
+        sql = (
             "UPDATE outbox SET status = 'delivered', acked_at = ?, lease_owner = NULL, "
-            "lease_expires_at = NULL WHERE outbox_id = ? AND status = 'leased'",
-            (isoformat(now or utcnow()), outbox_id),
+            "lease_expires_at = NULL WHERE outbox_id = ? AND status = 'leased'"
         )
+        params: list[Any] = [isoformat(now or utcnow()), outbox_id]
+        if expect_owner is not None:
+            sql += " AND lease_owner = ?"
+            params.append(expect_owner)
+        cursor = connection.execute(sql, tuple(params))
         return bool(cursor.rowcount)
 
     def nack(
@@ -1315,31 +1509,112 @@ class OutboxProjection:
         error: str,
         retry_at: datetime | None = None,
         terminal: bool = False,
+        expect_owner: str | None = None,
     ) -> bool:
         """Return a leased row to the queue, or fail it terminally.
+
+        Args:
+            connection: Write connection of the enclosing transaction.
+            outbox_id: Row to release.
+            error: Reason recorded on the row.
+            retry_at: Earliest time the row may be claimed again.
+            terminal: Fail the row outright instead of requeueing it.
+            expect_owner: When given, the stored lease owner must match; omitting
+                it keeps the previous owner-agnostic behaviour. The lookup and
+                both updates are guarded by the same condition, so a row that is
+                re-leased between them cannot be touched by mistake.
 
         Returns:
             ``True`` when the row was updated.
         """
         row = connection.execute(
-            "SELECT attempts, max_attempts, status FROM outbox WHERE outbox_id = ?", (outbox_id,)
+            "SELECT attempts, max_attempts, status, lease_owner FROM outbox WHERE outbox_id = ?",
+            (outbox_id,),
         ).fetchone()
         if row is None or row["status"] != OutboxStatus.LEASED.value:
             return False
+        if expect_owner is not None and (row["lease_owner"] or "") != expect_owner:
+            return False
         exhausted = bool(row["attempts"] >= row["max_attempts"])
+        guard = " AND status = 'leased'"
+        guard_params: list[Any] = []
+        if expect_owner is not None:
+            guard += " AND lease_owner = ?"
+            guard_params.append(expect_owner)
         if terminal or exhausted:
-            connection.execute(
+            cursor = connection.execute(
                 "UPDATE outbox SET status = 'failed', last_error = ?, lease_owner = NULL, "
-                "lease_expires_at = NULL WHERE outbox_id = ?",
-                (error, outbox_id),
+                "lease_expires_at = NULL WHERE outbox_id = ?" + guard,
+                (error, outbox_id, *guard_params),
             )
         else:
-            connection.execute(
+            cursor = connection.execute(
                 "UPDATE outbox SET status = 'pending', last_error = ?, lease_owner = NULL, "
-                "lease_expires_at = NULL, available_at = ? WHERE outbox_id = ?",
-                (error, isoformat(retry_at), outbox_id),
+                "lease_expires_at = NULL, available_at = ? WHERE outbox_id = ?" + guard,
+                (error, isoformat(retry_at), outbox_id, *guard_params),
             )
-        return True
+        return bool(cursor.rowcount)
+
+    def requeue(
+        self,
+        connection: sqlite3.Connection,
+        outbox_id: str,
+        *,
+        error: str | None = None,
+        retry_at: datetime | None = None,
+        expect_owner: str | None = None,
+        expect_attempts: int | None = None,
+        refund_attempt: bool = False,
+    ) -> bool:
+        """Return a leased row to the queue, with no exhaustion rule.
+
+        :meth:`nack` is the delivery worker's negative acknowledgement: the claim
+        counted against ``max_attempts``, and a row whose budget is gone is failed
+        even with ``terminal=False``. That is the right rule for "we tried to
+        deliver this and could not". It is the wrong rule for a claim that could
+        not be *used* at all -- the Runtime was unreachable when the adapter asked
+        it to authorize the send, so nothing was ever attempted -- because it would
+        let an outage end a message nobody tried to deliver. This method therefore
+        has no exhaustion branch at all: the row simply goes back.
+
+        Args:
+            connection: Write connection of the enclosing transaction.
+            outbox_id: Leased row to return to the queue.
+            error: Reason recorded in ``last_error``.
+            retry_at: Earliest time the row may be claimed again; ``None`` keeps it
+                immediately claimable, which is the pacing ``nack`` uses too.
+            expect_owner: When given, the stored lease owner must match.
+            expect_attempts: When given, the stored claim counter must match. This
+                is what makes a report about an *older* claim recognisable: a row
+                that was reclaimed in the meantime carries a higher counter and is
+                left alone.
+            refund_attempt: Give the claim's attempt back. Off by default, and
+                deliberately so: the claim counter is what makes a ``lease_id``
+                unique per claim, so refunding it lets a later claim hand out an id
+                that an earlier, already-released claim also carried -- which makes
+                a stale report indistinguishable from a current one. Leaving the
+                counter alone keeps lease-id staleness detection sound, at the cost
+                of a later real delivery failure being treated as the last allowed
+                attempt.
+
+        Returns:
+            ``True`` when the row was returned to the queue.
+        """
+        sql = (
+            "UPDATE outbox SET status = 'pending', last_error = COALESCE(?, last_error), "
+            "lease_owner = NULL, lease_expires_at = NULL, available_at = ?, attempts = attempts - ? "
+            "WHERE outbox_id = ? AND status = 'leased' AND attempts >= ?"
+        )
+        refund = 1 if refund_attempt else 0
+        params: list[Any] = [error, isoformat(retry_at), refund, outbox_id, refund]
+        if expect_owner is not None:
+            sql += " AND lease_owner = ?"
+            params.append(expect_owner)
+        if expect_attempts is not None:
+            sql += " AND attempts = ?"
+            params.append(int(expect_attempts))
+        cursor = connection.execute(sql, tuple(params))
+        return bool(cursor.rowcount)
 
     def cancel(self, connection: sqlite3.Connection, outbox_id: str, reason: str | None = None) -> bool:
         """Cancel a row that has not been delivered yet.
@@ -1536,6 +1811,29 @@ class UserModelProjection:
                 (int(bool(applied)), int(limit)),
             )
         return [row_to_dict(row, "interaction_observations") or {} for row in rows]
+
+    def observation_for_attempt(self, attempt_id: str) -> dict[str, Any] | None:
+        """Return the newest observation already attributed to ``attempt_id``.
+
+        This is the exactly-once guard for reply attribution: the user model is
+        trained from observed interactions, so folding the same reply into it
+        twice would double-count one piece of evidence and quietly bias the
+        learned parameters.
+
+        Args:
+            attempt_id: Action attempt the observation would belong to.
+
+        Returns:
+            The stored observation mapping, or ``None`` when there is none.
+        """
+        if not attempt_id:
+            return None
+        row = self._db.query_one(
+            "SELECT * FROM interaction_observations WHERE attempt_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (attempt_id,),
+        )
+        return row_to_dict(row, "interaction_observations") if row is not None else None
 
     def get_params(self, scope: str = GLOBAL_SCOPE) -> dict[str, Any] | None:
         """Return the stored parameter block for ``scope``."""

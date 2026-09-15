@@ -225,7 +225,17 @@ class AiohttpRuntimeTransport:
         return actions
 
     async def heartbeat_lease(self, request: LeaseHeartbeat, *, timeout_s: float) -> bool:
-        """Extend a lease; a 2xx response counts as confirmation."""
+        """Extend a lease; a 2xx response counts as confirmation.
+
+        Args:
+            request: The lease extension to request.
+            timeout_s: Per-request timeout.
+
+        Returns:
+            Whether the Runtime confirmed the extension. ``False`` means the lease
+            is gone (expired, re-leased, or unknown), which the caller must treat
+            as "stop working on this action" rather than as a transient error.
+        """
         data = await self._request(
             "POST",
             OUTBOX_HEARTBEAT_PATH.format(action_id=quote(request.action_id, safe="")),
@@ -233,7 +243,16 @@ class AiohttpRuntimeTransport:
             timeout_s=timeout_s,
         )
         if isinstance(data, dict) and "extended" in data:
-            return bool(data.get("extended"))
+            extended = bool(data.get("extended"))
+            if not extended:
+                # The Runtime states why (unknown_action / lease_lost / ...);
+                # surface it, since the consumer only sees the boolean.
+                self._log.debug(
+                    "Runtime refused the lease extension for %s: %s",
+                    request.action_id,
+                    data.get("reason") or "unspecified",
+                )
+            return extended
         return True
 
     async def authorize_action(
@@ -242,17 +261,35 @@ class AiohttpRuntimeTransport:
         *,
         timeout_s: float,
     ) -> AuthorizeDecision:
-        """Ask the Runtime whether an irreversible send may proceed right now."""
+        """Ask the Runtime whether an irreversible send may proceed right now.
+
+        Args:
+            request: The authorization request for one leased send action.
+            timeout_s: Per-request timeout.
+
+        Returns:
+            The Runtime's verdict.
+
+        Raises:
+            RuntimeTransportError: When no verdict can be read -- transport
+                failure, non-2xx status, or a body without an ``authorized``
+                field. An unreadable answer is *not* a refusal, and the caller
+                must not report it as one: a transient outage that looks like a
+                deliberate "no" is how a message gets dropped for good.
+        """
         data = await self._request(
             "POST",
             ACTION_AUTHORIZE_PATH.format(action_id=quote(request.action_id, safe="")),
             body=request.to_wire(),
             timeout_s=timeout_s,
         )
-        if isinstance(data, dict):
-            nested = data.get("authorization")
-            return AuthorizeDecision.from_wire(nested if isinstance(nested, dict) else data)
-        return AuthorizeDecision.denied("malformed_authorize_response")
+        if not isinstance(data, dict):
+            raise RuntimeTransportError("Runtime authorize response is not a verdict")
+        nested = data.get("authorization")
+        verdict = nested if isinstance(nested, dict) else data
+        if "authorized" not in verdict:
+            raise RuntimeTransportError("Runtime authorize response has no 'authorized' field")
+        return AuthorizeDecision.from_wire(verdict)
 
     async def report_action(self, body: dict[str, Any], *, timeout_s: float) -> None:
         """Report the outcome of a leased action."""

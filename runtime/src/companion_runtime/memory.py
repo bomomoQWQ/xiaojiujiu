@@ -40,7 +40,7 @@ from .typing import (
     UnfinishedMatter,
     new_id,
 )
-from .utility import clamp, exponential_decay, summarize_text, tokenize, utcnow
+from .utility import clamp, exponential_decay, summarize_text, tokenize, topic_tokens, utcnow
 
 LOGGER = logging.getLogger("companion_runtime.memory")
 
@@ -97,6 +97,24 @@ EMPHASIS_MARKERS = ("记住", "重要", "一定要", "千万", "别忘", "rememb
 
 #: Phrases that are almost certainly transient small talk.
 TRANSIENT_MARKERS = ("吃", "午饭", "晚饭", "天气", "几点", "哈哈", "在吗", "嗯", "哦")
+
+#: Similarity at or above which two summaries count as the same fact outright.
+DEDUPE_EXACT_RATIO = 0.85
+
+#: Similarity required when the candidate's topics are a subset of the stored
+#: memory's topics, i.e. the new statement is about something already known.
+DEDUPE_TOPIC_RATIO = 0.6
+
+#: How much of the *shorter* summary must appear in the longer one before the two are
+#: treated as one fact said at different lengths ("用户喜欢咖啡" / "用户喜欢手冲咖啡").
+#: Symmetric similarity under-reports these because it divides by the longer string.
+DEDUPE_CONTAINMENT_RATIO = 0.8
+
+#: ...but containment alone is far too permissive, because a short summary is
+#: trivially contained in a long one. A shared token also has to be more than
+#: incidental: "用户为这次面试准备了很久" contains the whole topic "面试", and that is
+#: not the same fact as "用户明天要去面试".
+DEDUPE_MIN_SHARED_TOKENS = 2
 
 
 def score_candidate(
@@ -375,20 +393,74 @@ def consolidate(
 
 
 def _find_duplicate(projection: MemoryProjection, candidate: MemoryCandidate) -> Memory | None:
-    """Return an existing memory with the same content, if any.
+    """Return an existing memory stating the same fact, if any.
 
-    Deduplication is lexical: the same source-event set, or an identical summary,
-    means the fact is already remembered.
+    Deduplication is about *content*, never about provenance. The candidate and the
+    memory must actually say the same thing - an identical summary scores above
+    ``duplicate_summary_threshold``, a near-identical one above
+    ``duplicate_topic_threshold`` **and** with overlapping topics.
+
+    Sharing a source event is explicitly not enough. One message routinely yields
+    several facts ("我生日是三月三号，喜欢手冲咖啡"), so every candidate built from it
+    carries the same single ``event_id``; treating that overlap as proof of
+    duplication silently merged distinct facts into whichever one was consolidated
+    first, and the merged memory then asserted the union of two unrelated claims.
     """
-    sources = set(candidate.source_event_ids)
+    summary = (candidate.summary or "").strip()
+    topics = set(candidate.topics or ())
+    if not summary and not topics:
+        return None
     for memory in projection.list_memories(
         status=[MemoryStatus.ACTIVE.value, MemoryStatus.LOW_ACTIVATION.value], limit=300
     ):
-        if memory.summary.strip() == candidate.summary.strip():
+        stored = (memory.summary or "").strip()
+        if summary and stored and summary == stored:
             return memory
-        if sources and sources & set(memory.source_event_ids):
+        if not summary or not stored:
+            continue
+        overlap = len(topics & set(memory.topics))
+        if not overlap:
+            continue
+        overlap = len(topics & set(memory.topics))
+        if not overlap:
+            continue
+        ratio = _similarity(summary, stored)
+        if ratio >= DEDUPE_EXACT_RATIO or ratio >= DEDUPE_TOPIC_RATIO:
+            return memory
+        # One summary containing the other is the "same fact, said at more length"
+        # case, which a symmetric score under-reports because it divides by the
+        # longer sentence - and which a substring test misses entirely when the
+        # extra words sit in the middle ("用户喜欢咖啡" / "用户喜欢手冲咖啡").
+        if _contains(summary, stored) or _contains(stored, summary):
             return memory
     return None
+
+
+def _contains(shorter: str, longer: str) -> bool:
+    """Return whether ``longer`` says everything ``shorter`` says, and more."""
+    shorter_tokens = topic_tokens(shorter)
+    if len(shorter_tokens) < DEDUPE_MIN_SHARED_TOKENS:
+        return False
+    shared = shorter_tokens & topic_tokens(longer)
+    if len(shared) < DEDUPE_MIN_SHARED_TOKENS:
+        return False
+    return len(shared) / len(shorter_tokens) >= DEDUPE_CONTAINMENT_RATIO
+
+
+def _similarity(left: str, right: str) -> float:
+    """Return a deterministic similarity in ``[0, 1]`` for two short summaries.
+
+    Token overlap (Jaccard) over CJK *bigrams* is used rather than an edit distance
+    or single characters. Single CJK characters are far too common to indicate a
+    shared subject - every summary about the user shares 用 and 户 - while bigrams
+    make the overlap mean "these two sentences are about the same thing". Integer
+    token counts also make the threshold exactly reproducible.
+    """
+    left_tokens = topic_tokens(left)
+    right_tokens = topic_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
 
 
 def _find_conflicts(
@@ -550,7 +622,16 @@ class MemoryStore:
             Hits ordered by descending score.
         """
         source = rng or random.Random()
-        pool = list(candidates or self._projection.list_memories(limit=300))
+        pool = list(
+            candidates
+            if candidates is not None
+            else self._projection.list_memories(
+                status=MemoryStatus.ACTIVE.value, limit=300
+            )
+        )
+        # A caller may hand in its own candidate set, so the status filter is applied
+        # here as well: an archived memory must not be retrievable by any route.
+        pool = [memory for memory in pool if memory.status == MemoryStatus.ACTIVE.value]
         if not pool:
             return []
 
@@ -705,19 +786,29 @@ class MemoryStore:
         return removed
 
     def activated_memories(self, limit: int = 8) -> list[tuple[ActivatedMemory, Memory]]:
-        """Return the activation pool joined with memory content."""
-        pool = self._projection.list_activated(limit=limit)
+        """Return the activation pool joined with memory content.
+
+        Archived memories are excluded. The pool is decayed and bounded but never
+        scanned for status, so without this filter a memory that archival had
+        removed from what the character knows would still be handed to the
+        candidate generator and the prompt.
+        """
+        pool = self._projection.list_activated_memories(
+            status=MemoryStatus.ACTIVE.value, limit=limit
+        )
         memories = self._projection.get_memories([a.memory_id for a in pool])
         pairs: list[tuple[ActivatedMemory, Memory]] = []
         for activated in pool:
             memory = memories.get(activated.memory_id)
-            if memory is not None:
+            if memory is not None and memory.status == MemoryStatus.ACTIVE.value:
                 pairs.append((activated, memory))
         return pairs
 
     def activation_strength(self) -> float:
         """Return mean activation of the pool, used as an approach-drive input."""
-        pool = self._projection.list_activated(limit=20)
+        pool = self._projection.list_activated_memories(
+            status=MemoryStatus.ACTIVE.value, limit=20
+        )
         if not pool:
             return 0.0
         return clamp(sum(item.activation for item in pool) / len(pool))

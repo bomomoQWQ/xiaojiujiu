@@ -47,6 +47,25 @@ def new_id(kind: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
+def is_event_identifier(identifier: str) -> bool:
+    """Return whether ``identifier`` names a raw event.
+
+    Runtime records all share one identifier shape (``<prefix>_<hex>``) but are not
+    interchangeable: a grounding identifier may name a memory, a memory candidate or
+    a candidate intent as well as an event. Anywhere a *raw event* is required - the
+    protocol's "is this evidence still there" check, for instance - the identifier
+    has to be recognised as an event first, otherwise a perfectly grounded
+    suggestion is discarded as if its evidence had vanished.
+
+    Args:
+        identifier: A generated identifier.
+
+    Returns:
+        ``True`` when the identifier carries the event prefix.
+    """
+    return isinstance(identifier, str) and identifier.split("_", 1)[0] == ID_PREFIXES["event"]
+
+
 # --------------------------------------------------------------------------------------
 # Enumerations
 # --------------------------------------------------------------------------------------

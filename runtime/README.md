@@ -918,7 +918,7 @@ Reducer 侧还有三条安全规则：
 ### 8.7 当前接线状态（诚实标注）
 
 - ✅ **已实现且已接线**：`SemanticProvider` 端口、`DeepRefreshRequest` / `DeepRefreshSuggestions` 契约、`parse_deep_refresh()` 校验、`DEEP_REFRESH_SYSTEM_PROMPT`、两种 provider 的 `deep_refresh()` 实现（含超时降级与统计）、触发判定（`evaluate_triggers`）、请求组装（`build_request`）、grounding（`ground_suggestions`）、编排（`Runtime.deep_refresh`）、落地端（`Reducer._apply_deep_refresh`）、HTTP 与 CLI 入口，以及 `tests/test_deep_refresh.py` 与 `tests/test_cognition_api.py`。
-- ⚠️ **没有内置自动调度**：`scheduler.py` 不引用深层刷新，也没有任何代码会自动调用 `Runtime.deep_refresh()`。触发**判定**是自动的，触发**调用**目前必须由宿主或运维发起（`POST /cognition/refresh` 或 `companion-runtime refresh`，例如放进宿主的每小时定时任务）。按补丁 §21 的字面要求，"何时触发"的条件表已经实现，但"由谁按定时器去问"这一环留给了宿主。
+- ✅ **内源轮已由 `serve` 自动驱动，深层刷新的节奏仍由轮次决定**：`companion-runtime serve` 会在启动时拉起 `scheduler.Scheduler`，由它按运行时锚点（未尽之事到期、边界到期、前台暂停、上一轮危险率）自动调用 `Runtime.endogenous_round()`，每轮内部再按触发判定调用 `Runtime.deep_refresh()` —— 因此标准部署不需要宿主定时器就会"自己醒来思考"。刷新本身的节流仍由 `evaluate_triggers` 的最小间隔与触发条件决定。宿主或运维仍可显式调用 `POST /cognition/refresh` 或 `companion-runtime refresh` 来强制一次刷新。`endogenous`/`tick` 子命令只跑一次，不启动该循环。
 - ⚠️ **`semantic.resolve_backlog()` 仍无生产调用方**：刷新路径直接用 `SemanticProjection.list_unresolved()`；`resolve_backlog()` 目前只有 `test_semantic.py` 覆盖，`unresolved_max_age_hours` 也只作为它的参数默认值存在 —— 也就是说"超过 72 小时的 unresolved 不再支撑刷新"这条策略**当前没有被刷新路径执行**。
 - ✅ **两个能力都已接线**：`deep_refresh()`（第 8 节）与 `explain_state()`（第 7.7 节）都有真实生产调用方。默认 `disabled` 时两者都安全地不做事。
 - ⚠️ **`template_fallback` / `interpretation_max_age_seconds` 无消费者**（见第 3.1 节）。
@@ -1356,7 +1356,7 @@ v0.2 之后仍然刻意简化但**不省略主要模块**，并且把"还没接�
 
 **v0.2 相关（仍未接通）**
 
-- **深层刷新没有内置自动调度**：触发**判定**已实现（`deep_refresh.evaluate_triggers`，含补丁 §21 的八条规则与最小间隔否决），但没有定时器会自动调用它 —— `scheduler.py` 不引用深层刷新，`Runtime.deep_refresh()` 目前只被 `POST /cognition/refresh` 与 `companion-runtime refresh` 调用。**"由谁按节奏去问"这一环留给宿主**（例如放进宿主的每小时任务）
+- **`companion-runtime serve` 已内置内源调度，深层刷新的"由谁去问"由轮次承担**：`scheduler.Scheduler` 现在被 `serve` 的生命周期启动/停止，按运行时锚点自动调用 `Runtime.endogenous_round()`，后者每轮按 `deep_refresh.evaluate_triggers`（含补丁 §21 的八条规则与最小间隔否决）决定是否刷新。仍然不存在的是一条**独立的**刷新定时器：刷新的节奏依附于内源轮，因此"很久没有轮次发生"时也不会有刷新。宿主仍可显式调用 `POST /cognition/refresh` 或 `companion-runtime refresh` 强制刷新
 - **`semantic.resolve_backlog()` 无生产调用方**：刷新路径直接读 `SemanticProjection.list_unresolved()`，因此"超过 `unresolved_max_age_hours` 的 unresolved 不再支撑刷新"这条策略当前**没有被执行**（原始事件当然仍然保留）
 - **`explain_state()` 的调用是有条件的**：`context._optional_explanation_provider()` 只在 provider `available()` 为真时才把它交给 `EmotionExplainer`。因此"provider 配置了但当前连不上"时，心理解释会安静地退回模板（这是刻意的：不给 context 路径增加一次注定失败的调用），但在 `/health` 里仍会看到 `semantic_provider.available = false`
 - **`template_fallback` 与 `interpretation_max_age_seconds` 无消费者**：模板兜底当前无条件生效（不可关）；解释缓存陈旧判定实际由 `task.explain_cache_ttl_seconds` 承担

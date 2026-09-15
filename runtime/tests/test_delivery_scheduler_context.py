@@ -164,7 +164,15 @@ def test_transport_exception_is_recorded(harness: Harness) -> None:
 
 
 def test_delivery_is_blocked_when_a_boundary_arrives_mid_flight(harness: Harness) -> None:
-    """A boundary that arrives after rendering stops the send."""
+    """A boundary that arrives after rendering stops the send and withdraws it.
+
+    The state is asserted exactly, not as "aborted *or* still ready to send": a
+    boundary is a hard constraint that reaches the attempt at ingest (the
+    foreground path re-coordinates everything that has not left the Runtime yet),
+    so the only correct outcome is a withdrawn intention. Accepting
+    ``ready_to_send`` here would also accept the defect this test exists to catch -
+    a declared boundary being ignored and the message going out anyway.
+    """
     attempt_id, _outbox_id, _candidate = _queue_render(harness)
     harness.service._renderer = RecordingRenderer()
     harness.service.cycle(now=harness.start)
@@ -180,9 +188,11 @@ def test_delivery_is_blocked_when_a_boundary_arrives_mid_flight(harness: Harness
     report = harness.service.cycle(now=harness.start + timedelta(seconds=3))
     assert report.sent == 0
     assert harness.transport.sent == []
-    # The user message re-coordinated the attempt, so the row is stale, not failed.
+    # The user message re-coordinated the attempt, so the intention is withdrawn
+    # and its row is stale, not failed: nothing about the delivery machinery broke.
     attempt = harness.runtime.projections.attempts.get(attempt_id)
-    assert attempt.state in {AttemptState.ABORTED.value, AttemptState.READY_TO_SEND.value}
+    assert attempt.state == AttemptState.ABORTED.value
+    assert attempt.reconcile_action == "abort"
 
 
 def test_delivery_skips_a_resolved_attempt(harness: Harness) -> None:

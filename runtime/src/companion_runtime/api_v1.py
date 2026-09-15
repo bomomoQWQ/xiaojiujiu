@@ -59,6 +59,14 @@ Deliberate omissions, stated rather than hidden
 * **``last_event_id``** is accepted and echoed, but does not gate the response:
   the Runtime cannot order a client's view of a session against its own, and
   refusing to answer would only cost the adapter its context block.
+* **Timestamps.** ``occurred_at`` must carry an explicit UTC offset, which the
+  shipped adapter's ``Z`` form does; a naive value is refused rather than read as
+  UTC, because the adapter's clock is not the Runtime's and a silent guess would
+  shift every fact in the record. Fail-open is preserved: the record is still
+  ingested, stamped with the Runtime's own clock, and the substitution is
+  reported in its outcome (``timestamp_rejected``) and kept in the event metadata
+  alongside the raw value the adapter sent. An identical policy applies to the
+  v0 API, where the same value is a 422 instead.
 """
 
 from __future__ import annotations
@@ -75,7 +83,13 @@ from . import context as context_module
 from .authorize import AuthorizeRequest, authorize
 from .config import RuntimeConfig
 from .typing import Actor, AttemptState, EventType, OutboxKind, OutboxStatus
-from .utility import ensure_aware, isoformat, parse_datetime, utcnow
+from .utility import (
+    NaiveTimestampError,
+    ensure_aware,
+    isoformat,
+    parse_aware_datetime,
+    utcnow,
+)
 
 LOGGER = logging.getLogger("companion_runtime.api_v1")
 
@@ -145,6 +159,18 @@ SETTLED_OUTBOX_STATUSES: frozenset[str] = frozenset(
     {OutboxStatus.DELIVERED.value, OutboxStatus.CANCELLED.value}
 )
 
+#: ``result`` flag an adapter sets when it could not obtain an authorization
+#: verdict at all -- the Runtime was unreachable, so the irreversible step was
+#: never authorized and never executed. This is an **outage, not a failure**: no
+#: verdict was given and nothing was attempted, so the Runtime must not record a
+#: verdict of its own. See :func:`_requeue_after_authorize_unavailable`.
+RESULT_AUTHORIZE_UNAVAILABLE = "authorize_unavailable"
+
+#: Optional pacing an outage report may request, in milliseconds. Honoured when
+#: present; otherwise the Runtime's own ``outbox.retry_backoff_seconds`` applies,
+#: which is the same knob ``Reducer.nack_outbox`` uses.
+RESULT_RETRY_AFTER_MS = "retry_after_ms"
+
 #: Section header used by the rendered injection block, e.g. ``【必要记忆】``.
 _SECTION_RE = re.compile(r"^【([^【】]+)】$")
 
@@ -208,17 +234,41 @@ def _strings(value: Any) -> list[str]:
     return []
 
 
-def _stamp(value: Any, default: datetime | None = None) -> datetime | None:
-    """Parse an optional ISO-8601 wire timestamp, falling back to ``default``."""
+def _stamp(value: Any, default: datetime | None = None) -> tuple[datetime | None, str]:
+    """Parse an optional ISO-8601 wire timestamp, falling back to ``default``.
+
+    A value that carries no explicit UTC offset is refused, never read as UTC.
+    The adapter's clock is not the Runtime's, so a bare ``"09:00:00"`` would
+    silently move every fact the record carries by the adapter's own offset, and
+    nothing downstream could detect the mistake afterwards. Refusing is also not
+    allowed to become a fault: this module is fail-open, so an unusable stamp
+    degrades to ``default`` (the server clock) and the caller is told why, rather
+    than costing the batch its 200 or the record its place in ``raw_events``.
+
+    Args:
+        value: The ``occurred_at`` value from the wire.
+        default: Moment used when the stamp is absent, empty or refused.
+
+    Returns:
+        ``(moment, rejection)``. ``rejection`` is ``""`` when the stamp was
+        usable, ``"naive_timestamp"`` when it carried no offset, and
+        ``"unparsable_timestamp"`` when it was not an ISO-8601 datetime at all.
+    """
+    if value in (None, ""):
+        return default, ""
     if isinstance(value, datetime):
-        return ensure_aware(value) or default
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            return default, "naive_timestamp"
+        return (ensure_aware(value) or default), ""
     raw = _text(value).strip()
     if not raw:
-        return default
+        return default, ""
     try:
-        return parse_datetime(raw) or default
+        return (parse_aware_datetime(raw) or default), ""
+    except NaiveTimestampError:
+        return default, "naive_timestamp"
     except (TypeError, ValueError):
-        return default
+        return default, "unparsable_timestamp"
 
 
 def _session_of(row: Any, settings: RuntimeConfig) -> str:
@@ -401,8 +451,17 @@ def _ingest_event(
 
     session = _text(data.get("session")).strip()
     conversation_id = session or settings.conversation_id
-    occurred_at = _stamp(data.get("occurred_at"), utcnow())
+    occurred_at, stamp_rejection = _stamp(data.get("occurred_at"), utcnow())
     metadata = _event_metadata(data, session=session, adapter_id=adapter_id)
+    if stamp_rejection:
+        # The adapter's stamp was unusable, so the Runtime substituted its own
+        # clock. Saying so in two places keeps the substitution honest rather
+        # than silent: durably in the event metadata (a later reinterpretation
+        # can see that this record's time came from the server, and the raw value
+        # the adapter sent is kept next to it), and immediately in this record's
+        # outcome (the adapter's own logs).
+        metadata["adapter"]["timestamp_rejected"] = stamp_rejection
+        metadata["adapter"]["occurred_at_raw"] = _text(data.get("occurred_at"))
 
     if kind == EVENT_USER_MESSAGE:
         outcome = runtime.process_user_message(
@@ -412,10 +471,23 @@ def _ingest_event(
             timestamp=occurred_at,
             metadata=metadata,
         )
-        return outcome.to_dict(), "accepted"
+        if outcome.duplicate:
+            # The identifier was already in the raw history: the Runtime ran no
+            # second foreground pass, so the adapter is told exactly what the
+            # cheap pre-check above would have told it. The shape is the same
+            # dict, because a client parses one duplicate form, not two.
+            return {"duplicate": True, "event_id": event_id}, "duplicate"
+        result = outcome.to_dict()
+        if stamp_rejection:
+            result["timestamp_rejected"] = stamp_rejection
+        return result, "accepted"
 
     with runtime.db.transaction() as conn:
         state = runtime.state()
+        if event_id and runtime.events.get(event_id) is not None:
+            # The pre-check ran before this transaction; the authoritative one
+            # runs inside it, next to the insert it guards.
+            return {"duplicate": True, "event_id": event_id}, "duplicate"
         event = runtime.events.append(
             EventType.ASSISTANT_MESSAGE,
             actor=Actor.ASSISTANT,
@@ -427,7 +499,10 @@ def _ingest_event(
             event_id=event_id or None,
             connection=conn,
         )
-    return {"event": event.to_dict()}, "accepted"
+    outcome: dict[str, Any] = {"event": event.to_dict()}
+    if stamp_rejection:
+        outcome["timestamp_rejected"] = stamp_rejection
+    return outcome, "accepted"
 
 
 # --------------------------------------------------------------------------------------
@@ -628,6 +703,209 @@ def _result_response(*, ok: bool, state: str, reason: str = "", **extra: Any) ->
     return body
 
 
+def _unavailable_marker(payload: Mapping[str, Any]) -> bool:
+    """Return whether this body declares that no authorization could be obtained.
+
+    The adapter sets ``result.authorize_unavailable = true`` when its authorize
+    call did not come back -- a timeout, a refused connection, an unusable
+    response. A non-empty string is honoured as well, so an adapter that put its
+    diagnostic in the same field instead of ``error`` is understood too, while an
+    explicit ``false``/``0``/``"no"`` is not a marker.
+    """
+    if RESULT_AUTHORIZE_UNAVAILABLE not in payload:
+        return False
+    value = payload.get(RESULT_AUTHORIZE_UNAVAILABLE)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        return bool(lowered) and lowered not in {"false", "0", "no", "off", "none", "null"}
+    return _flag(value, False)
+
+
+def _marker_requested_delay_seconds(result: Mapping[str, Any]) -> float | None:
+    """Return the retry delay an outage report asked for, or ``None``.
+
+    The adapter knows how long its own backoff is, so an explicit
+    ``result.retry_after_ms`` is honoured. Without one the Runtime's configured
+    ``outbox.retry_backoff_seconds`` applies -- the same default
+    ``Reducer.nack_outbox`` uses -- which is 0, i.e. immediately claimable.
+    """
+    raw = result.get(RESULT_RETRY_AFTER_MS)
+    if raw in (None, ""):
+        return None
+    try:
+        return max(0.0, float(raw) / 1000.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _requeue_after_authorize_unavailable(
+    runtime: Any,
+    conn: Any,
+    *,
+    row: Any,
+    data: Mapping[str, Any],
+    adapter_id: str,
+    action_type: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """Return a claim the adapter could not get a verdict for to the queue.
+
+    An adapter reports ``status=failed`` with ``result.authorize_unavailable``
+    when it leased an action, asked the Runtime to authorize the irreversible
+    step, and got no answer. Nothing was executed and no verdict was given, so the
+    honest record is *not* a failed delivery: recording one would fail the attempt
+    and the row terminally over a network blip the Runtime never even saw,
+    dropping a proactive message the character had already decided to send. The
+    row goes back to the queue and the attempt is not touched.
+
+    Idempotency is keyed on the **claim**, because that is the only thing this
+    path changes. The report names the ``lease_id`` it was working under, and that
+    id embeds the claim counter:
+
+    * a row that is no longer leased (already settled, already back in
+      ``pending``, cancelled or failed) means the claim it refers to is gone ->
+      ``ok=true`` with ``duplicate=true`` and nothing written;
+    * a stale ``lease_id`` -- the row was re-claimed since, so the counter in the
+      id no longer matches -- is the same answer;
+    * a lease held by a *different* adapter is refused (``ok=false``), because
+      releasing somebody else's live claim is not this adapter's business;
+    * the write itself is guarded by owner and counter, so a claim that changes
+      under us degrades to ``duplicate=true`` rather than to a wrong write.
+
+    Args:
+        runtime: The Runtime instance.
+        conn: Write connection of the enclosing report transaction.
+        row: The outbox row the report is about.
+        data: Decoded ``ActionReport.to_wire()`` body.
+        adapter_id: Reporting adapter.
+        action_type: The row's kind (``render`` or ``send``).
+        now: Reference time.
+
+    Returns:
+        The response body. It is never a terminal outcome: ``requeued`` says
+        whether this call returned the row to the queue.
+    """
+    result = _mapping(data.get("result"))
+    note = (
+        _text(data.get("error")).strip()
+        or _text(result.get("reason")).strip()
+        or "authorize_unavailable"
+    )
+
+    def answer(
+        *,
+        ok: bool,
+        duplicate: bool,
+        retryable: bool = False,
+        reason: str = "",
+        extra: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build the outage response (both documented shapes come from here).
+
+        ``retryable`` is the primary field for this report shape: it says the row
+        is back in the queue and will be handed out again. ``requeued`` carries the
+        same value under the name this module used first, and ``attempt_state`` is
+        the attempt's state *unchanged* by this call, which is the whole point of
+        the branch: an outage moves the row, never the intention.
+        """
+        payload: dict[str, Any] = {
+            "action_id": row.outbox_id,
+            "action_type": action_type,
+            "duplicate": bool(duplicate),
+            "retryable": bool(retryable),
+            "requeued": bool(retryable),
+            "error": note,
+        }
+        if extra:
+            payload.update(dict(extra))
+        return _result_response(
+            ok=ok, state=_attempt_state(runtime, row), reason=reason, **payload
+        )
+
+    if row.status != OutboxStatus.LEASED.value:
+        # Nothing is held any more: the claim was already released, settled or
+        # voided, so there is nothing to return to the queue.
+        return answer(ok=True, duplicate=True)
+
+    owner = _text(row.lease_owner).strip()
+    if owner and adapter_id and owner != adapter_id:
+        return answer(ok=False, duplicate=False, reason="lease_owner_mismatch")
+
+    attempt = _attempt_of(runtime, row)
+    if attempt is not None and (
+        attempt.state in TERMINAL_ATTEMPT_STATES
+        or attempt.state == AttemptState.SENT.value
+    ):
+        # The intention is already closed or already delivered, so there is no
+        # delivery left to retry: the row is void rather than requeued.
+        runtime.projections.outbox.cancel(conn, row.outbox_id, reason=f"attempt_{attempt.state}")
+        return answer(ok=True, duplicate=True)
+
+    lease_id = _text(data.get("lease_id")).strip()
+    if lease_id:
+        expected = _lease_id(
+            adapter_id=owner or adapter_id, outbox_id=row.outbox_id, attempts=row.attempts
+        )
+        if lease_id != expected:
+            return answer(ok=True, duplicate=True)
+
+    delay = _marker_requested_delay_seconds(result)
+    attempts = int(row.attempts or 0)
+    budget = int(row.max_attempts or 0)
+    # The row goes back with the worker's own primitive: a negative acknowledgement
+    # with ``terminal=False``, owner-guarded (``Reducer.nack_outbox`` takes the
+    # owner as ``owner=``), which leaves the attempt exactly as it was -- it only
+    # touches the outbox row.
+    #
+    # ``nack`` fails a row whose attempt budget is spent, and an outage must never
+    # spend that budget on a message nobody attempted to deliver, so past the
+    # budget the row is returned with the exhaustion-free requeue instead. Both
+    # paths end in the same place, which is what makes "retryable" below always
+    # the truth and stops a later sweep from closing the attempt behind an
+    # exhausted row.
+    item: Any = None
+    if attempts < budget:
+        runtime.reducer.nack_outbox(
+            row.outbox_id,
+            error=note,
+            terminal=False,
+            now=now,
+            retry_delay_seconds=delay,
+            owner=owner or None,
+        )
+        item = runtime.projections.outbox.get(row.outbox_id)
+    if item is None or item.status != OutboxStatus.PENDING.value:
+        LOGGER.warning(
+            "v1 outage report for %s could not be requeued as a plain nack "
+            "(attempts %s of %s, row status %s); restoring it with the "
+            "exhaustion-free requeue",
+            row.outbox_id,
+            attempts,
+            budget,
+            "absent" if item is None else item.status,
+        )
+        runtime.reducer.requeue_outbox(
+            row.outbox_id,
+            error=note,
+            now=now,
+            retry_delay_seconds=delay,
+            owner=owner or None,
+            claimed_attempts=attempts,
+        )
+        item = runtime.projections.outbox.get(row.outbox_id)
+
+    retryable = item is not None and item.status == OutboxStatus.PENDING.value
+    if not retryable:
+        # The claim was decided elsewhere between the read and the write.
+        return answer(ok=True, duplicate=True)
+    return answer(
+        ok=True,
+        duplicate=False,
+        retryable=True,
+        extra={"available_at": None if item is None else isoformat(item.available_at)},
+    )
+
+
 def _apply_action_report(
     runtime: Any,
     settings: RuntimeConfig,
@@ -647,6 +925,15 @@ def _apply_action_report(
     other send status fails the attempt through ``Reducer.mark_delivered`` with
     ``success=False``. ``committed`` is never treated as ``sent``.
 
+    One report shape is deliberately *not* terminal: ``status=failed`` with
+    ``result.authorize_unavailable``, which says the adapter could not obtain a
+    verdict at all. No verdict was given and nothing was executed, so the row is
+    handed back through :func:`_requeue_after_authorize_unavailable` -- a
+    ``nack_outbox(terminal=False)``, owner-guarded -- and the attempt is left
+    untouched (``ok=true``, ``retryable=true``, ``attempt_state`` unchanged). A
+    genuine execution failure -- a render that produced nothing usable, or a send
+    that the platform refused -- stays terminal.
+
     Args:
         runtime: The Runtime instance.
         settings: Effective configuration.
@@ -659,76 +946,179 @@ def _apply_action_report(
         The response body; ``ok`` is false only for an unknown row or a lease
         owned by a different adapter. A repeated report is ``ok=true`` with
         ``duplicate=true``.
+
+    The whole decision runs in one transaction. Idempotency here is decided from
+    the *effect* recorded on the row and its attempt, so two reports that arrive
+    together would otherwise both read "not settled yet" and both advance the
+    state -- a render would queue two sends, a delivery would count the contact
+    twice. Holding the write transaction across the check and the apply is what
+    makes "at most once" true for concurrent reports and not only for sequential
+    repeats.
     """
-    row = runtime.projections.outbox.get(action_id)
-    if row is None:
-        return _result_response(ok=False, state="", reason="unknown_action")
+    with runtime.db.transaction() as conn:
+        row = runtime.projections.outbox.get(action_id)
+        if row is None:
+            return _result_response(ok=False, state="", reason="unknown_action")
 
-    action_type = _text(data.get("action_type")).strip().lower()
-    row_kind = _text(row.kind).strip().lower()
-    if action_type and action_type != row_kind:
-        LOGGER.warning(
-            "v1 result for %s reported action_type=%s but the row is %s; using the row kind",
-            action_id,
-            action_type,
-            row_kind,
-        )
-    action_type = row_kind
-    if action_type not in (ACTION_RENDER, ACTION_SEND):
-        return _result_response(
-            ok=False,
-            state=_attempt_state(runtime, row),
-            reason=f"unsupported_action_type:{action_type or 'missing'}",
-        )
+        action_type = _text(data.get("action_type")).strip().lower()
+        row_kind = _text(row.kind).strip().lower()
+        if action_type and action_type != row_kind:
+            LOGGER.warning(
+                "v1 result for %s reported action_type=%s but the row is %s; using the row kind",
+                action_id,
+                action_type,
+                row_kind,
+            )
+        action_type = row_kind
+        if action_type not in (ACTION_RENDER, ACTION_SEND):
+            return _result_response(
+                ok=False,
+                state=_attempt_state(runtime, row),
+                reason=f"unsupported_action_type:{action_type or 'missing'}",
+            )
 
-    conflict = _lease_owner_conflict(row, adapter_id)
-    if conflict:
-        return _result_response(ok=False, state=_attempt_state(runtime, row), reason=conflict)
+        conflict = _lease_owner_conflict(row, adapter_id)
+        if conflict:
+            return _result_response(ok=False, state=_attempt_state(runtime, row), reason=conflict)
 
-    status = _text(data.get("status")).strip().lower() or STATUS_FAILED
-    attempt = _attempt_of(runtime, row)
-    if _already_settled(row=row, attempt=attempt, action_type=action_type, status=status):
-        return _result_response(
-            ok=True,
-            state=_attempt_state(runtime, row),
-            duplicate=True,
-            action_id=action_id,
-            action_type=action_type,
-        )
+        result = _mapping(data.get("result"))
+        status = _text(data.get("status")).strip().lower() or STATUS_FAILED
+        outage = _unavailable_marker(result) or _unavailable_marker(data)
+        if outage:
+            # An outage report is a statement about the *claim*, not about the
+            # action, so it is answered before any outcome logic: the marker says
+            # the Runtime gave no verdict at all, and a status the adapter chose
+            # while it could not reach the Runtime must not be turned into one.
+            #
+            # It never overrides a claim that something actually happened, though.
+            # A body that also says the message went out (``status=ok`` with
+            # ``result.sent``) or carries rendered text is applied as that
+            # outcome, because requeueing a delivery that already happened is
+            # precisely how one message becomes two.
+            claims_outcome = status == STATUS_OK and (
+                (action_type == ACTION_SEND and _flag(result.get("sent"), False))
+                or (
+                    action_type == ACTION_RENDER
+                    and bool(_text(result.get("text")).strip())
+                )
+            )
+            if claims_outcome:
+                LOGGER.warning(
+                    "v1 result for %s carries authorize_unavailable together with a "
+                    "successful outcome; applying the outcome",
+                    action_id,
+                )
+            else:
+                return _requeue_after_authorize_unavailable(
+                    runtime,
+                    conn,
+                    row=row,
+                    data=data,
+                    adapter_id=adapter_id,
+                    action_type=action_type,
+                    now=now,
+                )
+        #: Invariant for the rest of this function: every report that declares
+        #: ``authorize_unavailable`` without claiming an outcome has already
+        #: returned above, so nothing below can record an outage as a verdict --
+        #: in particular the ``mark_delivered(success=False)`` call in the send
+        #: branch. A test in ``tests/test_api_reliability.py`` pins this for both
+        #: action kinds.
 
-    result = _mapping(data.get("result"))
-    error = _text(data.get("error")).strip() or f"action_{status}"
-    extra: dict[str, Any] = {"action_id": action_id, "action_type": action_type}
+        attempt = _attempt_of(runtime, row)
+        if _already_settled(row=row, attempt=attempt, action_type=action_type, status=status):
+            return _result_response(
+                ok=True,
+                state=_attempt_state(runtime, row),
+                duplicate=True,
+                action_id=action_id,
+                action_type=action_type,
+            )
 
-    if action_type == ACTION_RENDER:
-        text = _text(result.get("text")).strip() if status == STATUS_OK else ""
-        if text:
-            render = runtime.reducer.complete_render(outbox_id=action_id, text=text, now=now)
-            state = render.state
-            extra["send_outbox_id"] = render.outbox_id
+        error = _text(data.get("error")).strip() or f"action_{status}"
+        extra: dict[str, Any] = {"action_id": action_id, "action_type": action_type}
+
+        if action_type == ACTION_RENDER:
+            text = _text(result.get("text")).strip() if status == STATUS_OK else ""
+            if text:
+                render = runtime.reducer.complete_render(outbox_id=action_id, text=text, now=now)
+                state = render.state
+                if render.outbox_id:
+                    extra["send_outbox_id"] = render.outbox_id
+                if not render.applied:
+                    # The render was already absorbed (or the row is void). Report
+                    # the recorded outcome instead of a second transition; a
+                    # *rejection* (nothing was ever rendered for this attempt) is
+                    # not a duplicate and must not be reported as one.
+                    if render.duplicate:
+                        extra["duplicate"] = True
+                    if render.reason:
+                        extra["reason"] = render.reason
+            else:
+                reason = error if status != STATUS_OK else "render_reported_ok_without_text"
+                runtime.reducer.fail_render(outbox_id=action_id, error=reason, now=now)
+                state = _attempt_state(runtime, row)
+                extra["error"] = reason
         else:
-            reason = error if status != STATUS_OK else "render_reported_ok_without_text"
-            runtime.reducer.fail_render(outbox_id=action_id, error=reason, now=now)
-            state = _attempt_state(runtime, row)
-            extra["error"] = reason
-    else:
-        sent = status == STATUS_OK and _flag(result.get("sent"), False)
-        if sent:
-            reason = None
-        elif status != STATUS_OK:
-            reason = error
-        else:
-            # status=ok without result.sent is a failed delivery, not a send.
-            reason = _text(result.get("reason")).strip() or "delivery_failed"
-        delivered = runtime.reducer.mark_delivered(
-            outbox_id=action_id, now=now, success=sent, error=reason
-        )
-        state = _attempt_state(runtime, row)
-        extra["delivered"] = bool(delivered.get("delivered"))
-        if reason:
-            extra["error"] = reason
+            # ---------------------------------------------------------------------
+            # authorize_unavailable -- explicit, retryable, non-terminal branch.
+            #
+            # The adapter reports this when it leased a send, asked for an
+            # authorization, and got no answer: nothing was executed and no verdict
+            # was given. It sits immediately before `mark_delivered`, the call it
+            # must never become, and it is the send-kind counterpart of the marker
+            # dispatch above (which also covers render rows).
+            # ---------------------------------------------------------------------
+            if action_type == ACTION_SEND and (
+                _unavailable_marker(result) or _unavailable_marker(data)
+            ):
+                if status == STATUS_OK and _flag(result.get("sent"), False):
+                    # Contradictory body: it also says the message went out, and
+                    # requeueing a delivery that already happened is how one
+                    # message becomes two.
+                    LOGGER.warning(
+                        "v1 result for %s carries authorize_unavailable together "
+                        "with result.sent; applying the delivery",
+                        action_id,
+                    )
+                else:
+                    # Returns ok=true, retryable=true, `attempt_state` unchanged and
+                    # hands the row back with `Reducer.nack_outbox(terminal=False)`
+                    # (owner-guarded), which never transitions the attempt.
+                    return _requeue_after_authorize_unavailable(
+                        runtime,
+                        conn,
+                        row=row,
+                        data=data,
+                        adapter_id=adapter_id,
+                        action_type=action_type,
+                        now=now,
+                    )
+            sent = status == STATUS_OK and _flag(result.get("sent"), False)
+            if sent:
+                reason = None
+            elif status != STATUS_OK:
+                reason = error
+            else:
+                # status=ok without result.sent is a failed delivery, not a send.
+                reason = _text(result.get("reason")).strip() or "delivery_failed"
+            # An outage report never reaches this call: the explicit
+            # authorize_unavailable branch above returned through
+            # `_requeue_after_authorize_unavailable` unless the body also claimed a
+            # successful outcome, and a claimed outcome is exactly what
+            # ``sent``/``reason`` encode here. ``success=False`` below therefore
+            # always describes a genuine execution failure, which stays terminal.
+            delivered = runtime.reducer.mark_delivered(
+                outbox_id=action_id, now=now, success=sent, error=reason
+            )
+            state = delivered.get("state") or _attempt_state(runtime, row)
+            extra["delivered"] = bool(delivered.get("delivered"))
+            if delivered.get("duplicate"):
+                extra["duplicate"] = True
+            if reason:
+                extra["error"] = reason
 
-    return _result_response(ok=True, state=state, **extra)
+        return _result_response(ok=True, state=state, **extra)
 
 
 def create_v1_router(runtime: Any, config: RuntimeConfig | None = None) -> APIRouter:
@@ -974,14 +1364,20 @@ def create_v1_router(runtime: Any, config: RuntimeConfig | None = None) -> APIRo
             base = ensure_aware(row.lease_expires_at) or now
             deadline = max(base, now) + timedelta(milliseconds=extend_ms)
             with runtime.db.transaction() as conn:
+                # ``attempts`` is part of the guard, not only of the check above:
+                # the claim counter is what makes a lease id stale, so matching it
+                # in the same statement means a row that was re-claimed between the
+                # check and the update cannot be extended on the old lease's
+                # behalf. The extension is refused (``lease_lost``) instead.
                 cursor = conn.execute(
                     "UPDATE outbox SET lease_expires_at = ? WHERE outbox_id = ? "
-                    "AND status = ? AND lease_owner = ?",
+                    "AND status = ? AND lease_owner = ? AND attempts = ?",
                     (
                         isoformat(deadline),
                         action_id,
                         OutboxStatus.LEASED.value,
                         _text(row.lease_owner).strip() or adapter_id,
+                        int(row.attempts),
                     ),
                 )
                 updated = int(cursor.rowcount or 0)
@@ -1090,6 +1486,31 @@ def create_v1_router(runtime: Any, config: RuntimeConfig | None = None) -> APIRo
         send status goes through ``Reducer.mark_delivered`` with
         ``success=False``. ``skipped`` is terminal for the same reason ``failed``
         is: the Runtime must not re-dispatch work the adapter cannot execute.
+
+        The one exception is an **outage**, which the adapter reports as
+        ``status=failed`` with ``result.authorize_unavailable=true``: it leased the
+        action, asked for an authorization, and got no answer, so nothing was
+        executed and no verdict was given. That report never reaches
+        ``mark_delivered``: the row is handed back with
+        ``nack_outbox(terminal=False)`` (owner-guarded), so it goes to ``pending``
+        with the lease cleared and ``last_error`` recording the outage, and the
+        answer is ``ok=true``, ``retryable=true``, ``duplicate=false`` with
+        ``attempt_state`` *unchanged* -- ``ready_to_send`` for a send,
+        ``rendering``/``committed`` for a render -- no failure reason, no state
+        version bump and no outcome event, because an outage says nothing about the
+        intention. ``requeued`` carries the same value as ``retryable``. Past the
+        row's attempt budget the claim is returned with the exhaustion-free
+        requeue, so an outage can never fail the row. Its answer is idempotent per
+        claim: a repeat, a report about an older ``lease_id``, or a report about a
+        row that is no longer leased answers ``ok=true`` with ``duplicate=true``; a
+        live lease held by a different adapter is refused with ``ok=false``; if the
+        attempt was closed or delivered underneath the claim, the row is cancelled
+        instead of requeued. ``result.retry_after_ms`` may ask for pacing.
+
+        A report that carries the marker *and* claims an outcome (``status=ok``
+        with ``result.sent``, or rendered text) is applied as that outcome: the
+        marker means "no verdict was obtained", and requeueing a delivery that
+        already happened is how one message becomes two.
 
         A repeated delivery of the same report is recognised from the recorded
         effect and answers ``ok=true`` with ``duplicate=true``, without a second
