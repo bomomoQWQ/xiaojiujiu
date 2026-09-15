@@ -64,9 +64,10 @@
 │   ├── docs/PATCH_V0.2_MAPPING.md    #   设计章节 → 代码位置 → 状态（含诚实缺口清单）
 │   └── README.md                     #   操作者手册（配置 / API / 蓝屏恢复 / 降级）
 │
-├── astrbot_plugin_companion_runtime/ # ★ AstrBot 薄插件（宿主侧唯一改动）
+├── astrbot_plugin_companion_runtime/ # ★ AstrBot 薄插件：**独立仓库**，本地克隆（不进本仓库 Git）
 │   ├── main.py                       #   监听 / 临时注入 / outbox 消费
 │   └── tests/                        #   143 项离线测试（另含 13 个子测试，带 AstrBot 桩）
+│                                     #   → https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime
 │
 ├── Dockerfile                        # ★ Runtime 镜像（非 root，状态全在 /data 卷）
 ├── docker-compose.yml                # ★ runtime + astrbot 两个容器，端口只发布到 loopback
@@ -92,6 +93,19 @@
 升级 AstrBot 只需替换该目录。详细边界见 `runtime/README.md` 与插件 README。
 它在 `.gitignore` 与 `.dockerignore` 里都被显式排除——既不会进仓库，也不会进镜像。
 
+**本项目由两个仓库组成**，刻意分开维护：
+
+| 仓库 | 内容 | 为什么分开 |
+|---|---|---|
+| [`xiaojiujiu`](https://github.com/bomomoQWQ/xiaojiujiu)（本仓库） | Runtime sidecar、Docker 部署、设计文档、验证脚本 | 主逻辑：跨时间的持久认知 |
+| [`astrbot_plugin_companion_runtime`](https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime) | 宿主侧薄插件（`main.py` + 插件核心 + `metadata.yaml`） | 插件要单独发到 AstrBot 插件市场，生命周期与主程序无关；发布 zip 只应包含插件本身 |
+
+插件仓库的 `metadata.yaml` 里 `repo` 指向它自己的地址（市场会校验
+`https://github.com/{owner}/{repo}` 形式），`author` 是 `bomomoQWQ`，
+`plugin_id` 为 `bomomoQWQ/astrbot_plugin_companion_runtime`。
+本仓库的 `docker-compose.yml` 会把 `./astrbot_plugin_companion_runtime` 挂进 AstrBot 容器，
+所以本地要有一份克隆（`git clone` 即可），该目录已在 `.gitignore` 中排除。
+
 ---
 
 ## 4. 部署
@@ -102,8 +116,10 @@ Runtime 与 AstrBot 是两个容器：Runtime 是持久认知 sidecar（本仓�
 AstrBot 只多装一个薄插件。仓库根的 `Dockerfile` 与 `docker-compose.yml` 就是这套组合。
 
 ```bash
+# 两个仓库：本仓库是主程序，插件在独立仓库里
 git clone https://github.com/bomomoQWQ/xiaojiujiu.git
 cd xiaojiujiu
+git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git
 
 docker compose up -d --build
 docker compose ps
@@ -153,16 +169,21 @@ API key **只从环境变量读**：配置对象里写的 key 会被刻意忽略
 镜像以非 root 用户（uid 10001）运行，`/data` 是唯一的持久卷，容器内自带的
 healthcheck 打 `/health`；`docker ps` 里的 `healthy` 就是可信的存活判据。
 
-### 4.2 安装薄插件（非 Docker 场景）
+### 4.2 安装薄插件
+
+插件在**独立仓库**里维护：<https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime>。
+
+推荐直接在 AstrBot WebUI 的「插件市场」搜索 `companion_runtime` 安装（市场从插件仓库取包）。
+也可以手动克隆到 AstrBot 的插件目录：
 
 ```powershell
-# 复制到 AstrBot 的插件目录（也可用 WebUI 上传 zip）
-Copy-Item -Recurse astrbot_plugin_companion_runtime AstrBot\data\plugins\ -Force
+git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git `
+  AstrBot\data\plugins\astrbot_plugin_companion_runtime
 ```
 
 然后在 AstrBot WebUI 里确认插件的 `runtime_base_url` 指向 Runtime 地址（同主机部署时
-插件与 Runtime 的默认值均为 `http://127.0.0.1:8787`）；若 Runtime 改过监听地址，
-再同步修改该项并重启 AstrBot。
+插件与 Runtime 的默认值均为 `http://127.0.0.1:8787`；两个容器同在 compose 网络里时是
+`http://runtime:8787`）；若 Runtime 改过监听地址，再同步修改该项并重启 AstrBot。
 
 > **多会话部署必做**：把 Runtime 的 `conversation_id` 设成会话的
 > `unified_msg_origin`（如 `aiocqhttp:FriendMessage:10001`）。
@@ -335,15 +356,20 @@ docker run --rm -v xiaojiujiu-data:/data -v E:\companion_runtime_backup:/backup 
 cd runtime
 .venv\Scripts\python.exe -m pytest tests -q          # 807 passed
 
+# 插件测试在插件仓库里（先 git clone，见 §4.2）
 cd ..\astrbot_plugin_companion_runtime
-$env:PYTHONPATH="$PWD\tests\stubs;$PWD\.."
-..\.venv-dev\Scripts\python.exe -m pytest tests -q   # 143 passed + 13 subtests
+$env:PYTHONPATH="$PWD\tests\stubs;$PWD"
+python -m pytest tests -q                            # 143 passed + 13 subtests
 
 cd ..
 python scripts\e2e_patch_v02.py                      # 28 项基础真机检查
 python scripts\e2e_resilience_simulation.py --base-dir E:\companion_runtime_backup\resilience-final
                                                      # 335 项高仿真检查（并发 / 重启 / 断网恢复）
 ```
+
+两个端到端脚本都会**导入插件仓库的代码**（它们驱动的是真实的插件传输层），
+所以本地必须有 `astrbot_plugin_companion_runtime/` 这份克隆；插件缺失时脚本会明确报错，
+而不是悄悄跳过。
 
 测试覆盖的重点不是行数，而是**几类容易悄悄坏掉的东西**：
 

@@ -1,3 +1,0 @@
-# The plugin only uses the standard library plus aiohttp, and aiohttp>=3.11.18 is
-# already a hard dependency of AstrBot itself, so this list stays empty on
-# purpose: installing it would trigger an unnecessary dependency check.

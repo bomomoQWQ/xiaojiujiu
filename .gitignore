@@ -49,6 +49,11 @@ __pycache__/
 # Upstream checkout: a separate clone that must never be committed or published
 AstrBot/
 
+# The AstrBot adapter lives in its own repository and is cloned here for local
+# development and for the docker-compose bind mount:
+#   git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git
+astrbot_plugin_companion_runtime/
+
 # Local scratch space
 /scratch/
 .scratch_*/
