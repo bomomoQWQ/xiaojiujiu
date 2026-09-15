@@ -68,6 +68,43 @@ DEEP_REFRESH_FIELDS = (
 #: The six fields of the explanation contract.
 EXPLANATION_FIELDS = ("experience", "focus", "conflict", "impulse", "inhibition", "expression")
 
+#: Phrases that mark a *dated promise to report back* -- the shape that has to
+#: become an unfinished matter, because the character is expected to remember it
+#: and ask later. Recognising this is one of the documented jobs of strong
+#: semantics ("复杂未尽之事识别"). The Runtime has no rule-based path that creates a
+#: matter from an ordinary message, so without a suggestion here the promise is
+#: simply forgotten and the character never follows up -- which is exactly the
+#: "内源主动" behaviour the whole project exists to produce.
+PROMISE_MARKERS: tuple[str, ...] = (
+    "告诉你",
+    "跟你说",
+    "和你说",
+    "回复你",
+    "再联系",
+    "回头说",
+    "有结果",
+    "出结果",
+)
+
+#: Time words that make a message dated, and therefore worth waiting on.
+TIME_MARKERS: tuple[str, ...] = (
+    "明天",
+    "后天",
+    "下周",
+    "下个月",
+    "周末",
+    "今晚",
+    "早上",
+    "下午",
+    "晚上",
+)
+
+
+def _short(text: str, limit: int = 24) -> str:
+    """Trim a message down to something usable as a matter title."""
+    cleaned = " ".join(str(text or "").split())
+    return cleaned if len(cleaned) <= limit else cleaned[:limit] + "…"
+
 
 def classify_prompt(system_prompt: str) -> str:
     """Return which contract a system prompt belongs to.
@@ -149,6 +186,14 @@ def build_deep_refresh_payload(request_body: Mapping[str, Any]) -> dict[str, Any
             }
         )
 
+    # A matter is proposed only for a message that actually carries something to
+    # wait for. Emitting one per unresolved event would fill the Runtime with
+    # matters nobody asked about, which is worse than staying quiet: a phantom
+    # matter makes the character ask about things that were never promised.
+    matter = _propose_unfinished_matter(unresolved, existing=unfinished)
+    if matter is not None:
+        payload["unfinished_matter_suggestions"].append(matter)
+
     # A candidate intent only when the pool is empty, so repeated refreshes do not
     # pile up duplicates -- the mock should be idempotent-ish for a calm scene.
     #
@@ -179,6 +224,50 @@ def build_deep_refresh_payload(request_body: Mapping[str, Any]) -> dict[str, Any
             }
         )
     return payload
+
+
+def _propose_unfinished_matter(
+    unresolved: list[Mapping[str, Any]], *, existing: Any
+) -> dict[str, Any] | None:
+    """Propose one unfinished matter when a message carries something to wait for.
+
+    A promise to report back ("结束了告诉你"), or a message that names a day, is
+    exactly the kind of thing the character must remember and follow up on. A
+    message that does neither gets no matter: the event is still kept, and
+    inventing a reason to speak is the failure mode the architecture spends the
+    most effort avoiding (a phantom matter makes the character ask about things
+    that were never promised).
+
+    Args:
+        unresolved: The unresolved events from the request.
+        existing: Matters already open, used to avoid proposing a duplicate.
+
+    Returns:
+        A grounded suggestion, or ``None``.
+    """
+    if existing:
+        return None
+    for item in unresolved:
+        content = str(item.get("content") or "")
+        event_id = str(item.get("event_id") or "")
+        if not content or not event_id:
+            continue
+        promised = any(marker in content for marker in PROMISE_MARKERS)
+        dated = any(marker in content for marker in TIME_MARKERS)
+        if not (promised or dated):
+            continue
+        title = f"等对方回报：{_short(content)}" if promised else f"跟进：{_short(content)}"
+        topics = [word for word in ("面试", "考试", "体检", "结果") if word in content]
+        return {
+            "sources": [event_id],
+            "payload": {
+                "title": title,
+                "priority": 0.7 if promised else 0.5,
+                "topics": topics or [_short(content, 8)],
+                "resolution_conditions": ["对方回来说了结果"] if promised else [],
+            },
+        }
+    return None
 
 
 def build_explanation_payload(request_body: Mapping[str, Any]) -> dict[str, str]:

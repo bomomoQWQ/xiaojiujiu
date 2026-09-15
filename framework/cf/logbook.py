@@ -324,33 +324,62 @@ class LogBridge(logging.Handler):
         *,
         logger_names: tuple[str, ...] = ("companion_runtime", "astrbot", "uvicorn"),
         minimum_level: int = logging.INFO,
+        per_logger_levels: Mapping[str, int] | None = None,
     ) -> None:
-        """Attach to every named logger."""
-        super().__init__(level=minimum_level)
+        """Attach to every named logger.
+
+        Args:
+            logbook: Destination.
+            logger_names: Loggers to attach to.
+            minimum_level: Default floor; records below it are ignored.
+            per_logger_levels: Overrides by logger name. The AstrBot adapter needs
+                DEBUG: it is *required* to swallow observation failures and report
+                them at that level, so an INFO floor hides exactly the errors this
+                bridge exists to surface.
+        """
+        # The handler's own level is the lowest floor any logger needs, so a
+        # DEBUG-level logger is not filtered out by the handler itself.
+        overrides = {str(k): int(v) for k, v in (per_logger_levels or {}).items()}
+        super().__init__(level=min([minimum_level, *overrides.values()]))
         self.logbook = logbook
         self.logger_names = logger_names
         self._attached: list[logging.Logger] = []
         for name in logger_names:
             target = logging.getLogger(name)
+            level = overrides.get(name, minimum_level)
             # A third-party logger defaults to WARNING and does not propagate to
             # a handler it never reaches; lowering the level and attaching here
-            # is the only way to see the program's INFO diagnostics.
-            if target.level == logging.NOTSET or target.level > minimum_level:
-                target.setLevel(minimum_level)
+            # is the only way to see the program's own diagnostics.
+            if target.level == logging.NOTSET or target.level > level:
+                target.setLevel(level)
             target.addHandler(self)
             self._attached.append(target)
 
     def emit(self, record: logging.LogRecord) -> None:
-        """Trace one program log record."""
+        """Trace one program log record.
+
+        Exception info is carried through. The adapter is *required* to swallow its
+        failures and reports them with ``exc_info=True`` at DEBUG, so a bridge that
+        recorded only ``getMessage()`` would turn "observation failed" into a dead
+        end. That is precisely what happened the first time this framework drove
+        the plugin, and it cost an hour of guessing at a line that had already
+        printed the answer.
+        """
         try:
+            detail = logging.Formatter().formatException(record.exc_info) if record.exc_info else ""
+            message = record.getMessage()
             self.logbook.debug(
                 "program_log",
                 {
                     "logger": record.name,
                     "level": record.levelname,
-                    "program_message": record.getMessage(),
+                    "program_message": message,
+                    "traceback": detail,
                 },
-                message=f"[{record.levelname.lower()}] {record.name}: {record.getMessage()}",
+                message=(
+                    f"[{record.levelname.lower()}] {record.name}: {message}"
+                    + (f"\n{detail}" if detail else "")
+                ),
             )
         except Exception:  # noqa: BLE001 - a logging failure must never break the run
             self.handleError(record)

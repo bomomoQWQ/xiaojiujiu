@@ -1,7 +1,28 @@
 # 小九九 · 外接测试框架（companion framework）
 
-一个**外接**的测试框架：它把同一仓库里的 Runtime 跑起来、喂它输入、任意摆弄它的时间、把它的内部变量写成日志，
-**并且一行都不改原程序**。
+一个**外接**的测试框架：起一个**聊天窗口**，你和主 LLM 说话，Runtime 在后台记着、攒着、到点自己开口——
+同时把它的内部变量写成日志，还能任意摆弄它的时间。**并且一行都不改原程序。**
+
+```console
+$ cf chat --start-time 2026-09-15T09:00:00Z
+小九九 · 外接框架聊天窗口
+  Runtime   : http://127.0.0.1:54739
+  主 LLM    : deepseek-chat @ https://api.deepseek.com/v1
+  会话      : webchat:FriendMessage:default
+
+[09-15 09:00 ×1 | 心境 +0.00 | I/R/P 0.06/0.51/0.00 | 未决 0 | 候选 0 | 未结 0]
+你> 我明天下午三点面试，结束了告诉你。
+◆ 小九九(回复) 09-15 09:00
+好，等你消息。别太紧张，正常发挥就行。
+
+[…] 你走开了 8 小时（/advance 8h）[…]
+
+◆ 小九九(主动) 09-15 17:00          ← 没人问它，它自己想起来的
+面试怎么样？
+```
+
+聊天窗口里你打的话会**连同 Runtime 注入的背景块**一起送给主 LLM；
+Runtime 那边同时在攒情绪、记未结之事、跑动机博弈，到点通过真实插件把消息渲染出来发给你。
 
 框架住在主项目里，但与被测代码严格分开：
 
@@ -28,14 +49,17 @@ xiaojiujiu/                       ← 主项目
 
 ---
 
-## 1. 四个能力
+## 1. 能力一览
 
 | 能力 | 在哪 | 说明 |
 |---|---|---|
+| **聊天窗口（TUI）** | `cf/tui.py` | 行式 REPL + 实时状态栏；主动消息会在你打字时插进来 |
+| **主 LLM 客户端** | `cf/main_llm.py` | 标准 OpenAI 兼容客户端，接到宿主主 LLM 的接缝上 |
+| **AstrBot 宿主模拟** | `cf/host.py` | 假平台 + 真插件（拿 AstrBot 桩加载），走真实的 observe→注入→生成→投递→回报 |
+| **人格价值观参数** | `cf/harness.py`、`cf/cli.py` | 8 个轴，`--values` 覆盖；它们是编译进动力学的性格，不是提示词装饰 |
 | **可控虚拟时钟** | `cf/clock.py`、`cf/control.py` | 运行中可 `set` / `advance` / `scale` / `freeze`，命令行驱动 |
-| **OpenAI 兼容端点** | `cf/mock_openai.py` | 作为原程序「强语义理解」（`remote_api` provider）的**输入源**，响应可脚本化、可注错 |
+| **OpenAI 兼容端点** | `cf/mock_openai.py` | 作为原程序「强语义理解」（`remote_api`）的输入源，可脚本化、可注错 |
 | **跑马日志** | `cf/logbook.py` | 轮转文本日志 + 结构化 JSONL 轨迹，逐条心跳记录变量 |
-| **组装与命令行** | `cf/harness.py`、`cf/cli.py` | 一键起全套，`cf` 命令控制 |
 
 ---
 
@@ -49,7 +73,15 @@ cd framework
 # RuntimeWarning（sys.prefix 与解释器路径对不上）。无害，但很吵。
 PY="$(cd ../runtime && pwd)/.venv/bin/python"
 
-# 终端 A：起一个 harness（前台，Ctrl-C 停）
+# 接真模型：key 只走环境变量，不要写进任何文件
+export CF_MAIN_LLM_BASE_URL=https://api.deepseek.com/v1
+export CF_MAIN_LLM_MODEL=deepseek-chat
+export CF_MAIN_LLM_API_KEY=<你的 key>
+
+# 开聊（推荐入口）
+"$PY" -m cf chat --run-dir runs/demo --start-time 2026-09-15T09:00:00Z
+
+# 或者只要一个后台 harness（无界面，用别的命令驱动）
 "$PY" -m cf run --run-dir runs/demo --start-time 2026-09-15T09:00:00Z
 
 # 终端 B：控制它
@@ -69,6 +101,13 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"
 三组命令：**起 harness**、**拨时间**、**喂输入看结果**。
 
 ```
+— 聊天（推荐） —
+cf chat             开一个聊天窗口：你和主 LLM 说话，Runtime 在后台工作
+                    --llm-base-url / --llm-model  覆盖端点（默认读 CF_MAIN_LLM_*）
+                    --system-prompt               角色设定（宿主人格，最高优先级）
+                    --values user_care=0.9,...    覆盖人格价值观轴（见 §6）
+                    --mock-semantics              强语义改用自带 mock，而不是主 LLM 端点
+
 — 起 —
 cf run              启动一个可外部调控的 harness（前台，Ctrl-C 停）
 
@@ -186,7 +225,46 @@ cf run --script 'json:{"reinterpretations":[]}'
 
 ---
 
-## 6. 日志里有什么
+## 6. 人格：8 个价值观轴
+
+架构文档 §4.2 把人格定义为**编译进动力学的数值**，而不是提示词里的一段形容。Runtime 有 8 个轴：
+
+| 轴 | 默认 | 它决定什么 | 被谁读 |
+|---|---|---|---|
+| `autonomy` | 0.72 | 自我推进的意愿 | `emotion.py` |
+| `boundary_respect` | 0.88 | 对边界的敬畏，被拒绝时的收敛 | `boundaries.py`、`motivation.py` |
+| `emotional_expression` | 0.46 | 情绪有多直接地写进话里 | `emotion.py` |
+| `relationship_maintenance` | 0.79 | 长期沉默后主动靠近的倾向 | `emotion.py`、`memory.py`、`motivation.py` |
+| `user_care` | 0.85 | 被对方的未结之事推动的强度 | `emotion.py`、`motivation.py` |
+| `conflict_directness` | 0.41 | 把话挑明的倾向 | `motivation.py` |
+| `stability_commitment` | 0.81 | 不被单次波动带偏 | `emotion.py`、`memory.py` |
+| `curiosity` | 0.76 | 追问与了解的驱动 | `motivation.py` |
+
+覆盖方式：
+
+```bash
+cf chat --values "user_care=0.98,emotional_expression=0.9,boundary_respect=0.35"
+cf chat --values-file persona.json        # {"user_care": 0.98, ...}
+```
+
+**注意两点**：
+
+1. **只在创建运行时那一行时写入。** 已经有数据库的 `--run-dir` 改这些不会生效，
+   框架会在日志里明确警告（`[values] ... DB 已存在，本次覆盖不会生效`）。
+   想看效果就换一个空的 `--run-dir`。
+2. **不配置也是一个选择，但要看得见。** 每次运行都会把生效的 8 个值写进 trace
+   （`values_configured`），所以"用了库里默认人格"是记录在案的，而不是隐形的。
+
+改这些**真的有区别**（同场景、同种子，只换价值观）：
+
+| 人格 | 候选效用 | 平均行动概率 |
+|---|---|---|
+| 默认（克制型） | 1.356 | 0.377 |
+| 热烈主动型（`user_care=0.98` `emotional_expression=0.90` `boundary_respect=0.35`） | 1.513 | **0.463**（+23%） |
+
+---
+
+## 7. 日志里有什么
 
 每次运行产出两个文件（都在 `--run-dir` 下）：
 
@@ -233,12 +311,12 @@ quiet_hours                                      是否落在免打扰时段
 
 ---
 
-## 7. 跑测试
+## 8. 跑测试
 
 ```bash
 cd framework
 PY="$(cd ../runtime && pwd)/.venv/bin/python"
-"$PY" -m pytest tests          # 107 passed
+"$PY" -m pytest tests          # 176 passed
 ```
 
 | 文件 | 覆盖 | 需要原程序 |
@@ -248,15 +326,20 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"
 | `test_mock_openai.py` | 两种契约、grounding、脚本与注错、token 不入日志 | 否 |
 | `test_harness_e2e.py` | 真程序端到端：接线、纪元、变量一致、故障降级、源码未改动 | **是** |
 | `test_cli.py` | 子进程跑 `cf run`，再用客户端命令驱动它（时间、tick、say、refresh、backlog、tail、shutdown） | **是** |
+| `test_main_llm.py` | OpenAI 客户端：请求形状、密钥不入日志、失败降级、reply/render 分流 | 否 |
+| `test_host.py` | 假平台、事件桩、AstrBot 三接口；端到端驱动**真插件**；价值观轴生效 | 部分 |
 
 后两个文件在原程序不可用时会自动 skip，所以只装框架也能跑前三个。
 
 ---
 
-## 8. 目录
+## 9. 目录
 
 | 路径 | 说明 |
 |---|---|
+| `cf/tui.py` | 聊天窗口：行式 REPL、实时状态栏、主动消息插入、斜杠命令 |
+| `cf/host.py` | AstrBot 宿主模拟：假平台 + 真插件 + 真实钩子顺序 |
+| `cf/main_llm.py` | 主 LLM：OpenAI 兼容客户端 + 无端点时的确定性替身 |
 | `cf/clock.py` | 可控时钟 + `install_process_clock`（重绑 `utcnow` / `utc_now_iso`） |
 | `cf/logbook.py` | 轮转日志、JSONL 轨迹、`LogBridge`（原程序日志桥接） |
 | `cf/mock_openai.py` | OpenAI 兼容端点、grounded 默认回复、`MockScript` / `MockReply` 注错 |
@@ -269,7 +352,7 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"
 
 ---
 
-## 9. 已知边界
+## 10. 已知边界
 
 * **不是黑盒**：为了完整接管时间，原程序被导入本进程（见 §4）。它仍然不被修改，但共享进程。
 * **单进程单 harness**：同时跑两个 harness 需要各自的 venv 或进程，因为 `install_process_clock`
@@ -277,10 +360,17 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"
 * **控制面无鉴权**：只绑回环，且 `ControlServer` 会拒绝非回环地址（除非显式 `allow_remote=True`）。
   把它暴露到可路由地址等于把"把角色快进十年并给用户刷屏"的能力交出去。
 * **`/cognition/refresh` 的信号名**是 HTTP 契约里的坑，见 §5。
+* **后台心跳会吃掉危险率窗口。** 每一拍 `lazy_tick` 都会消费掉它积分的流逝时间，
+  所以"手动步进 + 后台心跳"会让 `endogenous_round` 看到的 `delta_t≈0`，行动概率归零——
+  症状看起来像"这个角色就是不想说话"。要手动驱动场景就把 `--heartbeat-interval` 设成 0
+  （框架会记一条 `heartbeat_disabled`）。
+* **危险率是逐拍抽样的**，一次跳 30 小时只是抽了一次。要演"离开两天"就分成小步走
+  （黑盒仿真用约 1.4 小时/步），否则你会以为它不主动，其实只是样本太少。
+* **价值观参数只在创建运行时那一行时写入**，见 §6。
 
 ---
 
-## 10. 构建过程中发现的、属于原程序的现象
+## 11. 构建过程中发现的、属于原程序的现象
 
 框架不改原程序，但把它当被测对象时发现了两处值得记录的东西（详见 `cf/harness.py` 的注释）：
 

@@ -47,7 +47,15 @@ from typing import Any, Mapping
 
 from .clock import ControllableClock, install_process_clock, parse_duration, parse_when
 from .control import ControlServer
+from .host import DEFAULT_PLUGIN_ROOT, AstrBotHost, Platform, SESSION_DEFAULT
 from .logbook import LogBridge, Logbook
+from .main_llm import (
+    BASE_URL_ENV,
+    MODEL_ENV,
+    MainLLM,
+    OpenAICompatibleMainLLM,
+    ScriptedMainLLM,
+)
 from .mock_openai import MockOpenAIServer, MockReply, MockScript
 from .program import ProgramClient
 from .variables import VariableProbe
@@ -106,6 +114,24 @@ class HarnessConfig:
     use_mock_semantics: bool = True
     config_path: str | None = None
     echo_logs: bool = True
+    #: The acting layer. Empty values fall back to the ``CF_MAIN_LLM_*``
+    #: environment variables; with neither set, a deterministic stand-in is used
+    #: so the chat still runs end to end without any endpoint.
+    llm_base_url: str = ""
+    llm_model: str = ""
+    llm_system_prompt: str = ""
+    llm_temperature: float = 0.8
+    #: Partial overrides of the Runtime's 8 value axes -- the personality compiled
+    #: into dynamics. Applied when the runtime row is created, so it only takes
+    #: effect on a fresh run directory (see :meth:`Harness._apply_values`).
+    values: dict[str, float] = field(default_factory=dict)
+    #: The AstrBot plugin checkout, loaded against its own stubs.
+    plugin_root: Path = field(default_factory=lambda: Path(DEFAULT_PLUGIN_ROOT))
+    #: Boot the AstrBot host at all. Off when only the Runtime is wanted.
+    use_host: bool = True
+    #: Point the program's own strong semantics at the *main* LLM instead of the
+    #: mock endpoint. Off by default: the mock is grounded, deterministic and free.
+    semantic_from_main_llm: bool = False
 
     def resolved_base_dir(self) -> Path:
         """Return the program's data directory, defaulting to ``run_dir/program``."""
@@ -160,6 +186,9 @@ class Harness:
         #: Program source tree, snapshotted at boot and compared at teardown.
         self._program_src: Path | None = None
         self._source_before: dict[str, tuple[int, float]] = {}
+        self.platform: Platform | None = None
+        self.llm: MainLLM | None = None
+        self.host: AstrBotHost | None = None
 
     # ------------------------------------------------------------------- boot
 
@@ -199,9 +228,15 @@ class Harness:
         self._source_before = _snapshot_sources(self._program_src)
         # Attach after the import so the program's loggers exist, and before the
         # boot so a failure during startup is captured too.
-        self._log_bridge = LogBridge(self.logbook)
+        # The adapter reports its swallowed failures at DEBUG; without that
+        # level a plugin that never reports anything looks identical to one
+        # that is working silently.
+        self._log_bridge = LogBridge(
+            self.logbook, per_logger_levels={'astrbot': logging.DEBUG}
+        )
         self._rebound = install_process_clock(self.clock)
         self.logbook.event("clock_installed", {"rebound": self._rebound}, message=f"[clock] rebound {self._rebound} binding(s)")
+        self._build_llm()
         self._start_mock()
         self._build_runtime()
         self._start_http(startup_timeout)
@@ -212,6 +247,7 @@ class Harness:
         self._probe = VariableProbe(self.base_url, clock=self.clock)
         self.program = ProgramClient(self.base_url)
         self._start_control()
+        self._start_host()
         self._start_heartbeat()
         self.logbook.event(
             "harness_ready",
@@ -221,6 +257,8 @@ class Harness:
                 "mock_url": self.mock.base_url if self.mock else "",
                 "provider": getattr(getattr(self.runtime, "semantic_provider", None), "name", "unknown"),
                 "mock_calls": self.mock.calls_made if self.mock else 0,
+                "llm": self.llm.describe() if self.llm is not None else {},
+                "host": self.host.stats() if self.host is not None else {},
             },
             message=(
                 f"[ready] runtime={self.base_url} control={self.control.base_url if self.control else '-'} "
@@ -255,6 +293,36 @@ class Harness:
         """
         if not self.config.use_mock_semantics:
             return
+        if self.config.semantic_from_main_llm:
+            llm = self.llm
+            if llm is not None and getattr(llm, "configured", False):
+                # The same endpoint serves both halves of the architecture: the
+                # main LLM does the moment-to-moment acting, and the Runtime's
+                # low-frequency strong semantics call the same model for the jobs
+                # only a model can do (re-reading old events, naming what is
+                # unfinished). One endpoint, one key, two very different cadences.
+                os.environ["CR_SEMANTIC_BASE_URL"] = llm.base_url
+                os.environ["CR_SEMANTIC_MODEL"] = llm.model
+                os.environ["CR_SEMANTIC_API_KEY"] = getattr(llm, "_api_key", "") or MOCK_API_KEY
+                self.logbook.event(
+                    "semantic_wired",
+                    {
+                        "base_url": llm.base_url,
+                        "model": llm.model,
+                        "provider": "remote_api",
+                        "source": "main_llm",
+                    },
+                    message=f"[semantic] 复用主 LLM 端点 {llm.model} @ {llm.base_url}",
+                )
+                return
+            # Asked for the real model but none is configured: fall back rather
+            # than refuse to start. A chat that cannot boot because of a missing
+            # optional accelerator would be a worse failure than a mock.
+            self.logbook.warn(
+                "semantic_wired",
+                {"source": "mock", "reason": "main LLM endpoint is not configured"},
+                message="[semantic] 想要真模型但没配端点，回落到 mock",
+            )
         self.mock = MockOpenAIServer(self.logbook, model_name=SEMANTIC_ENV["CR_SEMANTIC_MODEL"])
         base_url = self.mock.start()
         os.environ["CR_SEMANTIC_BASE_URL"] = base_url
@@ -284,6 +352,7 @@ class Harness:
             config.semantic.provider = "remote_api"
         else:
             config.semantic.provider = "disabled"
+        self._apply_values(config)
         self._runtime_config = config
         self.runtime = Runtime(config, seed=self.config.seed, created_at=getattr(self, "epoch", None) or self.clock.now())
         self.logbook.event(
@@ -299,6 +368,59 @@ class Harness:
                 "created_at": self.clock.now().isoformat(),
             },
         )
+
+    def _apply_values(self, config: Any) -> None:
+        """Fold the configured value axes into the Runtime's personality.
+
+        The eight axes are the character: they are read by the emotion dynamics,
+        the motivational game, memory salience and boundary enforcement, so they
+        decide how easily this character is moved, how much it holds back, and
+        whether a due matter is enough to make it speak. Leaving them at the
+        library defaults is a legitimate choice, but it is a choice -- and an
+        invisible one, because nothing in the run says "generic personality".
+
+        They are seeded only when the runtime row is *created*, so a run directory
+        that already holds a database keeps its original profile. Saying that out
+        loud beats letting an operator change a number and see nothing happen.
+        """
+        from companion_runtime.typing import ValueProfile
+
+        defaults = ValueProfile().to_dict()
+        requested = {str(k): float(v) for k, v in (self.config.values or {}).items()}
+        unknown = sorted(set(requested) - set(defaults))
+        if unknown:
+            raise RuntimeError(
+                f"unknown value axe(s): {', '.join(unknown)}; known: {', '.join(sorted(defaults))}"
+            )
+        effective = {**defaults, **requested}
+        config.values = ValueProfile.from_mapping(effective)
+
+        database = Path(str(config.storage.database_path))
+        existed = database.exists()
+        self.logbook.event(
+            "values_configured",
+            {
+                "effective": effective,
+                "overridden": requested,
+                "database_existed": existed,
+                "note": "values are seeded only when the runtime row is created"
+                if not existed
+                else "database already existed; the stored profile is unchanged",
+            },
+            message=(
+                f"[values] {len(requested)} axe(s) overridden" if requested else "[values] library defaults"
+            )
+            + (" | DB 已存在，本次覆盖不会生效" if existed and requested else ""),
+        )
+        if existed and requested:
+            self.logbook.warn(
+                "values_ignored",
+                {"database": str(database), "overridden": requested},
+                message=(
+                    f"[values] {database} 已存在：价值观只在创建运行时那一行时写入，"
+                    "改动不会生效。换一个空的 --run-dir 才能看到效果。"
+                ),
+            )
 
     def _start_http(self, startup_timeout: float) -> None:
         """Serve the program's app with uvicorn in a background thread."""
@@ -388,7 +510,24 @@ class Harness:
         self.control.start()
 
     def _start_heartbeat(self) -> None:
-        """Start the beat that makes time pass and records the variables."""
+        """Start the beat that makes time pass and records the variables.
+
+        A non-positive interval disables the background beat entirely, which is
+        what a caller driving the clock by hand wants. Every ``lazy_tick``
+        *consumes* the elapsed time it integrates over, so a background beat
+        running between two manual steps leaves the next ``endogenous_round`` with
+        ``delta_t ~ 0`` -- and the hazard draw then has probability ~0 no matter how
+        long the scene is supposed to have lasted. That failure looks exactly like
+        "the character never wants to speak", which is why it is worth a switch
+        rather than a footnote.
+        """
+        if self.config.heartbeat_interval_s <= 0:
+            self.logbook.event(
+                "heartbeat_disabled",
+                {"reason": "heartbeat_interval_s <= 0"},
+                message="[beat] 后台心跳已关闭（由调用方手动推进）",
+            )
+            return
         self._heartbeat = threading.Thread(target=self._beat_loop, name="cf-heartbeat", daemon=True)
         self._heartbeat.start()
 
@@ -444,6 +583,68 @@ class Harness:
         )
         return variables
 
+
+    def _build_llm(self) -> None:
+        """Build the acting layer: a real endpoint when configured, else a stand-in."""
+        configured = OpenAICompatibleMainLLM.from_env(
+            logbook=self.logbook,
+            base_url=self.config.llm_base_url or None,
+            model=self.config.llm_model or None,
+            system_prompt=self.config.llm_system_prompt or None,
+            temperature=self.config.llm_temperature,
+        )
+        if configured.configured:
+            self.llm = configured
+            self.logbook.event(
+                "main_llm_wired",
+                {"mode": "openai_compatible", **configured.describe()},
+                message=f"[llm] {configured.model} @ {configured.base_url}",
+            )
+        else:
+            self.llm = ScriptedMainLLM(logbook=self.logbook)
+            self.logbook.warn(
+                "main_llm_wired",
+                {
+                    "mode": "scripted",
+                    "hint": f"set {BASE_URL_ENV} and {MODEL_ENV} for a real acting layer",
+                },
+                message="[llm] 没有配置主 LLM 端点，使用确定性替身（回复不代表真模型）",
+            )
+
+    def _start_host(self) -> None:
+        """Load the shipped AstrBot plugin so there is something to talk to."""
+        if not self.config.use_host:
+            return
+        self.platform = Platform()
+        self.host = AstrBotHost(
+            runtime_base_url=self.base_url,
+            platform=self.platform,
+            llm=self.llm,
+            clock=self.clock,
+            logbook=self.logbook,
+            plugin_root=self.config.plugin_root,
+        )
+        self.host.start()
+        self.platform.open(SESSION_DEFAULT)
+
+    def user_turn(self, text: str, session: str = SESSION_DEFAULT) -> str:
+        """Send one user message through the host and return the reply.
+
+        This is the whole deployed path: platform -> plugin hooks -> Runtime
+        context injection -> main LLM -> delivery report.
+        """
+        if self.host is None:
+            raise RuntimeError("the AstrBot host is not running (use_host=False?)")
+        return self.host.user_turn(text, session=session, at=self.clock.now())
+
+    def last_variables(self) -> dict[str, Any]:
+        """Return the most recent variable snapshot, for a status line."""
+        return dict(self._last_variables)
+
+    def beat_now(self, step: Any = None) -> dict[str, Any]:
+        """Run one heartbeat immediately (alias of :meth:`beat`)."""
+        return self.beat(step)
+
     # ------------------------------------------------------------------ hooks
 
     def tick(self, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -482,6 +683,9 @@ class Harness:
             "mock_stats": self.mock.stats() if self.mock else {},
             "provider": getattr(getattr(self.runtime, "semantic_provider", None), "name", "unknown"),
             "provider_health": _safe_health(self.runtime),
+            "llm": self.llm.describe() if self.llm is not None else {},
+            "llm_stats": self.llm.stats() if hasattr(self.llm, "stats") else {},
+            "host": self.host.stats() if self.host is not None else {},
             "variables": dict(self._last_variables),
             "rebound_bindings": self._rebound,
             "run_dir": str(self.run_dir),
@@ -537,6 +741,9 @@ class Harness:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
+        if self.host is not None:
+            self.host.stop()
+            self.host = None
         if self._log_bridge is not None:
             self._log_bridge.detach()
             self._log_bridge = None
@@ -555,6 +762,7 @@ class Harness:
             "beats": self._beats,
             "virtual_now": self.clock.now().isoformat(),
             "mock_calls": self.mock.calls_made if self.mock else 0,
+            "llm_stats": self.llm.stats() if hasattr(self.llm, "stats") else {},
             "program_source_untouched": source_check,
         }
         self.logbook.event("harness_stop", summary, message=f"[stop] beats={self._beats} mock_calls={summary['mock_calls']}")

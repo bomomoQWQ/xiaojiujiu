@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -27,9 +28,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .harness import DEFAULT_PROGRAM_SRC, Harness, HarnessConfig
+from .host import DEFAULT_PLUGIN_ROOT
 from .logbook import Logbook
 from .mock_openai import MockReply, MockScript
 from .program import ProgramClient, ProgramError
+from .tui import ChatTUI
 
 DEFAULT_RUNS_DIR = Path("runs")
 
@@ -418,6 +421,112 @@ def _print_variables(variables: dict[str, Any]) -> None:
             print(f"  {key:<20} {variables[key]}")
 
 
+
+# --------------------------------------------------------------------------- chat
+
+
+def cmd_chat(args: argparse.Namespace) -> int:
+    """Open a chat window: you talk to the main LLM, the Runtime works behind it."""
+    run_dir = Path(args.run_dir) if args.run_dir else DEFAULT_RUNS_DIR / time.strftime("%Y%m%d-%H%M%S")
+    config = HarnessConfig(
+        run_dir=run_dir,
+        program_src=Path(args.program_src),
+        base_dir=Path(args.base_dir) if args.base_dir else None,
+        start_time=args.start_time,
+        time_scale=args.time_scale,
+        step=args.step,
+        heartbeat_interval_s=args.heartbeat_interval,
+        seed=args.seed,
+        use_mock_semantics=True,
+        echo_logs=False,
+        llm_base_url=args.llm_base_url,
+        llm_model=args.llm_model,
+        llm_system_prompt=args.system_prompt,
+        llm_temperature=args.temperature,
+        plugin_root=Path(args.plugin_root),
+        values=_parse_values(args.values, args.values_file),
+        semantic_from_main_llm=not args.mock_semantics,
+    )
+    harness = Harness(config)
+    try:
+        harness.start()
+    except RuntimeError as exc:
+        print(f"framework: {exc}", file=sys.stderr)
+        harness.logbook.close()
+        return 2
+
+    tui = ChatTUI(
+        platform=harness.platform,
+        clock=harness.clock,
+        send=lambda text, session: harness.user_turn(text, session),
+        status_provider=harness.last_variables,
+        control={
+            "beat": lambda _arg: f"心跳 {harness.beat_now() and ''}完成",
+            "endogenous": lambda _arg: json.dumps(harness.endogenous({}), ensure_ascii=False)[:400],
+            "status": lambda _arg: json.dumps(harness.status(), ensure_ascii=False, indent=2, default=str)[:4000],
+        },
+        tty=None if not args.no_tty else False,
+    )
+    tui.banner(llm=harness.llm.describe() if harness.llm is not None else {}, runtime_url=harness.base_url)
+    if not getattr(harness.llm, "configured", False):
+        print(
+            "注意：没有配置主 LLM 端点，当前用确定性替身，回复不代表真模型。\n"
+            "      设 CF_MAIN_LLM_BASE_URL / CF_MAIN_LLM_MODEL / CF_MAIN_LLM_API_KEY，\n"
+            "      或传 --llm-base-url / --llm-model，即可接真模型。",
+            file=sys.stderr,
+        )
+    try:
+        return tui.run()
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        summary = harness.stop()
+        print(f"\n结束：{summary['beats']} 次心跳，LLM 调用 {summary.get('llm_stats', {}).get('calls', 0)} 次")
+        print(f"日志：{run_dir}/framework.log  轨迹：{run_dir}/trace.jsonl")
+
+
+#: The Runtime's eight value axes, with the library default and what each one moves.
+VALUE_AXES: dict[str, tuple[float, str]] = {
+    "autonomy": (0.72, "自我推进的意愿：越高越容易自己决定开口"),
+    "boundary_respect": (0.88, "对边界的敬畏：越高越不容易越线，也越容易被拒绝压住"),
+    "emotional_expression": (0.46, "情绪外露：越高情绪越直接地写在话里"),
+    "relationship_maintenance": (0.79, "关系维护：越高越会在长期沉默后主动靠近"),
+    "user_care": (0.85, "对用户的在意：越高越会被对方的未结之事推动"),
+    "conflict_directness": (0.41, "冲突直率：越高越倾向于把话挑明"),
+    "stability_commitment": (0.81, "稳定承诺：越高越不容易被单次波动带偏"),
+    "curiosity": (0.76, "好奇：越高越容易想追问、想了解"),
+}
+
+
+def _parse_values(inline: str, path: str) -> dict[str, float]:
+    """Build the value overrides from ``k=v,k=v`` and/or a JSON file.
+
+    Raises:
+        SystemExit: On an unknown axis or an unparseable number, naming the
+            offender. A silently ignored personality setting is the worst
+            outcome here: the operator would believe they had configured it.
+    """
+    values: dict[str, float] = {}
+    if path:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise SystemExit(f"{path}: expected a JSON object of axis -> number")
+        values.update({str(k): float(v) for k, v in raw.items()})
+    for chunk in (inline or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        key, sep, raw_value = chunk.partition("=")
+        if not sep:
+            raise SystemExit(f"价值观要写成 轴=数值，收到的是 {chunk!r}")
+        values[key.strip()] = float(raw_value)
+    unknown = sorted(set(values) - set(VALUE_AXES))
+    if unknown:
+        lines = "\n".join(f"  {name:<26} 默认 {default:<5} {doc}" for name, (default, doc) in VALUE_AXES.items())
+        raise SystemExit(f"未知的价值观轴：{', '.join(unknown)}\n可用的轴：\n{lines}")
+    return values
+
+
 # --------------------------------------------------------------------------- cli
 
 
@@ -515,6 +624,28 @@ def build_parser() -> argparse.ArgumentParser:
     backlog.add_argument("--run-dir", default="")
     backlog.add_argument("--full", action="store_true")
     backlog.set_defaults(func=cmd_backlog)
+
+    chat = sub.add_parser("chat", help="打开聊天窗口：你和主 LLM 对话，Runtime 在后台工作")
+    chat.add_argument("--run-dir", default="", help="本次运行的产物目录（默认 runs/<时间戳>）")
+    chat.add_argument("--program-src", default=DEFAULT_PROGRAM_SRC)
+    chat.add_argument("--plugin-root", default=str(Path(DEFAULT_PLUGIN_ROOT)), help="AstrBot 插件仓库位置")
+    chat.add_argument("--base-dir", default="")
+    chat.add_argument("--start-time", default=None, help="虚拟起始时间（ISO-8601）")
+    chat.add_argument("--time-scale", type=float, default=1.0, help="虚拟秒 / 真实秒")
+    chat.add_argument("--step", default=None, help="每个心跳推进的时长，如 30m")
+    chat.add_argument("--heartbeat-interval", type=float, default=1.0)
+    chat.add_argument("--seed", type=int, default=20260915)
+    chat.add_argument("--llm-base-url", default="", help="主 LLM 端点（默认读 CF_MAIN_LLM_BASE_URL）")
+    chat.add_argument("--llm-model", default="", help="主 LLM 模型名（默认读 CF_MAIN_LLM_MODEL）")
+    chat.add_argument("--system-prompt", default="", help="角色设定（宿主人格，最高优先级）")
+    chat.add_argument("--temperature", type=float, default=0.8)
+    chat.add_argument("--values", default="",
+                      help="覆盖人格价值观轴，如 user_care=0.95,emotional_expression=0.8")
+    chat.add_argument("--values-file", default="", help="从 JSON 文件读取价值观轴")
+    chat.add_argument("--mock-semantics", action="store_true",
+                      help="强语义改用框架自带的 mock 端点（默认是与主 LLM 同一个端点）")
+    chat.add_argument("--no-tty", action="store_true", help="关掉终端重绘（管道/重定向时用）")
+    chat.set_defaults(func=cmd_chat)
 
     return parser
 
