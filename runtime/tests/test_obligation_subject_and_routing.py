@@ -30,6 +30,7 @@ from typing import Iterator
 
 import pytest
 
+from companion_runtime import api_v1
 from companion_runtime import candidate as candidate_module
 from companion_runtime import projections as projections_module
 from companion_runtime import unfinished as unfinished_module
@@ -680,5 +681,51 @@ class TestAReplyBelongsToItsOwnChat:
             assert attempt is not None and attempt.state == "resolved"
             observation = runtime.projections.user_model.observation_for_attempt(attempt_id)
             assert observation is not None, "the reply in the right chat was not attributed"
+        finally:
+            runtime.close()
+
+
+class TestAProactivePromptStaysInItsChat:
+    """The block a proactive message is written from must not name another chat's business.
+
+    The prompt lists open matters so the main LLM knows what is going on, but the
+    message is delivered into exactly one conversation: naming a subject the user
+    only ever raised elsewhere is at best confusing, and it is how a check-up
+    reminder in one chat came out worded about an interview from another.
+    """
+
+    def _matter_in_b(self, clock: SimulatedClock) -> tuple[Runtime, UnfinishedMatter]:
+        runtime = build_runtime()
+        say(
+            runtime,
+            clock,
+            "我明天下午有个体检，出结果告诉你。",
+            at=BASE_TIME,
+            session=SESSION_B,
+        )
+        matters = runtime.projections.unfinished.list_open()
+        assert len(matters) == 1
+        return runtime, matters[0]
+
+    def test_the_render_block_omits_matters_from_other_chats(self, clock: SimulatedClock) -> None:
+        """Session A's prompt must not carry session B's matter."""
+        runtime, matter = self._matter_in_b(clock)
+        try:
+            block_a = api_v1._context_text(runtime, BASE_TIME + timedelta(hours=1), conversation_id=SESSION_A)
+            block_b = api_v1._context_text(runtime, BASE_TIME + timedelta(hours=1), conversation_id=SESSION_B)
+            assert matter.title not in block_a, (
+                "a message sent into session A was written from a block naming "
+                f"session B's matter ({matter.title})"
+            )
+            assert matter.title in block_b, "the matter's own chat must still see it"
+        finally:
+            runtime.close()
+
+    def test_an_unscoped_block_is_unchanged(self, clock: SimulatedClock) -> None:
+        """Callers with no conversation in hand (normal turns) see every matter."""
+        runtime, matter = self._matter_in_b(clock)
+        try:
+            block = api_v1._context_text(runtime, BASE_TIME + timedelta(hours=1))
+            assert matter.title in block
         finally:
             runtime.close()

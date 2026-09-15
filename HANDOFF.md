@@ -90,18 +90,32 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 
 | 项目 | 结果 |
 |---|---|
-| Runtime 离线测试 | 826 passed |
+| Runtime 离线测试 | 828 passed |
 | 插件离线测试 | 143 passed + 13 subtests |
 | 高仿真故障恢复 | 335/335 |
 | 用户黑盒仿真 | **69 / 69**（退出码 0） |
 | 版本 | Runtime 0.2.0；插件 0.1.0 |
 | 许可证 | GPL-3.0-or-later |
 
-**接手的第一个任务（已知未完成项）**：主动消息的 prompt 会列出**所有**会话的未尽之事
-（`context.py` 的 `- 未尽之事：{title}`），没有按会话过滤——所以在一个会话里提醒时，
-措辞可能提到只在另一个会话说过的事。黑盒仿真的隔离检查只覆盖了反方向，所以没抓到。
-建议：给 `select_matters` 之类的选择逻辑加会话作用域，并在黑盒仿真里补一条正向断言
-（"提醒的措辞不得提到只属于另一个会话的主题"）。
+**已验证的"检查真的会咬人"**（`--fault` 注错，每条都让对应断言失败）：
+
+| 注错 | 黑盒失败的检查数 |
+|---|---|
+| `leak`（把内部标记/密钥塞进用户可见文本） | 3 |
+| `duplicate`（每条主动消息发两次） | 5 |
+| `topic`（主动消息只聊被禁话题） | 9 |
+| `guilt`（加追责话术） | 8 |
+| `cross_session`（把私聊内容发到群聊） | 4 |
+| `default_session`（全部发到默认会话） | 5 |
+
+**接下来值得做的（按我的排序）**：
+
+1. 插件市场发布（`metadata.yaml` 已按规范校准；发布入口 <https://cloud.astrbot.app/>，
+   需要 AstrBot Cloud 账号，我这边没有）。
+2. 加 CI（需要给令牌 `workflow` 权限，或在网页上直接建 `.github/workflows/`）。
+3. 跨会话隔离的**正向**断言：现在只断言了"B 的话题不出现在 A"，没断言"渲染措辞不提别的会话"。
+   prompt 侧的过滤已经做了（`api_v1._scope_matters`），但黑盒里还没有对应的检查。
+4. `committed != sent` 与"平台已发出 / 结果已上报"之间的崩溃窗口（需要平台回执或宿主持久化幂等日志）。
 
 ```bash
 python scripts/blackbox_user_simulation.py --base-dir ./bb        # 69/69，退出码 0

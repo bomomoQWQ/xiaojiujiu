@@ -60,7 +60,7 @@
 .
 ├── runtime/                          # ★ 持久认知 sidecar（独立进程，Python 3.11+）
 │   ├── src/companion_runtime/        #   29 个模块（含协议 v1 兼容层 api_v1.py）
-│   ├── tests/                        #   826 项离线测试
+│   ├── tests/                        #   828 项离线测试
 │   ├── docs/PATCH_V0.2_MAPPING.md    #   设计章节 → 代码位置 → 状态（含诚实缺口清单）
 │   └── README.md                     #   操作者手册（配置 / API / 蓝屏恢复 / 降级）
 │
@@ -356,7 +356,7 @@ docker run --rm -v xiaojiujiu-data:/data -v E:\companion_runtime_backup:/backup 
 
 ```powershell
 cd runtime
-.venv\Scripts\python.exe -m pytest tests -q          # 826 passed
+.venv\Scripts\python.exe -m pytest tests -q          # 828 passed
 
 # 插件测试在插件仓库里（先 git clone，见 §4.2）
 cd ..\astrbot_plugin_companion_runtime

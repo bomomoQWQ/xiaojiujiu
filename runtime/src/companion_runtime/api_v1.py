@@ -354,7 +354,9 @@ def _fallback_block(bundle: Any) -> str:
     return "\n".join(lines)
 
 
-def _context_text(runtime: Any, now: datetime) -> str:
+def _context_text(
+    runtime: Any, now: datetime, *, conversation_id: str | None = None
+) -> str:
     """Assemble and render the Runtime's injection block for one turn.
 
     Fail-open by construction: prompt composition must never be the reason a
@@ -364,17 +366,71 @@ def _context_text(runtime: Any, now: datetime) -> str:
     Args:
         runtime: The Runtime instance.
         now: Reference time.
+        conversation_id: When set, matters raised in *other* conversations are left
+            out of the block. A message is delivered into exactly one chat, so
+            naming a subject the user only ever raised elsewhere is confusing at
+            best and leaks between chats at worst.
 
     Returns:
         The rendered block, or an empty string when it cannot be built.
     """
     try:
         bundle = context_module.build(runtime=runtime, now=now)
+        if conversation_id is not None:
+            _scope_matters(runtime, bundle, conversation_id=conversation_id)
         text = context_module.render_block(bundle).strip()
         return text or _fallback_block(bundle).strip()
     except Exception:  # noqa: BLE001 - a lease must survive a context fault
         LOGGER.exception("v1 context assembly failed while composing a prompt")
         return ""
+
+
+def _scope_matters(runtime: Any, bundle: Any, *, conversation_id: str) -> None:
+    """Keep only the open matters that belong to ``conversation_id``.
+
+    A matter shows up in the block more than once - as an entry in the unfinished
+    list, and as a working-situation fact ("未尽之事：…") written when it was
+    created - so filtering the list alone is not enough.
+
+    Matters whose conversation cannot be established (no source events, or the
+    events are gone) are kept: the character legitimately knows them, and dropping
+    them would hide information rather than protect a chat boundary.
+    """
+    situation = bundle.situation
+    foreign: set[str] = set()
+    for matter in runtime.projections.unfinished.list_open():
+        origin = _matter_conversation(runtime, matter.unfinished_id)
+        if origin is not None and origin != conversation_id:
+            foreign.add(str(matter.title))
+    if not foreign:
+        return
+    situation["unfinished"] = [
+        entry
+        for entry in (situation.get("unfinished") or [])
+        if str(entry.get("title")) not in foreign
+    ]
+    for key in ("facts", "inferences"):
+        situation[key] = [
+            text
+            for text in (situation.get(key) or [])
+            if not any(title in str(text) for title in foreign)
+        ]
+
+
+def _matter_conversation(runtime: Any, unfinished_id: Any) -> str | None:
+    """Return the conversation a matter was raised in, if it can be established."""
+    identifier = _text(unfinished_id).strip()
+    if not identifier:
+        return None
+    matter = runtime.projections.unfinished.get(identifier)
+    if matter is None or not matter.source_event_ids:
+        return None
+    events = runtime.events.get_many(list(matter.source_event_ids)[:4])
+    with_conversation = [event for event in events if event.conversation_id]
+    if not with_conversation:
+        return None
+    newest = max(with_conversation, key=lambda event: event.timestamp)
+    return str(newest.conversation_id)
 
 
 # --------------------------------------------------------------------------------------
@@ -548,7 +604,9 @@ def _render_payload(
     goal = _text(payload.get("goal")).strip()
     constraints = _strings(payload.get("constraints"))
     lines: list[str] = []
-    block = _context_text(runtime, now)
+    block = _context_text(
+        runtime, now, conversation_id=_text(getattr(item, "conversation_id", "")).strip() or None
+    )
     if block:
         lines.extend([block, ""])
     lines.append("【现在要写的话】")
