@@ -118,9 +118,10 @@ class RuntimeProjection:
             profile = values if values is not None else ValueProfile()
             with self._db.transaction() as conn:
                 conn.execute(
-                    "INSERT OR IGNORE INTO runtime_state("
+                    "INSERT INTO runtime_state("
                     "runtime_id, version, updated_at, epoch_at, last_tick_at, allow_proactive, values_json"
-                    ") VALUES(?, 0, ?, ?, ?, 1, ?)",
+                    ") VALUES(?, 0, ?, ?, ?, 1, ?) "
+                    "ON CONFLICT(runtime_id) DO NOTHING",
                     (
                         self.runtime_id,
                         wall_clock,
@@ -1313,10 +1314,15 @@ class OutboxProjection:
             placeholders = ",".join("?" for _ in statuses)
             clauses.append(f"status IN ({placeholders})")
             params.extend(statuses)
+        # Ties on ``created_at`` used to fall through to ``rowid``, which is
+        # SQLite-only. ``outbox`` has no insertion-order column of its own, so they
+        # fall through to the primary key instead: the order is still arbitrary
+        # among equal instants, but it is now the *same* order on both backends
+        # rather than one SQLite cannot express at all.
         rows = self._db.query(
             "SELECT * FROM outbox WHERE " + " AND ".join(clauses) +
             " ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'leased' THEN 1 ELSE 2 END, "
-            "created_at DESC, rowid DESC",
+            "created_at DESC, outbox_id DESC",
             tuple(params),
         )
         found: list[OutboxItem] = []

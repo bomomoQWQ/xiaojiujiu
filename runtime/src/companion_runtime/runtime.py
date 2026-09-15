@@ -41,7 +41,7 @@ from . import pool as pool_module
 from . import protocol as protocol_module
 from . import unfinished as unfinished_module
 from .config import RuntimeConfig, StorageConfig
-from .db import Database
+from .db import Database, open_database
 from .eventlog import EventLog, EventQuery
 from .projections import AttemptProjection, Projections, VersionConflict
 from .reducer import Reducer
@@ -375,9 +375,7 @@ class Runtime:
         """
         self.config = config or RuntimeConfig()
         storage: StorageConfig = self.config.storage
-        self._db = database or Database(
-            storage.database_path, busy_timeout_ms=storage.busy_timeout_ms, wal=storage.wal
-        )
+        self._db = database or open_database(storage)
         self._db.migrate()
         self.mirror_path = storage.raw_log_path if storage.mirror_raw_events else None
         self.events = EventLog(self._db, self.mirror_path)

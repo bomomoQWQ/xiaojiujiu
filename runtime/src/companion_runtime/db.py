@@ -26,6 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
+from .db_base import DatabaseBase
 from .utility import ensure_aware, isoformat, parse_datetime
 
 LOGGER = logging.getLogger("companion_runtime.db")
@@ -424,7 +425,7 @@ def loads(value: Any, default: Any = None) -> Any:
         return default
 
 
-class Database:
+class Database(DatabaseBase):
     """A thin, thread-safe SQLite wrapper with WAL and explicit transactions.
 
     The Runtime is a single-writer system, but FastAPI may serve requests from
@@ -436,6 +437,9 @@ class Database:
     describe committed state.
     """
 
+    #: Backend name used in logs and health output.
+    dialect = "sqlite"
+
     def __init__(self, path: str | Path, busy_timeout_ms: int = 5000, wal: bool = True) -> None:
         """Open (and create) the database at ``path``.
 
@@ -444,6 +448,7 @@ class Database:
             busy_timeout_ms: SQLite busy timeout.
             wal: Enable write-ahead logging for file-backed databases.
         """
+        super().__init__(busy_timeout_ms=busy_timeout_ms)
         self.path = str(path)
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -460,210 +465,50 @@ class Database:
         if wal and self.path != ":memory:":
             self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA synchronous = NORMAL")
-        self._depth = 0
-        #: One callback frame per open :meth:`transaction` level, outermost first.
-        #: Frames are consumed by COMMIT and thrown away by ROLLBACK, which is what
-        #: keeps a post-commit hook from ever observing a row that was rolled back.
-        self._txn_frames: list[list[Callable[[], None]]] = []
-        #: Per-level :meth:`on_rollback` callbacks: they run when their level (or an
-        #: enclosing one) rolls back, and are dropped unrun when it commits.
-        self._rollback_frames: list[list[Callable[[], None]]] = []
-        #: Per-level :meth:`on_release` callbacks: they run when their level ends
-        #: well by handing its work to the parent (a savepoint that released),
-        #: which is neither a commit of the whole transaction nor a rollback.
-        self._release_frames: list[list[Callable[[], None]]] = []
 
-    # ------------------------------------------------------------------ context
+    # ------------------------------------------------------- backend primitives
+    #
+    # Everything that differs from PostgreSQL is confined to these methods: how a
+    # transaction starts (``BEGIN IMMEDIATE`` takes the write lock up front, which
+    # is what makes outbox claiming race-free), how savepoints are named, and how
+    # one statement runs. The transaction template, the three hook kinds and the
+    # access helpers live in :class:`~companion_runtime.db_base.DatabaseBase`.
 
-    @contextmanager
-    def transaction(self, immediate: bool = True) -> Iterator[sqlite3.Connection]:
-        """Run a block inside a transaction, nesting via savepoints.
+    def _begin(self, *, immediate: bool) -> None:
+        self._conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
 
-        Hooks registered with :meth:`post_commit` inside the block run once, in
-        registration order, after the outermost transaction has committed. Hooks
-        registered with :meth:`on_rollback` run only when a transaction actually
-        rolls back, and :meth:`on_release` hooks run when a savepoint releases
-        into its parent. Each kind is buffered per level: a rollback - of the
-        whole transaction or of one savepoint - discards the hooks registered
-        inside the part that was rolled back, so a hook never observes a row that
-        is no longer there, while a level that ended well keeps its hooks queued
-        for the commit. Hook failures are logged, never raised: the commit itself
-        has already happened and must not be undone.
+    def _commit(self) -> None:
+        self._conn.execute("COMMIT")
 
-        Args:
-            immediate: Acquire a write lock up front (``BEGIN IMMEDIATE``),
-                which is what makes outbox claiming race-free.
+    def _rollback(self) -> None:
+        self._conn.execute("ROLLBACK")
 
-        Yields:
-            The underlying connection.
-        """
-        with self._lock:
-            outermost = self._depth == 0
-            if outermost:
-                self._conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
-            else:
-                self._conn.execute(f"SAVEPOINT sp_{self._depth}")
-            self._depth += 1
-            self._txn_frames.append([])
-            self._rollback_frames.append([])
-            self._release_frames.append([])
-            try:
-                yield self._conn
-            except BaseException:
-                self._depth -= 1
-                self._txn_frames.pop()
-                rollbacks = self._rollback_frames.pop()
-                self._release_frames.pop()
-                if outermost:
-                    self._conn.execute("ROLLBACK")
-                else:
-                    self._conn.execute(f"ROLLBACK TO sp_{self._depth}")
-                    self._conn.execute(f"RELEASE sp_{self._depth}")
-                self._run_hooks(rollbacks)
-                raise
-            else:
-                self._depth -= 1
-                hooks = self._txn_frames.pop()
-                rollbacks = self._rollback_frames.pop()
-                releases = self._release_frames.pop()
-                try:
-                    if outermost:
-                        self._conn.execute("COMMIT")
-                    else:
-                        self._conn.execute(f"RELEASE sp_{self._depth}")
-                except BaseException:
-                    # The statements did not commit, so every hook registered
-                    # under this transaction is dropped rather than run.
-                    LOGGER.warning(
-                        "Transaction commit failed; discarding %d post-commit hook(s)",
-                        len(hooks) + sum(len(frame) for frame in self._txn_frames),
-                        exc_info=True,
-                    )
-                    self._txn_frames.clear()
-                    self._rollback_frames.clear()
-                    self._release_frames.clear()
-                    raise
-                if outermost:
-                    self._run_hooks(hooks)
-                else:
-                    # A released savepoint is part of its parent transaction:
-                    # post-commit hooks wait for the outermost commit, and rollback
-                    # hooks must still fire if an enclosing level rolls back. The
-                    # release hooks are this level's own result and run now.
-                    self._txn_frames[-1].extend(hooks)
-                    self._rollback_frames[-1].extend(rollbacks)
-                    self._run_hooks(releases)
+    def _savepoint(self, name: str) -> None:
+        self._conn.execute(f"SAVEPOINT {name}")
 
-    def post_commit(self, callback: Callable[[], None]) -> None:
-        """Register ``callback`` to run after the current transaction commits.
+    def _release(self, name: str) -> None:
+        self._conn.execute(f"RELEASE {name}")
 
-        Outside a transaction the callback runs immediately, because the
-        autocommit write it documents is already durable. Inside one it is
-        buffered on the innermost level: it runs after the outermost ``COMMIT``
-        and is dropped if that part of the transaction rolls back. This is what
-        makes an external mirror (see
-        :mod:`companion_runtime.eventlog`) unable to record an event that the
-        database itself never kept.
+    def _rollback_to(self, name: str) -> None:
+        self._conn.execute(f"ROLLBACK TO {name}")
 
-        Args:
-            callback: Zero-argument callable.
-        """
-        with self._lock:
-            if self._depth:
-                self._txn_frames[self._depth - 1].append(callback)
-            else:
-                self._run_hooks([callback])
+    def _execute(self, sql: str, params: Sequence[Any] | dict[str, Any]) -> sqlite3.Cursor:
+        return self._conn.execute(sql, params)
 
-    def on_rollback(self, callback: Callable[[], None]) -> None:
-        """Register ``callback`` to run only if the transaction rolls back.
-
-        Used by buffered side effects that must drop the state belonging to a
-        level that rolled back. The callback is paired with the innermost
-        transaction level and runs - after the SQLite ``ROLLBACK`` - only when
-        that level, or a level enclosing it, actually rolls back. A level that
-        ends well discards it unrun and never fires it on the way out, because
-        releasing a savepoint is a success, not a rollback; a released level's
-        surviving state is handed over through :meth:`on_release` instead. Like a
-        failing post-commit hook it cannot fail the caller. Outside a transaction
-        there is nothing to discard, so the callback is not kept.
-
-        Args:
-            callback: Zero-argument callable.
-        """
-        with self._lock:
-            if self._depth:
-                self._rollback_frames[self._depth - 1].append(callback)
-
-    def on_release(self, callback: Callable[[], None]) -> None:
-        """Register ``callback`` to run when its savepoint releases into its parent.
-
-        A released savepoint has neither committed the transaction nor rolled
-        back: its rows are now part of the enclosing transaction, and their fate
-        is decided there. Buffered side effects use this to hand their state to
-        the parent instead of writing it early (which a later outer rollback would
-        have to undo) or dropping it (which would lose committed work). The
-        callback runs right after the SQLite ``RELEASE``; a top-level transaction
-        never releases, so a callback registered there is simply discarded with
-        its frame. Like the other hook kinds it cannot fail the caller.
-
-        Args:
-            callback: Zero-argument callable.
-        """
-        with self._lock:
-            if self._depth:
-                self._release_frames[self._depth - 1].append(callback)
-
-    @staticmethod
-    def _run_hooks(hooks: Sequence[Callable[[], None]]) -> None:
-        """Run post-commit hooks, logging and swallowing any failure.
-
-        The transaction has already committed by the time a hook runs, so a
-        failing hook must not turn valid database state into a failed call. The
-        same tolerance is applied to rollback hooks, which share this runner.
-        """
-        for hook in hooks:
-            try:
-                hook()
-            except Exception:
-                LOGGER.warning("Post-commit hook failed", exc_info=True)
-
-    @contextmanager
-    def read(self) -> Iterator[sqlite3.Connection]:
-        """Run read-only statements under the connection lock."""
-        with self._lock:
-            yield self._conn
-
-    # ------------------------------------------------------------------- access
-
-    def execute(self, sql: str, params: Sequence[Any] | dict[str, Any] = ()) -> sqlite3.Cursor:
-        """Execute a statement and return the cursor."""
-        with self._lock:
-            return self._conn.execute(sql, params)
-
-    def query(self, sql: str, params: Sequence[Any] | dict[str, Any] = ()) -> list[sqlite3.Row]:
-        """Execute a query and materialise all rows."""
-        with self._lock:
-            return list(self._conn.execute(sql, params).fetchall())
-
-    def query_one(self, sql: str, params: Sequence[Any] | dict[str, Any] = ()) -> sqlite3.Row | None:
-        """Execute a query and return the first row, or ``None``."""
-        with self._lock:
-            return self._conn.execute(sql, params).fetchone()
-
-    def in_transaction(self) -> bool:
-        """Return whether this thread is currently inside :meth:`transaction`."""
-        with self._lock:
-            return self._depth > 0
-
-    def transaction_depth(self) -> int:
-        """Return the current nesting depth: ``0`` outside any transaction."""
-        with self._lock:
-            return self._depth
+    def column_names(self, table: str) -> set[str]:
+        """Return the column names of ``table`` (SQLite introspection)."""
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {row["name"] for row in rows}
 
     def close(self) -> None:
         """Close the underlying connection."""
         with self._lock:
             self._conn.close()
+
+    def describe(self) -> dict[str, Any]:
+        """Return operator-facing facts about the store (never secrets)."""
+        mode = self._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        return {"dialect": self.dialect, "path": self.path, "journal_mode": mode}
 
     # -------------------------------------------------------------- migration
 
@@ -684,10 +529,7 @@ class Database:
             for statement in SCHEMA_STATEMENTS:
                 conn.execute(statement)
             for table, column, column_type in self.ADDED_COLUMNS:
-                existing = {
-                    row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-                }
-                if column not in existing:
+                if column not in self.column_names(table):
                     LOGGER.info("Adding column %s.%s", table, column)
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
             conn.execute(
@@ -696,6 +538,35 @@ class Database:
                 (str(SCHEMA_VERSION), isoformat(datetime.now().astimezone())),
             )
         return SCHEMA_VERSION
+
+
+def open_database(config: Any) -> DatabaseBase:
+    """Open the store a :class:`~companion_runtime.config.StorageConfig` selects.
+
+    SQLite is the default and needs nothing but a path. A DSN selects PostgreSQL
+    instead; the import is deferred so a deployment that never uses PG does not
+    need ``psycopg`` installed at all.
+
+    Args:
+        config: The ``storage`` section of the Runtime configuration (or anything
+            exposing ``dsn``, ``database_path``, ``busy_timeout_ms`` and ``wal``).
+
+    Returns:
+        A connected store; the caller owns closing it.
+    """
+    dsn = str(getattr(config, "dsn", "") or "").strip()
+    if dsn:
+        from .db_postgres import PostgresDatabase
+
+        return PostgresDatabase(
+            dsn,
+            busy_timeout_ms=int(getattr(config, "busy_timeout_ms", 5000) or 5000),
+        )
+    return Database(
+        getattr(config, "database_path", "./data/runtime.sqlite3"),
+        busy_timeout_ms=int(getattr(config, "busy_timeout_ms", 5000) or 5000),
+        wal=bool(getattr(config, "wal", True)),
+    )
 
 
 def row_to_dict(row: sqlite3.Row | None, table: str | None = None) -> dict[str, Any] | None:

@@ -59,12 +59,12 @@ import os
 import shutil
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 from .db import Database
-from .utility import isoformat, utcnow
+from .utility import ensure_aware, isoformat, utcnow
 
 LOGGER = logging.getLogger("companion_runtime.maintenance")
 
@@ -575,8 +575,17 @@ def restore(
 
 
 def snapshot_name(prefix: str = "runtime", *, now: datetime | None = None) -> str:
-    """Return a timestamped snapshot filename."""
-    stamp = (now or utcnow()).strftime("%Y%m%dT%H%M%SZ")
+    """Return a timestamped snapshot filename.
+
+    The trailing ``Z`` claims the stamp is UTC, so an aware ``now`` is converted
+    rather than formatted as-is: handing in a ``+08:00`` instant used to produce a
+    name like ``…T170000Z`` for what was really 09:00 UTC - a filename that lies, and
+    snapshot names are the only record of when a backup was taken. A naive value is
+    read as UTC, which is what :func:`~companion_runtime.utility.ensure_aware` does
+    everywhere else.
+    """
+    moment = ensure_aware(now) or utcnow()
+    stamp = moment.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{prefix}-{stamp}.sqlite3"
 
 

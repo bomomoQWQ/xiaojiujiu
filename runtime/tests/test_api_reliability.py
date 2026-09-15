@@ -186,7 +186,16 @@ def test_find_for_attempt_is_not_a_page_of_the_queue(runtime: Runtime) -> None:
     with runtime.db.transaction() as conn:
         old = runtime.projections.outbox.get(render_row_id)
         assert old is not None
+        # ``nack`` only rewrites a row that was *leased*, and this one never was, so
+        # the settled state the lookup below is about is written directly. The two
+        # rows then share a timestamp, which leaves the tiebreak (``outbox_id``)
+        # free to order them either way: what has to decide the lookup is the
+        # status, not which identifier happens to sort higher.
         runtime.projections.outbox.nack(conn, render_row_id, error="x", terminal=True)
+        conn.execute(
+            "UPDATE outbox SET status = ? WHERE outbox_id = ?",
+            (OutboxStatus.FAILED.value, render_row_id),
+        )
         fresh = OutboxItem(
             outbox_id=new_id("outbox"),
             kind=OutboxKind.RENDER.value,
@@ -195,7 +204,10 @@ def test_find_for_attempt_is_not_a_page_of_the_queue(runtime: Runtime) -> None:
             available_at=BASE_TIME,
         )
         runtime.projections.outbox.enqueue(conn, fresh)
-    assert rows_for(runtime, attempt_id, kind=OutboxKind.RENDER.value)[0].outbox_id == fresh.outbox_id
+    found = rows_for(runtime, attempt_id, kind=OutboxKind.RENDER.value)
+    assert found[0].outbox_id == fresh.outbox_id
+    assert found[0].status == OutboxStatus.PENDING.value
+    assert found[-1].status == OutboxStatus.FAILED.value
 
 
 def test_rendered_finds_its_row_behind_more_than_a_hundred_others(

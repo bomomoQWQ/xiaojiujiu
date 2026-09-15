@@ -83,14 +83,31 @@ class ServerConfig:
 
 @dataclass(slots=True)
 class StorageConfig:
-    """SQLite and raw-log locations."""
+    """Where the Runtime keeps its state.
+
+    Two backends are supported and they are deliberately equivalent: SQLite (the
+    default, a single file that can be snapshotted and shipped) and PostgreSQL
+    (chosen when ``dsn`` is set, for deployments that want a network database,
+    several Runtime processes or the operational tooling around a server). The
+    schema, the column types and the transaction semantics are the same on both,
+    so a deployment can move between them without a data-shape change.
+    """
 
     database_path: str = "./data/runtime.sqlite3"
     raw_log_path: str = "./data/raw_events.jsonl"
+    #: PostgreSQL connection string. When set it wins over ``database_path``.
+    #: A DSN carries a password, so it is read from the environment or a config
+    #: file and is redacted by the inspection endpoints like any other secret.
+    dsn: str = ""
     #: Write the raw event log to an append-only JSONL mirror as well as SQLite.
     mirror_raw_events: bool = True
     busy_timeout_ms: int = 5000
     wal: bool = True
+
+    @property
+    def is_postgres(self) -> bool:
+        """Return whether this configuration selects the PostgreSQL backend."""
+        return bool(self.dsn and self.dsn.strip())
 
 
 @dataclass(slots=True)

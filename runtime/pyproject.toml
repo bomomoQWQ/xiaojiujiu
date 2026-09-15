@@ -32,6 +32,11 @@ test = [
     "pytest-asyncio>=0.23",
     "httpx>=0.27",
 ]
+# Only needed when storage.dsn selects PostgreSQL. SQLite is the default and needs
+# nothing beyond the standard library, so psycopg stays an optional extra.
+postgres = [
+    "psycopg[binary]>=3.2",
+]
 
 [project.scripts]
 companion-runtime = "companion_runtime.cli:main"
