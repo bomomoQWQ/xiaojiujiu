@@ -713,8 +713,6 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
         # the clock changes what the next round decides. The hazard anchor is now the
         # previous *decision* rather than the previous tick, so no read can consume the
         # character's waiting window; see ``Runtime._record_decision``.
-        # MUTATION M2: the withdrawn read tick, restored.
-        runtime.tick_for_entry()
         signals = scheduler_module.collect_signals(
             runtime=runtime, now=utcnow(), hazard_wake_at=_optional_datetime(hazard_wake_at, "hazard_wake_at")
         )
