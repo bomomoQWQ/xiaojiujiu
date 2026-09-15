@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "endogenous-companion-runtime"
-version = "0.1.0"
+version = "0.2.0"
 description = "Endogenous proactive long-term companion Runtime sidecar: persistent emotion, memory, user model, candidate intents and motivational decision making."
 readme = "README.md"
 requires-python = ">=3.11"

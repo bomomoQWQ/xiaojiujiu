@@ -188,7 +188,10 @@ def detect(
     Args:
         event: Candidate event.
         config: Runtime configuration.
-        existing: Currently live matters, used to avoid duplicates.
+        existing: Matters whose *subjects* are already spoken for, used to avoid
+            duplicates. Pass :func:`subject_guards` rather than the open matters:
+            what makes a mention a duplicate is that the subject is taken, not that
+            the obligation is still open.
         resolved_topics: Subjects this same event just settled. A completion
             statement must not re-open an obligation about the thing it finished,
             so these subjects are skipped even when the text looks like a promise.
@@ -291,6 +294,103 @@ def _same_subject(candidate_title: str, existing_title: str) -> bool:
     # One side is pure template; only treat it as the same subject when the other
     # side is empty of meaning too.
     return False
+
+
+# --------------------------------------------------------------------------------------
+# Subject reservation
+# --------------------------------------------------------------------------------------
+
+#: Statuses in which a matter still owns its subject outright: nothing has discharged
+#: the obligation, so a mention of the subject is that obligation continuing.
+LIVE_MATTER_STATUSES: frozenset[str] = frozenset(
+    {
+        UnfinishedStatus.OPEN.value,
+        UnfinishedStatus.WAITING.value,
+        UnfinishedStatus.DUE.value,
+        UnfinishedStatus.MUTED.value,
+    }
+)
+
+#: Statuses in which the *user* closed the matter, as opposed to it having lapsed on
+#: its own (``expired``) or been withdrawn by the Runtime (``invalidated``). Only these
+#: leave a subject behind that is worth reserving: somebody said something about it.
+SETTLED_MATTER_STATUSES: frozenset[str] = frozenset(
+    {UnfinishedStatus.RESOLVED.value, UnfinishedStatus.CANCELLED.value}
+)
+
+#: How long a settled matter keeps its subject reserved, in seconds.
+#:
+#: Three days is the smallest window that covers a realistic "I'll tell you how it went
+#: / don't bring it up again" tail: the report itself, the acknowledgement, and the
+#: change of heart that follows. It is deliberately finite - a reservation that never
+#: expired would make the subject unreachable forever, and "下周三还有个面试" is a
+#: genuinely new promise about the same subject.
+SETTLED_SUBJECT_RESERVATION_SECONDS = 3 * 24 * 3600.0
+
+
+def subject_guards(
+    matters: Sequence[UnfinishedMatter],
+    *,
+    now: datetime,
+    reservation_seconds: float = SETTLED_SUBJECT_RESERVATION_SECONDS,
+) -> list[UnfinishedMatter]:
+    """Return the matters whose subjects are already spoken for.
+
+    This answers "is this subject taken?", which is the question the obligation
+    detector needs - *not* "is this obligation currently open?". A matter the user has
+    just settled still occupies its subject, and that is the whole point: the sentence
+    that reports a result and the sentence that forbids the topic both mention the
+    interview, and neither is a *new* promise about it. Reading only the open set is
+    what let "面试过了！" close the interview matter and, in the same breath, open a
+    fresh "等待面试结果" from that very sentence.
+
+    The reservation is finite on purpose: after :data:`SETTLED_SUBJECT_RESERVATION_SECONDS`
+    a mention may open a new matter again, so a genuinely later interview is still
+    remembered.
+
+    Args:
+        matters: Matters of any status.
+        now: Current time.
+        reservation_seconds: How long a settled matter keeps its subject.
+
+    Returns:
+        The live matters, plus every matter that settled recently enough to still hold
+        its subject. Conservative on missing evidence: a ``updated_at`` that is absent,
+        unparsable or ahead of ``now`` counts as recent, because treating the subject
+        as released is the more damaging guess.
+    """
+    guards: list[UnfinishedMatter] = []
+    for matter in matters:
+        if matter.status in LIVE_MATTER_STATUSES:
+            guards.append(matter)
+        elif matter.status in SETTLED_MATTER_STATUSES and _settled_recently(
+            matter, now=now, reservation_seconds=reservation_seconds
+        ):
+            guards.append(matter)
+    return guards
+
+
+def _settled_recently(
+    matter: UnfinishedMatter, *, now: datetime, reservation_seconds: float
+) -> bool:
+    """Return whether a settled matter still holds its subject.
+
+    A stamp *ahead* of ``now`` counts as recent too. That is not a hypothetical: the
+    whole day can be replayed under a simulated clock, and an event ingested with its
+    original timestamp lands in a matter whose ``updated_at`` is stamped from a clock
+    that has already moved past it. Reading that as "long released" would re-open
+    every subject the replay touched.
+    """
+    updated = matter.updated_at
+    if updated is None:
+        return True
+    try:
+        age = (now - updated).total_seconds()
+    except TypeError:
+        # A naive stamp cannot be compared with an aware ``now``; that is no evidence
+        # that the subject has been released either.
+        return True
+    return age <= reservation_seconds
 
 
 def detect_resolution(

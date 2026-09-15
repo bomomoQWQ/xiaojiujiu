@@ -928,7 +928,18 @@ class Runtime:
                 proposals = unfinished_module.detect(
                     event,
                     config=self.config,
-                    existing=self.projections.unfinished.list_open(),
+                    # ``existing`` answers "whose subject is already spoken for?", not
+                    # "what is currently open?". A matter the user settled a moment
+                    # ago still owns its subject: the sentence that reports a result
+                    # and the sentence that forbids the topic both name the interview
+                    # without promising anything new about it. Passing the *open* set
+                    # was the defect - the matter had been resolved a few lines above,
+                    # so the very message that closed the interview re-opened it, and
+                    # ``resolved_topics`` cannot prevent that on its own because the
+                    # ``result_reported`` rule declares no subjects at all.
+                    existing=unfinished_module.subject_guards(
+                        self.projections.unfinished.list_all(limit=200), now=stamp
+                    ),
                     # A completion statement must not create the obligation it just
                     # discharged, so the subjects this event settled are excluded.
                     resolved_topics=unfinished_module.resolved_topics(
@@ -1194,6 +1205,57 @@ class Runtime:
                         outcome.version = commit_state.version
                 return outcome
 
+    def _event_ids_behind(self, source: str) -> list[str]:
+        """Return the event ids one candidate source ultimately rests on.
+
+        Not every source is an event id. A follow-up candidate cites
+        ``unfinished:<id>`` and a curiosity candidate cites ``memory:<id>``: internal
+        namespaces that point *at* the events the intention was actually built on.
+        Feeding one of them to the event log as if it were an event id is not a
+        crash - the lookup simply finds nothing - which is what made the routing
+        defect silent: every follow-up fell through to "whoever spoke last".
+
+        Totality matters more than precision here. A commit must never fail because
+        routing could not be worked out, so an unknown or dangling identifier yields
+        no ids and lets the caller fall back.
+
+        Args:
+            source: One entry of a candidate's ``sources``.
+
+        Returns:
+            The event ids to resolve a conversation with, possibly empty.
+        """
+        identifier = str(source or "").strip()
+        if not identifier:
+            return []
+        try:
+            if identifier.startswith(candidate_module.UNFINISHED_SOURCE_PREFIX):
+                matter = self.projections.unfinished.get(
+                    identifier[len(candidate_module.UNFINISHED_SOURCE_PREFIX) :]
+                )
+                return [
+                    str(item)
+                    for item in (matter.source_event_ids if matter is not None else [])
+                    if item
+                ]
+            if identifier.startswith(candidate_module.MEMORY_SOURCE_PREFIX):
+                memory = self.projections.memory.get_memory(
+                    identifier[len(candidate_module.MEMORY_SOURCE_PREFIX) :]
+                )
+                return [
+                    str(item)
+                    for item in (memory.source_event_ids if memory is not None else [])
+                    if item
+                ]
+        except Exception:  # noqa: BLE001 - routing must not fail the commit
+            return []
+        if ":" in identifier:
+            # Another internal namespace (``emotion:``, ``situation:``). It names no
+            # event, and assuming it does would send the intention into whichever
+            # conversation happens to share the identifier.
+            return []
+        return [identifier]
+
     def _conversation_for(self, chosen: CandidateIntent, *, now: datetime) -> str:
         """Return the conversation a proactive action belongs to.
 
@@ -1203,10 +1265,18 @@ class Runtime:
         session that may not exist - the plugin then cannot resolve the address
         and the delivery silently fails.
 
+        The sources of an intention are *not all events*, which is the second half
+        of the same defect: a follow-up candidate cites ``unfinished:<id>``, so
+        treating every source as an event id made the event lookup come back empty
+        for exactly the candidates whose conversation mattered most, and routing
+        degraded to "the chat that spoke last". :meth:`_event_ids_behind` translates
+        each source into the events behind it first.
+
         Resolution order, most precise first:
 
-        1. the candidate's own source events, when they name real events (the
-           evidence the intention was built on already carries the conversation);
+        1. the events the candidate's sources ultimately rest on, when they name real
+           events (the evidence the intention was built on already carries the
+           conversation);
         2. the conversation of the most recent user message, which is simply the
            conversation the character is currently living in - most candidates are
            generated from internal signals such as an approach-drive anchor and
@@ -1220,7 +1290,10 @@ class Runtime:
         Returns:
             A conversation identifier suitable for the host's addressing scheme.
         """
-        identifiers = [str(item) for item in (chosen.sources or []) if item]
+        identifiers: list[str] = []
+        for source in chosen.sources or []:
+            if source:
+                identifiers.extend(self._event_ids_behind(source))
         if identifiers:
             try:
                 events = self.events.get_many(identifiers)

@@ -60,7 +60,7 @@
 .
 ├── runtime/                          # ★ 持久认知 sidecar（独立进程，Python 3.11+）
 │   ├── src/companion_runtime/        #   29 个模块（含协议 v1 兼容层 api_v1.py）
-│   ├── tests/                        #   807 项离线测试
+│   ├── tests/                        #   824 项离线测试
 │   ├── docs/PATCH_V0.2_MAPPING.md    #   设计章节 → 代码位置 → 状态（含诚实缺口清单）
 │   └── README.md                     #   操作者手册（配置 / API / 蓝屏恢复 / 降级）
 │
@@ -81,10 +81,13 @@
 │   ├── backup.ps1                    #   跨盘原子快照（蓝屏防护）
 │   ├── runtime_bench.py              #   关键路径延迟基准
 │   ├── e2e_patch_v02.py              #   28 项基础真机验证
-│   └── e2e_resilience_simulation.py  #   高仿真并发、重启与故障恢复验证
+│   ├── e2e_resilience_simulation.py  #   335 项高仿真：并发 / 重启 / 断网恢复
+│   └── blackbox_user_simulation.py   #   用户黑盒仿真：只断言用户看得见的事实
 │
 ├── 内源主动型长期陪伴AI_Runtime_完整架构设计.md   # 原始设计（97 节）
 ├── PATCH_v0.2_即时演出与持久认知分离...md        # 现行架构补丁
+├── CHANGELOG.md                      # 版本与改动（0.2.0 起）
+├── HANDOFF.md                        # 换机器接手手册
 ├── LICENSE                           # GPL-3.0-or-later
 └── RECOVERY.md                       # 备份 / 恢复 / 权重位置
 ```
@@ -200,7 +203,7 @@ uv venv .venv --python 3.12
 uv pip install --python .venv\Scripts\python.exe -e ".[test]"
 
 # 自检
-.venv\Scripts\python.exe -m pytest tests -q          # 期望 807 passed
+.venv\Scripts\python.exe -m pytest tests -q          # 期望 824 passed
 
 # 起服务（只监听 loopback）
 .venv\Scripts\python.exe -m companion_runtime.cli --base-dir . serve --host 127.0.0.1 --port 8787
@@ -353,7 +356,7 @@ docker run --rm -v xiaojiujiu-data:/data -v E:\companion_runtime_backup:/backup 
 
 ```powershell
 cd runtime
-.venv\Scripts\python.exe -m pytest tests -q          # 807 passed
+.venv\Scripts\python.exe -m pytest tests -q          # 824 passed
 
 # 插件测试在插件仓库里（先 git clone，见 §4.2）
 cd ..\astrbot_plugin_companion_runtime
@@ -364,7 +367,31 @@ cd ..
 python scripts\e2e_patch_v02.py                      # 28 项基础真机检查
 python scripts\e2e_resilience_simulation.py --base-dir E:\companion_runtime_backup\resilience-final
                                                      # 335 项高仿真检查（并发 / 重启 / 断网恢复）
+python scripts\blackbox_user_simulation.py --base-dir E:\companion_runtime_backup\blackbox
+                                                     # 69 项用户黑盒检查（见下）
 ```
+
+**用户黑盒仿真**（`scripts/blackbox_user_simulation.py`）是这套验证里最"像用户"的一层：
+它起真的 uvicorn、真的文件 SQLite(WAL)、真的 Scheduler，并通过**插件自身的钩子**收发消息，
+但**只承认用户看得见的事实**——聊天记录里收到了什么、宿主的回复是什么、公开 HTTP 面回答了什么。
+它不读 `runtime.projections.*`、不查库、不 import 内部状态来断言（这是刻意的约束）。
+
+它演的是一个人的十几天：打招呼闲聊 → 说一件有时限的事并保持沉默 → 在没开口的情况下收到主动关心
+→ 回复结果 → 划边界 → 换话题恢复 → 有条主动消息故意不回 → 第二个会话隔离 → 重启 → 重放
+→ 最后回放整条用户视角聊天记录，并审计全局契约：
+
+| 契约 | 判定方式 |
+|---|---|
+| 不刷屏 | 任意 24 小时窗口内的主动消息 ≤ 配置上限；相邻两条 ≥ 冷却 |
+| 边界即静默 | 划边界后的窗口内零主动消息，且不再出现被禁话题 |
+| 不重复 | 用户可见消息去重比较；重启与重放都不产生第二份 |
+| **不泄漏** | 用户可见文本里永不出现 `<companion_runtime_context`、「以下是 Runtime 注入」、`companion_runtime`、`api_key`、`Bearer`、`sk-`，以及 `evt_/obx_/att_/cnd_/unf_/emo_/obs_` 形式的内部 id |
+| 会话隔离 | 一个会话的消息不出现在另一个；进程默认会话永不作为收件人 |
+| 每条主动消息都有来由 | 必须落在剧本里"本该发生"的窗口内，且不能出现在静默窗口 |
+
+它自带 `--fault leak|duplicate|topic|guilt|cross_session|default_session` 六种注错，
+用来证明这些检查**真的会失败**（不是恒真的断言）。0.2.0 就是靠这套仿真抓到两个
+单元测试完全没覆盖的缺陷：已了结的义务被同一句话重新打开、以及群聊里形成的承诺被投递到私聊。
 
 两个端到端脚本都会**导入插件仓库的代码**（它们驱动的是真实的插件传输层），
 所以本地必须有 `astrbot_plugin_companion_runtime/` 这份克隆；插件缺失时脚本会明确报错，
