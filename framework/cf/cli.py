@@ -29,6 +29,7 @@ from typing import Any, Sequence
 from .harness import DEFAULT_PROGRAM_SRC, Harness, HarnessConfig
 from .logbook import Logbook
 from .mock_openai import MockReply, MockScript
+from .program import ProgramClient, ProgramError
 
 DEFAULT_RUNS_DIR = Path("runs")
 
@@ -60,15 +61,21 @@ def _get(url: str, timeout: float = 15.0) -> dict[str, Any]:
         raise SystemExit(f"cannot reach {url}: {exc.reason}") from exc
 
 
-def resolve_control_url(explicit: str, run_dir: str | None) -> str:
-    """Find the control URL of a running harness.
+def resolve_url(explicit: str, run_dir: str | None, field: str, flag: str) -> str:
+    """Find one of a running harness's URLs, from the flag or from its trace.
+
+    The harness records ``base_url``, ``control_url`` and ``mock_url`` in a single
+    ``harness_ready`` record, so every client command can find its target the same
+    way instead of each inventing its own discovery.
 
     Args:
-        explicit: Value of ``--control``; used verbatim when non-empty.
-        run_dir: A run directory whose trace names the control plane.
+        explicit: Value of the corresponding flag; used verbatim when non-empty.
+        run_dir: A run directory whose trace names the surfaces.
+        field: Which recorded field to read, e.g. ``control_url``.
+        flag: Flag name to mention in the error, e.g. ``--control``.
 
     Returns:
-        The control base URL.
+        The base URL, without a trailing slash.
 
     Raises:
         SystemExit: When neither source yields a URL.
@@ -78,7 +85,7 @@ def resolve_control_url(explicit: str, run_dir: str | None) -> str:
     if run_dir:
         trace = Path(run_dir) / "trace.jsonl"
         if not trace.exists():
-            raise SystemExit(f"no trace at {trace}; pass --control http://127.0.0.1:PORT")
+            raise SystemExit(f"no trace at {trace}; pass {flag} http://127.0.0.1:PORT")
         found = ""
         with trace.open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -89,12 +96,22 @@ def resolve_control_url(explicit: str, run_dir: str | None) -> str:
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if record.get("kind") == "harness_ready" and record.get("control_url"):
-                    found = str(record["control_url"])
+                if record.get("kind") == "harness_ready" and record.get(field):
+                    found = str(record[field])
         if not found:
-            raise SystemExit(f"{trace} names no control plane; is the harness still starting?")
+            raise SystemExit(f"{trace} names no {field}; is the harness still starting?")
         return found.rstrip("/")
-    raise SystemExit("pass --control http://127.0.0.1:PORT or --run-dir <dir>")
+    raise SystemExit(f"pass {flag} http://127.0.0.1:PORT or --run-dir <dir>")
+
+
+def resolve_control_url(explicit: str, run_dir: str | None) -> str:
+    """Find the control URL of a running harness."""
+    return resolve_url(explicit, run_dir, "control_url", "--control")
+
+
+def resolve_runtime_url(explicit: str, run_dir: str | None) -> str:
+    """Find the program's own HTTP base URL for a running harness."""
+    return resolve_url(explicit, run_dir, "base_url", "--runtime")
 
 
 # --------------------------------------------------------------------------- run
@@ -238,6 +255,82 @@ def cmd_shutdown(args: argparse.Namespace) -> int:
     base = resolve_control_url(args.control, args.run_dir)
     _post(f"{base}/control/shutdown", {})
     print("asked the harness to stop")
+    return 0
+
+
+# ------------------------------------------------------------------ program IO
+
+
+def _program(args: argparse.Namespace) -> ProgramClient:
+    """Build a client for the running program."""
+    return ProgramClient(resolve_runtime_url(args.runtime, args.run_dir))
+
+
+def cmd_say(args: argparse.Namespace) -> int:
+    """Append a user message, running the program's full foreground path."""
+    client = _program(args)
+    try:
+        result = client.say(
+            args.text,
+            conversation_id=args.conversation,
+            event_id=args.event_id,
+            timestamp=args.at,
+        )
+    except ProgramError as exc:
+        raise SystemExit(str(exc)) from exc
+    outcome = result.get("outcome") or {}
+    event = outcome.get("event") or {}
+    print(f"event      : {event.get('event_id')}  at {event.get('timestamp')}")
+    print(f"duplicate  : {outcome.get('duplicate', result.get('duplicate', False))}")
+    if outcome.get("semantic_status"):
+        print(f"settlement : {outcome.get('semantic_status')}")
+    if args.full:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_refresh(args: argparse.Namespace) -> int:
+    """Ask for a deep cognitive refresh -- the path that uses the mock endpoint."""
+    client = _program(args)
+    signals: dict[str, Any] = {}
+    for name in (
+        "major_event",
+        "matter_due",
+        "history_suspect",
+        "user_evidence_overturns",
+        "wants_proactive",
+    ):
+        if getattr(args, name.replace("-", "_"), False):
+            signals[name] = True
+    if args.candidate_pool_size is not None:
+        signals["candidate_pool_size"] = args.candidate_pool_size
+    if args.force:
+        signals["force"] = True
+    try:
+        result = client.refresh(now=args.at or None, **signals)
+    except ProgramError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(f"ran        : {result.get('ran')}   reason={result.get('reason')!r}")
+    print(f"trigger    : {result.get('trigger', {}).get('reason')!r}   provider={result.get('provider')!r}")
+    print(f"operations : {result.get('operations')}   applied={result.get('applied')}")
+    print(f"violations : {result.get('violations')}")
+    if args.full:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_backlog(args: argparse.Namespace) -> int:
+    """Show the events the program declined to guess about."""
+    client = _program(args)
+    try:
+        backlog = client.backlog()
+    except ProgramError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(backlog.get("stats", {}), ensure_ascii=False))
+    for item in backlog.get("items", [])[: args.limit or 20]:
+        print(f"  {item.get('event_id')}  relevance={item.get('potential_relevance')}")
+    if args.full:
+        print(json.dumps(backlog, ensure_ascii=False, indent=2, default=str))
     return 0
 
 
@@ -391,6 +484,37 @@ def build_parser() -> argparse.ArgumentParser:
     tail.add_argument("--follow", action="store_true", help="持续跟踪")
     tail.add_argument("--json", action="store_true", help="原样打印 JSON 行")
     tail.set_defaults(func=cmd_tail)
+
+    say = sub.add_parser("say", help="让用户说一句话（走原程序完整前台路径）")
+    say.add_argument("text", help="用户说的话")
+    say.add_argument("--conversation", default="", help="会话 id")
+    say.add_argument("--at", default="", help="这句话发生的时间（ISO-8601）")
+    say.add_argument("--event-id", default="", help="自带 event id 可让重复调用幂等")
+    say.add_argument("--runtime", default="")
+    say.add_argument("--run-dir", default="")
+    say.add_argument("--full", action="store_true")
+    say.set_defaults(func=cmd_say)
+
+    refresh = sub.add_parser("refresh", help="请求一次深层认知刷新（这条才会打到 mock 端点）")
+    refresh.add_argument("--at", default="", help="该次刷新使用的虚拟时刻")
+    refresh.add_argument("--major-event", action="store_true", help="触发信号：发生了关系上的大事")
+    refresh.add_argument("--matter-due", action="store_true", help="触发信号：有未尽之事到期")
+    refresh.add_argument("--history-suspect", action="store_true", help="触发信号：早先的解释可能不对")
+    refresh.add_argument("--user-evidence-overturns", action="store_true", help="触发信号：新证据推翻了旧读数")
+    refresh.add_argument("--wants-proactive", action="store_true", help="触发信号：动机层想行动")
+    refresh.add_argument("--candidate-pool-size", type=int, default=None, help="触发信号：当前候选池大小")
+    refresh.add_argument("--force", action="store_true", help="跳过触发判定（诊断用）")
+    refresh.add_argument("--runtime", default="")
+    refresh.add_argument("--run-dir", default="")
+    refresh.add_argument("--full", action="store_true")
+    refresh.set_defaults(func=cmd_refresh)
+
+    backlog = sub.add_parser("backlog", help="看还没被理解的事件")
+    backlog.add_argument("--limit", type=int, default=20)
+    backlog.add_argument("--runtime", default="")
+    backlog.add_argument("--run-dir", default="")
+    backlog.add_argument("--full", action="store_true")
+    backlog.set_defaults(func=cmd_backlog)
 
     return parser
 

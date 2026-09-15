@@ -66,18 +66,40 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"
 
 ## 3. 命令行
 
+三组命令：**起 harness**、**拨时间**、**喂输入看结果**。
+
 ```
-cf run          启动一个可外部调控的 harness（前台）
-cf time set     跳到绝对时刻      --value 2026-09-15T09:00:00Z
-cf time advance 推进一段时间      --value 8h / 90s / 1h30m / 2d
-cf time scale   虚拟秒/真实秒     --value 60（0 = 时间不走）
-cf time freeze / unfreeze        钉住 / 恢复
-cf tick         立刻跑一次心跳，--by 2h 表示先推进 2h
-cf endogenous   强制一次内源决策回合
-cf status       查看时钟与端口（--full 打印完整 JSON）
-cf tail         看结构化轨迹（--kind 过滤、--json、--follow）
-cf shutdown     让运行中的 harness 停止
+— 起 —
+cf run              启动一个可外部调控的 harness（前台，Ctrl-C 停）
+
+— 拨时间（打控制面，影响心跳） —
+cf time set         --value 2026-09-15T09:00:00Z   跳到绝对时刻
+cf time advance     --value 8h / 90s / 1h30m / 2d  推进一段时间
+cf time scale       --value 60                     虚拟秒/真实秒（0 = 时间不走）
+cf time freeze / unfreeze                          钉住 / 恢复
+cf tick             --by 2h                        立刻跑一次心跳（可先推进）
+cf endogenous                                      强制一次内源决策回合
+cf status           --full                         查看时钟与端口
+cf shutdown                                        让运行中的 harness 停止
+
+— 喂输入 / 看认知 —
+cf say "…"          --conversation c1 --at <ISO> --event-id <id>   让用户说一句话
+cf refresh          --at <ISO> --major-event --force               请求深层认知刷新（这条才打到 mock）
+cf backlog          --limit 20                                     看还没被理解的事件
+
+— 看日志 —
+cf tail             --kind heartbeat --json --follow --limit N     看结构化轨迹
 ```
+
+`cf run` 会把 runtime / control / mock 三个地址打进 trace，其它命令用 `--run-dir` 自己去找，
+所以日常不需要手抄端口（也可以用 `--control` / `--runtime` 显式指定）。
+
+几个容易忽略但很有用的点：
+
+* `cf say --event-id <固定id>` 让重复调用**幂等**：第二次是 `duplicate: True` 而不是多一条消息。
+  测重投递时用它，不要靠"再发一次"。
+* `cf refresh` 的信号（`--major-event` 等）会放在 body **顶层**发给 `/cognition/refresh` —— 见 §5 的坑。
+* `cf tick --by 1h` 是"推进 + 心跳"一步到位，比 `cf time advance 1h` 再 `cf tick` 少一条命令。
 
 `cf run` 的常用参数：
 
@@ -216,7 +238,7 @@ quiet_hours                                      是否落在免打扰时段
 ```bash
 cd framework
 PY="$(cd ../runtime && pwd)/.venv/bin/python"
-"$PY" -m pytest tests          # 102 passed
+"$PY" -m pytest tests          # 107 passed
 ```
 
 | 文件 | 覆盖 | 需要原程序 |
@@ -225,7 +247,7 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"
 | `test_logbook.py` | 双写、轮转、过滤、程序日志桥接 | 否 |
 | `test_mock_openai.py` | 两种契约、grounding、脚本与注错、token 不入日志 | 否 |
 | `test_harness_e2e.py` | 真程序端到端：接线、纪元、变量一致、故障降级、源码未改动 | **是** |
-| `test_cli.py` | 子进程跑 `cf run` + 客户端命令驱动它 | **是** |
+| `test_cli.py` | 子进程跑 `cf run`，再用客户端命令驱动它（时间、tick、say、refresh、backlog、tail、shutdown） | **是** |
 
 后两个文件在原程序不可用时会自动 skip，所以只装框架也能跑前三个。
 

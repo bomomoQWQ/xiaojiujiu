@@ -295,6 +295,52 @@ class TestTail:
         assert "no trace at" in (result.stdout + result.stderr)
 
 
+class TestProgramIO:
+    """Feeding the program is a command-line job too, not just a Python one.
+
+    Without these, the framework could move time from the shell but not put words
+    in the user's mouth, which makes it useless for driving a scene interactively.
+    """
+
+    def test_say_appends_a_user_message(self, running_harness) -> None:
+        """``cf say`` runs the program's real foreground path and reports the event."""
+        run_dir, _ = running_harness
+        result = _cf("say", "最近有点累，但也不知道该怎么说。", "--conversation", "c1", "--run-dir", str(run_dir))
+        assert "event      : evt_" in result.stdout
+        assert "duplicate  : False" in result.stdout
+
+    def test_say_with_a_fixed_event_id_is_idempotent(self, running_harness) -> None:
+        """Re-sending the same event id is a redelivery, not a second message."""
+        run_dir, _ = running_harness
+        args = ("say", "同一句话。", "--event-id", "evt_cli_idem", "--conversation", "c1", "--run-dir", str(run_dir))
+        first = _cf(*args)
+        assert "duplicate  : False" in first.stdout
+        second = _cf(*args)
+        assert "duplicate  : True" in second.stdout
+
+    def test_backlog_shows_unresolved_events(self, running_harness) -> None:
+        """``cf backlog`` reports what the program declined to interpret."""
+        run_dir, _ = running_harness
+        _cf("say", "算了，先这样吧，回头再说。", "--conversation", "c1", "--run-dir", str(run_dir))
+        result = _cf("backlog", "--run-dir", str(run_dir))
+        assert "unresolved" in result.stdout
+
+    def test_refresh_hits_the_mock_endpoint(self, running_harness) -> None:
+        """``cf refresh`` is the command that exercises the OpenAI-compatible path."""
+        run_dir, _ = running_harness
+        _cf("say", "有件小事，我说不好。", "--conversation", "c1", "--run-dir", str(run_dir))
+        result = _cf("refresh", "--at", "2026-09-20T09:00:00Z", "--major-event", "--run-dir", str(run_dir))
+        assert "ran        : True" in result.stdout
+        assert "provider='remote_api'" in result.stdout
+        assert "violations : []" in result.stdout
+
+    def test_refresh_on_a_dead_runtime_explains_itself(self) -> None:
+        """Pointing a client command at nothing is a clear error, not a traceback."""
+        result = _cf("backlog", "--runtime", "http://127.0.0.1:1", check=False)
+        assert result.returncode != 0
+        assert "unreachable" in (result.stdout + result.stderr)
+
+
 class TestShutdown:
     """The CLI can stop what it started."""
 
