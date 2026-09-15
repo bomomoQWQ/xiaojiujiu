@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 from typing import Any, Sequence
 
 from . import candidate as candidate_module
+from . import memory as memory_module
 from .config import RuntimeConfig
 from .projections import Projections
 from .typing import (
@@ -128,16 +129,23 @@ def build_situation(
     now: datetime,
     limit: int = 12,
 ) -> dict[str, Any]:
-    """Project the working situation into facts, inferences and active items.
+    """Project the working situation into facts, inferences and unfinished matters.
+
+    "Currently active information" is deliberately *not* part of this mapping. The
+    activated memories are assembled by :func:`select_memories` into the bundle's
+    own ``memories`` section, which is the one place the prompt reads them from;
+    duplicating them here would give the same fact two representations in one
+    injected block, and the design keeps the working situation to facts, inferences
+    and unfinished matters.
 
     Args:
         projections: Projection bundle.
         now: Reference time.
-        limit: Maximum number of items.
+        limit: Maximum number of situation items.
 
     Returns:
-        A mapping with ``facts``, ``inferences``, ``active_items`` and
-        ``unfinished``.
+        A mapping with ``facts``, ``inferences``, ``unfinished`` and
+        ``generated_at``.
     """
     items = projections.situation.list_active(limit=limit)
     facts: list[str] = []
@@ -204,7 +212,11 @@ def select_memories(
 
     Archived memories are filtered out: archival is the Runtime's own statement that
     a memory is no longer part of what the character knows, so re-injecting it into
-    the prompt would contradict the decision that produced it.
+    the prompt would contradict the decision that produced it. Superseded memories
+    are filtered for the matching reason: a newer statement replaced them, and the
+    prompt must carry what the character currently believes rather than the version
+    it corrected. Faded (``low_activation``) memories never reach this point - the
+    activation query only returns ``active`` rows.
     """
     pool = projections.memory.list_activated_memories(limit=limit)
     memories = projections.memory.get_memories([item.memory_id for item in pool])
@@ -212,6 +224,8 @@ def select_memories(
     for activated in pool:
         memory = memories.get(activated.memory_id)
         if memory is None or memory.status != MemoryStatus.ACTIVE.value:
+            continue
+        if memory_module.is_superseded(memory):
             continue
         selected.append(
             {

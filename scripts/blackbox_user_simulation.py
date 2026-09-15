@@ -100,7 +100,10 @@ The user's day, phase by phase
 11. ``timeline`` - the whole user-perspective transcript, plus the global
     contract (daily cap, no duplicates, no leakage, no crosstalk, every message
     attributable to a scripted window).
-12. ``teardown`` - every thread joined, artifacts confined to ``--base-dir``, no
+12. ``memory`` - the user states a durable fact in passing, and the day moves on:
+    the bot has to end up knowing it, be handed it the next time it speaks, and
+    never hold a memory of words the user did not type.
+13. ``teardown`` - every thread joined, artifacts confined to ``--base-dir``, no
     bytecode next to the sources.
 
 Usage::
@@ -119,8 +122,10 @@ only to prove that the corresponding check fails when the fact it protects is
 broken: ``leak`` (a hidden-context/credential marker in a delivered message),
 ``duplicate`` (every proactive message sent twice), ``topic`` (a proactive
 message that ignores the topic ban), ``guilt`` (an accusatory message),
-``cross_session`` (the private chat's messages delivered into the group chat) and
-``default_session`` (everything delivered to the process-default conversation).
+``cross_session`` (the private chat's messages delivered into the group chat),
+``default_session`` (everything delivered to the process-default conversation) and
+``memory`` (a deployment whose maintenance pass never becomes due, so no long-term
+memory is ever formed).
 """
 
 from __future__ import annotations
@@ -191,6 +196,25 @@ TEXT_REVOKE = "我撤回刚才那句话，你可以主动找我了。"
 TEXT_NEW_TOPIC = "对了，我明天上午有个考试，考完告诉你。"
 TEXT_SESSION_B = "你好呀，我明天下午有个体检，出结果告诉你。"
 TEXT_SMALL_TALK = "我先去健身房了，回头聊。"
+
+# -- the memory phase's own lines ------------------------------------------------------
+#: A durable fact the user states once, in passing, and never repeats. It is
+#: unrelated to every other line in the story on purpose: "the bot remembers this"
+#: must not be confusable with "the bot is quoting the message it just received".
+TEXT_MEMORY_FACT = "对了，我喝咖啡只喝手冲，不加糖，别的都不喝。"
+#: The word that identifies that fact in a memory or in a prompt.
+TEXT_MEMORY_MARK = "手冲"
+#: An ordinary later message, so the fact has to reach the prompt unasked for.
+TEXT_MEMORY_LATER = "忙完了，随便聊聊吧。"
+#: How far the simulated clock moves before the memory must exist. The Runtime's
+#: maintenance interval is one simulated hour and a step is two, so one step is
+#: enough; the extra step is there so a late scheduler wake cannot excuse a miss.
+MEMORY_WAIT = timedelta(hours=4)
+#: The section the Runtime marks remembered facts with inside its context block.
+MEMORY_SECTION = "【必要记忆】"
+#: Minimum share of a memory's character bigrams that must appear in what the user
+#: typed. Below it, the Runtime is asserting something the user never said.
+MEMORY_TRACE_RATIO = 0.5
 
 #: Topics the user forbade after ``TEXT_TOPIC_BAN``.
 FORBIDDEN_TOPICS = ("面试",)
@@ -1013,6 +1037,16 @@ class Faults:
         """Whether every proactive message should be sent twice."""
         return "duplicate" in self.names
 
+    @property
+    def memory_never_due(self) -> bool:
+        """Whether maintenance is configured so far out that no memory can form.
+
+        The switch is a *deployment* fault, not a source edit: it configures the
+        Runtime the way a badly set-up instance would be configured, so the memory
+        checks have to fail while every other phase still passes.
+        """
+        return "memory" in self.names
+
     def redirect_session(self, session: str) -> str:
         """Return the session a message is actually addressed to."""
         if "cross_session" in self.names and session == SESSION_A:
@@ -1258,7 +1292,7 @@ def _wait_until(predicate: Callable[[], bool], *, timeout: float, interval: floa
     return False
 
 
-def build_runtime_config(directory: Path) -> Any:
+def build_runtime_config(directory: Path, *, faults: "Faults | None" = None) -> Any:
     """Build the Runtime configuration for the story.
 
     Every interval is expressed in *simulated* time and is a real window: the
@@ -1268,6 +1302,9 @@ def build_runtime_config(directory: Path) -> Any:
 
     Args:
         directory: Scenario directory (database and JSONL mirror live here).
+        faults: Injected harness faults, if any. The only one that touches the
+            configuration is ``memory``, which sets the maintenance interval beyond
+            any story length - the shape of a deployment that never forms a memory.
 
     Returns:
         A configured :class:`~companion_runtime.config.RuntimeConfig`.
@@ -1300,6 +1337,10 @@ def build_runtime_config(directory: Path) -> Any:
     config.utility.min_sleep_seconds = 0.02
     config.utility.max_sleep_seconds = 0.05
     config.task.merge_window_seconds = 5.0
+    if faults is not None and faults.memory_never_due:
+        # A maintenance interval longer than the story: no candidate ever becomes
+        # due, which is what a misconfigured deployment looks like from outside.
+        config.memory.consolidation_interval_seconds = 10_000 * 3600.0
     return config
 
 
@@ -1431,6 +1472,10 @@ class PluginHost:
         self.filters: Any = None
         self.handlers: dict[str, Callable[..., Any]] = {}
         self.recording: RecordingTransport | None = None
+        #: The hidden context block the plugin injected into the most recent LLM
+        #: request. This is what the acting layer was actually handed, which is the
+        #: only place a black-box run can see "the bot knows this" from.
+        self.last_injected = ""
 
     def start(self) -> None:
         """Import the plugin, install the stubs and run ``initialize``.
@@ -1556,7 +1601,7 @@ class PluginHost:
         event._result_text = reply
         self.platform.deliver(session, reply, kind="reply", at=self.clock.now())
         self.loop.call(self.handlers["on_after_message_sent"](self.plugin, event))
-        del injected
+        self.last_injected = injected
         return reply
 
 
@@ -1573,6 +1618,12 @@ class Window:
     end: datetime
     proactive_allowed: bool
     note: str = ""
+    #: Index into the transcript at the moment the window was opened. Membership is
+    #: decided by *delivery order* as well as by the clock, because the world clock
+    #: moves in two-hour steps: a message the bot committed just before the user
+    #: spoke carries the same instant as the user's own line, and comparing instants
+    #: alone would file it inside a window the user had not opened yet.
+    opened_after_turn: int = 0
 
 
 class Story:
@@ -1608,7 +1659,7 @@ class Story:
         directory = self.base_dir / "scenario"
         directory.mkdir(parents=True, exist_ok=True)
         self.server = RuntimeServer(
-            config=build_runtime_config(directory),
+            config=build_runtime_config(directory, faults=self.faults),
             clock=self.clock,
             name="user-sim",
         )
@@ -1775,12 +1826,44 @@ class Story:
     # -- scripted windows ----------------------------------------------------------
 
     def open_window(self, window: Window) -> Window:
-        """Register a scripted stretch of the user's life."""
+        """Register a scripted stretch of the user's life and anchor it in time.
+
+        The anchor is the transcript length at this moment: everything the platform
+        delivers from here on belongs to this window, and everything delivered
+        before it does not - even when the two share a clock reading.
+        """
+        window.opened_after_turn = len(self.recorder.turns)
         self.windows.append(window)
         return window
 
+    def in_window(self, window: Window, *, who: str = "", kind: str = "") -> list[Turn]:
+        """Return the transcript lines that belong to one scripted window.
+
+        Args:
+            window: The window, as returned by :meth:`open_window`.
+            who: Optional filter (``"bot"`` / ``"user"``).
+            kind: Optional filter (``"reply"`` / ``"proactive"``).
+
+        Returns:
+            The turns delivered after the window opened and no later than its end.
+        """
+        return [
+            turn
+            for index, turn in enumerate(self.recorder.turns)
+            if index >= window.opened_after_turn
+            and turn.at <= window.end
+            and (not who or turn.who == who)
+            and (not kind or turn.kind == kind)
+            and (not window.session or turn.session == window.session)
+        ]
+
     def bot_messages(self, start: datetime, end: datetime, session: str = "") -> list[Turn]:
-        """Return bot messages inside a simulated window."""
+        """Return bot messages inside a simulated *time* span (diagnostics only).
+
+        Time spans cannot express "delivered after the user spoke" when the world
+        clock moves in two-hour steps; use :meth:`in_window` for anything a check
+        depends on.
+        """
         return [
             turn
             for turn in self.recorder.between(start, end, session)
@@ -1788,7 +1871,7 @@ class Story:
         ]
 
     def proactive_messages(self, start: datetime, end: datetime, session: str = "") -> list[Turn]:
-        """Return proactive messages inside a simulated window."""
+        """Return proactive messages inside a simulated *time* span (diagnostics only)."""
         return [turn for turn in self.bot_messages(start, end, session) if turn.kind == "proactive"]
 
     # -- operator-observable probes (diagnostics only) ------------------------------
@@ -1886,7 +1969,8 @@ PHASES: list[tuple[str, str]] = [
     ("restart", "PHASE 9 a restart that does not disturb / 重启不打扰"),
     ("replay", "PHASE 10 duplicate delivery and replay / 重复投递"),
     ("timeline", "PHASE 11 the whole day, replayed / 一整天时间线回放"),
-    ("teardown", "PHASE 12 teardown"),
+    ("memory", "PHASE 12 long-term memory / 它记住了什么"),
+    ("teardown", "PHASE 13 teardown"),
 ]
 PHASE_IDS = [identifier for identifier, _title in PHASES]
 
@@ -2034,7 +2118,7 @@ def phase_timed_matter(story: Story, ctx: "Context") -> None:
     before_users = len(story.recorder.user_turns(session))
     story.advance(window.end - story.clock.now(), label="quiet after the promise")
 
-    proactives = story.proactive_messages(window.start, window.end, session)
+    proactives = story.in_window(window, who="bot", kind="proactive")
     V.check(
         "the bot speaks first, with no user message to trigger it",
         len(proactives) >= 1,
@@ -2080,6 +2164,13 @@ def phase_closure(story: Story, ctx: "Context") -> None:
     V.phase("closure", "PHASE 4 closing the loop / 回复闭环")
     session = SESSION_A
     before_report = story.ops_matters("obligations before the user reports the result")
+    # Everything the bot delivers from this recorder index on is strictly *after*
+    # the report: the user's turn is appended at this index and the platform
+    # transcript is in delivery order. Timestamps alone cannot express that,
+    # because the world clock moves in two-hour steps and a proactive message
+    # committed moments before the report is stamped with the same instant - it
+    # was an answer the user had not given yet, not a question asked after it.
+    report_index = len(story.recorder.turns)
     reply = story.say(session=session, text=TEXT_RESULT)
     after_report = story.ops_matters("obligations after the user reports the result")
     answered_at = story.clock.now()
@@ -2108,11 +2199,19 @@ def phase_closure(story: Story, ctx: "Context") -> None:
     )
     story.advance(window.end - story.clock.now(), label="two days after the result")
 
-    bot = story.bot_messages(window.start, window.end, session)
+    bot = story.in_window(window, who="bot")
+    # A message delivered *before* the report is not a re-ask, however close the two
+    # clock readings are; only what the user received after telling the bot counts.
+    # The reply to the report itself is in this slice, so the check can never pass
+    # by looking at an empty window.
+    delivered_after_the_report = story.recorder.turns[report_index + 1 :]
     offenders = [
         turn
-        for turn in bot
-        if turn.kind == "proactive" and any(topic in turn.text for topic in FORBIDDEN_TOPICS)
+        for turn in delivered_after_the_report
+        if turn.who == "bot"
+        and turn.session == session
+        and turn.kind == "proactive"
+        and any(topic in turn.text for topic in FORBIDDEN_TOPICS)
     ]
     V.check(
         "the bot never asks about that topic again once the user has reported the result",
@@ -2120,7 +2219,9 @@ def phase_closure(story: Story, ctx: "Context") -> None:
         "offending opportunistic message(s): "
         + _short([{"at": turn.at.isoformat(), "text": turn.text} for turn in offenders])
         if offenders
-        else f"0 of {len(bot)} bot message(s) in the window mention it",
+        else f"0 of {len(delivered_after_the_report)} turn(s) delivered after the report mention it "
+        f"({len([t for t in delivered_after_the_report if t.kind == 'proactive'])} unprompted, "
+        f"{len(bot)} bot message(s) in the two-day window)",
     )
     V.check(
         "the answer to the result does not ask for the result again",
@@ -2164,7 +2265,7 @@ def phase_boundary(story: Story, ctx: "Context") -> None:
     )
     story.advance(window.end - story.clock.now(), label="three days under the boundary")
 
-    all_bot = story.bot_messages(window.start, window.end, session)
+    all_bot = story.in_window(window, who="bot")
     proactives = [turn for turn in all_bot if turn.kind == "proactive"]
     answers = [
         turn for turn in all_bot if turn.kind == "reply" and _has_user_turn_before(story, turn)
@@ -2228,7 +2329,7 @@ def phase_resume(story: Story, ctx: "Context") -> None:
     )
     story.advance(window.end - story.clock.now(), label="two days after the mute was lifted")
 
-    proactives = story.proactive_messages(window.start, window.end, session)
+    proactives = story.in_window(window, who="bot", kind="proactive")
     V.check(
         "an unprompted message is allowed again once the user lifts the mute",
         len(proactives) >= 1,
@@ -2262,7 +2363,7 @@ def phase_silence(story: Story, ctx: "Context") -> None:
     )
     story.advance(window.end - story.clock.now(), label="the user stays silent")
 
-    proactives = story.proactive_messages(window.start, window.end, session)
+    proactives = story.in_window(window, who="bot", kind="proactive")
     cap = story.server.config.drive.max_contacts_per_day
     worst = 0
     worst_at: datetime | None = None
@@ -2295,7 +2396,7 @@ def phase_silence(story: Story, ctx: "Context") -> None:
     )
     guilty = [
         turn
-        for turn in story.bot_messages(window.start, window.end, session)
+        for turn in story.in_window(window, who="bot")
         if scan_guilt(turn.text)
     ]
     V.check(
@@ -2347,7 +2448,7 @@ def phase_isolation(story: Story, ctx: "Context") -> None:
     a_turn_at = story.clock.now()
     story.advance(window_b.end - story.clock.now(), label="second chat's promise comes due")
 
-    b_proactives = story.proactive_messages(window_b.start, window_b.end, session_b)
+    b_proactives = story.in_window(window_b, who="bot", kind="proactive")
     if not b_proactives:
         story.ops_matter_routing()
         story.ops_snapshot("the second chat never heard from the bot")
@@ -2742,7 +2843,7 @@ def phase_timeline(story: Story, ctx: "Context") -> None:
         matches = [
             window
             for window in story.windows
-            if window.session == turn.session and window.start <= turn.at <= window.end
+            if window.session == turn.session and _delivered_in(story, turn, window)
         ]
         if not matches or not any(window.proactive_allowed for window in matches):
             orphans.append(
@@ -2760,10 +2861,14 @@ def phase_timeline(story: Story, ctx: "Context") -> None:
     )
     forbidden_windows = [window for window in story.windows if not window.proactive_allowed]
     intrusions = [
-        {"at": turn.at.isoformat(), "text": turn.text}
+        {
+            "at": turn.at.isoformat(),
+            "window": window.name,
+            "text": turn.text,
+        }
         for turn in proactives
         for window in forbidden_windows
-        if window.session == turn.session and window.start <= turn.at <= window.end
+        if window.session == turn.session and _delivered_in(story, turn, window)
     ]
     V.check(
         "nothing appears out of nowhere in a window where the user asked for silence",
@@ -2808,9 +2913,217 @@ def phase_timeline(story: Story, ctx: "Context") -> None:
         V.note(observation)
 
 
+def _delivered_in(story: Story, turn: Turn, window: Window) -> bool:
+    """Whether one delivered turn belongs to one scripted window.
+
+    Membership is decided by delivery order *and* the clock, not by the clock alone:
+    the world moves in two-hour steps, so a message the bot committed moments before
+    the user spoke carries the same instant as the user's own line. Comparing
+    instants would file that message inside a window the user had not opened yet -
+    which is how a legitimate message came to be reported as a boundary violation.
+
+    Args:
+        story: The live story (its transcript is in delivery order).
+        turn: The delivered turn.
+        window: The scripted window.
+
+    Returns:
+        ``True`` when the turn was delivered after the window opened and no later
+        than the window's end.
+    """
+    for index, candidate in enumerate(story.recorder.turns):
+        if candidate is turn:
+            return index >= window.opened_after_turn and turn.at <= window.end
+    return False
+
+
+def _section(text: str, header: str) -> str:
+    """Return the body of one ``【...】`` section of an injected context block.
+
+    The block is line-oriented: a section starts at its header line and ends at the
+    next header (or at the end). Isolating the body matters, because a word can
+    appear in the block for reasons that have nothing to do with memory - the
+    user's own recent message is in there too - and a check for "the fact is in the
+    prompt" would otherwise pass without any memory existing.
+
+    Args:
+        text: The rendered block.
+        header: The exact header line, e.g. ``【必要记忆】``.
+
+    Returns:
+        The section body, or ``""`` when the section is absent.
+    """
+    lines = text.splitlines()
+    start = next((index for index, line in enumerate(lines) if line.strip() == header), None)
+    if start is None:
+        return ""
+    body: list[str] = []
+    for line in lines[start + 1 :]:
+        if line.strip().startswith("【"):
+            break
+        body.append(line)
+    return "\n".join(body).strip()
+
+
+def _trace_ratio(summary: str, said: str) -> float:
+    """Return the share of a memory's character bigrams that occur in ``said``.
+
+    Character bigrams are used for the same reason the Runtime uses them: single
+    CJK characters are shared by unrelated sentences, while a bigram means "these
+    two texts are talking about the same thing". A memory whose wording appears
+    nowhere in what the user typed is a memory of a conversation that never
+    happened.
+
+    Args:
+        summary: The memory's own text.
+        said: Everything the user typed in this run, concatenated.
+
+    Returns:
+        A ratio in ``[0, 1]``; ``1.0`` for a summary with no comparable bigrams.
+    """
+    tokens = {
+        summary[index : index + 2]
+        for index in range(len(summary) - 1)
+        if not summary[index : index + 2].isspace()
+    }
+    if not tokens:
+        return 1.0
+    return sum(1 for token in tokens if token in said) / len(tokens)
+
+
+def phase_memory(story: Story, ctx: "Context") -> None:
+    """记忆: what the bot keeps, and what it is handed the next time it speaks.
+
+    Three user-observable facts, in the order a person would notice them:
+
+    * the user states a durable fact **once**, in passing, and never repeats it;
+    * the day moves on, and the bot ends up knowing it - not because it was asked,
+      but because the Runtime formed the memory on its own maintenance pass;
+    * the next time the bot speaks, that fact is in front of it (the check reads
+      the request the host pipeline actually built, not a Runtime endpoint).
+
+    And one thing the user must never see: a bot that "remembers" words they never
+    typed. Every memory held at the end has to trace back to a user message.
+
+    Args:
+        story: The live story.
+        ctx: Harness context (unused beyond the shared verifier).
+    """
+    V.phase("memory", "PHASE 12 long-term memory / 它记住了什么")
+    assert story.server is not None and story.host is not None
+    server = story.server
+
+    def held() -> list[Mapping[str, Any]]:
+        """Return the memories the operator surface reports, defensively."""
+        payload = server.get("/memories").field("memories", default=[])
+        if not isinstance(payload, Sequence):
+            return []
+        return [item for item in payload if isinstance(item, Mapping)]
+
+    def about_the_fact() -> list[Mapping[str, Any]]:
+        """Return the memories whose text mentions the fact's marker."""
+        return [item for item in held() if TEXT_MEMORY_MARK in str(item.get("summary") or "")]
+
+    started_at = story.clock.now()
+    V.check(
+        "the bot remembers nothing about the fact before the user says it",
+        not about_the_fact(),
+        _short([item.get("summary") for item in held()[:4]])
+        or f"{len(held())} other memory/memories held, none of them about it",
+    )
+
+    story.say(session=SESSION_A, text=TEXT_MEMORY_FACT)
+    V.check(
+        "the user can drop a fact into an ordinary sentence and still get a reply",
+        bool(story.bot_messages(started_at, story.clock.now() + timedelta(seconds=1), SESSION_A)),
+        _short({"fact": TEXT_MEMORY_FACT, "reply_kind": "reply"}),
+    )
+
+    # The memory must not depend on the user asking about it: the Runtime forms it
+    # by itself once the maintenance interval has elapsed on its own timeline.
+    story.advance(MEMORY_WAIT, label="memory: let the day move on")
+
+    formed = about_the_fact()
+    V.check(
+        "after the day moves on the Runtime has formed the memory by itself",
+        len(formed) == 1,
+        _short([{key: item.get(key) for key in ("summary", "kind", "status", "retrievable")} for item in formed])
+        or f"{len(held())} memory/memories held after {MEMORY_WAIT}",
+    )
+    V.check(
+        "the memory is retrievable, and says it was extracted by rules, not written by a model",
+        bool(formed)
+        and formed[0].get("retrievable") is True
+        and (formed[0].get("structured") or {}).get("proposed_by") == "rule",
+        _short({key: formed[0].get(key) for key in ("retrievable", "retrieval_reason", "structured")})
+        if formed
+        else "no such memory",
+    )
+
+    # The payoff, and the only check here that is about what the *bot* was given:
+    # the next request the host pipeline builds has to carry the fact. A bot that
+    # stored a memory but never sees it again has not remembered anything.
+    story.say(session=SESSION_A, text=TEXT_MEMORY_LATER)
+    injected = story.host.last_injected
+    memory_section = _section(injected, MEMORY_SECTION)
+    V.check(
+        "the bot's next turn is composed with the remembered fact in front of it",
+        TEXT_MEMORY_MARK in memory_section,
+        _short(
+            {
+                "section_present": bool(memory_section),
+                "section_body": memory_section,
+                "injected_chars": len(injected),
+            }
+        ),
+    )
+
+    # Remembering must not change what is allowed to reach the user: the hidden
+    # block is now longer, and it must still not be quoted into a chat message.
+    said = "\n".join(turn.text for turn in story.recorder.user_turns())
+    new_turns = [turn for turn in story.recorder.bot_turns() if turn.at >= started_at]
+    leaked = [
+        {"at": turn.at.isoformat(), "patterns": ",".join(scan_leakage(turn.text)), "text": turn.text}
+        for turn in new_turns
+        if scan_leakage(turn.text)
+    ]
+    V.check(
+        "remembering does not leak the hidden block into what the user reads",
+        not leaked,
+        _short(leaked) or f"{len(new_turns)} message(s) after the fact was stated, none leaking",
+    )
+
+    untraceable = [
+        {"summary": item.get("summary"), "trace_ratio": round(_trace_ratio(str(item.get("summary") or ""), said), 3)}
+        for item in held()
+        if _trace_ratio(str(item.get("summary") or ""), said) < MEMORY_TRACE_RATIO
+    ]
+    V.check(
+        "every memory traces back to words the user actually typed (nothing invented)",
+        not untraceable,
+        _short(untraceable)
+        or f"{len(held())} memory/memories, all traced to {len(story.recorder.user_turns())} user message(s)",
+    )
+    V.note(
+        "memories held at the end: "
+        + _short(
+            [
+                {
+                    "summary": item.get("summary"),
+                    "kind": item.get("kind"),
+                    "status": item.get("status"),
+                    "retrievable": item.get("retrievable"),
+                }
+                for item in held()
+            ],
+            400,
+        )
+    )
+
+
 def phase_teardown(story: Story, ctx: "Context") -> None:
     """teardown: nothing is left running, and nothing was written outside --base-dir."""
-    V.phase("teardown", "PHASE 12 teardown")
+    V.phase("teardown", "PHASE 13 teardown")
     host_thread_alive = ctx.host_running(story)
     server = story.server
     server_thread_alive = bool(server and server.thread and server.thread.is_alive())
@@ -3052,7 +3365,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--fault",
         action="append",
         default=[],
-        choices=["leak", "duplicate", "topic", "guilt", "cross_session", "default_session"],
+        choices=[
+            "leak",
+            "duplicate",
+            "topic",
+            "guilt",
+            "cross_session",
+            "default_session",
+            "memory",
+        ],
         help="inject a harness-side defect to prove that a check bites (never a repo change)",
     )
     return parser.parse_args(argv)
@@ -3149,6 +3470,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "restart": phase_restart,
             "replay": phase_replay,
             "timeline": phase_timeline,
+            "memory": phase_memory,
         }
         try:
             for identifier, _title in PHASES:

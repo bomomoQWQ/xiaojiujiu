@@ -59,8 +59,8 @@
 ```text
 .
 ├── runtime/                          # ★ 持久认知 sidecar（独立进程，Python 3.11+）
-│   ├── src/companion_runtime/        #   29 个模块（含协议 v1 兼容层 api_v1.py）
-│   ├── tests/                        #   828 项离线测试
+│   ├── src/companion_runtime/        #   31 个模块（含协议 v1 兼容层 api_v1.py）
+│   ├── tests/                        #   903 项离线测试（14 项按环境跳过）
 │   ├── docs/PATCH_V0.2_MAPPING.md    #   设计章节 → 代码位置 → 状态（含诚实缺口清单）
 │   └── README.md                     #   操作者手册（配置 / API / 蓝屏恢复 / 降级）
 │
@@ -356,7 +356,7 @@ docker run --rm -v xiaojiujiu-data:/data -v E:\companion_runtime_backup:/backup 
 
 ```powershell
 cd runtime
-.venv\Scripts\python.exe -m pytest tests -q          # 828 passed
+.venv\Scripts\python.exe -m pytest tests -q          # 903 passed, 14 skipped
 
 # 插件测试在插件仓库里（先 git clone，见 §4.2）
 cd ..\astrbot_plugin_companion_runtime
@@ -368,7 +368,7 @@ python scripts\e2e_patch_v02.py                      # 28 项基础真机检查
 python scripts\e2e_resilience_simulation.py --base-dir E:\companion_runtime_backup\resilience-final
                                                      # 335 项高仿真检查（并发 / 重启 / 断网恢复）
 python scripts\blackbox_user_simulation.py --base-dir E:\companion_runtime_backup\blackbox
-                                                     # 70 项用户黑盒检查（见下）
+                                                     # 77 项用户黑盒检查（见下，13 个阶段）
 ```
 
 **用户黑盒仿真**（`scripts/blackbox_user_simulation.py`）是这套验证里最"像用户"的一层：
@@ -388,10 +388,21 @@ python scripts\blackbox_user_simulation.py --base-dir E:\companion_runtime_backu
 | **不泄漏** | 用户可见文本里永不出现 `<companion_runtime_context`、「以下是 Runtime 注入」、`companion_runtime`、`api_key`、`Bearer`、`sk-`，以及 `evt_/obx_/att_/cnd_/unf_/emo_/obs_` 形式的内部 id |
 | 会话隔离 | 一个会话的消息不出现在另一个；进程默认会话永不作为收件人 |
 | 每条主动消息都有来由 | 必须落在剧本里"本该发生"的窗口内，且不能出现在静默窗口 |
+| **记得住** | 用户顺口说过一次的事实，过一阵子必须真的被记住，并且**下一次回复时被摆在模型面前**（读的是宿主实际构造的那次请求）；同时每一条记忆都必须能追溯到用户自己打过的话 |
 
-它自带 `--fault leak|duplicate|topic|guilt|cross_session|default_session` 六种注错，
-用来证明这些检查**真的会失败**（不是恒真的断言）。0.2.0 就是靠这套仿真抓到两个
-单元测试完全没覆盖的缺陷：已了结的义务被同一句话重新打开、以及群聊里形成的承诺被投递到私聊。
+最后一行是唯一读宿主请求内容的检查，因为"它记得我"在聊天窗口里的含义就是：
+**下一次它开口时，这件事在它面前**。判定时会把 `【必要记忆】` 那一段单独切出来看，
+而不是在整块注入文本里找关键词——用户刚说过的话本来就在注入文本里，
+不切开就会把"复读上一句"误判成"记住了"。
+
+它自带 `--fault leak|duplicate|topic|guilt|cross_session|default_session|memory` 七种注错，
+用来证明这些检查**真的会失败**（不是恒真的断言）；`memory` 把维护间隔配到超出整个剧本长度，
+于是三条记忆检查必然失败。0.2.0 就是靠这套仿真抓到两个单元测试完全没覆盖的缺陷：
+已了结的义务被同一句话重新打开、以及群聊里形成的承诺被投递到私聊。
+
+窗口归属按**投递顺序 + 时钟**判定，而不是只看时间戳：世界钟按 2 小时一步走，
+在用户开口同一瞬间、但投递更早的消息，用时间戳会被算进"用户说完之后"的窗口——
+那曾让两条断言随机误报（产品行为本身是对的）。
 
 两个端到端脚本都会**导入插件仓库的代码**（它们驱动的是真实的插件传输层），
 所以本地必须有 `astrbot_plugin_companion_runtime/` 这份克隆；插件缺失时脚本会明确报错，

@@ -328,6 +328,10 @@ class EndogenousOutcome:
     #: Outcome of the deep cognition refresh attempted during this round. Always
     #: present so an operator can tell "nothing needed doing" from "never tried".
     deep_refresh: dict[str, Any] = field(default_factory=dict)
+    #: Outcome of the rule-based consolidation pass attempted during this round.
+    #: Always present, for the same reason as ``deep_refresh``: long-term memory
+    #: forming (or not forming) must be visible without guessing.
+    consolidation: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable rendering."""
@@ -340,6 +344,7 @@ class EndogenousOutcome:
             "activated_memory_ids": list(self.activated_memory_ids),
             "version": self.version,
             "deep_refresh": dict(self.deep_refresh),
+            "consolidation": dict(self.consolidation),
         }
 
 
@@ -985,7 +990,10 @@ class Runtime:
                 # --- memory candidate
                 # ``created`` only exists when the event was settled; an
                 # unresolved event has no emotional salience yet by definition,
-                # so it contributes none rather than guessing one.
+                # so it contributes none rather than guessing one. The candidate is
+                # stamped with the Runtime's own timeline instant, not the wall
+                # clock: when it becomes due for consolidation is a question about
+                # this timeline (a replayed or simulated one included).
                 salience = max((e.intensity for e in created), default=0.0)
                 proposal_memory = memory_module.propose_from_event(
                     event,
@@ -993,6 +1001,7 @@ class Runtime:
                     unfinished=self.projections.unfinished.list_open(),
                     emotion_salience=salience,
                     config=self.config,
+                    created_at=stamp,
                 )
                 if proposal_memory is not None:
                     self.projections.memory.upsert_candidate(conn, proposal_memory)
@@ -1085,6 +1094,15 @@ class Runtime:
         understood backlog can inform whether to speak, and it is never allowed to
         block the round - a refresh that declines is simply recorded.
 
+        Memory consolidation runs *after* the decision, in its own write
+        transaction and gated on
+        :func:`~companion_runtime.memory.needs_consolidation`. It is the only writer
+        of the ``memories`` table, so without this step the shipped default
+        deployment (``semantic.provider = "disabled"``) would never form a single
+        long-term memory; running it last also means the memories it forms can
+        inform the *next* round without changing the decision this one just made.
+        Like the refresh, a failing pass is logged and reported, never raised.
+
         Args:
             now: Reference time.
             force: Bypass the foreground pause and the scheduler gate.
@@ -1113,6 +1131,10 @@ class Runtime:
             if not force and state.foreground_pause_until is not None and stamp < state.foreground_pause_until:
                 outcome.decision = {"acted": False, "reason": "foreground_pause"}
                 outcome.next_wake_at = state.foreground_pause_until
+                # A paused foreground silences speech, not maintenance: memory
+                # formation is exactly the kind of work that must still happen
+                # while the character is being quiet.
+                outcome.consolidation = self._consolidate_if_due(now=stamp)
                 return outcome
 
             active = self.projections.emotion.list_active()
@@ -1207,7 +1229,12 @@ class Runtime:
                         outcome.attempt_id = attempt_id
                         outcome.outbox_id = outbox_id
                         outcome.version = commit_state.version
-                return outcome
+
+            # The decision is committed, so the maintenance pass cannot change it.
+            # It gets its own transaction (the block above has closed) and its own
+            # failure domain, exactly like the deep refresh.
+            outcome.consolidation = self._consolidate_if_due(now=stamp)
+            return outcome
 
     def _event_ids_behind(self, source: str) -> list[str]:
         """Return the event ids one candidate source ultimately rests on.
@@ -1384,6 +1411,71 @@ class Runtime:
         )
         self.projections.runtime.write(state, conn, expect_version=state.version)
         return attempt.attempt_id, item.outbox_id
+
+    # ------------------------------------------------------ memory maintenance
+
+    def consolidate(
+        self, *, now: datetime | None = None, limit: int = 20
+    ) -> memory_module.ConsolidationResult:
+        """Run one rule-based memory consolidation pass.
+
+        This is the unattended writer of the ``memories`` table: it needs no model
+        and no operator, which is what makes long-term memory exist in the shipped
+        default deployment (``semantic.provider = "disabled"``). The pass promotes
+        pending candidates with the summary the rule-based proposal already built,
+        merges restatements, records conflicts and archives what has faded.
+
+        It is deliberately not on the foreground path: consolidation is a P3
+        maintenance job, so the endogenous round runs it when
+        :func:`~companion_runtime.memory.needs_consolidation` says it is due, and
+        ``companion-runtime consolidate`` runs one pass on demand.
+
+        Args:
+            now: Reference time; defaults to the wall clock.
+            limit: Maximum number of candidates to promote in one pass.
+
+        Returns:
+            A :class:`~companion_runtime.memory.ConsolidationResult`.
+        """
+        stamp = ensure_aware(now) or utcnow()
+        with self.write_session():
+            with self._db.transaction() as conn:
+                return memory_module.consolidate(
+                    self.projections.memory,
+                    conn,
+                    config=self.config,
+                    now=stamp,
+                    limit=limit,
+                )
+
+    def _consolidate_if_due(self, *, now: datetime) -> dict[str, Any]:
+        """Consolidate pending memory candidates when the interval has elapsed.
+
+        The failure tolerance matches the deep-refresh path: forming a memory is
+        never urgent enough to break the round it happened in, so a fault is logged
+        and reported instead of propagating. The report is always present, so an
+        operator can tell "nothing was due" from "the pass failed" from "it ran".
+
+        Args:
+            now: Reference time.
+
+        Returns:
+            A rendering of the pass: ``ran``, ``reason``, ``consolidated``,
+            ``archived`` and ``skipped``.
+        """
+        try:
+            if not memory_module.needs_consolidation(
+                self.projections.memory, config=self.config, now=now
+            ):
+                return {"ran": False, "reason": "not_due"}
+            result = self.consolidate(now=now)
+        except Exception:  # noqa: BLE001 - a maintenance pass is never worth a failed round
+            LOGGER.exception(
+                "Memory consolidation during the endogenous round failed; continuing"
+            )
+            return {"ran": False, "reason": "error"}
+        worked = bool(result.consolidated or result.archived)
+        return {"ran": True, "reason": "applied" if worked else "nothing_to_do"} | result.to_dict()
 
     # ------------------------------------------------------ deep cognition path
 

@@ -45,6 +45,7 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from . import candidate as candidate_module
 from . import context as context_module
+from . import memory as memory_module
 from . import protocol as protocol_module
 from . import scheduler as scheduler_module
 from .authorize import AuthorizeRequest, authorize
@@ -52,6 +53,7 @@ from .config import RuntimeConfig, redact
 from .typing import (
     Actor,
     EventType,
+    MemoryStatus,
     OutboxStatus,
     Priority,
     ReconcileAction,
@@ -775,12 +777,25 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
 
     @router.get("/memories", tags=["inspect"])
     def get_memories(limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
-        """Return long-term memories, the activation pool and pending candidates."""
-        memories = runtime.projections.memory.list_memories(limit=limit)
+        """Return long-term memories, the activation pool and pending candidates.
+
+        Every memory carries its supersession record, so a memory that retrieval and
+        the prompt will never use again states why (``superseded_by_hint``, or a
+        retention status such as ``low_activation``). Faded and replaced memories are
+        exactly the ones an operator needs to be able to see: forgetting in this
+        Runtime is archival, never deletion.
+        """
+        memories = runtime.projections.memory.list_memories(
+            status=[MemoryStatus.ACTIVE.value, MemoryStatus.LOW_ACTIVATION.value],
+            limit=limit,
+        )
         activated = runtime.projections.memory.list_activated(limit=limit)
         candidates = runtime.projections.memory.list_candidates(limit=limit)
         return {
-            "memories": [memory.to_dict() for memory in memories],
+            "memories": [
+                memory.to_dict() | memory_module.supersession_record(memory)
+                for memory in memories
+            ],
             "activated": [item.to_dict() for item in activated],
             "candidates": [item.to_dict() for item in candidates],
         }

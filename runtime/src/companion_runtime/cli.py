@@ -5,6 +5,7 @@ Subcommands::
     serve        run the HTTP sidecar
     tick         advance the Runtime to a moment (lazy_tick)
     endogenous   run one endogenous round and print the decision
+    consolidate  run one rule-based memory consolidation pass (no model needed)
     state        print a read-only view of the Runtime
     verify       integrity and consistency check
     checkpoint   fold the WAL back into the database file
@@ -32,6 +33,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import __version__
+from . import memory as memory_module
 from .config import configure_logging, load_config, resolve_paths
 from .db import Database
 from .maintenance import (
@@ -46,6 +48,7 @@ from .maintenance import (
     verify,
 )
 from .runtime import Runtime
+from .typing import MemoryStatus
 from .utility import parse_datetime, utcnow
 
 LOGGER = logging.getLogger("companion_runtime.cli")
@@ -133,6 +136,17 @@ def build_parser() -> argparse.ArgumentParser:
     refresh.add_argument("--now", default=None, help="ISO-8601 reference time (default: now)")
     refresh.add_argument(
         "--force", action="store_true", help="ignore the trigger check (diagnostics)"
+    )
+
+    consolidate_cmd = subparsers.add_parser(
+        "consolidate",
+        help="run one rule-based memory consolidation pass (no model required)",
+    )
+    consolidate_cmd.add_argument(
+        "--now", default=None, help="ISO-8601 reference time (default: now)"
+    )
+    consolidate_cmd.add_argument(
+        "--limit", type=int, default=20, help="maximum candidates to promote in this pass"
     )
 
     backlog = subparsers.add_parser(
@@ -355,6 +369,26 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_consolidate(args: argparse.Namespace) -> int:
+    """Run one memory consolidation pass and print what it produced.
+
+    This is the manual form of the pass the endogenous round runs on its own. It
+    needs no provider and no key, which is the point: the shipped default
+    deployment (``semantic.provider = "disabled"``) must still form long-term
+    memories. A pass that finds nothing due is a normal result, so this exits 0 and
+    reports the counts.
+    """
+    config = _resolve_config(args)
+    configure_logging(config.server.log_level)
+    runtime = Runtime(config)
+    try:
+        result = runtime.consolidate(now=_parse_now(args.now), limit=args.limit)
+        _emit(result.to_dict(), as_json=True)
+    finally:
+        runtime.close()
+    return EXIT_OK
+
+
 def cmd_backlog(args: argparse.Namespace) -> int:
     """Print the unresolved-event backlog and its relevance breakdown."""
     config = _resolve_config(args)
@@ -387,7 +421,11 @@ def cmd_state(args: argparse.Namespace) -> int:
                 item.to_dict() for item in projections.candidates.list_active(limit=50)
             ],
             "memories": lambda: [
-                item.to_dict() for item in projections.memory.list_memories(limit=50)
+                item.to_dict() | memory_module.supersession_record(item)
+                for item in projections.memory.list_memories(
+                    status=[MemoryStatus.ACTIVE.value, MemoryStatus.LOW_ACTIVATION.value],
+                    limit=50,
+                )
             ],
             "unfinished": lambda: [
                 item.to_dict() for item in projections.unfinished.list_all(limit=50)
@@ -533,6 +571,7 @@ COMMANDS = {
     "tick": cmd_tick,
     "endogenous": cmd_endogenous,
     "refresh": cmd_refresh,
+    "consolidate": cmd_consolidate,
     "backlog": cmd_backlog,
     "state": cmd_state,
     "verify": cmd_verify,

@@ -5,6 +5,102 @@
 
 ---
 
+## 0.3.0 — 2026-09-15
+
+这一版只做三件事：**把记忆模块真正接上**、**把存储从"只能 SQLite"变成可选 PostgreSQL**、
+**把"复用宿主自带知识库"这条路验证清楚并写成契约**。三条不变量与 0.2.0 完全一致。
+
+### 修复：记忆模块（审计 block A §13–§20、block C 必须补 #1）
+
+改动集中在 `memory.py` / `runtime.py` / `scheduler.py` / `context.py` / `api.py` / `cli.py`，
+回归测试在 `runtime/tests/test_memory_pipeline.py`（20 条，每条写的是它守的那个不变量）。
+
+- **默认部署根本不会形成长期记忆**（最严重）。`consolidate()` 其实**不需要模型**，
+  但它**没有任何调用者**：`semantic.provider="disabled"` 的标准部署里 `memories` 表永远是空的，
+  `/memories` 永远空、激活池永远空、提示词里永远没有 `【必要记忆】`。
+  现在 `Runtime.consolidate()` 是公开入口，`endogenous_round()` 在决策提交后按
+  `needs_consolidation()` 触发一次（独立事务、独立失败域，失败只记录不炸轮次），
+  `companion-runtime consolidate` 可手动跑一次；`EndogenousOutcome.consolidation` 永远存在，
+  "没到点""跑完了""炸了"三者可区分。
+- **候选的时间戳取的是墙钟**，于是重放/仿真时间线上"到点"永远不成立。改为由调用方传入
+  本次 ingest 的时间（`propose_from_event(..., created_at=stamp)`）。
+- **`scheduler._maintenance_due` 与真正干活的那条规则不一致**：它只看按价值排序的前 5 条，
+  算出的唤醒点可能对不上实际会读的窗口（承诺一次什么都没干的唤醒）。现在两边都走
+  `memory.next_consolidation_due()`。
+- **去重判据写坏了**：`if not overlap: continue` 卡在 `ratio >= 0.85` 之前，使"几乎一字不差的重述"
+  永远合并不了；同一段 `overlap` 还重复出现两次。现在顺序是：完全相同 → `>=0.85` 只按内容 →
+  `>=0.6` 且至少共享一个主题 → 包含关系且共享主题。**被取代的记忆永不作为合并目标**
+  （否则新说法会掉进一条再也检索不到的行里，无声消失）。
+- **`supersedes` / `superseded_by_hint` 只写不读**：被新说法取代的事实仍然会被检索、进激活池、
+  进提示词——角色会继续断言自己刚纠正过的版本。现在读侧统一走 `is_superseded()`
+  （`retrieve` / `activated_memories` / `activation_strength` / `context.select_memories`），
+  `/memories` 与 `state --include memories` 给出 `retrievable` / `retrieval_reason` /
+  `superseded_by_hint`，并且 `low_activation` 的记忆不再从运维视图里消失。
+  "以前…现在…"这种**散文式改写需要模型**，代码里如实写明只做了确定性的一半：被取代的事实不再被断言。
+- **`MemoryStatus.LOW_ACTIVATION` 无处置位**：`active → low_activation → archived` 链条缺中间一环。
+  现在 `decay_pool()` 降到 `activation_threshold` 以下即降级（只降 `active`，归档永不被复活），
+  同一事实被重述时 `reinforce()` 加激活并提升回 `active`。
+- **冲突检测用单字当"同一主体"**：读侧上线后，"不喜欢别人连续追问我在干嘛"会被
+  "喜欢手冲咖啡"撤回（共用 我/喜/欢）。改用与去重同一个 CJK bigram 判据（≥2 个共享 bigram），
+  `喜欢咖啡` / `不喜欢咖啡` 仍然判为冲突，无关的两句不再互相撤回；`superseded_at` 也改用本轮时间。
+- 文档撒谎的地方逐条改掉（`build_situation` 承诺过 `active_items`、若干阈值配置名不存在、
+  若干公式与实现不符等）；`tick_activation` / `pool_times` 确认无人调用，如实标注而不是假装修好。
+
+### 新增
+
+- **存储可选 PostgreSQL**（`runtime/src/companion_runtime/db_postgres.py`，可选依赖
+  `pip install companion-runtime[postgres]`）：`DatabaseBase` 抽出事务模板（savepoint 栈、
+  逐层 `BEGIN IMMEDIATE`），SQLite 与 PG 各自实现方言；`?`→`%s` 用 AST 级词法转换，
+  `rowid`→`ctid`，`LIMIT -1` 重写，单写者用会话级 advisory lock。
+  同一个测试套件在两种后端上都跑（`CR_TEST_PG_DSN` 打开 PG 专项）。
+- **宿主知识库复用契约** `runtime/docs/HOST_KB_REUSE.md`：在真机 AstrBot 4.28.1 上实测出的四条事实
+  ——插件 `initialize()` 早于 embedding provider 与 KB 初始化（必须用 `@filter.on_astrbot_loaded()`）；
+  KB 必须绑定 embedding provider；**返回的 `score` 是"结果集内 min-max 归一化的融合分"而不是相似度**
+  （无关问题也会给第一名 1.0，所以不能拿它卡阈值）；以及进程内/HTTP 两种调用形状。
+- **用户黑盒仿真新增"记忆"阶段**（第 12 阶段，13 阶段共 77 项检查）：用户顺口说一次的事实，
+  过一阵子必须真的被记住，并且**下次开口时被摆在模型面前**——读的是宿主实际构造的那次请求里的
+  `【必要记忆】` 段（不是整块注入文本，否则"复读上一句"会被误判成"记住了"）。
+  另加"每条记忆都必须追溯到用户自己打过的话"。`--fault memory` 让这三条必然失败，证明检查会咬。
+- **三份审阅报告** `runtime/docs/audit/`（block A/B/C）与合并缺口清单。
+
+### 黑盒仿真在这一轮抓到的缺陷
+
+1. **"用户说完之后"的断言会随机误报**（断言的错，不是产品的错）：世界钟以 2 小时为一步，
+   在用户开口**同一瞬间**、但**投递在其之前**的消息，会被时间戳窗口 `<=/>=` 误判成"之后"
+   ——一次把"报结果后不再追问"打成失败，一次把"请求安静期间零主动消息"打成失败
+   （改动前 7 次全量运行里误报 2 次）。transcript 是投递顺序（`Recorder.turns` 只追加、不排序），
+   两次误报都证明那条消息排在用户发言**之前**。现在窗口归属同时看投递顺序与时钟
+   （`Window.opened_after_turn` + `Story.in_window()`），`phase_boundary` / `phase_closure` /
+   `phase_timeline` 三处判定统一。修好后连跑 3 次全量 77/77——产品行为本身一直是对的。
+
+### 验证（0.3.0 定版时点，全部本机实测）
+
+| 套件 | 结果 |
+|---|---|
+| `runtime` 离线测试 | **903 passed / 14 skipped** |
+| 同上，接 `CR_TEST_PG_DSN` | 917 项（PG 专项 14 项不再跳过） |
+| `scripts/e2e_resilience_simulation.py` | **335 / 335** |
+| `scripts/blackbox_user_simulation.py` | **77 / 77**（断言修正后连跑 3 次一致） |
+| 插件仓库 | 143 passed + 13 subtests |
+
+变异验证（临时改回旧行为确认测试会失败，再改回）：把去重改回旧写法 → 重述合并那条失败；
+把轮次里的 consolidate 调用删掉 → 恰好 6 条失败（`/memories` 空、激活池空、无 `【必要记忆】`）。
+
+注错验证（每条都让对应检查失败、退码 1；每格跑两次，`topic` 因唤醒时刻受真实墙钟影响浮动 ±1）：
+`leak` 3、`duplicate` 5、`topic` 10–11、`guilt` 9、`cross_session` 4、`default_session` 5、`memory` 3。
+
+### 已知边界（新增）
+
+- PG 后端**尚未在测试实例上接线**（`CR_STORAGE__DSN` + psycopg 镜像还没进 `docker-compose`）；
+  `maintenance.py` 的备份/恢复/WAL 命令仍是 SQLite 专用，PG 后端需要方言闸门。
+- 宿主知识库目前只验证到"可复用 + 契约清楚"，**记忆镜像到 KB、检索结果进提示词还没接**。
+- 记忆的"以前…现在…"散文改写、以及不带极性词的矛盾检测，仍然需要模型或不支持。
+- block A/B/C 审阅报告里的其余必修项（记忆/心跳时间推进只覆盖了部分写入口、用户模型时间动态、
+  候选形状与 `CANDIDATE_GEN`、`invalidate_when` 硬编码表等）尚未处理，清单在
+  `runtime/docs/audit/README.md`。
+
+---
+
 ## 0.2.0 — 2026-09-15
 
 第一个"可以拿去部署、也有人能接手"的版本。相对 0.1.0 的改动分四块：把审阅发现的缺陷逐条修掉、

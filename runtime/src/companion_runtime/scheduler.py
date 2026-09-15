@@ -23,6 +23,7 @@ from typing import Any, Callable, Sequence
 
 from . import action as action_module
 from . import boundaries as boundary_module
+from . import memory as memory_module
 from . import unfinished as unfinished_module
 from .config import RuntimeConfig
 from .typing import AttemptState, CandidateStatus, RuntimeState
@@ -113,14 +114,20 @@ def collect_signals(
 
 
 def _maintenance_due(runtime: Any, now: datetime) -> datetime | None:
-    """Return when the next P3 maintenance pass is due, if anything is pending."""
-    pending = runtime.projections.memory.pending_candidates(limit=5)
-    if not pending:
-        return None
-    newest = max((c.created_at for c in pending if c.created_at is not None), default=None)
-    if newest is None:
-        return now
-    return newest + timedelta(seconds=runtime.config.memory.consolidation_interval_seconds)
+    """Return when the next P3 maintenance pass is due, if anything is pending.
+
+    The anchor is computed by
+    :func:`companion_runtime.memory.next_consolidation_due`, the same rule
+    :func:`companion_runtime.memory.needs_consolidation` applies, so the wake this
+    anchor promises is exactly the wake at which the round finds work to do:
+    :meth:`companion_runtime.runtime.Runtime.endogenous_round` consolidates pending
+    memory candidates when that check returns ``True``. Computing the anchor here
+    from a differently-sized window - as this function used to - would make the
+    scheduler promise a maintenance wake that the round then skips.
+    """
+    return memory_module.next_consolidation_due(
+        runtime.projections.memory, config=runtime.config, now=now
+    )
 
 
 def plan(

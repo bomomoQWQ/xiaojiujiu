@@ -5,11 +5,27 @@ The full chain is::
     raw events -> working situation -> memory candidates -> consolidation
                 -> long-term memory -> retrieval (lexical RAG) -> activation pool
 
-Two deliberate simplifications for the first version:
+Consolidation, the only writer of the ``memories`` table, is **rule-based and needs
+no model**. The Runtime drives it unattended from
+:meth:`companion_runtime.runtime.Runtime.endogenous_round` (gated on
+:func:`needs_consolidation`) and an operator can drive one pass by hand with
+``companion-runtime consolidate``. A semantic provider may *replace* a candidate's
+summary with a model-written one, but it is never required for a memory to form,
+and a memory the rules built says so through ``structured["proposed_by"]``.
+
+Forgetting is a chain rather than a flag: ``active -> low_activation -> archived``
+(:class:`~companion_runtime.typing.MemoryStatus`). A faded memory leaves the
+working set while staying in the database, and reinforcement puts it back.
+
+Three deliberate simplifications for the first version:
 
 * retrieval uses an FTS-like lexical overlap score instead of embeddings, with a
   clear seam (:meth:`MemoryStore.retrieve`) for an embedding sidecar;
-* forgetting means *archival*, never deletion.
+* forgetting means *archival*, never deletion;
+* conflict handling is one-directional and deterministic: when a newer statement
+  contradicts an older memory, the older one is withdrawn from retrieval
+  (:func:`is_superseded`) rather than re-described in prose - "used to ..., now
+  ..." is a language task, and no model is guaranteed to exist.
 
 Every memory keeps a dual representation: structured fields for the Runtime and a
 natural-language summary for RAG, the strong semantic API and the main LLM.
@@ -40,7 +56,15 @@ from .typing import (
     UnfinishedMatter,
     new_id,
 )
-from .utility import clamp, exponential_decay, summarize_text, tokenize, topic_tokens, utcnow
+from .utility import (
+    clamp,
+    ensure_aware,
+    exponential_decay,
+    summarize_text,
+    tokenize,
+    topic_tokens,
+    utcnow,
+)
 
 LOGGER = logging.getLogger("companion_runtime.memory")
 
@@ -116,6 +140,29 @@ DEDUPE_CONTAINMENT_RATIO = 0.8
 #: not the same fact as "用户明天要去面试".
 DEDUPE_MIN_SHARED_TOKENS = 2
 
+#: Provenance recorded when the deterministic rule path formed the memory, i.e.
+#: when the summary is the one the rule-based proposal already extracted. It must
+#: never read as if a model wrote it.
+PROVENANCE_RULE = "rule"
+
+#: Provenance recorded when an outside model supplied the summary text.
+PROVENANCE_SEMANTIC_API = "semantic_api"
+
+#: Structured key under which the replacement hint is stored on a superseded memory.
+SUPERSEDED_HINT_KEY = "superseded_by_hint"
+
+#: Structured key under which the replacement time is stored on a superseded memory.
+SUPERSEDED_AT_KEY = "superseded_at"
+
+#: Structured key under which the identifiers a memory replaced are stored.
+SUPERSEDES_KEY = "supersedes"
+
+#: Why a superseded memory is withheld from retrieval, activation and the prompt.
+SUPERSEDED_REASON = "superseded_by_newer_memory"
+
+#: Activation added by one reinforcement (a restatement of the same fact).
+REINFORCEMENT_ACTIVATION = 0.35
+
 
 def score_candidate(
     *,
@@ -133,11 +180,16 @@ def score_candidate(
 
     Args:
         text: Candidate content.
-        source_events: Events the candidate derives from.
+        source_events: Events the candidate derives from. Accepted for interface
+            stability and diagnostics only: the score is computed from the text, the
+            state, the live matters and the emotional salience, so one source event
+            or a whole batch produces the same value.
         state: Runtime state (values modulate importance).
         unfinished: Live unfinished matters.
         emotion_salience: Peak emotional intensity around the source events.
-        config: Runtime configuration.
+        config: Runtime configuration. Also accepted for interface stability: every
+            weight below is a module constant, and only :func:`propose_from_event`
+            compares the returned total against ``config.memory.candidate_min_value``.
 
     Returns:
         A :class:`CandidateValue` including the signed total in ``[0, 1]``.
@@ -198,6 +250,7 @@ def propose_from_event(
     unfinished: Sequence[UnfinishedMatter],
     emotion_salience: float,
     config: RuntimeConfig,
+    created_at: datetime | None = None,
 ) -> MemoryCandidate | None:
     """Build a memory candidate from one event, or ``None`` when too weak.
 
@@ -207,6 +260,11 @@ def propose_from_event(
         unfinished: Live unfinished matters.
         emotion_salience: Peak emotional intensity around the event.
         config: Runtime configuration.
+        created_at: Instant the candidate is created at, on the caller's timeline.
+            The Runtime passes the moment it ingested the event, because the
+            maintenance interval that decides when the candidate is consolidated is
+            measured against that clock; defaulting to the wall clock would make a
+            replayed or simulated timeline consolidate on the wrong schedule.
 
     Returns:
         A pending :class:`MemoryCandidate` when it clears
@@ -242,7 +300,7 @@ def propose_from_event(
         source_event_ids=[event.event_id],
         value=value.total,
         status="pending",
-        created_at=utcnow(),
+        created_at=ensure_aware(created_at) or utcnow(),
         topics=tokenize(text)[:6],
         confidence=0.5,
     )
@@ -291,9 +349,20 @@ def consolidate(
 ) -> ConsolidationResult:
     """Promote pending candidates into long-term memories.
 
+    This is the only writer of the ``memories`` table, and it needs nothing but the
+    rules: the summary of a promoted memory is the one the candidate already
+    carries. A ``summarizer`` may replace it with a model-written text, and only a
+    text that actually differs is recorded as model provenance
+    (``structured["proposed_by"]``), so a rule-formed memory never claims a model
+    wrote it.
+
     Conflicting new information does not delete the old memory; it lowers its
-    confidence and links the new one through the ``supersedes`` structured field,
-    so the pair can later be re-described as "used to ... but now ...".
+    confidence, links the new one through the ``supersedes`` structured field and
+    marks the old one with ``superseded_by_hint``. The read side of that pair is
+    :func:`is_superseded`: a replaced memory leaves retrieval, activation and the
+    prompt. Re-describing the pair in prose ("used to ..., but now ...") is a
+    language task and is *not* done here - the deterministic half is that the
+    replaced fact stops being asserted.
 
     Args:
         projection: Memory storage.
@@ -324,12 +393,15 @@ def consolidate(
         existing = _find_duplicate(projection, candidate)
         if existing is not None:
             # The same content was already remembered: strengthen the existing
-            # memory instead of storing a near-duplicate row.
+            # memory instead of storing a near-duplicate row. Saying the same thing
+            # again is also the reinforcement that lifts a faded memory back into
+            # the working set.
             existing.importance = clamp(existing.importance + 0.05 * candidate.value)
             existing.confidence = clamp(existing.confidence + 0.05)
             existing.source_event_ids = sorted(
                 set(existing.source_event_ids) | set(candidate.source_event_ids)
             )
+            reinforce(projection, connection, existing, config=config, now=stamp)
             projection.upsert_memory(connection, existing)
             projection.set_candidate_status(
                 connection,
@@ -341,13 +413,18 @@ def consolidate(
             continue
 
         summary = candidate.summary
+        provenance = PROVENANCE_RULE
         if summarizer is not None:
             try:
-                summary = str(summarizer(candidate)) or summary
+                proposed = str(summarizer(candidate)) or summary
             except Exception:  # pragma: no cover - defensive boundary around a model
                 LOGGER.exception("Memory summarizer failed; keeping candidate summary")
+            else:
+                if proposed != summary:
+                    summary = proposed
+                    provenance = PROVENANCE_SEMANTIC_API
 
-        supersedes = _find_conflicts(projection, candidate, connection)
+        supersedes = _find_conflicts(projection, candidate, connection, now=stamp)
         importance = clamp(
             0.5 * kind_importance(candidate.kind, config) + 0.5 * candidate.value
         )
@@ -358,7 +435,9 @@ def consolidate(
             structured={
                 "value_breakdown": candidate.value,
                 "confidence": candidate.confidence,
-                "supersedes": supersedes,
+                # Who produced this memory. The rule path must not read as a model.
+                "proposed_by": provenance,
+                SUPERSEDES_KEY: supersedes,
                 "topics": candidate.topics,
             },
             topics=list(candidate.topics),
@@ -392,19 +471,130 @@ def consolidate(
     return ConsolidationResult(consolidated=consolidated, archived=archived, skipped=skipped)
 
 
+def is_superseded(memory: Memory) -> bool:
+    """Return whether a newer statement has replaced this memory's content.
+
+    The write side is :func:`_find_conflicts`, which records
+    ``superseded_by_hint``/``superseded_at`` on the replaced memory and lists its
+    identifier in the replacement's ``supersedes`` field. This is the read side: a
+    replaced memory is no longer asserted, so retrieval, activation and the prompt
+    all skip it. It stays in the database - an old fact is history, not an error.
+    """
+    return bool(str(memory.structured.get(SUPERSEDED_HINT_KEY) or "").strip())
+
+
+def supersession_record(memory: Memory) -> dict[str, Any]:
+    """Return the operator-facing supersession view of one memory.
+
+    ``/memories`` prints a memory's structured fields verbatim, but "why is this
+    fact never recalled again" should not require knowing that
+    ``superseded_by_hint`` is the field to look at, so the reason is stated.
+
+    Returns:
+        ``superseded``, ``superseded_by_hint``, ``superseded_at``, ``supersedes``,
+        ``retrievable`` and ``retrieval_reason``.
+    """
+    superseded = is_superseded(memory)
+    if superseded:
+        reason = SUPERSEDED_REASON
+    elif memory.status != MemoryStatus.ACTIVE.value:
+        reason = f"status:{memory.status}"
+    else:
+        reason = "active"
+    return {
+        "superseded": superseded,
+        "superseded_by_hint": memory.structured.get(SUPERSEDED_HINT_KEY),
+        "superseded_at": memory.structured.get(SUPERSEDED_AT_KEY),
+        "supersedes": list(memory.structured.get(SUPERSEDES_KEY) or []),
+        "retrievable": reason == "active",
+        "retrieval_reason": reason,
+    }
+
+
+def reinforce(
+    projection: MemoryProjection,
+    connection: sqlite3.Connection,
+    memory: Memory,
+    *,
+    config: RuntimeConfig,
+    now: datetime,
+    amount: float = REINFORCEMENT_ACTIVATION,
+) -> ActivatedMemory:
+    """Raise a memory's activation, promoting it when it crosses the threshold.
+
+    ``LOW_ACTIVATION`` is not a deletion: it is the middle rung of the
+    ``active -> low_activation -> archived`` chain. A memory leaves it as soon as
+    something reinforces it, and a restatement of the same fact - which is what
+    consolidation sees when a duplicate candidate arrives - is exactly that
+    evidence.
+
+    Args:
+        projection: Memory storage.
+        connection: Write connection.
+        memory: The memory being reinforced. Its status is updated in place, so the
+            caller is responsible for persisting the row (``upsert_memory``).
+        config: Runtime configuration.
+        now: Reference time.
+        amount: How much activation one reinforcement adds.
+
+    Returns:
+        The updated activation entry.
+    """
+    current = _activation_of(projection, memory.memory_id)
+    base = current.activation if current is not None else 0.0
+    activation = clamp(base + amount)
+    updated = ActivatedMemory(
+        memory_id=memory.memory_id,
+        activation=activation,
+        last_recalled_at=now,
+        recall_count=(current.recall_count if current is not None else 0) + 1,
+        reason="reinforced",
+    )
+    projection.upsert_activation(connection, updated)
+    if (
+        memory.status == MemoryStatus.LOW_ACTIVATION.value
+        and activation >= config.memory.activation_threshold
+    ):
+        memory.status = MemoryStatus.ACTIVE.value
+    return updated
+
+
+def _activation_of(
+    projection: MemoryProjection, memory_id: str
+) -> ActivatedMemory | None:
+    """Return the activation entry of one memory, or ``None`` when it has none."""
+    for activated in projection.list_activated(limit=500):
+        if activated.memory_id == memory_id:
+            return activated
+    return None
+
+
 def _find_duplicate(projection: MemoryProjection, candidate: MemoryCandidate) -> Memory | None:
     """Return an existing memory stating the same fact, if any.
 
     Deduplication is about *content*, never about provenance. The candidate and the
-    memory must actually say the same thing - an identical summary scores above
-    ``duplicate_summary_threshold``, a near-identical one above
-    ``duplicate_topic_threshold`` **and** with overlapping topics.
+    memory must actually say the same thing, and the module's thresholds describe
+    three different cases:
+
+    * ``_similarity >= DEDUPE_EXACT_RATIO`` (0.85): the same fact restated. This
+      branch does *not* require overlapping topics - topic lists are extracted at
+      proposal time and drift, and a restatement that is 85% identical is the same
+      fact however the two rows were tagged;
+    * ``_similarity >= DEDUPE_TOPIC_RATIO`` (0.6) **and** at least one shared topic:
+      similar wording about something already known. Here the topic overlap is what
+      keeps two different facts with similar phrasing apart;
+    * one summary containing the other (``DEDUPE_CONTAINMENT_RATIO``), again with a
+      shared topic: the "same fact, said at more length" case.
 
     Sharing a source event is explicitly not enough. One message routinely yields
     several facts ("我生日是三月三号，喜欢手冲咖啡"), so every candidate built from it
     carries the same single ``event_id``; treating that overlap as proof of
     duplication silently merged distinct facts into whichever one was consolidated
     first, and the merged memory then asserted the union of two unrelated claims.
+
+    A memory that a newer statement replaced is never a merge target. It is withheld
+    from retrieval (:func:`is_superseded`), so folding a fresh statement into it
+    would make that statement disappear without a trace instead of being asserted.
     """
     summary = (candidate.summary or "").strip()
     topics = set(candidate.topics or ())
@@ -413,19 +603,20 @@ def _find_duplicate(projection: MemoryProjection, candidate: MemoryCandidate) ->
     for memory in projection.list_memories(
         status=[MemoryStatus.ACTIVE.value, MemoryStatus.LOW_ACTIVATION.value], limit=300
     ):
+        if is_superseded(memory):
+            continue
         stored = (memory.summary or "").strip()
         if summary and stored and summary == stored:
             return memory
         if not summary or not stored:
             continue
-        overlap = len(topics & set(memory.topics))
-        if not overlap:
-            continue
-        overlap = len(topics & set(memory.topics))
-        if not overlap:
-            continue
         ratio = _similarity(summary, stored)
-        if ratio >= DEDUPE_EXACT_RATIO or ratio >= DEDUPE_TOPIC_RATIO:
+        if ratio >= DEDUPE_EXACT_RATIO:
+            return memory
+        overlap = len(topics & set(memory.topics))
+        if not overlap:
+            continue
+        if ratio >= DEDUPE_TOPIC_RATIO:
             return memory
         # One summary containing the other is the "same fact, said at more length"
         # case, which a symmetric score under-reports because it divides by the
@@ -437,7 +628,14 @@ def _find_duplicate(projection: MemoryProjection, candidate: MemoryCandidate) ->
 
 
 def _contains(shorter: str, longer: str) -> bool:
-    """Return whether ``longer`` says everything ``shorter`` says, and more."""
+    """Return whether ``longer`` says everything ``shorter`` says, and more.
+
+    The comparison is token-based and one-directional: at least
+    ``DEDUPE_MIN_SHARED_TOKENS`` of ``shorter``'s topical tokens must also appear in
+    ``longer``, and they must cover ``DEDUPE_CONTAINMENT_RATIO`` of ``shorter``. The
+    caller applies it in both directions, so a substring test is deliberately not
+    used: the extra words may sit in the middle of the longer sentence.
+    """
     shorter_tokens = topic_tokens(shorter)
     if len(shorter_tokens) < DEDUPE_MIN_SHARED_TOKENS:
         return False
@@ -464,18 +662,42 @@ def _similarity(left: str, right: str) -> float:
 
 
 def _find_conflicts(
-    projection: MemoryProjection, candidate: MemoryCandidate, connection: sqlite3.Connection
+    projection: MemoryProjection,
+    candidate: MemoryCandidate,
+    connection: sqlite3.Connection,
+    *,
+    now: datetime,
 ) -> list[str]:
     """Find existing memories that the candidate appears to supersede.
 
-    A conflict is a same-kind memory from the same topic set with opposite
-    polarity markers (e.g. "likes coffee" now vs "doesn't like coffee" before).
+    A conflict is a same-kind, still-live memory *about the same thing* that carries
+    the opposite polarity marker (e.g. "likes coffee" now vs "doesn't like coffee"
+    before).
+
+    "About the same thing" is measured with the same bigram tokens
+    :func:`_similarity` uses, not with the stored single-character topic tags:
+    topics are the first six characters of a message, so "不喜欢别人连续追问" and
+    "喜欢手冲咖啡" share 我/喜/欢 and would otherwise look like one subject. Two
+    shared bigrams keep "喜欢咖啡" vs "不喜欢咖啡" contradictory while leaving
+    unrelated clauses alone.
+
+    The replaced memory keeps its row - it is marked through
+    :data:`SUPERSEDED_HINT_KEY`/:data:`SUPERSEDED_AT_KEY` and read out of retrieval
+    by :func:`is_superseded`, never deleted. ``now`` is the caller's reference time
+    rather than the wall clock, so the recorded replacement time lives on the same
+    timeline as the rest of the pass.
+
+    Args:
+        projection: Memory storage.
+        candidate: The candidate that may replace older statements.
+        connection: Write connection.
+        now: Reference time of the consolidation pass.
 
     Returns:
         Identifiers of superseded memories, whose confidence is lowered.
     """
-    candidate_tokens = set(candidate.topics)
-    if not candidate_tokens:
+    subject = topic_tokens(candidate.summary)
+    if not subject:
         return []
     lowered = candidate.summary.lower()
     polarity = None
@@ -490,8 +712,7 @@ def _find_conflicts(
     for memory in projection.list_memories(status=MemoryStatus.ACTIVE.value, limit=200):
         if memory.kind != candidate.kind:
             continue
-        overlap = len(candidate_tokens & set(memory.topics))
-        if overlap < 1:
+        if len(subject & topic_tokens(memory.summary)) < DEDUPE_MIN_SHARED_TOKENS:
             continue
         other = memory.summary.lower()
         other_polarity = None
@@ -503,8 +724,8 @@ def _find_conflicts(
             continue
         memory.confidence = clamp(memory.confidence * 0.8)
         memory.structured = dict(memory.structured) | {
-            "superseded_by_hint": candidate.summary,
-            "superseded_at": isoformat_or_none(utcnow()),
+            SUPERSEDED_HINT_KEY: candidate.summary,
+            SUPERSEDED_AT_KEY: isoformat_or_none(now),
         }
         projection.upsert_memory(connection, memory)
         superseded.append(memory.memory_id)
@@ -520,6 +741,11 @@ def archive_stale(
     low_threshold: float = 0.10,
 ) -> list[str]:
     """Archive memories whose activation has faded below a threshold.
+
+    This is the last rung of ``active -> low_activation -> archived``: to be
+    archived a memory must be both below ``low_threshold`` *and* untouched for two
+    weeks. A memory that merely faded is demoted instead
+    (:meth:`MemoryStore._demote_if_faded`) and can still be reinforced.
 
     Returns:
         Identifiers of newly archived memories.
@@ -599,6 +825,17 @@ class MemoryStore:
         self._projection = projection
         self._config = config
 
+    def _usable(self, memory: Memory) -> bool:
+        """Return whether a memory may take part in retrieval, activation or the prompt.
+
+        Two independent statements withdraw a memory from the working set: archival
+        (the Runtime decided it is no longer part of what the character knows) and
+        supersession (a newer statement replaced it). Demotion to
+        ``low_activation`` is a third: the memory is still known, but it is out of
+        the working set until something reinforces it.
+        """
+        return memory.status == MemoryStatus.ACTIVE.value and not is_superseded(memory)
+
     def retrieve(
         self,
         cue: RetrievalCue,
@@ -610,7 +847,7 @@ class MemoryStore:
         """Score and rank memories for a retrieval cue.
 
         ``Score = lexical + situation + unfinished + emotion + recency
-        - recently_recalled_penalty + epsilon``.
+        + 0.3 * importance - recently_recalled_penalty + epsilon``.
 
         Args:
             cue: Retrieval cue.
@@ -629,9 +866,10 @@ class MemoryStore:
                 status=MemoryStatus.ACTIVE.value, limit=300
             )
         )
-        # A caller may hand in its own candidate set, so the status filter is applied
-        # here as well: an archived memory must not be retrievable by any route.
-        pool = [memory for memory in pool if memory.status == MemoryStatus.ACTIVE.value]
+        # A caller may hand in its own candidate set, so the eligibility filter is
+        # applied here as well: an archived, demoted or superseded memory must not
+        # be retrievable by any route.
+        pool = [memory for memory in pool if self._usable(memory)]
         if not pool:
             return []
 
@@ -692,13 +930,19 @@ class MemoryStore:
         return hits[: max(1, limit)]
 
     def tick_activation(self, *, dt_seconds: float) -> list[str]:
-        """Compute decayed activation values for the pool (pure calculation).
+        """Compute decayed activation values for the pool without persisting them.
+
+        This is a preview of what a decay *would* do. Nothing in the Runtime calls
+        it: :meth:`decay_pool` is the implementation that actually writes the decayed
+        values, demotes faded memories and drops empty entries. Both use the same
+        rate, so a preview and the persisted result agree.
 
         Args:
             dt_seconds: Elapsed seconds.
 
         Returns:
-            Memory identifiers whose activation has fallen to zero.
+            Memory identifiers whose activation would fall below ``1e-4``, i.e. the
+            entries :meth:`decay_pool` would drop from the pool.
         """
         if dt_seconds <= 0.0:
             return []
@@ -765,6 +1009,14 @@ class MemoryStore:
     def decay_pool(self, connection: sqlite3.Connection, *, dt_seconds: float) -> list[str]:
         """Decay the whole activation pool in the database.
 
+        A memory whose activation falls below ``memory.activation_threshold`` - the
+        same boundary the activation gate uses on the way in - is demoted to
+        :data:`~companion_runtime.typing.MemoryStatus.LOW_ACTIVATION`. Demotion is
+        the middle rung of ``active -> low_activation -> archived``: the memory
+        leaves the working set (retrieval, :meth:`activated_memories` and the prompt
+        all require ``active``) without being forgotten, and a later reinforcement
+        (:func:`reinforce`) puts it back.
+
         Args:
             connection: Write connection.
             dt_seconds: Elapsed seconds.
@@ -783,15 +1035,33 @@ class MemoryStore:
                 continue
             activated.activation = value
             self._projection.upsert_activation(connection, activated)
+            self._demote_if_faded(connection, activated.memory_id, activation=value)
         return removed
+
+    def _demote_if_faded(
+        self, connection: sqlite3.Connection, memory_id: str, *, activation: float
+    ) -> None:
+        """Move an active memory to ``low_activation`` once it fades below the gate."""
+        if activation >= self._config.memory.activation_threshold:
+            return
+        memory = self._projection.get_memory(memory_id)
+        # Only ``active`` memories are demoted: archival is a stronger statement and
+        # a decay pass must not quietly undo it.
+        if memory is None or memory.status != MemoryStatus.ACTIVE.value:
+            return
+        self._projection.set_memory_status(
+            connection, memory_id, MemoryStatus.LOW_ACTIVATION.value
+        )
 
     def activated_memories(self, limit: int = 8) -> list[tuple[ActivatedMemory, Memory]]:
         """Return the activation pool joined with memory content.
 
-        Archived memories are excluded. The pool is decayed and bounded but never
-        scanned for status, so without this filter a memory that archival had
-        removed from what the character knows would still be handed to the
-        candidate generator and the prompt.
+        Archived, demoted and superseded memories are excluded. The pool is decayed
+        and bounded but never scanned for status, so without the eligibility filter a
+        memory that archival had removed from what the character knows would still be
+        handed to the candidate generator and the prompt - and so would a fact that a
+        newer statement replaced, which would make the character assert the version it
+        corrected.
         """
         pool = self._projection.list_activated_memories(
             status=MemoryStatus.ACTIVE.value, limit=limit
@@ -800,18 +1070,29 @@ class MemoryStore:
         pairs: list[tuple[ActivatedMemory, Memory]] = []
         for activated in pool:
             memory = memories.get(activated.memory_id)
-            if memory is not None and memory.status == MemoryStatus.ACTIVE.value:
+            if memory is not None and self._usable(memory):
                 pairs.append((activated, memory))
         return pairs
 
     def activation_strength(self) -> float:
-        """Return mean activation of the pool, used as an approach-drive input."""
+        """Return mean activation of the usable pool, used as an approach-drive input.
+
+        Only memories that could actually be recalled count: a faded or replaced
+        memory still decaying in the pool is not evidence that something is on the
+        character's mind.
+        """
         pool = self._projection.list_activated_memories(
             status=MemoryStatus.ACTIVE.value, limit=20
         )
-        if not pool:
+        memories = self._projection.get_memories([item.memory_id for item in pool])
+        usable = [
+            item
+            for item in pool
+            if (memory := memories.get(item.memory_id)) is not None and self._usable(memory)
+        ]
+        if not usable:
             return 0.0
-        return clamp(sum(item.activation for item in pool) / len(pool))
+        return clamp(sum(item.activation for item in usable) / len(usable))
 
 
 def isoformat_or_none(value: datetime | None) -> str | None:
@@ -850,23 +1131,55 @@ def build_cue(
     )
 
 
+def next_consolidation_due(
+    projection: MemoryProjection, *, config: RuntimeConfig, now: datetime
+) -> datetime | None:
+    """Return the instant the next unattended consolidation pass becomes due.
+
+    The scheduler anchor and the work it wakes must agree on one rule, so both
+    :func:`needs_consolidation` and
+    :func:`companion_runtime.scheduler._maintenance_due` are computed here: a pass
+    is due one ``consolidation_interval_seconds`` after the *newest* candidate the
+    pass would consider - the same ``candidate_max_open`` window
+    :func:`consolidate` is willing to read. A candidate with no timestamp makes the
+    pass due immediately, since there is no schedule to wait for.
+
+    Args:
+        projection: Memory storage.
+        config: Runtime configuration.
+        now: Reference time, used only for the untimestamped case.
+
+    Returns:
+        The due instant, or ``None`` when nothing is pending.
+    """
+    pending = projection.pending_candidates(limit=config.memory.candidate_max_open)
+    if not pending:
+        return None
+    newest = max((c.created_at for c in pending if c.created_at is not None), default=None)
+    if newest is None:
+        return now
+    return newest + timedelta(seconds=config.memory.consolidation_interval_seconds)
+
+
 def needs_consolidation(
     projection: MemoryProjection, *, config: RuntimeConfig, now: datetime
 ) -> bool:
     """Return whether a background consolidation pass is due.
 
     The check is time-based so the pass stays a P3 maintenance job: cheap, lazy
-    and skippable.
+    and skippable. It is exactly "the anchor has been reached"
+    (:func:`next_consolidation_due`), so the wake the scheduler promises is the wake
+    at which this returns ``True``.
     """
-    pending = projection.pending_candidates(limit=config.memory.candidate_max_open)
-    if not pending:
-        return False
-    newest = max((c.created_at for c in pending if c.created_at is not None), default=None)
-    if newest is None:
-        return True
-    return (now - newest).total_seconds() >= config.memory.consolidation_interval_seconds
+    due = next_consolidation_due(projection, config=config, now=now)
+    return due is not None and due <= now
 
 
 def pool_times(memories: Sequence[Memory]) -> list[datetime]:
-    """Return creation times of memories (helper for scheduling)."""
+    """Return creation times of memories.
+
+    A small summary helper with no caller in the Runtime. The scheduler does not use
+    it: wake anchors are computed from the pending-candidate window by
+    :func:`next_consolidation_due`, not from when memories were created.
+    """
     return [m.created_at for m in memories if m.created_at is not None]
