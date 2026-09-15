@@ -68,7 +68,10 @@
 │   ├── main.py                       #   监听 / 临时注入 / outbox 消费
 │   └── tests/                        #   143 项离线测试（另含 13 个子测试，带 AstrBot 桩）
 │
-├── AstrBot/                          # 上游 AstrBot 4.28.1，**零修改**
+├── Dockerfile                        # ★ Runtime 镜像（非 root，状态全在 /data 卷）
+├── docker-compose.yml                # ★ runtime + astrbot 两个容器，端口只发布到 loopback
+│
+├── AstrBot/                          # 上游 AstrBot 4.28.1，**零修改**（不进镜像、不进 Git）
 │
 ├── archive/                          # 已放弃的本地模型路线（留档，不参与构建）
 │   └── README.md                     #   为什么放弃 + 实测数据
@@ -81,17 +84,93 @@
 │
 ├── 内源主动型长期陪伴AI_Runtime_完整架构设计.md   # 原始设计（97 节）
 ├── PATCH_v0.2_即时演出与持久认知分离...md        # 现行架构补丁
+├── LICENSE                           # GPL-3.0-or-later
 └── RECOVERY.md                       # 备份 / 恢复 / 权重位置
 ```
 
 **`AstrBot/` 是上游代码，任何情况下都不修改。** 所有集成通过公开 API 完成，
 升级 AstrBot 只需替换该目录。详细边界见 `runtime/README.md` 与插件 README。
+它在 `.gitignore` 与 `.dockerignore` 里都被显式排除——既不会进仓库，也不会进镜像。
 
 ---
 
-## 4. 快速开始
+## 4. 部署
 
-### 4.1 启动 Runtime
+### 4.1 Docker（推荐）
+
+Runtime 与 AstrBot 是两个容器：Runtime 是持久认知 sidecar（本仓库核心），
+AstrBot 只多装一个薄插件。仓库根的 `Dockerfile` 与 `docker-compose.yml` 就是这套组合。
+
+```bash
+git clone https://github.com/bomomoQWQ/xiaojiujiu.git
+cd xiaojiujiu
+
+docker compose up -d --build
+docker compose ps
+curl http://127.0.0.1:8787/health
+```
+
+起来之后：AstrBot WebUI 在 `http://127.0.0.1:6185`，Runtime 在 `http://127.0.0.1:8787`。
+
+**首次启动必做两步**（都在 AstrBot WebUI 里）：
+
+1. 把插件配置里的 `runtime_base_url` 改成 `http://runtime:8787`——容器网络内用服务名
+   解析；插件默认值 `http://127.0.0.1:8787` 只在同主机/同容器部署时才对。
+2. **多会话部署**：把 Runtime 的 `conversation_id` 设成会话的 `unified_msg_origin`
+   （如 `aiocqhttp:FriendMessage:10001`），用环境变量 `CR_CONVERSATION_ID` 或 `--config` 指定。
+
+数据落在两个 named volume：`runtime-data`（SQLite WAL + `raw_events.jsonl`）与
+`astrbot-data`（AstrBot 自己的配置与插件数据）。两个端口默认只发布到 `127.0.0.1`：
+**不要把 8787 直接暴露到公网**，Runtime 没有面向公网的鉴权设计，远程访问请在
+AstrBot WebUI 前放反代。
+
+只要 Runtime 一个容器：
+
+```bash
+docker build -t xiaojiujiu .
+docker run -d --name xiaojiujiu \
+  -p 127.0.0.1:8787:8787 \
+  -v xiaojiujiu-data:/data \
+  xiaojiujiu
+docker logs -f xiaojiujiu
+```
+
+默认**不需要任何模型**：`SemanticProvider` 是 `disabled`，Runtime 靠确定性代码工作。
+要接远程语义 provider（可选）：
+
+```bash
+docker run -d --name xiaojiujiu -p 127.0.0.1:8787:8787 -v xiaojiujiu-data:/data \
+  -e CR_SEMANTIC_PROVIDER=remote_api \
+  -e CR_SEMANTIC_BASE_URL=https://api.example.com/v1 \
+  -e CR_SEMANTIC_MODEL=your-model \
+  -e CR_SEMANTIC_API_KEY=... \
+  xiaojiujiu
+```
+
+API key **只从环境变量读**：配置对象里写的 key 会被刻意忽略，也不要把它写进
+`docker-compose.yml` 或任何仓库文件。
+
+镜像以非 root 用户（uid 10001）运行，`/data` 是唯一的持久卷，容器内自带的
+healthcheck 打 `/health`；`docker ps` 里的 `healthy` 就是可信的存活判据。
+
+### 4.2 安装薄插件（非 Docker 场景）
+
+```powershell
+# 复制到 AstrBot 的插件目录（也可用 WebUI 上传 zip）
+Copy-Item -Recurse astrbot_plugin_companion_runtime AstrBot\data\plugins\ -Force
+```
+
+然后在 AstrBot WebUI 里确认插件的 `runtime_base_url` 指向 Runtime 地址（同主机部署时
+插件与 Runtime 的默认值均为 `http://127.0.0.1:8787`）；若 Runtime 改过监听地址，
+再同步修改该项并重启 AstrBot。
+
+> **多会话部署必做**：把 Runtime 的 `conversation_id` 设成会话的
+> `unified_msg_origin`（如 `aiocqhttp:FriendMessage:10001`）。
+> 主动消息会投递到「形成这个意图的会话」，而 Runtime 需要知道自己是哪个会话——
+> 只在单会话下用默认值才是安全的。相关推导与测试见
+> `runtime/tests/test_proactive_routing.py`。
+
+### 4.3 本地 venv（开发 / 调试）
 
 ```powershell
 cd F:\理解痞老板\runtime
@@ -103,30 +182,19 @@ uv pip install --python .venv\Scripts\python.exe -e ".[test]"
 # 自检
 .venv\Scripts\python.exe -m pytest tests -q          # 期望 807 passed
 
-# 起服务（默认 127.0.0.1:8787）
-.venv\Scripts\python.exe -m companion_runtime.cli serve --db runtime\data\companion.db
+# 起服务（只监听 loopback）
+.venv\Scripts\python.exe -m companion_runtime.cli --base-dir . serve --host 127.0.0.1 --port 8787
 ```
 
-`serve` 只监听 loopback，并且**不需要任何模型**——默认配置下
-`SemanticProvider` 是 `disabled`，Runtime 完全靠确定性代码工作。
-
-### 4.2 安装薄插件
+`--base-dir` 是**全局参数，必须写在子命令前面**，用来解析相对存储路径
+（默认数据库 `<base-dir>/data/runtime.sqlite3`、镜像文件 `<base-dir>/data/raw_events.jsonl`）。
+要换路径用 `--config <file.toml>`，或环境变量 `CR_STORAGE__DATABASE_PATH`：
 
 ```powershell
-# 复制到 AstrBot 的插件目录（也可用 WebUI 上传 zip）
-Copy-Item -Recurse astrbot_plugin_companion_runtime AstrBot\data\plugins\ -Force
+.venv\Scripts\python.exe -m companion_runtime.cli --config .\deploy\runtime.toml serve
 ```
 
-然后在 AstrBot WebUI 里确认插件的 `runtime_base_url` 指向 Runtime 地址（插件与
-Runtime 的当前默认值均为 `http://127.0.0.1:8787`）；若 Runtime 改过监听地址，再同步修改该项并重启 AstrBot。
-
-> **多会话部署必做**：把 Runtime 的 `conversation_id` 设成会话的
-> `unified_msg_origin`（如 `aiocqhttp:FriendMessage:10001`）。
-> 主动消息会投递到「形成这个意图的会话」，而 Runtime 需要知道自己是哪个会话——
-> 只在单会话下用默认值才是安全的。相关推导与测试见
-> `runtime/tests/test_proactive_routing.py`。
-
-### 4.3 验证
+### 4.4 验证
 
 ```powershell
 # 真机端到端（会起一个真实 HTTP 服务并打真实请求）
@@ -243,11 +311,19 @@ CPU        0.45 s / 200 轮
   无过期时间的租约等），损坏时退出码 3 而不是抛裸异常。
 
 ```powershell
-# 备份（默认不覆盖，可 --keep N 保留最近 N 份）
-companion-runtime backup  --db runtime\data\companion.db --output E:\backups\latest.db
-companion-runtime verify  --db runtime\data\companion.db
-companion-runtime recover --db runtime\data\companion.db    # 给出恢复建议
+# 备份（destination 是位置参数；默认写到数据库同级的 backups/ 下，--keep N 保留最近 N 份）
+companion-runtime --base-dir . backup E:\companion_runtime_backup\manual
+companion-runtime --base-dir . verify --json
+companion-runtime --base-dir . recover --backup-dir E:\companion_runtime_backup
+
+# 容器部署下不需要进容器：在宿主上对卷里的数据库做一致性检查
+docker run --rm -v xiaojiujiu-data:/data xiaojiujiu-runtime:local verify --json
+docker run --rm -v xiaojiujiu-data:/data -v E:\companion_runtime_backup:/backup \
+  xiaojiujiu-runtime:local backup /backup/manual
 ```
+
+`--base-dir` 是全局参数（必须写在子命令前）；数据库路径由 `--config` 或
+`CR_STORAGE__DATABASE_PATH` 决定，CLI 本身没有 `--db` 选项。
 
 跨盘快照与完整恢复流程见 `RECOVERY.md`；源码快照在 `E:\companion_runtime_backup\`。
 
@@ -315,7 +391,25 @@ python scripts\e2e_resilience_simulation.py --base-dir E:\companion_runtime_back
 
 ---
 
-## 12. 从这里往下读
+## 12. 许可证
+
+**GNU General Public License v3.0 or later（GPL-3.0-or-later）**，全文见 `LICENSE`。
+Copyright (C) 2026 bomomoQWQ。
+
+对你实际意味着什么：
+
+- **自己跑、自己改、自己用**：随便用，没有额外义务。GPL 的 copyleft 只在**分发**时触发，
+  把 Runtime 部署成自己的服务（哪怕改了代码）不需要开源你的改动。
+- **把改了的东西发出去**（发二进制、发镜像、发 fork、随产品一起交付）：必须按 GPL-3.0
+  提供对应源码，并保留同样的许可与版权声明。Docker 镜像属于"分发"，所以发布镜像时
+  要一并提供构建它的源码。
+- **"or later"**：你可以选择 GPL-3.0，也可以选 FSF 之后发布的任何更新版本。
+- 上游 AstrBot 是独立项目、独立许可证，本仓库不对它主张任何权利；本仓库只包含通过其
+  公开 API 集成的薄插件。
+
+---
+
+## 13. 从这里往下读
 
 | 想了解 | 读 |
 |---|---|

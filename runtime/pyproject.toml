@@ -8,9 +8,16 @@ version = "0.1.0"
 description = "Endogenous proactive long-term companion Runtime sidecar: persistent emotion, memory, user model, candidate intents and motivational decision making."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
-authors = [{ name = "Runtime Team" }]
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "bomomoQWQ" }]
 keywords = ["agent", "runtime", "companion", "sidecar", "emotion", "memory"]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
 # Standard library first. FastAPI/uvicorn are the only real runtime needs;
 # httpx/pytest are for the test suite.
