@@ -44,6 +44,15 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+.venv-dev/
+
+# Upstream checkout: a separate clone that must never be committed or published
+AstrBot/
+
+# Local scratch space
+/scratch/
+.scratch_*/
+/data/
 
 # Editors and OS
 .vscode/
