@@ -179,6 +179,8 @@ class RuntimeProcess:
         """Return one line of fleet status for this person."""
         process = self.process
         payload = self.health()
+        stats = payload.get("semantic_provider") or {}
+        semantics = payload.get("semantics") or {}
         return {
             "person": self.slug,
             "session": self.session,
@@ -189,6 +191,10 @@ class RuntimeProcess:
             "uptime_s": round(time.monotonic() - self.started_at, 1) if self.started_at else None,
             "raw_events": payload.get("raw_events"),
             "allow_proactive": payload.get("allow_proactive"),
+            "open_unfinished": payload.get("open_unfinished"),
+            "unresolved": semantics.get("unresolved"),
+            "semantic_calls": (stats.get("stats") or {}).get("deep_refresh_calls"),
+            "explain_calls": (stats.get("stats") or {}).get("explain_calls"),
             "health": payload.get("status"),
         }
 
@@ -343,8 +349,48 @@ class Fleet:
 ADVERTISE_HOST = "runtime-fleet"
 
 
-def make_handler(fleet: Fleet):
-    """Build the request handler bound to ``fleet``."""
+def render_dashboard(people: list[dict[str, object]]) -> str:
+    """Render the fleet as one self-refreshing page.
+
+    Deliberately plain: one card per person with the numbers an operator actually
+    looks at during a week-long run (activity, unresolved backlog, whether the
+    autonomous side is alive), no script beyond a meta refresh, no styling beyond
+    what a browser does by itself.
+    """
+    rows = []
+    for item in people:
+        healthy = item.get("health") == "ok"
+        colour = "#0a0" if healthy else "#c00"
+        rows.append(
+            "<tr>"
+            f"<td><b>{item.get('person')}</b><br><small>{item.get('session')}</small></td>"
+            f"<td style='color:{colour}'>{item.get('health')}</td>"
+            f"<td>{item.get('port')}</td>"
+            f"<td>{item.get('raw_events')}</td>"
+            f"<td>{item.get('unresolved')}</td>"
+            f"<td>{item.get('open_unfinished')}</td>"
+            f"<td>{item.get('semantic_calls')} / {item.get('explain_calls')}</td>"
+            f"<td>{item.get('restarts')}</td>"
+            f"<td>{item.get('uptime_s')}s</td>"
+            "</tr>"
+        )
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta http-equiv='refresh' content='30'>"
+        "<title>小九九 fleet</title></head><body>"
+        f"<h2>小九九 fleet — {len(people)} runtime(s)</h2>"
+        "<table border='1' cellpadding='6' cellspacing='0'>"
+        "<tr><th>person</th><th>health</th><th>port</th><th>events</th>"
+        "<th>unresolved</th><th>open matters</th><th>deep/explain calls</th>"
+        "<th>restarts</th><th>uptime</th></tr>"
+        + "".join(rows)
+        + "</table><p>auto-refresh 30s · "
+        "<a href='/fleet/status'>status json</a> · "
+        "<a href='/fleet/routes'>routes json</a></p></body></html>"
+    )
+
+
+def make_handler(fleet: Fleet):    """Build the request handler bound to ``fleet``."""
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "companion-fleet/1"
@@ -353,6 +399,14 @@ def make_handler(fleet: Fleet):
             body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_html(self, html: str) -> None:
+            body = html.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -366,6 +420,13 @@ def make_handler(fleet: Fleet):
                 with fleet.lock:
                     people = [item.status() for item in fleet._ordered()]
                 self._send({"count": len(people), "people": people})
+                return
+            if path == "/fleet/dashboard":
+                # A week-long beta is watched, not queried: one HTML page beats
+                # remembering a JSON shape, and it needs no new service.
+                with fleet.lock:
+                    people = [item.status() for item in fleet._ordered()]
+                self._send_html(render_dashboard(people))
                 return
             self._send({"error": "not found"}, 404)
 

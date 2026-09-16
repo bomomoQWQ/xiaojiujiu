@@ -1319,6 +1319,17 @@ def create_v1_router(runtime: Any, config: RuntimeConfig | None = None) -> APIRo
                 "sections": _split_sections(text),
                 "ttl_ms": CONTEXT_TTL_MS,
             }
+            # What the host was told, recorded for the beta's read-back. Cheap and
+            # off the decision path: sections and sizes always, the text only when
+            # observability.record_context_text is on.
+            runtime.record_context_render(
+                session=session,
+                trigger=trigger,
+                version=body["version"],
+                text=text,
+                sections=body["sections"],
+                now=now,
+            )
         except Exception:  # noqa: BLE001 - context injection is never worth a 500
             LOGGER.exception("v1 context assembly failed for session %r", session)
             body = {

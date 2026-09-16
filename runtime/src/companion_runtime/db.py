@@ -371,6 +371,45 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_attempt_events ON attempt_events(attempt_id, created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS decisions (
+        decision_id          TEXT PRIMARY KEY,
+        decided_at           TEXT NOT NULL,
+        runtime_version      INTEGER NOT NULL DEFAULT 0,
+        conversation_id      TEXT,
+        trigger              TEXT NOT NULL DEFAULT '',
+        acted                INTEGER NOT NULL,
+        reason               TEXT NOT NULL,
+        chosen_candidate_id  TEXT,
+        hazard               REAL NOT NULL DEFAULT 0,
+        advantage            REAL NOT NULL DEFAULT 0,
+        silence_utility      REAL NOT NULL DEFAULT 0,
+        action_probability   REAL NOT NULL DEFAULT 0,
+        delta_t              REAL NOT NULL DEFAULT 0,
+        next_wake_at         TEXT,
+        payload_json         TEXT NOT NULL DEFAULT '{}',
+        created_at           TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_decisions_at ON decisions(decided_at)",
+    """
+    CREATE TABLE IF NOT EXISTS state_samples (
+        sample_id        TEXT PRIMARY KEY,
+        sampled_at       TEXT NOT NULL,
+        runtime_version  INTEGER NOT NULL DEFAULT 0,
+        reason           TEXT NOT NULL DEFAULT '',
+        mood_valence     REAL NOT NULL DEFAULT 0,
+        mood_arousal     REAL NOT NULL DEFAULT 0,
+        mood_stability   REAL NOT NULL DEFAULT 0,
+        approach_impulse REAL NOT NULL DEFAULT 0,
+        restraint        REAL NOT NULL DEFAULT 0,
+        pressure         REAL NOT NULL DEFAULT 0,
+        allow_proactive  INTEGER NOT NULL DEFAULT 1,
+        payload_json     TEXT NOT NULL DEFAULT '{}',
+        created_at       TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_state_samples_at ON state_samples(sampled_at)",
 )
 
 #: JSON columns that hold arrays; every other JSON column holds an object.
@@ -407,6 +446,10 @@ JSON_COLUMNS: dict[str, tuple[str, ...]] = {
     "background_tasks": ("source_event_ids",),
     "interpretation_versions": ("source_event_ids",),
     "reappraisals": ("source_event_ids",),
+    # The two observability tables a closed beta is read back through: the full
+    # motivational verdict (including every candidate that lost) and the state curve.
+    "decisions": ("payload_json",),
+    "state_samples": ("payload_json",),
 }
 
 

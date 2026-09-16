@@ -409,6 +409,29 @@ class SemanticConfig:
 
 
 @dataclass(slots=True)
+class ObservabilityConfig:
+    """What the Runtime keeps so a long run can be read back afterwards.
+
+    A closed beta is judged from data the Runtime would otherwise discard: the
+    motivational verdict of every round (including the ones that decided to stay
+    silent) and the curve of its own state. Both are off the decision path and
+    never change behaviour -- they only add rows -- so they are on by default.
+
+    Attributes:
+        enabled: Write the decision verdict and a state sample on every round.
+        record_context_text: Also record the *text* handed to the host on each
+            context render, as a raw event. Off by default: the injected block is
+            by design renderable at any time from the state, and keeping every
+            render's full text is only worth it while debugging why a reply was
+            what it was. With it off, the render is still recorded (version and
+            section sizes), which is enough to correlate a turn with the state it saw.
+    """
+
+    enabled: bool = True
+    record_context_text: bool = False
+
+
+@dataclass(slots=True)
 class RuntimeConfig:
     """Aggregate configuration for the whole Runtime."""
 
@@ -433,6 +456,7 @@ class RuntimeConfig:
     #: generative model mandatory.
     semantic: SemanticConfig = field(default_factory=SemanticConfig)
     task: TaskConfig = field(default_factory=TaskConfig)
+    observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     #: Free-form extras; useful for experiments without touching the schema.
     extras: dict[str, Any] = field(default_factory=dict)
 

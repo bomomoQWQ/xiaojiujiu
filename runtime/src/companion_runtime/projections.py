@@ -2191,6 +2191,130 @@ class SemanticProjection:
 # --------------------------------------------------------------------------------------
 
 
+def _as_stamp(value: Any) -> str | None:
+    """Return an ISO timestamp for a datetime or an already-rendered string."""
+    if value is None or value == "":
+        return None
+    return value if isinstance(value, str) else isoformat(value)
+
+
+class ObservabilityProjection:
+    """The beta's read-back tables: what the character decided, and how it felt.
+
+    Both exist because the alternative is guesswork. ``decisions`` keeps the whole
+    motivational verdict -- every candidate's utility breakdown, the hazard, the
+    advantage over silence, and the reason it did *not* act -- for acted and
+    non-acted rounds alike. Without the non-acted rounds there is no way to answer
+    "why did she never speak?" other than re-running the week.
+    ``state_samples`` turns ``runtime_state`` (one current snapshot) into a curve,
+    which is what "how did the mood move" actually needs.
+
+    Writes go through the reducer's own transaction like every other table, so this
+    is observability rather than a second writer.
+    """
+
+    def __init__(self, db: Database) -> None:
+        """Store the database handle."""
+        self.db = db
+
+    def record_decision(self, connection: Any, entry: dict[str, Any]) -> str:
+        """Append one motivational verdict; returns its id."""
+        decision_id = entry.get("decision_id") or new_id("decision")
+        connection.execute(
+            "INSERT INTO decisions(decision_id, decided_at, runtime_version, conversation_id, "
+            "trigger, acted, reason, chosen_candidate_id, hazard, advantage, silence_utility, "
+            "action_probability, delta_t, next_wake_at, payload_json, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                decision_id,
+                _as_stamp(entry.get("decided_at")),
+                int(entry.get("runtime_version") or 0),
+                entry.get("conversation_id"),
+                str(entry.get("trigger") or ""),
+                1 if entry.get("acted") else 0,
+                str(entry.get("reason") or ""),
+                entry.get("chosen_candidate_id"),
+                float(entry.get("hazard") or 0.0),
+                float(entry.get("advantage") or 0.0),
+                float(entry.get("silence_utility") or 0.0),
+                float(entry.get("action_probability") or 0.0),
+                float(entry.get("delta_t") or 0.0),
+                _as_stamp(entry.get("next_wake_at")),
+                dumps(entry.get("payload") or {}),
+                _as_stamp(entry.get("created_at") or entry.get("decided_at")),
+            ),
+        )
+        return decision_id
+
+    def record_state_sample(self, connection: Any, entry: dict[str, Any]) -> str:
+        """Append one point of the mood/impulse curve; returns its id."""
+        sample_id = entry.get("sample_id") or new_id("sample")
+        connection.execute(
+            "INSERT INTO state_samples(sample_id, sampled_at, runtime_version, reason, "
+            "mood_valence, mood_arousal, mood_stability, approach_impulse, restraint, pressure, "
+            "allow_proactive, payload_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                sample_id,
+                _as_stamp(entry.get("sampled_at")),
+                int(entry.get("runtime_version") or 0),
+                str(entry.get("reason") or ""),
+                float(entry.get("mood_valence") or 0.0),
+                float(entry.get("mood_arousal") or 0.0),
+                float(entry.get("mood_stability") or 0.0),
+                float(entry.get("approach_impulse") or 0.0),
+                float(entry.get("restraint") or 0.0),
+                float(entry.get("pressure") or 0.0),
+                1 if entry.get("allow_proactive", True) else 0,
+                dumps(entry.get("payload") or {}),
+                _as_stamp(entry.get("created_at") or entry.get("sampled_at")),
+            ),
+        )
+        return sample_id
+
+    def list_decisions(
+        self,
+        *,
+        limit: int = 200,
+        acted_only: bool = False,
+        since: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return recent verdicts, newest last, for an operator or an export."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if acted_only:
+            clauses.append("acted = 1")
+        if since:
+            clauses.append("decided_at >= ?")
+            params.append(since)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(max(1, int(limit)))
+        rows = self.db.query(
+            "SELECT * FROM decisions" + where + " ORDER BY decided_at DESC LIMIT ?",
+            tuple(params),
+        )
+        return [row_to_dict(row, "decisions") for row in reversed(rows)]
+
+    def list_state_samples(
+        self,
+        *,
+        limit: int = 500,
+        since: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return recent state samples, oldest first, for a curve."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if since:
+            clauses.append("sampled_at >= ?")
+            params.append(since)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(max(1, int(limit)))
+        rows = self.db.query(
+            "SELECT * FROM state_samples" + where + " ORDER BY sampled_at DESC LIMIT ?",
+            tuple(params),
+        )
+        return [row_to_dict(row, "state_samples") for row in reversed(rows)]
+
+
 class Projections:
     """Convenience bundle of every projection object."""
 
@@ -2213,6 +2337,8 @@ class Projections:
         #: first-class outcome here, so this projection is what tells the Runtime
         #: how much it has deliberately left uninterpreted.
         self.semantics = SemanticProjection(db)
+        #: The beta read-back tables (motivational verdicts + the state curve).
+        self.observability = ObservabilityProjection(db)
 
     def ensure_defaults(
         self, now: datetime | None = None, values: ValueProfile | None = None

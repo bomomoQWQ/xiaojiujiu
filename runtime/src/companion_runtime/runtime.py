@@ -1398,6 +1398,137 @@ class Runtime:
         self._last_decision_at = when
         return version
 
+    def _record_observability(
+        self,
+        connection: Any,
+        stamp: datetime,
+        *,
+        outcome: dict[str, Any],
+        state: RuntimeState,
+        trigger: str = "endogenous_round",
+    ) -> None:
+        """Persist one motivational verdict and one point of the state curve.
+
+        Both are beta instrumentation: the verdict (including every candidate that
+        lost, and the reason nothing was attempted) is the only way to tune the
+        motivational game from real data instead of re-running a week, and the
+        samples turn the single current-state row into a mood curve.
+
+        Failure here must not take a round down -- observability is not the product
+        -- so it is guarded, and the round's own transaction stays the writer.
+
+        Args:
+            connection: Connection of the enclosing round transaction.
+            stamp: Reference time of the round.
+            outcome: The decision as rendered by ``DecisionOutcome.to_dict()``.
+            state: The runtime state read for this round.
+            trigger: What caused the round, for grouping in the export.
+        """
+        if not self.config.observability.enabled:
+            return
+        # ``outcome`` is ``MotivationResult.to_dict()``: the verdict under
+        # ``outcome`` plus every assessment. Index the verdict, keep the whole thing
+        # as the payload -- the losers are the reason this table exists.
+        inner = outcome.get("outcome") if isinstance(outcome.get("outcome"), dict) else outcome
+        try:
+            self.projections.observability.record_decision(
+                connection,
+                {
+                    "decided_at": stamp,
+                    "runtime_version": int(state.version or 0),
+                    "conversation_id": self.config.conversation_id,
+                    "trigger": trigger,
+                    "acted": bool(inner.get("acted")),
+                    "reason": inner.get("reason"),
+                    "chosen_candidate_id": inner.get("chosen_candidate_id"),
+                    "hazard": inner.get("hazard"),
+                    "advantage": inner.get("advantage"),
+                    "silence_utility": inner.get("silence_utility"),
+                    "action_probability": inner.get("action_probability"),
+                    "delta_t": inner.get("delta_t"),
+                    "next_wake_at": inner.get("next_wake_at"),
+                    "payload": outcome,
+                },
+            )
+            self.projections.observability.record_state_sample(
+                connection,
+                {
+                    "sampled_at": stamp,
+                    "runtime_version": int(state.version or 0),
+                    "reason": trigger,
+                    "mood_valence": state.mood_valence,
+                    "mood_arousal": state.mood_arousal,
+                    "mood_stability": state.mood_stability,
+                    "approach_impulse": state.approach_impulse,
+                    "restraint": state.restraint,
+                    "pressure": state.pressure,
+                    "allow_proactive": state.allow_proactive,
+                    "payload": {
+                        "contact_count_today": state.contact_count_today,
+                        "cooldown_until": isoformat(state.cooldown_until) if state.cooldown_until else None,
+                        "foreground_pause_until": (
+                            isoformat(state.foreground_pause_until)
+                            if state.foreground_pause_until
+                            else None
+                        ),
+                    },
+                },
+            )
+        except Exception:
+            LOGGER.warning("Recording the decision for observability failed; continuing", exc_info=True)
+
+    def record_context_render(
+        self,
+        *,
+        session: str,
+        trigger: str,
+        version: str,
+        text: str,
+        sections: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Record what the host was handed on one context render (observability).
+
+        The injected block is temporary by design and never persisted by the host, so
+        without this record an optimization pass can see what the character answered
+        but never what she had been told. Section sizes (and the full text, when
+        ``observability.record_context_text`` is on) are what make a turn
+        reproducible after the fact.
+
+        Args:
+            session: Session the block was rendered for.
+            trigger: ``llm_request`` or ``message`` (the prefetch path).
+            version: The state version the block was rendered from.
+            text: The rendered block.
+            sections: Section name -> body, as returned to the host.
+            now: Reference time; defaults to the current UTC time.
+        """
+        if not self.config.observability.enabled:
+            return
+        stamp = ensure_aware(now) or utcnow()
+        metadata: dict[str, Any] = {
+            "trigger": trigger,
+            "version": version,
+            "chars": len(text),
+            "sections": {str(name): len(str(body or "")) for name, body in (sections or {}).items()},
+        }
+        if self.config.observability.record_context_text:
+            metadata["text"] = text
+        try:
+            with self._db.transaction() as conn:
+                self.events.append(
+                    EventType.SYSTEM,
+                    actor=Actor.RUNTIME,
+                    content="context_rendered",
+                    conversation_id=session or self.config.conversation_id,
+                    metadata=metadata,
+                    timestamp=stamp,
+                    runtime_version=self.projections.runtime.read().version,
+                    connection=conn,
+                )
+        except Exception:
+            LOGGER.warning("Recording a context render failed; continuing", exc_info=True)
+
     def _last_decision(self, state: RuntimeState | None = None) -> datetime | None:
         """Return when the last decision was taken, or ``None`` when there is none.
 
@@ -1578,6 +1709,9 @@ class Runtime:
                 # acted or drew "not yet". The anchor is written inside this transaction
                 # (a savepoint), so a committed attempt builds on the version it stored.
                 outcome.version = self._record_decision(stamp, conn)
+                # Persist the verdict itself, acted or not: a week of "why didn't she
+                # speak" cannot be answered from the decisions that did act.
+                self._record_observability(conn, stamp, outcome=outcome.decision, state=state)
 
                 if result.outcome.acted and result.outcome.chosen_candidate_id:
                     chosen = next(
