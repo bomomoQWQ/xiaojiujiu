@@ -732,12 +732,6 @@ def exp_neg(value: float) -> float:
     return math.exp(-max(0.0, value))
 
 
-def _latest(*values: datetime | None) -> datetime | None:
-    """Return the most recent of ``values``, ignoring ``None``."""
-    present = [value for value in values if value is not None]
-    return max(present) if present else None
-
-
 def release_after_contact(state: RuntimeState, *, config: RuntimeConfig, now: datetime) -> None:
     """Apply the post-contact transition.
 
@@ -792,12 +786,6 @@ def cooldown_remaining(state: RuntimeState, now: datetime) -> float:
     if state.cooldown_until is None:
         return 0.0
     return max(0.0, (state.cooldown_until - now).total_seconds())
-
-
-def empirical_impulse_half_life(state: RuntimeState, config: RuntimeConfig) -> float:
-    """Diagnostic helper: seconds for the current impulse gap to halve."""
-    tau = config.drive.tau_impulse_seconds
-    return tau * math.log(2.0) if tau > 0 else 0.0
 
 
 # --------------------------------------------------------------------------------------

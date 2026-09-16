@@ -12,12 +12,15 @@ Usage (from the repository root, ``xiaojiujiu/``)::
     runtime/.venv/bin/python scripts/mutation_design_conformance.py priors     # one group
 
 Groups:
-    encoding  item ①, observation/prediction describe a behaviour the same way
-    priors    item ⑤, what the cold-start priors claim
+    encoding         item ①, observation/prediction describe a behaviour the same way
+    priors           item ⑤, what the cold-start priors claim
+    declared_unused  item ⑦, nothing declared and never produced
 """
 
 from __future__ import annotations
 
+import contextlib
+import os
 import pathlib
 import subprocess
 import sys
@@ -27,13 +30,17 @@ RUNTIME_DIR = ROOT / "runtime"
 RUNTIME = RUNTIME_DIR / "src/companion_runtime/runtime.py"
 USER_MODEL = RUNTIME_DIR / "src/companion_runtime/user_model.py"
 API = RUNTIME_DIR / "src/companion_runtime/api.py"
+REDUCER = RUNTIME_DIR / "src/companion_runtime/reducer.py"
+PROJECTIONS = RUNTIME_DIR / "src/companion_runtime/projections.py"
+TYPING = RUNTIME_DIR / "src/companion_runtime/typing.py"
 
-#: ``(label, tests_path, [(path, old, new), ...])``. Multi-edit mutations are grouped so
-#: every mutation is a *plausible* alternative implementation, not a syntax error.
-GROUPS: dict[str, tuple[str, list[tuple[str, list[tuple[pathlib.Path, str, str]]]]]] = {
+#: ``group -> (test paths, [(label, [(path, old, new), ...]), ...])``. Multi-edit mutations
+#: are grouped so every mutation is a *plausible* alternative implementation, not a syntax
+#: error.
+GROUPS: dict[str, tuple[list[str], list[tuple[str, list[tuple[pathlib.Path, str, str]]]]]] = {
     # ------------------------------------------------------------------ item ①
     "encoding": (
-        "tests/test_action_encoding_parity.py",
+        ["tests/test_action_encoding_parity.py"],
         [
             (
                 "E1 observation reverts to the thin A (the original defect)",
@@ -142,7 +149,7 @@ GROUPS: dict[str, tuple[str, list[tuple[str, list[tuple[pathlib.Path, str, str]]
     ),
     # ------------------------------------------------------------------ item ⑤
     "priors": (
-        "tests/test_user_model_priors.py",
+        ["tests/test_user_model_priors.py"],
         [
             (
                 "P1 `novelty` is neutralised without updating its documented reason",
@@ -231,17 +238,124 @@ GROUPS: dict[str, tuple[str, list[tuple[str, list[tuple[pathlib.Path, str, str]]
             ),
         ],
     ),
+    # ------------------------------------------------------------------ item ⑦
+    "declared_unused": (
+        ["tests/test_reappraisal_events.py", "tests/test_declared_but_unused.py"],
+        [
+            (
+                "U1 the reappraisal event is not appended (the original gap)",
+                [
+                    (
+                        REDUCER,
+                        """        self._events.append(
+            EventType.REAPPRAISAL,
+            actor=Actor.RUNTIME,
+            content=str(record["content"]),""",
+                        """        self._events.append(
+            EventType.SYSTEM,
+            actor=Actor.RUNTIME,
+            content=str(record["content"]),""",
+                    )
+                ],
+            ),
+            (
+                "U2 the log entry and the projection row disagree",
+                [
+                    (
+                        REDUCER,
+                        '            content=str(record["content"]),\n            conversation_id=self._config.conversation_id,',
+                        '            content="unrelated text",\n            conversation_id=self._config.conversation_id,',
+                    )
+                ],
+            ),
+            (
+                "U3 a reappraisal calls itself a memory again",
+                [
+                    (
+                        PROJECTIONS,
+                        '        identifier = new_id("reappraisal")',
+                        '        identifier = new_id("memory")',
+                    )
+                ],
+            ),
+            (
+                "U4 the duplicated provenance comes back",
+                [
+                    (
+                        REDUCER,
+                        "        provenance = list(dict.fromkeys([target_event, *proposal.source_event_ids]))",
+                        "        provenance = [target_event, *proposal.source_event_ids]",
+                    )
+                ],
+            ),
+            (
+                "U5 a never-emitted EventType member is added back",
+                [
+                    (
+                        TYPING,
+                        '    SYSTEM = "system"',
+                        '    TICK = "tick"\n    SYSTEM = "system"',
+                    )
+                ],
+            ),
+            (
+                "U6 the reappraisal member is deleted to make the orphan check pass",
+                [
+                    (
+                        TYPING,
+                        '    REAPPRAISAL = "reappraisal"',
+                        "",
+                    ),
+                    (
+                        REDUCER,
+                        "            EventType.REAPPRAISAL,",
+                        "            EventType.SYSTEM,",
+                    ),
+                ],
+            ),
+        ],
+    ),
 }
 
 
-def run_tests(tests_path: str) -> tuple[bool, str]:
+def _bytecode_paths(path: pathlib.Path) -> list[pathlib.Path]:
+    """Return the ``__pycache__`` entries Python would load for ``path``."""
+    cache = path.parent / "__pycache__"
+    if not cache.is_dir():
+        return []
+    return sorted(cache.glob(f"{path.stem}.*.pyc"))
+
+
+def _invalidate_bytecode(paths) -> None:
+    """Delete the cached bytecode of every touched source.
+
+    Required, not hygiene. CPython validates a ``.pyc`` against the source's **mtime and
+    size**, so a mutation that keeps the byte length and is reverted inside the same second
+    leaves a cache entry whose header still "matches": the *restored* file then runs as the
+    **mutant**. Measured here: ``-1.10`` → ``-0.10`` is the same five characters, and every
+    prior that goes to ``0.00`` is the same four - so a whole class of mutations was able to
+    leave the tree quietly testing the wrong code, and the harness's own "restored green"
+    check could not see it. Bytecode is therefore never trusted: it is deleted around every
+    apply and every restore, and the test subprocess runs with bytecode writing disabled.
+    """
+    for path in paths:
+        for cached in _bytecode_paths(path):
+            with contextlib.suppress(OSError):
+                cached.unlink()
+
+
+def run_tests(tests_paths: list[str]) -> tuple[bool, str]:
     """Run one group's acceptance tests; return (green?, summary line)."""
+    env = dict(os.environ)
+    # Belt and braces with _invalidate_bytecode: a test run must never *create* the stale
+    # cache entry that a later restore would silently accept.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     proc = subprocess.run(
         [
             str(RUNTIME_DIR / ".venv/bin/python"),
             "-m",
             "pytest",
-            tests_path,
+            *tests_paths,
             "-p",
             "no:randomly",
             "--tb=no",
@@ -249,19 +363,34 @@ def run_tests(tests_path: str) -> tuple[bool, str]:
         cwd=RUNTIME_DIR,
         capture_output=True,
         text=True,
+        env=env,
     )
     lines = [line for line in proc.stdout.strip().splitlines() if line.strip()]
     summary = lines[-1] if lines else "(no output)"
     return proc.returncode == 0, summary
 
 
-def run_group(name: str, tests_path: str, mutations) -> list[str]:
+def _assert_restored(touched, originals: dict[pathlib.Path, str]) -> None:
+    """Fail loudly if the tree is not exactly the original source, bytecode included."""
+    for path in touched:
+        if path.read_text(encoding="utf-8") != originals[path]:
+            raise AssertionError(f"{path} was not restored to its original content")
+        stale = _bytecode_paths(path)
+        if stale:
+            raise AssertionError(
+                f"stale bytecode survives for {path.name}: {[p.name for p in stale]}"
+            )
+
+
+def run_group(name: str, tests_paths: list[str], mutations) -> list[str]:
     """Mutate, test, restore. Return the labels that survived."""
     touched = sorted({path for _label, edits in mutations for path, _old, _new in edits})
+    _invalidate_bytecode(touched)
     originals = {path: path.read_text(encoding="utf-8") for path in touched}
     survivors: list[str] = []
     try:
-        green, summary = run_tests(tests_path)
+        _assert_restored(touched, originals)
+        green, summary = run_tests(tests_paths)
         print(f"[{name}] baseline green={green}: {summary}")
         if not green:
             print(f"[{name}] baseline is not green; refusing to mutate")
@@ -278,15 +407,19 @@ def run_group(name: str, tests_path: str, mutations) -> list[str]:
                     break
                 path.write_text(text.replace(old, new, 1), encoding="utf-8")
                 restore_needed.append(path)
+            _invalidate_bytecode(restore_needed)
             if missing:
                 for path in restore_needed:
                     path.write_text(originals[path], encoding="utf-8")
+                _invalidate_bytecode(restore_needed)
                 survivors.append(f"{name}/{label} (anchor missing)")
                 continue
 
-            green, summary = run_tests(tests_path)
+            green, summary = run_tests(tests_paths)
             for path in restore_needed:
                 path.write_text(originals[path], encoding="utf-8")
+            _invalidate_bytecode(restore_needed)
+            _assert_restored(restore_needed, originals)
             verdict = "SURVIVED" if green else "KILLED"
             if green:
                 survivors.append(f"{name}/{label}")
@@ -294,8 +427,10 @@ def run_group(name: str, tests_path: str, mutations) -> list[str]:
     finally:
         for path, text in originals.items():
             path.write_text(text, encoding="utf-8")
+        _invalidate_bytecode(touched)
 
-    green, summary = run_tests(tests_path)
+    _assert_restored(touched, originals)
+    green, summary = run_tests(tests_paths)
     print(f"[{name}] restored green={green}: {summary}")
     return survivors
 
@@ -309,8 +444,8 @@ def main(argv: list[str]) -> int:
 
     survivors: list[str] = []
     for name in requested:
-        tests_path, mutations = GROUPS[name]
-        survivors.extend(run_group(name, tests_path, mutations))
+        tests_paths, mutations = GROUPS[name]
+        survivors.extend(run_group(name, tests_paths, mutations))
 
     total = sum(len(GROUPS[name][1]) for name in requested)
     if survivors:

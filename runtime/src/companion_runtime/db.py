@@ -712,23 +712,3 @@ def row_to_dict(row: sqlite3.Row | None, table: str | None = None) -> dict[str, 
     return data
 
 
-def row_timestamp(data: dict[str, Any], key: str, default: datetime | None = None) -> datetime | None:
-    """Read an ISO text column as an aware datetime."""
-    return parse_datetime(data.get(key)) or default
-
-
-def row_bool(data: dict[str, Any], key: str, default: bool = False) -> bool:
-    """Read an INTEGER column as a bool."""
-    value = data.get(key, None)
-    if value is None:
-        return default
-    return bool(value)
-
-
-def row_time_columns(data: dict[str, Any], *keys: str) -> dict[str, Any]:
-    """Normalise the named columns of ``data`` from text to aware datetimes."""
-    out = dict(data)
-    for key in keys:
-        if key in out:
-            out[key] = ensure_aware(out[key]) if not isinstance(out[key], datetime) else out[key]
-    return out

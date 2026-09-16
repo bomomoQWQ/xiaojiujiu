@@ -641,7 +641,7 @@ class Reducer:
             sources = [str(item) for item in (operation.get("sources") or [])]
             try:
                 if kind == "reinterpretation":
-                    self._apply_reinterpretation(conn, proposal, body, sources)
+                    self._apply_reinterpretation(conn, proposal, body, sources, state=state)
                 elif kind == "psychological_interpretation":
                     self._apply_interpretation_cache(
                         conn, body, state=state, now=proposal.created_at
@@ -695,12 +695,18 @@ class Reducer:
         proposal: protocol_module.Proposal,
         body: Mapping[str, Any],
         sources: Sequence[str],
+        *,
+        state: RuntimeState,
     ) -> None:
         """Append a new interpretation version and a reappraisal event.
 
         History is never rewritten: the previous version stays, and the new one
         explicitly supersedes it. That is what makes "I only understood this
         later" auditable rather than a silent edit of the past.
+
+        ``state`` is used only for the ``runtime_version`` stamped on the event appended to
+        the log (design §67's ``reappraisal_event``) - the projection row and the log entry
+        are two views of one fact and must carry the same version.
         """
         target_event = sources[0] if sources else (
             proposal.source_event_ids[0] if proposal.source_event_ids else None
@@ -711,6 +717,11 @@ class Reducer:
         if not content:
             raise ValueError("reinterpretation requires content")
         previous = self._p.interpretations.latest("event", target_event)
+        # The proposal's sources already include the target when the model grounded its
+        # reading on the very event it rereads, so the naive ``[target, *sources]``
+        # duplicated it. Provenance is a set of events, and a repeated identifier reads as
+        # two pieces of evidence for one fact.
+        provenance = list(dict.fromkeys([target_event, *proposal.source_event_ids]))
         record = self._p.interpretations.add_version(
             conn,
             target_kind="event",
@@ -718,15 +729,37 @@ class Reducer:
             content=content,
             confidence=clamp(float(body.get("confidence", 0.6))),
             source_version=proposal.based_on_version,
-            source_event_ids=[target_event, *proposal.source_event_ids],
+            source_event_ids=provenance,
             supersedes_id=str(previous["interpretation_id"]) if previous else None,
         )
-        self._p.interpretations.add_reappraisal(
+        reappraisal_id = self._p.interpretations.add_reappraisal(
             conn,
-            source_event_ids=[target_event, *proposal.source_event_ids],
+            source_event_ids=provenance,
             new_interpretation=str(record["content"]),
             previous_interpretation=str(previous["content"]) if previous else None,
             delta_summary=str(body.get("realized_text") or content),
+        )
+        # Design §67 asks for a ``reappraisal_event``, not only a projection row: the event
+        # log is the Runtime's history of record, and "I understood this later" is exactly
+        # the kind of thing it exists to keep. Until this append existed,
+        # ``EventType.REAPPRAISAL`` was a declared-but-never-emitted member and the two
+        # records of the same fact disagreed: the projection knew, the log did not.
+        self._events.append(
+            EventType.REAPPRAISAL,
+            actor=Actor.RUNTIME,
+            content=str(record["content"]),
+            conversation_id=self._config.conversation_id,
+            metadata={
+                "reappraisal_id": reappraisal_id,
+                "interpretation_id": record["interpretation_id"],
+                "target_event_id": target_event,
+                "previous_interpretation": str(previous["content"]) if previous else None,
+                "supersedes_id": str(previous["interpretation_id"]) if previous else None,
+            },
+            source_event_ids=provenance,
+            timestamp=proposal.created_at,
+            runtime_version=state.version,
+            connection=conn,
         )
 
     def _apply_interpretation_cache(

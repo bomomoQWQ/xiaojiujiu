@@ -31,6 +31,7 @@ ID_PREFIXES: Mapping[str, str] = {
     "outbox": "obx",
     "task": "tsk",
     "interpretation": "itp",
+    "reappraisal": "rap",
 }
 
 
@@ -72,7 +73,19 @@ def is_event_identifier(identifier: str) -> bool:
 
 
 class EventType(str, Enum):
-    """Kinds of append-only raw events."""
+    """Kinds of append-only raw events.
+
+    Every member here has a producer in this package: :mod:`tests.test_declared_but_unused`
+    fails otherwise. A member that nothing emits is worse than no member at all, because
+    it makes "this happens and is recorded" the reading of the code while nothing happens.
+
+    ``TICK``, ``USER_MODEL_SUMMARY``, ``EMOTION_EVENT_EVAL`` and ``MEMORY_CONSOLIDATED``
+    used to be listed here and were never emitted (a tick is not a fact about the user; the
+    user-model summary is persisted in ``user_model_params.last_summary_json``; the design's
+    ``emotion_event_eval`` is a *task* type, covered by :class:`TaskKind.EMOTION_EVAL`; and
+    memory consolidation writes the memory itself). ``REAPPRAISAL`` was the same shape until
+    design §67's ``reappraisal_event`` was finally appended by the reducer.
+    """
 
     USER_MESSAGE = "user_message"
     ASSISTANT_MESSAGE = "assistant_message"
@@ -80,16 +93,12 @@ class EventType(str, Enum):
     BOUNDARY_DECLARED = "boundary_declared"
     BOUNDARY_REVOKED = "boundary_revoked"
     REAPPRAISAL = "reappraisal"
-    EMOTION_EVENT_EVAL = "emotion_event_eval"
     INTERACTION_OBSERVATION = "interaction_observation"
-    MEMORY_CONSOLIDATED = "memory_consolidated"
     CANDIDATE_PROPOSAL = "candidate_proposal"
     ACTION_ATTEMPT = "action_attempt"
     PROACTIVE_COMMITTED = "proactive_committed"
     PROACTIVE_SENT = "proactive_sent"
     PROACTIVE_ABORTED = "proactive_aborted"
-    USER_MODEL_SUMMARY = "user_model_summary"
-    TICK = "tick"
     SYSTEM = "system"
 
 

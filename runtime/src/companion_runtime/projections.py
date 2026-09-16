@@ -390,14 +390,6 @@ class EmotionProjection:
             ),
         )
 
-    def update_intensity(
-        self, connection: sqlite3.Connection, emotion_event_id: str, intensity: float, activation: float
-    ) -> None:
-        """Persist new intensity/activation for one emotion event."""
-        connection.execute(
-            "UPDATE active_emotion_events SET intensity = ?, activation = ? WHERE emotion_event_id = ?",
-            (float(intensity), float(activation), emotion_event_id),
-        )
 
     def deactivate(self, connection: sqlite3.Connection, emotion_event_ids: Sequence[str]) -> None:
         """Mark emotion events as decayed."""
@@ -2006,10 +1998,16 @@ class InterpretationProjection:
     ) -> str:
         """Append a reappraisal event (history is never rolled back).
 
+        The identifier carries the ``rap`` prefix, not ``mem``: the Runtime's records all
+        share one ``<prefix>_<hex>`` shape and are *not* interchangeable, so a reappraisal
+        that called itself a memory would be read as one by anything that switches on the
+        prefix (grounding, for instance, decides whether an identifier names a memory, a
+        memory candidate, a candidate intent or an event).
+
         Returns:
             The reappraisal identifier.
         """
-        identifier = new_id("memory")
+        identifier = new_id("reappraisal")
         connection.execute(
             "INSERT INTO reappraisals(reappraisal_id, source_event_ids, previous_interpretation, "
             "new_interpretation, delta_summary, created_at) VALUES(?, ?, ?, ?, ?, ?)",

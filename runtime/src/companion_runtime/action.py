@@ -421,11 +421,6 @@ def summarise(attempt: ActionAttempt) -> dict[str, Any]:
     }
 
 
-def reconcile_candidates(candidate_ids: Sequence[str]) -> list[str]:
-    """Return the distinct candidate identifiers referenced by attempts."""
-    return list(dict.fromkeys(candidate_ids))
-
-
 def describe_reconcile(action: str) -> str:
     """Return a human-readable explanation of a re-coordination outcome."""
     return {

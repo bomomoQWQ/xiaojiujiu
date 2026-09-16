@@ -130,20 +130,6 @@ def approach(current: float, target: float, tau_seconds: float, dt_seconds: floa
     return current + (target - current) * alpha
 
 
-def weighted_mean(items: Iterable[tuple[float, float]]) -> float:
-    """Return a weighted mean of ``(value, weight)`` pairs, 0.0 when empty."""
-    numerator = 0.0
-    denominator = 0.0
-    for value, weight in items:
-        if weight <= 0.0:
-            continue
-        numerator += value * weight
-        denominator += weight
-    if denominator <= 0.0:
-        return 0.0
-    return numerator / denominator
-
-
 def jitter(magnitude: float, rng) -> float:
     """Return a symmetric uniform perturbation in ``[-magnitude, magnitude]``."""
     if magnitude <= 0.0:
@@ -367,15 +353,6 @@ def summarize_text(text: str, limit: int = 120) -> str:
     return collapsed[: max(0, limit - 1)].rstrip() + "…"
 
 
-def contains_any(text: str, needles: Iterable[str]) -> str | None:
-    """Return the first needle present in ``text`` (case-insensitive), else ``None``."""
-    lowered = (text or "").lower()
-    for needle in needles:
-        if needle and needle.lower() in lowered:
-            return needle
-    return None
-
-
 def tokenize(text: str) -> list[str]:
     """Split text into lowercase tokens for lexical scoring.
 
@@ -417,3 +394,4 @@ def topic_tokens(text: str) -> set[str]:
             continue
         tokens.update(run[index : index + 2] for index in range(len(run) - 1))
     return tokens
+

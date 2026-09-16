@@ -239,6 +239,17 @@ python scripts/blackbox_user_simulation.py --base-dir ./bb --fault leak   # 注�
    插件那套靠 `PYTHONPATH=tests/stubs:.`。在错误目录下跑 `pytest` 会去收集上游 AstrBot 的测试
    （表现为上百个 collection error），那不是你的改动坏了。
 6. **别在 `runtime/` 之外的目录跑 `python -m pytest`**：同样会收集到 `AstrBot/` 的测试套件。
+7. **`import` 到的不一定是你写的那份源码。** CPython 只按 **mtime + 大小**校验 `.pyc`，
+   所以**同长度的改动在同一秒内还原**会留下一个"看起来有效"的缓存，让还原后的文件按改动版运行。
+   任何"改文件→跑测试→还原"的工具都必须设 `PYTHONDONTWRITEBYTECODE=1` 并清缓存
+   （`scripts/mutation_design_conformance.py` 三层防护 + 断言，见 ⑨）。
+8. **改完源码后第一次跑黑盒仿真，teardown 会报 `changed: __pycache__/*.pyc`**——
+   `repo_sources_changed` 把 `.pyc` 也算进了"源文件被改"，于是刚刚跑过 pytest（重编译了改动的模块）
+   就会让这一次仿真在一条**指责仿真自己**的检查上失败；第二次跑就绿了，于是很容易被当成"偶发"。
+   **已修**：字节码不再进"源文件被改"这个集合，改由它自己的检查（`no bytecode was written next to
+   the sources this run imports`）和一条 note 负责——与 `scripts/e2e_resilience_simulation.py`
+   早就正确的处理方式对齐。同时记住：`... | tail` 会把退出码换成 `tail` 的 0，这次差一点把红当成绿
+   （见 §3 的显示陷阱 3）。
 
 ---
 
@@ -457,7 +468,9 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
 | ④ | ~~§86.10（隐藏心理上下文不进永久历史）在两个仓库都没有断言~~ | §86.10 | **撤回——误判**，见下 |
 | ⑤ | `DEFAULT_THETA` 注释自称 symmetric/agnostic，字面值不对称 | §31 | **已修**，见下 |
 | ⑥ | §22.1「消息长度」是死字段 | §22.1 | ① 里已从编码器移除；**是否作为真特征**见下 |
-| ⑦ | 死旋钮 / 零调用函数清理（含 `_last_proactive_context`——一个零调用的**第三种** A 编码器） | — | 待做 |
+| ⑦ | 死旋钮 / 零调用函数清理 | — | **已做（旋钮有意保留）**，见下 |
+| ⑧ | 黑盒仿真 teardown 把 `.pyc` 变更算成"源文件被改"（改完源码后第一次跑必假红） | — | **已修**，见下 |
+| ⑨ | **变异框架会留下陈旧字节码，使"已还原"的源码仍按变异体运行** | — | **已修**，见下 |
 
 ### ⚠️ 核实后撤回的三条（②③④）—— 教训写在这里
 
@@ -506,6 +519,100 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
 
 **证据**：5 条测试 + `priors` 组 7 个变异全部 KILLED（含"把 novelty 抹成 0 却不改理由"、
 "让冷启动变可疑"、"让疲劳比许可更弱"）。
+
+### ⑦ 声明了却没有生产者的东西（已做；旋钮有意保留）
+
+**先重新推导清单，不用审计那份**（它的数字有两处对不上：12 个零调用函数里有些是 argparse
+目标、`__repr__`、以值传递的回调，以及一个和属性同名的模块函数；5 个 `EventType` 孤儿里
+`REAPPRAISAL` 有设计依据）。新增 `scripts/dead_code_inventory.py`：A 段=无调用方函数、
+B 段=无读者配置项、C 段=从未发出的 `EventType`；**排除项全部打印**，所以"没有调用方"这句话
+可以被人复核，而不是关键词没命中就算数。
+
+- **删掉 16 个零调用函数**（`reconcile_candidates`、`render_constraints`、`delivery_window_open`、
+  `clamp_window`、`describe_pool`、`row_timestamp`/`row_bool`/`row_time_columns`、`encode_payload`、
+  `empirical_impulse_half_life`、`_latest`、`update_intensity`、`worker_id`、
+  `_has_pending_observation`、`weighted_mean`、`contains_any`）。A 段现在报 **0**。
+- **`EventType` 孤儿从 5 个收敛到 0**，两条路各走一半：
+  - **删掉 4 个**：`TICK`（tick 不是关于用户的事实）、`USER_MODEL_SUMMARY`（摘要存在
+    `user_model_params.last_summary_json`）、`EMOTION_EVENT_EVAL`（设计里的
+    `emotion_event_eval` 是 **task_type**，已有 `TaskKind.EMOTION_EVAL`）、`MEMORY_CONSOLIDATED`
+    （巩固写的是记忆本身，设计里没有这个事件）。
+  - **给 `REAPPRAISAL` 一个生产者**（这是 ③ 的真正残留）：`reducer._apply_reinterpretation`
+    现在同时写投影行和 `EventType.REAPPRAISAL` 事件，两者互相指认（事件 metadata 里带
+    `reappraisal_id`、`interpretation_id`、`target_event_id`、`supersedes_id`）。
+    顺带修掉同一条路上的两个小问题：重估记录的标识符原先用 `new_id("memory")` → `mem_` 前缀
+    （现在 `ID_PREFIXES["reappraisal"] = "rap"`，因为记录共享一种 `<prefix>_<hex>` 形状但**不可
+    互换**，grounding 就是靠前缀判断标识符指代什么的）；provenance 里目标事件被重复列两次
+    （现在 `dict.fromkeys` 去重）。
+- **新增 `tests/test_declared_but_unused.py`（3 条）**把这件事变成常驻断言：每个 `EventType`
+  成员都必须有生产者，或者出现在显式的 `HOST_WRITTEN` 白名单里（`TOOL_RESULT`——`POST /events`
+  接受任意 `event_type`，所以它协议可达）；白名单不许留过期条目；并且**单独钉一条**
+  `REAPPRAISAL` 必须存在且被 reducer 发出——否则"删掉成员"也能让孤儿检查通过，那是把缺口藏起来
+  而不是补上。
+- **15 个死旋钮：有意不删。** `GET /config` 会序列化所有字段，删字段是**响应形状变更**，需要一次
+  产品决策；B 段继续把它们当报告列出来。
+
+**证据**：`declared_unused` 组 6 个变异全部 KILLED（含"重估不发事件"、"日志与投影行不一致"、
+"标识符又叫回 memory"、"provenance 重复又来"、"加回一个从未发出的成员"、"删掉 REAPPRAISAL
+成员以让孤儿检查通过"）；`scripts/mutation_design_conformance.py` 三个组共 **21 个变异全部 KILLED**。
+清点工具本身也做过注错自证：往 `utility.py` 末尾追加一个公开死函数和一个私有死函数，
+A 段立刻报 **2**，删除后回到 **0**（这一步同时验证了"私有名字不会被 prose 保活"）。
+
+### ⑧ 验证工具自己的一条假红（已修）
+
+跑四条验证命令时发现的，不属于设计一致性，但属于"检查会咬错人"：
+
+**病**：`scripts/blackbox_user_simulation.py` 的 `repo_sources_changed` 把 `".pyc"` 和 `.py` 一起
+当成"源文件被改"，并在 teardown 里作为**失败**上报（`no file appeared among those sources, and
+none of them changed`）。而这次仿真自己设了 `sys.dont_write_bytecode = True`，**根本写不出字节码**；
+真正改写 `.pyc` 的是同一 checkout 里的 pytest（刚跑过、重编译了改动的模块）。于是
+**每次改完源码后的第一次黑盒仿真都会假红，第二次就绿**——很容易被当成偶发而忽略。
+
+**证据（前后对照）**：改成删掉 `weighted_mean`/`contains_any` 后第一次跑 → teardown 报
+`changed: ["runtime/src/companion_runtime/__pycache__/api.cpython-314.pyc", ...]`，退出码被
+`| tail` 吞成 0；紧接着再跑一次 → 77/77。修完后再做一次注错：仿真进行中 `touch` 掉
+**32 个** `.pyc` → **77/77 通过**，并出现 note
+"bytecode under this run's source trees was recompiled while it was in flight（another process
+in the same checkout; this run sets sys.dont_write_bytecode, so it cannot be the author）"。
+
+**修法**：`.pyc` 不再进 `repo_sources_changed` / `repo_files_created`（字节码有它自己的检查
+"no bytecode was written next to the sources this run imports"），新增
+`repo_bytecode_churn` 作为**note**——这与 `scripts/e2e_resilience_simulation.py` 早就正确的
+处理方式（churn 只 note、不 failure）一致；两个脚本对同一件事的口径现在统一了。
+
+### ⑨ 变异框架留下的陈旧字节码（已修）——这条最值得记住
+
+**怎么发现的**：改完 ⑦ 之后跑全量，`test_permission_and_contact_fatigue_are_the_two_load_bearing_priors`
+变红。查下去：**工作区的源码是正确的**（`git diff` 为空、文件里就是 `-1.10`），但 `import` 出来的
+`DEFAULT_THETA["reply_probability"][7]` 是 **`-0.1`**——正是我自己的变异 **P7**。
+
+**机制**：CPython 用**源文件的 mtime + size** 校验 `.pyc`。变异 `-1.10` → `-0.10` 是**同长度**
+（都是 5 个字符，`0.00` 那条同理），而"还原"与"变异"落在**同一秒**内，于是还原后的源文件
+mtime 与 size 与变异编译出来的 `.pyc` 头部**完全吻合** → Python 认为缓存有效 → **按变异体的字节码
+运行**。旧版框架的 `run_tests` 没有关掉字节码写入，所以它自己就会写下那个缓存。
+
+**影响范围（要诚实说清）**：
+- **KILLED/SURVIVED 判定本身仍然可信**：判定是在"变异已写入源文件"的状态下跑的，那时 mtime 或
+  size 必然对不上缓存，Python 会重新编译变异体。
+- **危险的是变异之后的状态**：`_assert_restored` 之前那次"已还原"检查、以及**我随后手动跑的任何
+  pytest**，都可能加载变异体字节码。这次就是这样：一次手动全量跑，测的是 P7 的模型。
+- 所以"框架报 21 个变异全部 KILLED"这个结论没有被推翻，但**它自带的"restored green"证据是弱的**。
+
+**修法**（三层，缺一不可）：
+1. `run_tests` 给子进程设 **`PYTHONDONTWRITEBYTECODE=1`**——这是**承重**的一层：测试运行不再写下
+   任何 `.pyc`，陈旧缓存无从产生；
+2. 每次应用变异**和**每次还原后，删除被触碰源文件的 `__pycache__` 条目
+   （防的是**别的进程**留下的缓存，例如我手动跑的那次 pytest）；
+3. `_assert_restored`：还原后断言文件内容等于原样**且**该文件没有 `.pyc` 残留，
+   否则**直接抛错中止**，而不是打印一个可能是假的 verdict。
+
+**注错自证**：把 1 和 2 都关掉（恢复修复前的行为）→ 框架在 P1 之后立刻
+`AssertionError: stale bytecode survives for user_model.py: ['user_model.cpython-314.pyc']`，
+**中止而不是报数**。只关掉 2 则是绿的——说明承重的是第 1 层，第 2/3 层是纵深防御。
+
+**教训（比这一条更值钱）**：**"还原了源码"不等于"跑的是还原后的源码"**。任何"改文件 → 跑测试 →
+还原"的工具链都要显式处理字节码缓存，否则它会静默地用自己的中间状态回答。这类缺陷不会变红，
+只会让结论失真——正是本项目最在意的那种。
 
 ### ⑥ §22.1 里未实现的 A 字段（已决定：留档不改）
 
@@ -557,8 +664,10 @@ parameter vector for %s")` 并**回退到先验**——也就是**每个既有�
 断言**绝对**编码值，而不是"和预测一致"——后者在两边一起改错时仍会通过；另有"标点不得进入特征
 向量"一条，用 `contact`（canonical question=0）因为只有它会让标点启发式**改变**向量）。
 `scripts/mutation_design_conformance.py`（仓库根目录）8 个变异**全部 KILLED**，包括"观察侧退回薄 A"
-（19 failed）与"用标点判 是否追问"（1 failed）。全量 **1080 passed / 17 skipped / 0 failed**。
+（19 failed）与"用标点判 是否追问"（1 failed）。
 
-**遗留**：`_last_proactive_context` 里还有第三份、且**零调用**的 A 编码器——留给 ⑦ 删除
-（改它无法用测试证伪，删它才是可证伪的收尾）。
+**遗留已清**：`_last_proactive_context` 里那份第三个、零调用的 A 编码器已在 ⑦ 删除。
+它同时暴露了清点工具自己的一个假阴性：**prose 里提到一个私有函数，会把它从"死代码"里藏起来**
+——我自己的交接文档写了这个名字，于是第一次扫描没发现它。工具现已改为"私有名字只由代码保活"，
+并且"引用"不只算调用（`resolvable=self._is_resolvable` 就是被当作值传出去的）。
 

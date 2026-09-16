@@ -224,7 +224,6 @@ _CONDITION_STOPWORDS: frozenset[str] = frozenset(
 GENERIC_CONDITION_MIN_TOKENS = 2
 
 
-
 @dataclass(slots=True)
 class CandidateOperation:
     """A proposed mutation of the candidate pool."""
@@ -1680,21 +1679,6 @@ def invalidated_by_source_state(
             if key not in emotion_ids:
                 return condition
     return None
-
-
-def describe_pool(candidates: Sequence[CandidateIntent]) -> list[dict[str, Any]]:
-    """Return a compact rendering of a candidate pool for prompts and APIs."""
-    return [
-        {
-            "candidate_id": candidate.candidate_id,
-            "type": candidate.type,
-            "intent": candidate.intent,
-            "goal": candidate.goal,
-            "status": candidate.status,
-            "confidence": round(candidate.confidence, 3),
-        }
-        for candidate in candidates
-    ]
 
 
 def expires_in_seconds(candidate: CandidateIntent, now: datetime) -> float | None:

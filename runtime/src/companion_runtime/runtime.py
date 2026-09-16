@@ -467,10 +467,6 @@ class Runtime:
         """Return the underlying database handle."""
         return self._db
 
-    @property
-    def worker_id(self) -> str:
-        """Return this process's lease owner identifier."""
-        return self._worker_id
 
     def close(self) -> None:
         """Close the database handle."""
@@ -2534,27 +2530,6 @@ class Runtime:
         if event is None:
             return None
         return delta_seconds(now, event.timestamp)
-
-    def _has_pending_observation(self) -> bool:
-        """Return whether a sent proactive message is still awaiting an observation."""
-        return self._newest_sent_attempt() is not None
-
-    def _last_proactive_context(self) -> dict[str, Any]:
-        """Return the action/context of the most recent sent attempt."""
-        attempt = self._newest_sent_attempt()
-        if attempt is None:
-            return {}
-        candidate = (
-            self.projections.candidates.get(attempt.candidate_id) if attempt.candidate_id else None
-        )
-        return {
-            "attempt_id": attempt.attempt_id,
-            "action": {
-                "type": candidate.type if candidate else "contact",
-                "proactive": True,
-            },
-            "context": {},
-        }
 
     def _situation_context(self, now: datetime) -> dict[str, Any]:
         """Assemble the fast-variable context used by the user model."""

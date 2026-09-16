@@ -72,6 +72,52 @@
   三条都是**用自己编的词 grep、又直接信了审计文档的状态标签**造成的误判；教训写在
   `HANDOFF.md` 的"核实后撤回的三条"一节。
 
+- **声明了却没有生产者的东西：清点、删除、并让这一类缺陷无法再悄悄回来。**
+  `EventType` 的孤儿从 5 个收敛到 **0**，走两条不同的路：**删掉** `TICK`（tick 不是关于用户的
+  事实）、`USER_MODEL_SUMMARY`（摘要存在 `user_model_params.last_summary_json`）、
+  `EMOTION_EVENT_EVAL`（设计里的 `emotion_event_eval` 是 **task_type**，已有
+  `TaskKind.EMOTION_EVAL`）、`MEMORY_CONSOLIDATED`（巩固写的是记忆本身）；
+  **给 `REAPPRAISAL` 一个生产者**——`reducer._apply_reinterpretation` 现在同时写投影行和
+  `EventType.REAPPRAISAL` 事件（设计 §67 的 `reappraisal_event`），两者互相指认
+  （事件 metadata 带 `reappraisal_id` / `interpretation_id` / `target_event_id` / `supersedes_id`）。
+  同一条路上还修掉两个同族问题：重估记录的标识符原先用 `new_id("memory")` → `mem_` 前缀
+  （现在 `ID_PREFIXES["reappraisal"] = "rap"`；记录共享一种 `<prefix>_<hex>` 形状但**不可互换**，
+  grounding 就是靠前缀判断标识符指代什么的），以及 provenance 里目标事件被重复列两次
+  （现在去重）。另删除 **17 个零调用函数**（含 `_last_proactive_context`——① 时留下的第三份
+  A 编码器）。
+
+  新增 `scripts/dead_code_inventory.py`（A 段无调用方函数 / B 段无读者配置项 / C 段从未发出的
+  `EventType`，排除项全部打印）与 `tests/test_declared_but_unused.py`（3 条：每个成员必须有
+  生产者或出现在显式的 `HOST_WRITTEN` 白名单里、白名单不许留过期条目、`REAPPRAISAL` 必须存在
+  且被 reducer 发出——最后一条是防止"删掉成员"也能让孤儿检查通过）。
+  **15 个死旋钮有意不删**：`GET /config` 会序列化所有字段，删字段是响应形状变更。
+  验收：`declared_unused` 组 6 个变异全部击杀；清点工具本身注错自证（加一个公开 + 一个私有死函数
+  → A 段报 2，删掉 → 0）。
+
+- **验证工具自己的一条假红：黑盒仿真把字节码变更算成"源文件被改"。**
+  `blackbox_user_simulation.py` 的 `repo_sources_changed` 把 `".pyc"` 与 `.py` 并列，并在 teardown
+  里当**失败**上报；而这次仿真自己设了 `sys.dont_write_bytecode = True`，写不出字节码——真正改写
+  `.pyc` 的是同一 checkout 里刚跑过的 pytest。后果是**每次改完源码后的第一次黑盒仿真都假红、
+  第二次就绿**（`| tail` 还会把退出码吞掉，容易把红当成绿）。现在 `.pyc` 不再进
+  `repo_sources_changed` / `repo_files_created`，改由它自己的检查（"no bytecode was written next
+  to the sources this run imports"）和一条 note 负责，与 `e2e_resilience_simulation.py` 早就
+  正确的口径统一。注错自证：仿真进行中 `touch` 掉 32 个 `.pyc` → 77/77 通过并出现对应 note。
+
+- **变异框架会留下陈旧字节码，使"已还原"的源码仍按变异体运行（最值得记住的一条）。**
+  发现方式：改完死代码清理后跑全量，`test_permission_and_contact_fatigue_are_the_two_load_bearing_priors`
+  变红——源码是对的（`git diff` 为空、文件里就是 `-1.10`），但 `import` 出来的
+  `DEFAULT_THETA["reply_probability"][7]` 是 **`-0.1`**，正是框架里的变异 P7。
+  机制：CPython 只用**源文件 mtime + size** 校验 `.pyc`，而 `-1.10` → `-0.10` 是**同长度**、
+  还原又落在**同一秒**内，于是还原后的源文件与变异编译出的 `.pyc` 头部完全吻合 → 按变异体运行。
+  影响：KILLED/SURVIVED 判定本身可信（判定时源文件是变异体，缓存必然失配），但**变异之后的状态
+  不可信**——包括框架自己的"restored green"检查和随后手动跑的任何 pytest。
+  修法三层：① `run_tests` 给子进程设 `PYTHONDONTWRITEBYTECODE=1`（**承重层**，测试运行不再写
+  `.pyc`）；② 每次应用变异与每次还原后删除被触碰文件的 `__pycache__` 条目（防别的进程留下的）；
+  ③ `_assert_restored` 断言"内容等于原样**且**无 `.pyc` 残留"，否则抛错中止而不是打印可能的假
+  verdict。注错自证：把①②都关掉 → 框架立刻 `AssertionError: stale bytecode survives for
+  user_model.py`，中止而非报数；只关②是绿的，说明承重的是①。教训：**"还原了源码"不等于"跑的
+  是还原后的源码"**。
+
 - **"被无视"这条证据终于有人产生（审计 #4 / 设计 §22.3）。**
   此前反馈回路只有**正面一半**：用户下次开口时，回复被归属到最新一条已发出的主动消息并结算；
   而一条**发出后石沉大海**的消息不留任何痕迹——`no_reply_weight` 那条路径在生产里**永远不可达**，

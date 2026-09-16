@@ -555,6 +555,3 @@ def decay_and_persist(
     return {"active": len(active), "expired": len(expired), "total": len(every)}
 
 
-def clamp_window(hours: float) -> float:
-    """Clamp a boundary window into a sane range."""
-    return clamp(hours, 0.5, 24.0 * 365)

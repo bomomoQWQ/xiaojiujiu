@@ -108,12 +108,22 @@
     改为 savepoint 内插入再回滚到它，两个后端都能接着读。34 条测试 + 11 个变异。
 13. **[已修 0.3.2]** §77 表名对照缺失。`runtime/docs/DESIGN_TABLE_MAPPING.md`：18 张逐条对照
     （同名 14/改名 1/合并 2/有意不实现 1），反向另有 5 张；并纠正本文件"8 张文档未列"的笔误（实为 5 张，共 21 张）。
-14. **[未修，清单已备]** 死代码与无消费者字段的清理。
+14. **[部分已修 0.3.2]** 死代码与无消费者字段的清理。
     只读审计已交付完整清单：**15 个死旋钮**（含审计没点名的 `EmotionConfig.event_reactivity`——
     唯一读者是死函数；`RuntimeConfig.boundary` 整块不可达）、**5 个 `EventType` 孤儿**、
     **12 个零调用函数**、若干只写不读字段。**注意**：`GET /config` 会序列化所有字段，删字段是
     响应形状变更；`POST /events` 接受任意 event_type，所以"无内部生产者"≠"外部不可达"——
     协议可达的成员（`TOOL_RESULT`/`REAPPRAISAL`/`Priority`/`Actor.TOOL`）要先决定宿主侧问题再删。
+    **[已做]** 零调用函数：本机重新推导（不用这份清单）得到 **16 个**（审计的 12 个里有些是
+    argparse 目标、`__repr__`、以值传递的回调、以及和属性同名的模块函数——那些都不是死代码），
+    已全部删除，`scripts/dead_code_inventory.py` 现在报 **0**（并把 52 个框架入口与 16 个手工核实
+    的名字一并打印，便于复核）。`EventType` 孤儿：**4 个**（`TICK`/`USER_MODEL_SUMMARY`/
+    `EMOTION_EVENT_EVAL`/`MEMORY_CONSOLIDATED`，审计的 5 个里有 `REAPPRAISAL`）——后 4 个已删，
+    `REAPPRAISAL` 反而**给了生产者**（设计 §67 的 `reappraisal_event`，见下），并新增
+    `tests/test_declared_but_unused.py` 把"枚举成员必须有生产者"变成常驻断言（审计的 5 个数字
+    与本次推导差 1，原因是这份清单把"协议可达"也算进了孤儿）。
+    **[仍未做]** 15 个死旋钮：**有意不动**——`GET /config` 会序列化所有字段，删字段是响应形状
+    变更，需要一次产品决策；`scripts/dead_code_inventory.py` 的 B 段会持续把它列出来当报告。
 15. **[已修 0.3.2]** 恒真测试。21 条重写为"行为被破坏就失败"的断言（含点名的 §87 场景 4/5），
     **29 个变异全部击杀**，且把旧版本从 HEAD 抽出来跑其中 12 个变异 → **旧版全部存活**（前后对照）。
     没有删除或削弱任何测试。**父代理独立复核**其中一条（关系情绪衰减调制，落在无人在改的
@@ -136,6 +146,12 @@
    它让"看起来实现了"成为默认印象，是这份审计存在的最大理由。
 2. **只写不读的状态**：`supersedes` / `superseded_by_hint`、`UnfinishedStatus.CANCELLED`、
    `dormant`、`reappraisals`、`proposed_by`。
+   **[部分已修 0.3.2]** `reappraisals` 从"只写不读"变成**两处都写、一处可读**：重解释现在会
+   同时写投影行与 `EventType.REAPPRAISAL` 事件（设计 §67），日志因此能回答"哪些事件被重新理解过"，
+   `tests/test_reappraisal_events.py` 4 条钉住二者是同一事实。顺带修掉两个同族问题：重估记录的
+   标识符用 `new_id("memory")` → `mem_` 前缀（现在 `ID_PREFIXES["reappraisal"] = "rap"`），
+   以及 provenance 里目标事件被重复列两次。`GET /observations` 之外仍没有专门的
+   "重估历史"端点——`GET /events` 可按 `event_type=reappraisal` 过滤，这已足够。
 3. **两套不一致的编码**：行为特征在"预测"与"观察"两条路径上编码不同（question 一个按类型、
    一个按问号），模型学的与模型用的是同一个词的不同含义。
    **[已修 0.3.2]** 但实际情况比这一行摘要严重：不是 1 个特征对不上，是**5 个里有 3 个**——
@@ -180,7 +196,8 @@ cd runtime && python -m pytest                    # 1080 passed / 17 skipped（�
 CR_TEST_PG_DSN=postgresql://… python -m pytest    # 对真 PG（本机无 psycopg，恒跳过）
 
 # 第三条在仓库根目录（xiaojiujiu/）跑；它自己进 runtime/ 并还原改动
-runtime/.venv/bin/python scripts/mutation_design_conformance.py   # ①⑤ 的 15 个变异，应全部 KILLED
+runtime/.venv/bin/python scripts/mutation_design_conformance.py   # ①⑤⑦ 的 21 个变异，应全部 KILLED
+runtime/.venv/bin/python scripts/dead_code_inventory.py            # A/B/C 三段；A 与 C 应为 0
 ```
 
 每一条判定都能用分册里的 `file.py::symbol:line` 定位；若某条与当前代码不符，以代码为准并在

@@ -3187,6 +3187,13 @@ def phase_teardown(story: Story, ctx: "Context") -> None:
             "(another process in the same checkout, not written by this run): "
             + _short(ctx.repo_other_changes[:5])
         )
+    if ctx.repo_bytecode_churn:
+        V.note(
+            "bytecode under this run's source trees was recompiled while it was in flight "
+            "(another process in the same checkout; this run sets sys.dont_write_bytecode, "
+            "so it cannot be the author): "
+            + _short(ctx.repo_bytecode_churn[:5])
+        )
     produced = [
         str(path.relative_to(ctx.base_dir))
         for path in (
@@ -3274,18 +3281,50 @@ class Context:
 
     @property
     def repo_files_created(self) -> list[str]:
-        """Return files this run could have created in its own source trees."""
-        return sorted(name for name in self._owned_files() if name not in self.repo_snapshot)
+        """Return files this run could have created in its own source trees.
+
+        New bytecode is excluded for the same reason as in
+        :attr:`repo_sources_changed`: it has its own check, and this run cannot write it.
+        """
+        return sorted(
+            name
+            for name in self._owned_files()
+            if name not in self.repo_snapshot and not name.endswith(".pyc")
+        )
 
     @property
     def repo_sources_changed(self) -> list[str]:
-        """Return owned source/config files that changed during the run."""
-        watched = (".py", ".pyc", ".json", ".jsonl", ".yaml", ".yml", ".toml")
+        """Return owned source/config files that changed during the run.
+
+        Bytecode is deliberately *not* watched here. This run sets
+        :data:`sys.dont_write_bytecode` before importing anything, so it cannot rewrite a
+        ``.pyc`` at all: bytecode churn under these trees comes from another process in the
+        same checkout (typically a test run that just recompiled an edited module).
+        Counting it as "a source file changed" made the *first* blackbox run after every
+        source edit fail on a check whose message blames this simulation. Bytecode has its
+        own check ("no bytecode was written next to the sources this run imports") and its
+        own note (:attr:`repo_bytecode_churn`).
+        """
+        watched = (".py", ".json", ".jsonl", ".yaml", ".yml", ".toml")
         current = self._owned_files()
         return sorted(
             name
             for name, stamp in current.items()
             if self.repo_snapshot.get(name) != stamp and name.endswith(watched)
+        )
+
+    @property
+    def repo_bytecode_churn(self) -> list[str]:
+        """Return owned-tree bytecode another process created or rewrote.
+
+        Reported as a note for the same reason as :attr:`repo_other_changes`: this run
+        cannot produce it, so failing here would blame the harness for a neighbour's work.
+        """
+        current = self._owned_files()
+        return sorted(
+            name
+            for name, stamp in current.items()
+            if name.endswith(".pyc") and self.repo_snapshot.get(name) != stamp
         )
 
     @property

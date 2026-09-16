@@ -290,11 +290,6 @@ def build_render_payload(item: OutboxItem, context_bundle: Mapping[str, Any] | N
     return payload
 
 
-def encode_payload(payload: Mapping[str, Any]) -> str:
-    """Serialise a payload for storage (helper used by tests and tooling)."""
-    return json.dumps(payload, ensure_ascii=False)
-
-
 def is_sendable_state(state: str) -> bool:
     """Return whether an attempt in ``state`` may still be delivered."""
     return state == AttemptState.READY_TO_SEND.value
