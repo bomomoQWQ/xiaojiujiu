@@ -88,6 +88,21 @@ setInterval(refresh, 700); refresh();
 """
 
 
+class _FrontendHTTP(ThreadingHTTPServer):
+    """Threaded HTTP server with an accept backlog big enough for a load test.
+
+    ``socketserver.TCPServer`` defaults ``request_queue_size`` to 5, so ten people
+    typing at once overflow the accept queue and the *client* sees
+    ``ConnectionResetError`` -- a harness limit that looks exactly like the bot
+    dropping messages. Measured: a 20-connection burst lost about a third of the
+    sends until this was raised.
+    """
+
+    daemon_threads = True
+    request_queue_size = 128
+    allow_reuse_address = True
+
+
 class OneBotService:
     """HTTP control surface plus the link itself."""
 
@@ -119,7 +134,7 @@ class OneBotService:
         self.frontend.on_frame = self._on_frame
         self.frontend.start()
         handler = _make_handler(self)
-        self._server = ThreadingHTTPServer((self.host, self.port), handler)
+        self._server = _FrontendHTTP((self.host, self.port), handler)
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever, name="cf-onebot-http", daemon=True)
         self._thread.start()
