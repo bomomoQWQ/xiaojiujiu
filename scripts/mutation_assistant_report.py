@@ -112,6 +112,15 @@ MUTATIONS = [
             return""",
         "test_an_unknown_person_is_provisioned_automatically",
     ),
+    (
+        "main",
+        "M10: empty events are reported (pokes become 'the user said nothing')",
+        """            text = as_str(getattr(event, "message_str", "")).strip()
+            if not text:""",
+        """            text = as_str(getattr(event, "message_str", "")).strip()
+            if False:  # MUTATION M10""",
+        "test_an_empty_message_event_is_not_reported",
+    ),
 ]
 
 

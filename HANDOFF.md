@@ -644,6 +644,35 @@ http://runtime-fleet:8799` → fleet 13 人 → 他自己的库里只有他自�
 **默认回落实例已清空**（`xxj-runtime-test` 里路由生效前的 20001–20010/20099 历史已删除），
 现在它只作为回退存在，只剩下系统自己的 `default` 会话。
 
+### ⚠️ 宿主坑：AstrBot 把 OneBot 的「通知」包装成空正文的消息事件
+
+真机取证（真人 QQ，14 秒内 8 条 `user_message`，其中 7 条正文为空、`message_id` 是 UUID、
+`sender_name` 退化成 id）。根因在宿主侧：
+`aiocqhttp_platform_adapter.py::_convert_handle_notice_event` 把 OneBot 的 notice
+（**戳一戳**、好友请求、群成员变动）包装成 `AstrBotMessage`：
+
+```python
+abm.sender = MessageMember(user_id=str(event.user_id), nickname=str(event.user_id))  # 昵称=id
+abm.message_str = ""            # 正文为空
+abm.message_id = uuid.uuid4().hex  # 非数字 id
+```
+
+后果（插件修复前）：Runtime 把 7 次戳一戳记成 7 条"用户什么都没说"，
+`working_situation_items` 里出现空的「用户说：」，每条还各触发一次前台处理并压住主动派发。
+
+**修法**：正文（`strip()` 后）为空的消息一律不上报，并在 `/companion_runtime`
+里报一行 `skipped empty events: N`（否则它又是一个静默丢弃）。
+若将来"戳一戳"本身值得进入认知，应在协议里给它一个自己的 event kind，而不是让插件编造文本。
+测试 `test_an_empty_message_event_is_not_reported`；变异 M10（空事件照常上报）KILLED。
+
+### ⚠️ 又一个只能在真机上现形的 bug：fleet 把控制面端口发出去了
+
+`8787 + 13 = 8800`，而 8800 是 fleet 控制面自己的端口。第 14 个人（真号 `1670681411`）
+被分到 8800 → 他的 Runtime 绑不上端口，注册表却已登记 `http://runtime-fleet:8800`
+→ 插件的 `/v1/events` 打到控制面（404）→ **他的第一条消息一条都没落进自己的库**。
+修法：`_next_port()` 同时排除 ①已分配端口 ②控制面端口 ③当前 bind 不上的端口。
+**封测名单超过 13 人就会撞上，务必保留这个修复。**
+
 ### 已修并验证（本节点）
 
 **#2 记忆种类由子串决定** —— `runtime/src/companion_runtime/memory.py`
