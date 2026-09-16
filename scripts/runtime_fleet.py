@@ -390,7 +390,8 @@ def render_dashboard(people: list[dict[str, object]]) -> str:
     )
 
 
-def make_handler(fleet: Fleet):    """Build the request handler bound to ``fleet``."""
+def make_handler(fleet: Fleet):
+    """Build the request handler bound to ``fleet``."""
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "companion-fleet/1"
