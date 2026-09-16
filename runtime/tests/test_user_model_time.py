@@ -267,7 +267,10 @@ def test_a_relative_slow_reply_is_weaker_evidence_not_negative_evidence() -> Non
     model, db = make_model()
     try:
         learn_replies(model, db, delay_seconds=TEN_MINUTES, count=4)
-        # Topic + asked-back + long reply: 0.5 + 0.12 + 0.08 + 0.10 = 0.80 normally.
+        # Topic + asked-back: 0.5 + 0.12 + 0.08 = 0.70. The reply length adds nothing,
+        # and that is the point of design §29: ``learn_replies`` writes 30 characters
+        # every time, so 30 *is* this user's habit - "long" has to mean long for them,
+        # not long in the abstract. (It used to add a flat +0.10 for ``>= 20`` chars.)
         late = BehaviourReaction(
             replied=True,
             reply_delay_seconds=90 * DAY,
@@ -275,8 +278,8 @@ def test_a_relative_slow_reply_is_weaker_evidence_not_negative_evidence() -> Non
             continued_topic=True,
             asked_back=True,
         )
-        # 0.80 minus the full relative-delay weight, not below neutral.
-        assert model._target_rewards(late)["positive_probability"] == pytest.approx(0.70)
+        # 0.70 minus the full relative-delay weight, not below neutral.
+        assert model._target_rewards(late)["positive_probability"] == pytest.approx(0.60)
         # With no bonus to cancel, a late reply adds nothing and stays positive.
         plain = BehaviourReaction(replied=True, reply_delay_seconds=90 * DAY, reply_length=8)
         assert model._target_rewards(plain)["positive_probability"] == pytest.approx(0.40)

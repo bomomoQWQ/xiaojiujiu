@@ -18,6 +18,7 @@ Groups:
     redelivery       崩溃窗口, a re-leased message must say so
     chat_history     backlog ③-1, the chat window's durable history
     boundary_synonyms 业务逻辑 B, a boundary must not be bypassable by renaming
+    reply_length    业务逻辑 A, reply length judged against the user's own habit
 """
 
 from __future__ import annotations
@@ -492,6 +493,92 @@ GROUPS: dict[str, tuple[list[str], list[tuple[str, list[tuple[pathlib.Path, str,
                         CANDIDATE,
                         '    return behaviour_class_of({"type": candidate.type}) not in NON_PROACTIVE_BEHAVIOUR_CLASSES',
                         '    return behaviour_class_of({"type": candidate.type}) in {"proactive_contact", "follow_up"}',
+                    )
+                ],
+            ),
+        ],
+    ),
+    # ------------------------------------------------------------------ 业务逻辑 A
+    "reply_length": (
+        ["tests/test_reply_length_baseline.py"],
+        [
+            (
+                "L1 the absolute bars come back (the original defect)",
+                [
+                    (
+                        USER_MODEL,
+                        "            positive += self._relative_length_delta(reaction, positive)",
+                        "            positive += 0.10 if reaction.reply_length >= 20 else (-0.05 if reaction.reply_length <= 4 else 0.0)",
+                    )
+                ],
+            ),
+            (
+                "L2 the weight gate goes back to counting characters",
+                [
+                    (
+                        USER_MODEL,
+                        "        return self.relative_length_signal(int(length)) <= -REPLY_LENGTH_SHORT_SIGNAL",
+                        "        return int(length) <= 4",
+                    )
+                ],
+            ),
+            (
+                "L3 the baseline is never trusted",
+                [
+                    (
+                        USER_MODEL,
+                        "        if self._length_samples >= REPLY_LENGTH_BASELINE_MIN_SAMPLES:",
+                        "        if False:",
+                    )
+                ],
+            ),
+            (
+                "L4 observations never teach the baseline",
+                [
+                    (
+                        USER_MODEL,
+                        "    def _learn_reply_length(self, reaction: BehaviourReaction) -> None:",
+                        "    def _learn_reply_length(self, reaction: BehaviourReaction) -> None:\n        return  # MUTATION",
+                    )
+                ],
+            ),
+            (
+                "L5 the baseline is not persisted",
+                [
+                    (
+                        USER_MODEL,
+                        '        params["reply_length_baseline"] = {\n            "log_mean": self._length_log_mean,',
+                        '        params["reply_length_baseline"] = {\n            "log_mean": 0.0,',
+                    )
+                ],
+            ),
+            (
+                "L7 the conversation term saturates at a hardcoded three again",
+                [
+                    (
+                        USER_MODEL,
+                        "            + CONVERSATION_TARGET_WEIGHT * self.conversation_bonus(reaction)",
+                        "            + CONVERSATION_TARGET_WEIGHT * min(3, reaction.turns) / 3.0",
+                    )
+                ],
+            ),
+            (
+                "L8 the conversation baseline is never consulted (always the fallback)",
+                [
+                    (
+                        USER_MODEL,
+                        "        if self._turns_samples >= CONVERSATION_BASELINE_MIN_SAMPLES:",
+                        "        if False:",
+                    )
+                ],
+            ),
+            (
+                "L6 a short reply is allowed to invert the sign",
+                [
+                    (
+                        USER_MODEL,
+                        "        delta = REPLY_LENGTH_TARGET_WEIGHT * self.relative_length_signal(int(reaction.reply_length))\n        if delta >= 0.0:\n            return delta\n        return -min(-delta, max(0.0, positive - 0.5))",
+                        "        return REPLY_LENGTH_TARGET_WEIGHT * self.relative_length_signal(int(reaction.reply_length))",
                     )
                 ],
             ),

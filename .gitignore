@@ -73,6 +73,11 @@ astrbot_plugin_companion_runtime/
 /res-run/
 /mem/
 /mem-run/
+# The relationship-progression simulation needs its own base dir too: pointing two
+# simulations at one --base-dir leaves only the last report.json behind, so the earlier
+# simulation's numbers are gone by the time anyone reads them.
+/rel/
+/rel-run/
 
 # Editors and OS
 .vscode/

@@ -56,7 +56,7 @@ def probe_reply_length_is_absolute() -> None:
     length changes. If length were relative, the three rows would be indistinguishable.
     """
     print("=" * 78)
-    print("probe 1 — 回复长度是绝对阈值（设计 §29 要求相对用户自己的基线）")
+    print("probe 1 — 回复长度是否相对用户自己的基线（设计 §29）［已修，保留作回归观察］")
     print("=" * 78)
     print("同一个用户行为（每次都回复 / 继续话题 / 主动反问），只改回复长度：\n")
     print(f"  {'情形':<16}{'长度':>5}{'每条证据权重':>14}{'positive 前→后':>22}{'reply 前→后':>20}")
@@ -172,12 +172,52 @@ def probe_emotion_alignment_ignores_synonyms() -> None:
     print("  同族还有 protocol.py:346 的分类器，它只认 {follow_up, curious_question, check_in}。\n")
 
 
+def probe_conversation_length_saturation() -> None:
+    """§29's third clause: 对话持续长度.
+
+    ``min(3, reaction.turns)`` saturated for *everyone* at three turns, so a three-turn and
+    a thirty-turn conversation scored identically and the user's own habit never entered
+    the formula.
+    """
+    print("=" * 78)
+    print("probe 4 — 对话持续长度（§29 第三句）［已修，保留作回归观察］")
+    print("=" * 78)
+    runtime = _runtime()
+    try:
+        model = runtime.user_model
+        print("  冷启动（习惯未知，退回旧的绝对参考 3 轮）：")
+        for turns in (1, 2, 3, 10, 30):
+            print(f"    turns={turns:>3}  bonus={model.conversation_bonus(BehaviourReaction(replied=True, turns=turns)):.3f}")
+        print("\n  改之前 turns=3 与 turns=30 的目标值完全相同（min(3, turns) 饱和）；")
+        print("  现在习惯未知时仍是上面这条曲线，习惯已知后饱和点跟着用户走：")
+        stamp = BASE_TIME
+        for _ in range(6):
+            stamp += timedelta(hours=6)
+            with runtime.db.transaction() as conn:
+                model.observe(
+                    conn,
+                    action={"type": "contact", "proactive": True},
+                    context={},
+                    reaction=BehaviourReaction(replied=True, reply_length=30, turns=30, reply_delay_seconds=300.0),
+                    now=stamp,
+                    observed_at=stamp,
+                )
+        reference, trusted = model.turns_reference()
+        print(f"    习惯被学到：参考 {reference:.1f} 轮（trusted={trusted}）")
+        for turns in (3, 10, 30):
+            print(f"    turns={turns:>3}  bonus={model.conversation_bonus(BehaviourReaction(replied=True, turns=turns)):.3f}")
+    finally:
+        runtime.close()
+    print()
+
+
 def main() -> int:
     """Run every probe; always exit 0 (this is a measurement, not an assertion)."""
     print()
     probe_reply_length_is_absolute()
     probe_hard_boundary_can_be_bypassed()
     probe_emotion_alignment_ignores_synonyms()
+    probe_conversation_length_saturation()
     print("=" * 78)
     print("以上均为实测输出。报告：runtime/docs/BUSINESS_LOGIC_AUDIT.md")
     print("=" * 78)

@@ -279,6 +279,70 @@ REPLY_DELAY_Z_SCALE = 2.0
 #: update without drowning the other observation channels.
 REPLY_DELAY_TARGET_WEIGHT = 0.10
 
+# --------------------------------------------------------------------------------------
+# Relative reply-*length* scoring (§29)
+#
+# Design §29 is one sentence with three clauses: "回复速度、回复长度、对话持续长度，都应该相对
+# 用户自己的历史基线，而不是绝对阈值". Speed got a baseline; length did not, and was compared
+# against the hardcoded bars ``<= 4`` and ``>= 20`` instead. For a user whose habit is three
+# characters, *every* reply was therefore scored as weak evidence AND as a small negative -
+# they were judged cold for having a terse style. These constants build the same machinery
+# for length that :data:`REPLY_DELAY_*` builds for speed.
+# --------------------------------------------------------------------------------------
+
+#: Minimum number of observed reply lengths before the baseline is trusted. Until then the
+#: length contributes **nothing** - see :meth:`UserInteractionModel.short_reply_relative`
+#: for why the fallback here is silence rather than an absolute default.
+REPLY_LENGTH_BASELINE_MIN_SAMPLES = 3
+
+#: Weight of the newest length sample in the exponential moving average, in ``log1p``
+#: characters. Same value and reasoning as :data:`REPLY_DELAY_BASELINE_ALPHA`.
+REPLY_LENGTH_BASELINE_ALPHA = 0.25
+
+#: Floor for the baseline's log-space standard deviation. Without it a user who types the
+#: same number of characters every time would register an enormous z-score for a one-word
+#: difference.
+REPLY_LENGTH_MIN_LOG_STDEV = 0.34
+
+#: Divisor turning the length z-score into a signal in ``[-1, 1]``. Two log-space standard
+#: deviations is "this reply is far outside their normal length".
+REPLY_LENGTH_Z_SCALE = 2.0
+
+#: Largest absolute contribution of the relative-length term to ``positive_probability``.
+#: Equal to :data:`REPLY_DELAY_TARGET_WEIGHT`, which is what the delay constant's own
+#: comment already assumed.
+REPLY_LENGTH_TARGET_WEIGHT = 0.10
+
+#: How far below the user's own baseline counts as "short" for *weighting* purposes, in
+#: units of :meth:`UserInteractionModel.relative_length_signal`. ``0.5`` is one log-space
+#: standard deviation - noticeably shorter, not merely different.
+REPLY_LENGTH_SHORT_SIGNAL = 0.5
+
+# --------------------------------------------------------------------------------------
+# Relative conversation-length scoring (§29, third clause)
+#
+# §29 names three signals that must be relative to the user's own habit. Speed and length
+# are scored as z-scores, which need a spread; conversation length is scored as a *ratio*
+# to the habit, which does not - so this baseline stores a mean and nothing else, and
+# deliberately does not carry a variance it would never read.
+# --------------------------------------------------------------------------------------
+
+#: Minimum number of completed conversations before the turns baseline is trusted. Until
+#: then :data:`CONVERSATION_FALLBACK_TURNS` stands in, which is exactly the absolute bar
+#: this replaced - so cold start behaves as it always did.
+CONVERSATION_BASELINE_MIN_SAMPLES = 3
+
+#: Weight of the newest conversation length in the exponential moving average.
+CONVERSATION_BASELINE_ALPHA = 0.25
+
+#: The reference used before the habit is known. ``3.0`` is the value the old hardcoded
+#: ``min(3, turns) / 3`` implied; keeping it means the fix changes nothing until a user's
+#: own habit has been measured.
+CONVERSATION_FALLBACK_TURNS = 3.0
+
+#: Largest contribution of the conversation-length term to ``continue_probability``.
+CONVERSATION_TARGET_WEIGHT = 0.10
+
 
 @dataclass(slots=True)
 class Prediction:
@@ -360,7 +424,9 @@ class BehaviourReaction:
         }
 
 
-def source_weight(reaction: BehaviourReaction, config: Any) -> float:
+def source_weight(
+    reaction: BehaviourReaction, config: Any, *, short_reply_relative: bool = False
+) -> float:
     """Return the evidence quality implied by the *source* of the observation.
 
     Explicit user statements dominate; a non-reply is a very weak signal.
@@ -368,6 +434,9 @@ def source_weight(reaction: BehaviourReaction, config: Any) -> float:
     Args:
         reaction: Observed reaction.
         config: User-model configuration.
+        short_reply_relative: Whether the reply was short *for this user*, per the
+            caller's baseline (design §29). The default is ``False`` so that a caller
+            without a baseline cannot accidentally reintroduce an absolute bar.
 
     Returns:
         A weight in ``(0, 1]``.
@@ -378,7 +447,12 @@ def source_weight(reaction: BehaviourReaction, config: Any) -> float:
         return config.explicit_negative_weight
     if not reaction.replied:
         return config.no_reply_weight
-    if (reaction.reply_length or 0) <= 4:
+    if short_reply_relative:
+        # A reply that is noticeably shorter than *this user's* habit is ambiguous - it
+        # could be indifference, or it could be a busy one-word "嗯" from someone who
+        # normally writes paragraphs - so it counts as weak evidence, exactly like a
+        # slower-than-usual reply. What it is NOT is a fixed character count: that bar
+        # penalised every terse user permanently (design §29).
         return min(config.implicit_weight, config.slow_reply_weight)
     return config.implicit_weight
 
@@ -417,6 +491,7 @@ def compute_weight(
     observed_at: datetime | None,
     now: datetime,
     semantic_confidence: float = 0.6,
+    short_reply_relative: bool = False,
 ) -> EvidenceWeight:
     """Combine the four evidence weights into one.
 
@@ -426,13 +501,17 @@ def compute_weight(
         observed_at: When the observation was made.
         now: Reference time.
         semantic_confidence: Confidence of the semantic reading of the reaction.
+        short_reply_relative: Whether this reply was short *for this user* (design §29).
+            The caller owns this judgement because it needs the per-user baseline, which
+            lives on the model. It defaults to ``False`` - an unknown style is not a
+            reason to weaken the evidence.
 
     Returns:
         An :class:`EvidenceWeight` whose ``total`` is ``w_source * w_attribution *
         w_semantic * w_recency``.
     """
     weight = EvidenceWeight(
-        source=source_weight(reaction, config),
+        source=source_weight(reaction, config, short_reply_relative=short_reply_relative),
         attribution=attribution_weight(reaction, config),
         semantic=clamp(semantic_confidence),
         recency=recency_weight(observed_at, now),
@@ -520,6 +599,20 @@ def default_parameter_block(prior_precision: float = 1.0) -> tuple[dict[str, Any
         "log_variance": 0.0,
         "samples": 0,
     }
+    # Same shape, different signal. ``samples`` 0 means "no opinion about this user's
+    # typical length yet", which is a *neutral* state for length (see
+    # :meth:`UserInteractionModel.short_reply_relative`).
+    params["reply_length_baseline"] = {
+        "log_mean": 0.0,
+        "log_variance": 0.0,
+        "samples": 0,
+    }
+    # Log space, mean only: the turns term is a ratio to the habit, so a spread would be
+    # stored and never read.
+    params["reply_turns_baseline"] = {
+        "log_mean": 0.0,
+        "samples": 0,
+    }
     precision = {name: [prior_precision] * len(FEATURE_NAMES) for name in TARGET_NAMES}
     return params, precision
 
@@ -553,6 +646,14 @@ class UserInteractionModel:
         self._delay_log_mean = 0.0
         self._delay_log_variance = 0.0
         self._delay_samples = 0
+        #: The same three fields for reply *length* (§29's second clause), in
+        #: ``log1p(characters)`` space.
+        self._length_log_mean = 0.0
+        self._length_log_variance = 0.0
+        self._length_samples = 0
+        #: Conversation length (§29's third clause), ``log1p(turns)``, mean only.
+        self._turns_log_mean = 0.0
+        self._turns_samples = 0
         self._summary: dict[str, Any] | None = None
         self._load()
 
@@ -584,6 +685,8 @@ class UserInteractionModel:
             }
             self._delta = {}
             self._reset_reply_delay_baseline()
+            self._reset_reply_length_baseline()
+            self._reset_reply_turns_baseline()
             self._observations = 0
             self._effective_count = 0.0
             return
@@ -611,6 +714,8 @@ class UserInteractionModel:
         }
         self._class_counts = self._load_class_counts(params)
         self._load_reply_delay_baseline(params)
+        self._load_reply_length_baseline(params)
+        self._load_reply_turns_baseline(params)
         self._observations = int(stored.get("observations") or 0)
         self._effective_count = float(stored.get("effective_count") or 0.0)
         self._summary = stored.get("last_summary_json") or None
@@ -648,6 +753,62 @@ class UserInteractionModel:
         self._delay_log_mean = mean
         self._delay_log_variance = variance
         self._delay_samples = samples
+
+    def _reset_reply_length_baseline(self) -> None:
+        """Forget the reply-length baseline (fresh model, or a malformed stored row)."""
+        self._length_log_mean = 0.0
+        self._length_log_variance = 0.0
+        self._length_samples = 0
+
+    def _load_reply_length_baseline(self, params: Mapping[str, Any]) -> None:
+        """Restore the persisted reply-length baseline, when the row has one.
+
+        Identical in shape to :meth:`_load_reply_delay_baseline`, and for the same
+        reasons: a row written before this field existed reads as the cold-start state
+        rather than as an error, and a malformed baseline is discarded rather than
+        allowed to mis-score every later reply.
+        """
+        self._reset_reply_length_baseline()
+        raw = params.get("reply_length_baseline")
+        if not isinstance(raw, Mapping):
+            return
+        try:
+            samples = max(0, int(raw.get("samples") or 0))
+            mean = float(raw.get("log_mean") or 0.0)
+            variance = max(0.0, float(raw.get("log_variance") or 0.0))
+        except (TypeError, ValueError):
+            LOGGER.warning("Discarding malformed reply-length baseline")
+            return
+        if samples <= 0:
+            return
+        if not (math.isfinite(mean) and math.isfinite(variance)):
+            LOGGER.warning("Discarding non-finite reply-length baseline")
+            return
+        self._length_log_mean = mean
+        self._length_log_variance = variance
+        self._length_samples = samples
+
+    def _reset_reply_turns_baseline(self) -> None:
+        """Forget the conversation-length baseline."""
+        self._turns_log_mean = 0.0
+        self._turns_samples = 0
+
+    def _load_reply_turns_baseline(self, params: Mapping[str, Any]) -> None:
+        """Restore the persisted conversation-length baseline, when the row has one."""
+        self._reset_reply_turns_baseline()
+        raw = params.get("reply_turns_baseline")
+        if not isinstance(raw, Mapping):
+            return
+        try:
+            samples = max(0, int(raw.get("samples") or 0))
+            mean = float(raw.get("log_mean") or 0.0)
+        except (TypeError, ValueError):
+            LOGGER.warning("Discarding malformed conversation-length baseline")
+            return
+        if samples <= 0 or not math.isfinite(mean):
+            return
+        self._turns_log_mean = mean
+        self._turns_samples = samples
 
     @staticmethod
     def _load_class_counts(params: Mapping[str, Any]) -> dict[str, int]:
@@ -688,6 +849,15 @@ class UserInteractionModel:
             "log_mean": self._delay_log_mean,
             "log_variance": self._delay_log_variance,
             "samples": self._delay_samples,
+        }
+        params["reply_length_baseline"] = {
+            "log_mean": self._length_log_mean,
+            "log_variance": self._length_log_variance,
+            "samples": self._length_samples,
+        }
+        params["reply_turns_baseline"] = {
+            "log_mean": self._turns_log_mean,
+            "samples": self._turns_samples,
         }
         self._projection.upsert_params(
             connection,
@@ -798,6 +968,206 @@ class UserInteractionModel:
             deviation * deviation - self._delay_log_variance
         )
         self._delay_samples += 1
+
+    # ------------------------------------------- relative reply-length baseline
+
+    @property
+    def reply_length_baseline_samples(self) -> int:
+        """Return how many observed reply lengths the baseline is built from."""
+        return int(self._length_samples)
+
+    @property
+    def reply_length_baseline_chars(self) -> float | None:
+        """Return this user's own typical reply length in characters, or ``None``.
+
+        A *typical* length (closer to a median than to an arithmetic mean), because the
+        baseline is an exponential moving average in ``log1p`` space. ``None`` means no
+        reply has been measured yet - it does not mean zero characters.
+        """
+        if self._length_samples <= 0:
+            return None
+        return math.expm1(self._length_log_mean)
+
+    def length_reference(self) -> tuple[float, float, bool]:
+        """Return ``(reference, spread, baseline_trusted)`` for length scoring.
+
+        ``reference`` and ``spread`` are in ``log1p`` characters. Until
+        :data:`REPLY_LENGTH_BASELINE_MIN_SAMPLES` lengths have been observed,
+        ``baseline_trusted`` is ``False`` and the caller must treat length as *unknown*
+        rather than compare it against a default - see :meth:`short_reply_relative`.
+        The reference is still returned (the current running mean) so a diagnostic can
+        show what the baseline is converging on.
+        """
+        spread = max(REPLY_LENGTH_MIN_LOG_STDEV, math.sqrt(max(0.0, self._length_log_variance)))
+        if self._length_samples >= REPLY_LENGTH_BASELINE_MIN_SAMPLES:
+            return self._length_log_mean, spread, True
+        return self._length_log_mean, spread, False
+
+    def relative_length_signal(self, reply_length: int) -> float:
+        """Return how long one reply was *for this user*, in ``[-1, 1]``.
+
+        ``+1`` means "far longer than this user normally writes", ``0`` means "about
+        their usual length", ``-1`` means "far shorter". A z-score of
+        ``log1p(characters)`` against the baseline, divided by
+        :data:`REPLY_LENGTH_Z_SCALE` and clamped. Returns ``0.0`` while the baseline is
+        untrusted: an unmeasured user has no "usual length" to be shorter than.
+        """
+        reference, spread, trusted = self.length_reference()
+        if not trusted:
+            return 0.0
+        observed = math.log1p(max(0, int(reply_length)))
+        z = (observed - reference) / max(1e-6, spread)
+        return clamp(z / REPLY_LENGTH_Z_SCALE, -1.0, 1.0)
+
+    def short_reply_relative(self, reaction: BehaviourReaction) -> bool:
+        """Return whether this reply was short *for this user* (design §29).
+
+        This replaced a hardcoded ``<= 4`` characters, which punished a terse user for
+        their style: someone who always writes three characters had every reply scored as
+        weak evidence and as a small negative. There is no defensible *absolute* reference
+        length to fall back on, so while the baseline is untrusted the answer is ``False``
+        - "not known to be short" - rather than a guess (design §31: do not punish what
+        you have no evidence about).
+        """
+        length = reaction.reply_length
+        if not reaction.replied or length is None:
+            return False
+        _, _, trusted = self.length_reference()
+        if not trusted:
+            return False
+        return self.relative_length_signal(int(length)) <= -REPLY_LENGTH_SHORT_SIGNAL
+
+    def _relative_length_delta(self, reaction: BehaviourReaction, positive: float) -> float:
+        """Return the signed adjustment the relative reply length contributes.
+
+        ``+REPLY_LENGTH_TARGET_WEIGHT`` for a reply far longer than this user's own
+        baseline, down to ``-REPLY_LENGTH_TARGET_WEIGHT`` for one far shorter. Exactly
+        like the delay term, the negative side is capped at the bonus the other signals
+        already earned (``positive - 0.5``): a shorter-than-usual reply makes a reply
+        *weaker positive* evidence, it never turns a reply into negative evidence. The
+        hardcoded ``-0.05`` it replaces could do exactly that.
+        """
+        if not reaction.replied or reaction.reply_length is None:
+            return 0.0
+        delta = REPLY_LENGTH_TARGET_WEIGHT * self.relative_length_signal(int(reaction.reply_length))
+        if delta >= 0.0:
+            return delta
+        return -min(-delta, max(0.0, positive - 0.5))
+
+    def reply_length_baseline_view(self) -> dict[str, Any]:
+        """Return the reply-length baseline and what scoring compares against."""
+        reference, spread, trusted = self.length_reference()
+        return {
+            "samples": self._length_samples,
+            "min_samples": REPLY_LENGTH_BASELINE_MIN_SAMPLES,
+            "mean_chars": (
+                None if self._length_samples <= 0 else round(math.expm1(self._length_log_mean), 3)
+            ),
+            "reference_chars": round(math.expm1(reference), 3) if self._length_samples else None,
+            "log_stdev": round(spread, 6),
+            "trusted": trusted,
+        }
+
+    def _learn_reply_length(self, reaction: BehaviourReaction) -> None:
+        """Fold one observed reply length into the per-user baseline.
+
+        Only actual replies teach it, and only ones that carried text: a missing reply
+        says nothing about how long this user writes, and an empty one is not a style. The
+        sample is folded in *after* scoring, so an observation is judged against the habit
+        as it stood before it - otherwise one unusual reply would redefine "normal" and
+        then judge itself by the new definition.
+        """
+        if not reaction.replied:
+            return
+        length = reaction.reply_length
+        if length is None or int(length) <= 0:
+            return
+        sample = math.log1p(float(int(length)))
+        if self._length_samples <= 0:
+            self._length_log_mean = sample
+            self._length_log_variance = 0.0
+            self._length_samples = 1
+            return
+        deviation = sample - self._length_log_mean
+        self._length_log_mean += REPLY_LENGTH_BASELINE_ALPHA * deviation
+        self._length_log_variance += REPLY_LENGTH_BASELINE_ALPHA * (
+            deviation * deviation - self._length_log_variance
+        )
+        self._length_samples += 1
+
+    # ------------------------------------- relative conversation-length baseline
+
+    @property
+    def reply_turns_baseline_samples(self) -> int:
+        """Return how many completed conversations the turns baseline is built from."""
+        return int(self._turns_samples)
+
+    @property
+    def reply_turns_baseline_turns(self) -> float | None:
+        """Return this user's own typical conversation length in turns, or ``None``."""
+        if self._turns_samples <= 0:
+            return None
+        return max(1.0, math.expm1(self._turns_log_mean))
+
+    def turns_reference(self) -> tuple[float, bool]:
+        """Return ``(reference_turns, baseline_trusted)`` for conversation-length scoring.
+
+        While the habit is unknown the reference is :data:`CONVERSATION_FALLBACK_TURNS`,
+        which reproduces the absolute bar this replaced - so nothing about a user's verdict
+        changes until their own habit has been measured.
+        """
+        if self._turns_samples >= CONVERSATION_BASELINE_MIN_SAMPLES:
+            return max(1.0, math.expm1(self._turns_log_mean)), True
+        return CONVERSATION_FALLBACK_TURNS, False
+
+    def conversation_bonus(self, reaction: BehaviourReaction) -> float:
+        """Return how much credit one conversation's length earns, in ``[0, 1]``.
+
+        A *ratio* to this user's own habit rather than a z-score, because the question is
+        "was this a long conversation for them", and the answer saturates: talking for
+        thirty turns when the habit is three is not ten times the signal. The old formula
+        was ``min(3, turns) / 3``, which saturated at three turns for *everyone* - a user
+        who habitually talks for thirty turns could not be distinguished from one who
+        stops at three, and a user whose habit is one turn got no credit for staying for
+        three. Returns ``0.0`` when the conversation length is unknown.
+        """
+        turns = int(reaction.turns or 0)
+        if turns <= 0:
+            return 0.0
+        reference, _trusted = self.turns_reference()
+        return clamp(turns / max(1.0, reference), 0.0, 1.0)
+
+    def _learn_reply_turns(self, reaction: BehaviourReaction) -> None:
+        """Fold one conversation's length into the per-user baseline.
+
+        Only actual replies with a known turn count teach it: a missing reply is not a
+        conversation. Folded in after scoring, like the other two baselines.
+        """
+        if not reaction.replied:
+            return
+        turns = int(reaction.turns or 0)
+        if turns <= 0:
+            return
+        sample = math.log1p(float(turns))
+        if self._turns_samples <= 0:
+            self._turns_log_mean = sample
+            self._turns_samples = 1
+            return
+        self._turns_log_mean += CONVERSATION_BASELINE_ALPHA * (sample - self._turns_log_mean)
+        self._turns_samples += 1
+
+    def reply_turns_baseline_view(self) -> dict[str, Any]:
+        """Return the conversation-length baseline and what scoring compares against."""
+        reference, trusted = self.turns_reference()
+        return {
+            "samples": self._turns_samples,
+            "min_samples": CONVERSATION_BASELINE_MIN_SAMPLES,
+            "mean_turns": (
+                None if self._turns_samples <= 0 else round(math.expm1(self._turns_log_mean), 3)
+            ),
+            "reference_turns": round(reference, 3),
+            "trusted": trusted,
+        }
 
     # ---------------------------------------------------------------- prediction
 
@@ -944,6 +1314,10 @@ class UserInteractionModel:
             observed_at=observed_at or stamp,
             now=stamp,
             semantic_confidence=semantic_confidence,
+            # Judged against the baseline as it stands *before* this observation: the
+            # length is folded in further down (``_learn_reply_length``), so one unusual
+            # reply cannot redefine "normal" and then judge itself by the new definition.
+            short_reply_relative=self.short_reply_relative(reaction),
         )
         if attribution_confidence is not None:
             weight.attribution = clamp(attribution_confidence)
@@ -971,6 +1345,8 @@ class UserInteractionModel:
         # already contains it would compare the reply with itself and detect nothing.
         targets = self._target_rewards(reaction)
         self._learn_reply_delay(reaction)
+        self._learn_reply_length(reaction)
+        self._learn_reply_turns(reaction)
         if not self._update(connection, action, context, targets, weight.total, learning_rate):
             # ``_update`` skips a zero-weight observation; the baseline still moved,
             # so it is persisted on its own rather than waiting for the next update.
@@ -1002,11 +1378,16 @@ class UserInteractionModel:
         else:
             positive += 0.12 if reaction.continued_topic else -0.05
             positive += 0.08 if reaction.asked_back else -0.05
-            positive += 0.10 if reaction.reply_length >= 20 else (-0.05 if reaction.reply_length <= 4 else 0.0)
+            # §29: judged against this user's own habit, not a fixed bar. A shorter reply
+            # can only take back bonus already earned - it never becomes negative evidence.
+            positive += self._relative_length_delta(reaction, positive)
             positive += self._relative_delay_delta(reaction, positive)
         targets["positive_probability"] = clamp(positive)
         targets["continue_probability"] = clamp(
-            0.2 + 0.6 * (1.0 if reaction.continued_topic else 0.0) + 0.1 * min(3, reaction.turns) / 3.0
+            0.2
+            + 0.6 * (1.0 if reaction.continued_topic else 0.0)
+            # §29's third clause: relative to this user's own habit, not a bar at 3.
+            + CONVERSATION_TARGET_WEIGHT * self.conversation_bonus(reaction)
         )
         targets["boundary_risk"] = 1.0 if reaction.boundary_touched else 0.0
         return targets
