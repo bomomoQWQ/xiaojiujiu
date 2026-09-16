@@ -229,10 +229,26 @@ class Fleet:
         return [str(item) for item in data if str(item).strip()]
 
     def _write_people(self) -> None:
-        """Persist the current fleet so a container restart comes back the same."""
+        """Persist the current fleet so a container restart comes back the same.
+
+        A failure here must never take the supervisor down: the fleet is already
+        running in memory, and losing the bookkeeping write is strictly better than
+        losing ten Runtimes. Measured once: the mounted people-file directory was
+        owned by the host user while the container runs as uid 10001, and the
+        PermissionError killed the supervisor on its first start.
+        """
         self.people_file.parent.mkdir(parents=True, exist_ok=True)
         payload = [item.session for item in self._ordered()]
-        self.people_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            self.people_file.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as error:
+            say(
+                f"WARNING could not persist the people file ({error}); the fleet keeps "
+                "running but a container restart would lose the provisioned members",
+            )
 
     def _ordered(self) -> list[RuntimeProcess]:
         """Return the people ordered by port, so port allocation is stable."""
