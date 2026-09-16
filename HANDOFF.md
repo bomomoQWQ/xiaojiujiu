@@ -498,6 +498,67 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
   要根治应让 harness 自己驱动回合（而不是靠真实定时器），或把断言从"必须回到 active"
   放宽成"这一轮确实以用户那句话为线索"。
 
+### 主动消息（内源主动联系）：**已全程跑通**（本节点实测，含一次我自己的误判）
+
+链路：`hazard 触发 → proactive_committed → outbox(render) → 插件租约 → 用本会话模型 render
+→ Runtime authorize → send → delivered`。
+
+实测证据（测试栈，1v1 会话 `default:FriendMessage:20001`）：
+- `POST /endogenous {"now": +2h}` → `{"acted": true, "reason": "hazard_triggered"}`；
+- `action_attempts.state=committed`、`proactive_committed` 落 raw_events、outbox 出现 `render` 行动
+  （`intent=询问等待检查结果`、`constraints=[避免造成催促感, 不要连续追问]`）；
+- 另一个会话先说话时，Runtime 判定 `reconcile:rerender / reason=user_spoke_first`
+  （"用户先开口了，原措辞需要重写"）→ **没有把旧措辞发出去**，`committed != sent` 在真实链路上成立；
+- 最终 `outbox: {"stats":{"delivered":2}, status="delivered"}`，聊天里出现那条**没人触发**的消息：
+  "体检结果出来了吗？不着急，有消息了跟我说一声就行。" —— 与 intent/constraints 完全吻合，且发给
+  正确会话（当时正在说话的是另一个 user）。
+
+**⚠️ 我在这条上误判过一次，教训写在这里**：我把 `available_at` 改到 19:40 后，**19:41 就直读数据库**，
+看到 `attempts=0` 就断言"主动消息根本落不了地"，还把正常的 `dispatch: false / attempt_in_flight`
+当成死结。真相是投递要走"租约 → 渲染（要调一次 LLM，几十秒）→ 授权 → 发送"四步。
+两条方法论：**多步异步链路的观察窗口至少 1–2 分钟**；**直读 DB 的瞬时快照只能证伪"已发生"，
+不能证明"不会发生"**。
+
+### 待做：按会话路由到不同 Runtime（已勘察，未开工；异地接手可直接执行）
+
+**为什么需要**：`memories` / `memory_candidates` 表**没有 `conversation_id` 列**（列是
+`memory_id/kind/summary/structured_json/topics_json/importance/confidence/status/source_event_ids/created_at/updated_at/archived_at`），
+`list_memories` / `_retrievable` 也不按会话过滤 → **长期记忆是全局一份**。实测两人各自私聊时
+事件与投递路由是分开的（`default:FriendMessage:20001` 19 条 / `...20002` 5 条），主动消息也投给了
+正确的会话，但记忆池共享。封测形态是"好几个人各自和它 1v1"，所以要么一人一个 Runtime，要么记忆必串。
+
+**选定方案：插件按会话选 Runtime（不动 Runtime 认知层）**。理由：认知层加会话作用域要改 schema +
+检索过滤，动静大且碰语义；路由只加一层寻址。
+
+**已经勘察好的接口事实（省去重新摸索）**：
+- 事件上报：`main.py::on_message_observed` → `_enqueue_event(record)` → `self._queue.put({...})` →
+  `_deliver(item)` 用 `self._transport.post_events(...)`；**队列 payload 里加 `target` 即可让单队列多目标**
+  （`BoundedRetryQueue` 的 sender 是 `self._deliver`，`item.payload` 是自由字典）。
+- 注入：`on_llm_request` → `_inject_context` → `self._bridge`；`ContextBridge` 的缓存**本来就按 session 键**
+  （`_cache` + `context_cache_max_sessions`），所以每个目标一个 bridge 实例即可，缓存语义不变。
+- 主动消息：`OutboxConsumer.run()` 用 `self._transport` 租约 → **这是唯一真正的扇出点**：
+  需要每个目标一个 consumer（或一个 consumer 轮询全部目标），租约请求里的 `adapter_id` 保持不变。
+- 会话取值：`event.unified_msg_origin`（与 raw_events 的 `conversation_id` 一致，如
+  `default:FriendMessage:20001`）。
+- 目标取值：新增 `Settings.session_routes: dict[str, str]`（配置里一张 JSON 表，键为 session 或
+  session 前缀，值为 `http://runtime-b:8787`），未命中回落 `runtime_base_url`。
+  **不要**只加配置项不接线——那正是本项目反复清掉的"声明了却没有读者"。
+- `_status_text()`（`/companion_runtime` 指令）要按目标分行报 queue/bridge/outbox 统计，
+  否则多实例下状态不可读。
+
+**验收（必须可证伪）**：
+1. 离线：两个 `FakeTransport` 目标 + 两个 session，断言"事件落到各自的 transport、注入读的是各自的
+   bridge 缓存、outbox 只租约自己那台的行动"；再加一条"未配置路由时全部回落默认目标"（保护单实例部署
+   的既有行为）。
+2. 变异：把 `target_for()` 改成恒返回默认值 → 上面第一条必须变红。
+3. 真机：在 `astrbot_test` compose 里再加一个 `runtime-b`（同镜像、另一个卷、`CR_CONVERSATION_ID` 不同），
+   两个 user_id 各聊一轮，**各自 `/memories` 里只应看到自己的事**，且 `assistant_message` 两台的
+   raw_events 各自 1:1。
+
+**当前状态（本轮结束时）**：插件仓停在 `3861678`（干净、148 passed + 13 subtests），Runtime 仓 `c0e6687`，
+测试栈可用且**主动消息已全程跑通**（见下），**没有半成品改动**。
+
+
 ### 已修并验证（本节点）
 
 **#2 记忆种类由子串决定** —— `runtime/src/companion_runtime/memory.py`

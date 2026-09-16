@@ -56,6 +56,12 @@ def main() -> int:
     parser.add_argument("text", nargs="*", help="messages to send, in order")
     parser.add_argument("--url", default=DEFAULT_URL, help=f"frontend root (default: {DEFAULT_URL})")
     parser.add_argument(
+        "--user-id",
+        default=None,
+        help="send as this OneBot user id (the frontend fixes one at start-up; "
+        "passing another simulates a second person)",
+    )
+    parser.add_argument(
         "--gap",
         type=float,
         default=20.0,
@@ -70,8 +76,11 @@ def main() -> int:
         return 0
 
     for index, text in enumerate(args.text):
+        payload: dict[str, object] = {"text": text}
+        if args.user_id is not None:
+            payload["user_id"] = str(args.user_id)
         try:
-            response = _post(f"{args.url}/send", {"text": text}, args.timeout)
+            response = _post(f"{args.url}/send", payload, args.timeout)
         except urllib.error.URLError as error:
             print(f"send failed: {error}")
             return 1
