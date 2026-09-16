@@ -75,6 +75,12 @@ class RuntimeProcess:
         self.log_path = log_dir / f"{self.slug}.log"
         self.env = dict(env)
         self.env["CR_CONVERSATION_ID"] = session
+        # The image sets *absolute* CR_STORAGE__* paths (``/data/companion.sqlite3``),
+        # and those are inherited by every child -- which would put all ten people in
+        # one database, the exact blending the fleet exists to prevent. Measured:
+        # every child wrote to the same file until this was overridden per person.
+        self.env["CR_STORAGE__DATABASE_PATH"] = str(self.base_dir / "companion.sqlite3")
+        self.env["CR_STORAGE__RAW_LOG_PATH"] = str(self.base_dir / "raw_events.jsonl")
         self.process: subprocess.Popen[bytes] | None = None
         self.restarts = 0
         self.started_at: float | None = None
