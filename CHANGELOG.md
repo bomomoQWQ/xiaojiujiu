@@ -46,10 +46,17 @@
   基线不可信时**不表态**（长度没有可当先验的绝对参考值），负向只能抵消已得加分。
   冷启动曲线与旧公式逐值相同，**既有数据库判定不变**。
   验收 `tests/test_reply_length_baseline.py` 12 条 + 8 个变异。
-- **C 情绪时宜性按 type 硬编码（`repair` 1.000 vs `apology` 0.440）仍待修**：
-  它的集合本身需要一次设计确认，见报告 §4。
+- **C 情绪时宜性按 type 硬编码（§7，`545ddc8`）。**
+  同一个意图 `repair` 1.000 / `apology` 0.440，差 2.3 倍，而这个数直接进候选效用（§45）——
+  "该不该道歉"居然取决于 provider 拼的是哪个词。现在按**行为类**两张表判
+  （`MOOD_MATCH_NEGATIVE_CLASSES` / `MOOD_MATCH_POSITIVE_CLASSES`，`proactive_contact`
+  在两张里都有，这是旧清单并集的如实翻译）；**未知 type 拿通用值、不加成**——与 B 的
+  失败关闭方向相反，是刻意的（B 是硬约束，C 是分寸）。同族的 `protocol.py:346` 改为复用
+  `QUESTION_TYPES`（旧清单漏了 `question`）。验收 `tests/test_mood_matching_by_class.py`
+  7 条 + 4 个变异。
 
-全仓变异数 31 → **43，全部 KILLED**；全量 1096 → **1111 passed**；四套仿真全绿。
+**审计报告里的三条缺陷至此全部修完。** 全仓变异数 31 → **47，全部 KILLED**；
+全量 1096 → **1123 passed**；四套仿真全绿（77 / 335 / 25 / 105）。
 
 ### 主业务逻辑审计（诊断）
 

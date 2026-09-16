@@ -88,7 +88,7 @@ Runtime 完全靠确定性代码工作；可选的远端语义 provider 的 key 
 
 ```bash
 # 1. Runtime 离线测试
-cd runtime && .venv/bin/python -m pytest              # 期望 1111 passed
+cd runtime && .venv/bin/python -m pytest              # 期望 1123 passed
 
 # 2. 插件离线测试（在插件仓库里）
 cd ../astrbot_plugin_companion_runtime
@@ -151,7 +151,7 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 
 | 项目 | 结果 |
 |---|---|
-| Runtime 离线测试 | **1111 passed / 17 skipped**（无 DSN；PG 专项恒跳过） |
+| Runtime 离线测试 | **1123 passed / 17 skipped**（无 DSN；PG 专项恒跳过） |
 | 插件离线测试 | 143 passed + 13 subtests |
 | 高仿真故障恢复 | 335/335 |
 | 用户黑盒仿真 | **77 / 77**（退出码 0，连跑多次一致） |
@@ -197,8 +197,7 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 ### ⚠️ 主业务逻辑三个缺陷（2026-09-16）
 
 报告：**`runtime/docs/BUSINESS_LOGIC_AUDIT.md`**（含实测数字与每条的验收方式）。
-**B 与 A 已修，C 待修**。要动 C 先读报告 §4——它的**集合本身**需要一次设计确认，
-不是机械替换。三条的性质不同：
+**A / B / C 三条全部已修**（`29f2328` / `94549a5` / `545ddc8`）。三条各自的性质：
 
 1. ~~**回复长度用绝对阈值 `<= 4` / `>= 20`**~~ —— **已修（`29f2328`）**。
    照抄 `reply_delay_baseline` 加了 `reply_length_baseline` 与 `reply_turns_baseline`
@@ -220,11 +219,17 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
    `apology`/`emotional_expression`/`question` 不会。违反 §52/§86.5「边界是硬约束」。
    默认配置下不可达（规则生成器不产出这三个），一开 v0.2 的 `remote_api` 就生效。
    **最该先修**：它是安全约束。
-3. **情绪时宜性按 type 硬编码**（`runtime.py:2614` `:2616`，同族还有 `protocol.py:346`）。
-   同一个意图 `repair` 1.000 / `apology` 0.440，差 2.3 倍，而它直接进候选效用。
+3. ~~**情绪时宜性按 type 硬编码**~~ —— **已修（`545ddc8`）**。
+   改为按行为类两张表（`MOOD_MATCH_NEGATIVE_CLASSES` / `MOOD_MATCH_POSITIVE_CLASSES`）；
+   **未知 type 拿通用值、不加成**——与 B 的失败关闭方向相反，是刻意的（B 是硬约束，
+   C 是分寸）。`protocol.py:346` 改为复用 `QUESTION_TYPES`（旧清单漏了 `question`）。
+   验收 `tests/test_mood_matching_by_class.py` 7 条 + 4 个变异。
+   原始描述留档：同一个意图 `repair` 1.000 / `apology` 0.440，差 2.3 倍，直接进候选效用。
 
 共同根因：`TYPE_TO_BEHAVIOUR` 是唯一权威的类型→行为类映射，但**四处各自硬编码了 type 集合**
-且互相矛盾（清单在报告 §5）。所以修法不是各处改一行，而是先定义这一维度的权威语义。
+且互相矛盾（清单在报告 §5）。三条的修法都是把消费方收敛到那个权威映射，而不是各处改一行。
+剩下的一条（报告 §5 的第 4 项）是让"意图类型"这一维度本身有单一的权威语义，
+下次加 type 时才不会再犯——那需要一次设计决定，**尚未做**。
 **这三条现有测试一条都查不出来**（当时的 1096 + 四套仿真全绿），因为没有任何检查要求
 "同义词必须等价"或"跨用户可比"。修复的顺序就是先补这类等价性检查、再动实现——
 两个已修项各自的第一条测试都是等价性断言，而不是把某个数字钉死。
