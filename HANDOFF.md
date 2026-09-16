@@ -203,7 +203,9 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
    照抄 `reply_delay_baseline` 加了 `reply_length_baseline` 与 `reply_turns_baseline`
    两条基线（后者只要均值：这一项是比值不是 z 分数）；两处绝对阈值替换；
    负向只能抵消已得加分，不再把真实回复判成负面证据；冷启动曲线与旧公式**逐值相同**，
-   所以既有数据库判定不变。验收 `tests/test_reply_length_baseline.py` 12 条 + 8 个变异。
+   所以既有数据库判定不变。验收 `tests/test_reply_length_baseline.py` **13 条 + 9 个变异**
+   （第 13 条与第 9 个变异来自 `019ee8a`：清点工具发现我写了两个基线视图却没接进
+   `numeric_view`，成了新的死代码——见下"这一轮的工具反过来抓到了我"）。
    原始描述留档：`user_model.py:381` `:1005`，`turns` 在 `:1009`。
    违反设计 §29「回复速度、回复长度、对话持续长度都应相对用户自己的历史基线」。
    **唯一在默认配置下就发生**的一条：话少但行为一致的用户，证据权重被压低 2.5 倍
@@ -228,14 +230,72 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 
 共同根因：`TYPE_TO_BEHAVIOUR` 是唯一权威的类型→行为类映射，但**四处各自硬编码了 type 集合**
 且互相矛盾（清单在报告 §5）。三条的修法都是把消费方收敛到那个权威映射，而不是各处改一行。
-剩下的一条（报告 §5 的第 4 项）是让"意图类型"这一维度本身有单一的权威语义，
-下次加 type 时才不会再犯——那需要一次设计决定，**尚未做**。
 **这三条现有测试一条都查不出来**（当时的 1096 + 四套仿真全绿），因为没有任何检查要求
 "同义词必须等价"或"跨用户可比"。修复的顺序就是先补这类等价性检查、再动实现——
-两个已修项各自的第一条测试都是等价性断言，而不是把某个数字钉死。
+已修的各项，第一条测试都是等价性断言，而不是把某个数字钉死。
+
+#### 接手从这里接：两件**需要人拍板**的事（都不是"还没写代码"）
+
+**① 给"意图类型"这一维度定义单一权威语义（报告 §5 第 4 项）。**
+现在"行为类"有了单一来源（`TYPE_TO_BEHAVIOUR`），但**另外三件事仍是各消费方自己判断的**：
+
+| 这一维度 | 现在谁在定义 | 后果 |
+|---|---|---|
+| 主动 / 被动 | `candidate.NON_PROACTIVE_BEHAVIOUR_CLASSES`（B 新加的，从行为类推） | 已是单一来源 |
+| 情绪方向（合时宜性） | `user_model.MOOD_MATCH_{NEGATIVE,POSITIVE}_CLASSES`（C 新加的） | 已是单一来源，但**表在 user_model 里、语义属于情绪** |
+| 是否追问 | `user_model.QUESTION_TYPES` + `protocol` 复用 | 已是单一来源 |
+| **加一个新 type 时要改几处** | 4 处（行为类 + 上面的三项按需） | 仍然靠人记得 |
+
+要拍板的是：**要不要把这三件事变成类型词表里的显式字段**（例如
+`TYPE_BEHAVIOUR = {"apology": {"class": "repair", "proactive": True, "mood": "-"}}`），
+让"加一个 type"只需改一行、且漏改会当场报错。
+倾向是要（那样它就只有一处来源），但这会**改变 `TYPE_TO_BEHAVIOUR` 的形状**、
+动到 4 个模块的读取方式，属于一次小重构，不是补丁。**没做，等决定。**
+
+**② 两处既有测试的期望值被我改过，需要确认可接受。**
+B/A 修好之后有两条既有断言必须动，我改的是数字，但这属于"改别人的断言"，应当由你裁定：
+
+| 测试 | 改动 | 我的理由 |
+|---|---|---|
+| `test_action_encoding_parity.py` 的 `CANONICAL_ACTION_FEATURES` | `apology`/`question`/`emotional_expression` 的 `proactive`：0 → 1 | 那张表编码的是**旧分类**（B 修的就是它）。同文件真正防回归的"预测侧 == 观察侧"断言未受影响 |
+| `test_user_model_time.py::test_a_relative_slow_reply_is_weaker_evidence_not_negative_evidence` | `0.70` → `0.60` | 它的注释算术含一个已删除的绝对加成（`回复 >= 20 字` +0.10），而 fixture 每次都写 30 字——按 §29，30 字**就是**该用户的常态。要守的性质（延迟项只抵消加分、不翻转符号）没变 |
+
+**若你判定这算削弱既有测试**，替代做法是把原始断言改成针对旧行为的 `xfail(strict=True)`
+并在注释里写明"旧行为已被 §29/B 取代"，而不是直接改数字——**告诉我一声我就改过去。**
+
+#### 怎么复核这一节（四条命令，都能独立回答"修了没有"）
+
+```bash
+cd /home/bomomo/理解痞老板/xiaojiujiu
+# 1) 现象：三个探针打印改前/改后对照，恒退出 0，不断言
+runtime/.venv/bin/python scripts/business_logic_probes.py
+
+# 2) 验收：三组各自的可证伪断言（8 + 13 + 7 条）
+cd runtime && ./.venv/bin/python -m pytest tests/test_boundary_synonyms.py \
+    tests/test_reply_length_baseline.py tests/test_mood_matching_by_class.py
+
+# 3) 变异：把 bug 放回去，看测试是否变红（全仓 48 个，全部应 KILLED）
+cd .. && runtime/.venv/bin/python scripts/mutation_design_conformance.py
+runtime/.venv/bin/python scripts/mutation_design_conformance.py boundary_synonyms  # 只跑一组
+
+# 4) 清点：改完 A 之后这里必须仍是 0，否则就是我刚犯过的那个错（新增死代码）
+runtime/.venv/bin/python scripts/dead_code_inventory.py
+```
+
+变异框架的分组名，按修的顺序：
+`encoding`(①) `priors`(⑤) `declared_unused`(⑦) `redelivery`(崩溃窗口)
+`chat_history`(③-1) `boundary_synonyms`(B) `reply_length`(A) `mood_classes`(C)。
+
+**这一轮的工具反过来抓到了我**：修完 A 之后跑第 4 条命令，A 段从 0 变成 2——
+我写了 `reply_length_baseline_view` / `reply_turns_baseline_view` 却没接进 `numeric_view`，
+造出了新的死代码（正是 ⑦ 刚清掉的那一类）。`019ee8a` 修掉并补了一条测试 + 一个变异。
+**结论：这三条检查（探针 / 验收 / 变异 / 清点）不是仪式，改完主业务逻辑后必须全跑一遍。**
 
 ### 接下来值得做的
 
+0. **需要人拍板的两件**（详见上面"接手从这里接"）：① 要不要把"行为类 / 主动被动 /
+   情绪方向 / 是否追问"合并成类型词表的显式字段（防止下次加 type 漏改）；
+   ② 确认 B/A 修复时改动的那两处既有测试期望值可接受。**这两件不解决，下面的都可以先不做。**
 1. ~~`committed != sent` 与"平台已发出 / 结果已上报"之间的崩溃窗口~~
    **已做（部分）**：Runtime 侧能做的部分做完了 —— 见下"崩溃窗口"一节。
    剩下的是 host 侧选择（至多一次需要落盘的"已发出"表），以及两个**有意留着**的判断。
