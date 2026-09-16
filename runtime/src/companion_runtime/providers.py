@@ -101,10 +101,24 @@ DEEP_REFRESH_SYSTEM_PROMPT = (
     "candidate_intent_operations, memory_suggestions, unfinished_matter_suggestions, "
     "user_model_evidence_suggestions。"
     "前五个中除 psychological_interpretation 是对象外，其余都是数组。"
-    "样例：{\"reinterpretations\": [{\"event_id\": \"evt_1\", \"reinterpretation\": \"……\"}], "
-    "\"psychological_interpretation\": {\"summary\": \"……\"}, "
-    "\"candidate_intent_operations\": [], \"memory_suggestions\": [], "
-    "\"unfinished_matter_suggestions\": [], \"user_model_evidence_suggestions\": []}"
+    # The shape has to be spelled out, item keys included. Naming only the six
+    # top-level fields is not enough: measured against a real backlog the model
+    # answered with `event_id` where the grounding step requires `sources`, and every
+    # reinterpretation was then discarded as `missing_sources` - the refresh ran,
+    # applied nothing, and settled no event. `sources` is what ties a suggestion to
+    # real events, so an item without it cannot be applied at all.
+    "每个条目必须带 sources 数组，元素取自输入 unresolved_events 里的 event_id，"
+    "不得编造 id。格式样例："
+    "{\"reinterpretations\": [{\"sources\": [\"evt_x\"], \"content\": \"当时那句话的意思\", "
+    "\"confidence\": 0.6}], "
+    "\"psychological_interpretation\": {\"summary\": \"当前心理状态\"}, "
+    "\"candidate_intent_operations\": [{\"sources\": [\"evt_x\"], \"operation\": \"add\", "
+    "\"intent\": \"想做的事\", \"confidence\": 0.5}], "
+    "\"memory_suggestions\": [{\"sources\": [\"evt_x\"], \"summary\": \"值得长期记住的事\", "
+    "\"kind\": \"episodic\", \"importance\": 0.6}], "
+    "\"unfinished_matter_suggestions\": [{\"sources\": [\"evt_x\"], \"title\": \"还没了结的事\"}], "
+    "\"user_model_evidence_suggestions\": [{\"sources\": [\"evt_x\"], \"trait\": \"推断出的特征\", "
+    "\"weight\": 0.3}]}"
     "你只提供建议，不决定任何状态变更，不生成台词，不创造输入中不存在的事件；"
     # The guardrail here has to be phrased as "do not invent", never as "stay silent
     # when unsure". The earlier wording ("return empty arrays when the evidence is

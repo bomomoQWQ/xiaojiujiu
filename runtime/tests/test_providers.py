@@ -592,6 +592,29 @@ class TestRemoteAPIProvider:
         assert "JSON" in DEEP_REFRESH_SYSTEM_PROMPT
         assert '"reinterpretations"' in DEEP_REFRESH_SYSTEM_PROMPT
 
+    def test_the_prompt_spells_out_the_item_keys_grounding_demands(self) -> None:
+        """The example must show ``sources`` on every suggestion kind.
+
+        Naming only the six top-level fields is not enough: measured against a real
+        backlog the model put the event id under ``event_id``, grounding rejected
+        every reading as ``missing_sources``, and a refresh that "ran: true" settled
+        nothing. ``sources`` is the field that ties a suggestion to real events.
+        """
+        from companion_runtime.providers import DEEP_REFRESH_SYSTEM_PROMPT
+
+        example = DEEP_REFRESH_SYSTEM_PROMPT.split("格式样例：", 1)[1]
+        for field in (
+            "reinterpretations",
+            "candidate_intent_operations",
+            "memory_suggestions",
+            "unfinished_matter_suggestions",
+            "user_model_evidence_suggestions",
+        ):
+            assert field in example, field
+        # One `sources` per kind in the example, plus the instruction itself.
+        assert example.count('"sources"') == 5
+        assert "不得编造 id" in DEEP_REFRESH_SYSTEM_PROMPT
+
     def test_bearer_token_is_sent_but_never_stored_in_headers_dict(self) -> None:
         transport = FakeTransport(lambda *_: _reply(GOOD_SUGGESTIONS))
         provider = RemoteAPIProvider(
