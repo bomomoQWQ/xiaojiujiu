@@ -34,6 +34,7 @@ import argparse
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -61,6 +62,16 @@ def slugify(session: str) -> str:
     """Turn a session into a filesystem- and DNS-safe name."""
     cleaned = "".join(char if char.isalnum() else "-" for char in session)
     return cleaned.strip("-").lower()[-40:] or "person"
+
+
+def _port_is_free(port: int) -> bool:
+    """Return whether ``port`` can still be bound inside this container."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("0.0.0.0", port))
+        except OSError:
+            return False
+    return True
 
 
 class RuntimeProcess:
@@ -261,10 +272,17 @@ class Fleet:
         return sorted(self.people.values(), key=lambda item: item.port)
 
     def _next_port(self) -> int:
-        """Return the lowest free port in the fleet's range."""
+        """Return the lowest free port for a person's Runtime.
+
+        Two things this must never hand out: the control surface's own port
+        (measured: the fourteenth person was given 8800, so their Runtime could not
+        bind and their messages went to the control handler), and any port already
+        bound inside the container -- a Runtime being re-provisioned still holds its
+        old port for a moment.
+        """
         used = {item.port for item in self.people.values()}
         port = self.base_port
-        while port in used:
+        while port in used or port == self.control_port or not _port_is_free(port):
             port += 1
         return port
 
