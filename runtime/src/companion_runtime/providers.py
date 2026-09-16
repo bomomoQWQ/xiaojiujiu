@@ -101,14 +101,31 @@ DEEP_REFRESH_SYSTEM_PROMPT = (
     "candidate_intent_operations, memory_suggestions, unfinished_matter_suggestions, "
     "user_model_evidence_suggestions。"
     "前五个中除 psychological_interpretation 是对象外，其余都是数组。"
+    "样例：{\"reinterpretations\": [{\"event_id\": \"evt_1\", \"reinterpretation\": \"……\"}], "
+    "\"psychological_interpretation\": {\"summary\": \"……\"}, "
+    "\"candidate_intent_operations\": [], \"memory_suggestions\": [], "
+    "\"unfinished_matter_suggestions\": [], \"user_model_evidence_suggestions\": []}"
     "你只提供建议，不决定任何状态变更，不生成台词，不创造输入中不存在的事件；"
-    "证据不足时返回空数组或空对象，不要猜测。"
+    # The guardrail here has to be phrased as "do not invent", never as "stay silent
+    # when unsure". The earlier wording ("return empty arrays when the evidence is
+    # insufficient, do not guess") read as "if the intent is not explicit, say
+    # nothing": measured against a real 10KB backlog, the model answered with 57
+    # tokens of six empty collections, every time, while every rewriting that names
+    # fabrication instead produced ~1000 tokens of usable suggestions. The whole
+    # deferred-interpretation path depends on this call coming back with something,
+    # because an event that is never reinterpreted is never settled and therefore
+    # never becomes an emotion event.
+    "不要编造输入中没有的事件、会话或时间戳。"
 )
 
 EXPLAIN_STATE_SYSTEM_PROMPT = (
     "你是长期陪伴角色的情绪解释器：把已有的结构化心理状态翻译成第一人称心理语言。"
     "只输出一个 JSON 对象，字段固定为 experience, focus, conflict, impulse, inhibition, expression。"
     "每个字段一句话，20 到 40 字，不出现数字，不生成台词，不创造输入中不存在的事件。"
+    # The JSON Output mode requires the word "json" plus a shape example in the
+    # prompt; this is that example.
+    "样例：{\"experience\": \"……\", \"focus\": \"……\", \"conflict\": \"……\", "
+    "\"impulse\": \"……\", \"inhibition\": \"……\", \"expression\": \"……\"}"
 )
 
 
@@ -443,6 +460,7 @@ class _OpenAICompatibleProvider:
         deep_timeout_s: float | None = None,
         max_tokens: int = 1024,
         temperature: float = 0.0,
+        json_mode: bool = True,
         headers: Mapping[str, str] | None = None,
         transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]]
         | None = None,
@@ -455,6 +473,11 @@ class _OpenAICompatibleProvider:
         self.timeout_s = float(timeout_s)
         self.deep_timeout_s = float(deep_timeout_s if deep_timeout_s is not None else timeout_s)
         self.max_tokens = int(max_tokens)
+        #: Ask the endpoint to emit a JSON object (``response_format``). Both
+        #: structured callers here parse JSON out of the reply, so the constraint
+        #: only removes a failure mode; it is toggleable because not every
+        #: OpenAI-compatible gateway accepts an unknown body key.
+        self.json_mode = bool(json_mode)
         self.temperature = float(temperature)
         self.headers: dict[str, str] = dict(headers or {})
         self._transport = transport or self._http_transport
@@ -533,6 +556,7 @@ class _OpenAICompatibleProvider:
         timeout: float,
         grammar: str | None = None,
         extra_body: Mapping[str, Any] | None = None,
+        json_mode: bool = False,
     ) -> str:
         """Send one chat completion request and return the assistant text.
 
@@ -542,6 +566,10 @@ class _OpenAICompatibleProvider:
             timeout: Hard deadline in seconds.
             grammar: Optional inline GBNF grammar for constrained decoding.
             extra_body: Extra request-body fields, e.g. ``chat_template_kwargs``.
+            json_mode: Ask the endpoint for a JSON object (``response_format``).
+                Both callers here want a JSON object, but only when the endpoint is
+                known to implement the field - a gateway that rejects unknown body
+                keys would fail every call.
 
         Returns:
             The assistant text.
@@ -561,6 +589,8 @@ class _OpenAICompatibleProvider:
         }
         if grammar:
             body["grammar"] = grammar
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
         if extra_body:
             body.update(dict(extra_body))
         response = self._transport(
@@ -610,6 +640,7 @@ class _OpenAICompatibleProvider:
                 timeout=deadline,
                 grammar=self._grammar_for("deep_refresh"),
                 extra_body=self._extra_body(),
+                json_mode=self.json_mode,
             )
             suggestions = parse_deep_refresh(
                 self._parse_raw_json(raw), provider=self.name, latency_ms=_ms(started)
@@ -676,6 +707,7 @@ class _OpenAICompatibleProvider:
                 timeout=self.timeout_s,
                 grammar=self._grammar_for("explanation"),
                 extra_body=self._extra_body(),
+                json_mode=self.json_mode,
             )
             explanation = parse_explanation(self._parse_raw_json(raw))
         except Exception as exc:  # noqa: BLE001 - any failure means degradation
@@ -797,6 +829,8 @@ class RemoteAPIProvider(_OpenAICompatibleProvider):
         max_tokens: Completion cap.
         temperature: Sampling temperature.
         grammar: Inline GBNF grammar, only meaningful for self-hosted gateways.
+        json_mode: Ask for a JSON object via ``response_format``. On for every
+            structured call; ``CR_SEMANTIC_JSON_MODE=0`` disables it.
         headers: Extra request headers.
         transport: Injectable transport used by tests.
         cache_ttl_s: TTL of the provider's own explanation cache. Callers pass the
@@ -816,6 +850,7 @@ class RemoteAPIProvider(_OpenAICompatibleProvider):
         max_tokens: int = 1024,
         temperature: float = 0.0,
         grammar: str | None = None,
+        json_mode: bool = True,
         headers: Mapping[str, str] | None = None,
         transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]]
         | None = None,
@@ -834,6 +869,7 @@ class RemoteAPIProvider(_OpenAICompatibleProvider):
             deep_timeout_s=deep_timeout_s,
             max_tokens=max_tokens,
             temperature=temperature,
+            json_mode=json_mode,
             headers=headers,
             transport=transport,
             cache_ttl_s=cache_ttl_s,
@@ -928,6 +964,11 @@ def _build_remote(
         env=env,
         timeout_s=_first_float(env.get("CR_SEMANTIC_TIMEOUT_S")) or 30.0,
         max_tokens=int(_first_float(env.get("CR_SEMANTIC_MAX_TOKENS")) or 1024),
+        # JSON Output: the endpoint is asked for a JSON object, so a reply cannot
+        # come back as prose that has to be scavenged for braces. Default on (both
+        # callers here are structured); `CR_SEMANTIC_JSON_MODE=0` turns it off for a
+        # gateway that rejects the field.
+        json_mode=_bool_setting(_first_str(env.get("CR_SEMANTIC_JSON_MODE")), default=True),
         # The provider's own explanation cache is paced by the same number the
         # Runtime uses, so the two caches cannot disagree about staleness.
         cache_ttl_s=_first_float(_read_semantic(config, "interpretation_max_age_seconds"))
@@ -1057,6 +1098,25 @@ def _first_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError, AttributeError):
         return None
+
+
+def _bool_setting(value: Any, *, default: bool) -> bool:
+    """Read one boolean setting, keeping ``default`` when the text says nothing.
+
+    Environment values arrive as text, and the two ways an operator turns a switch
+    off - ``0`` and ``false`` - both have to work, so the recognised spellings are
+    listed rather than left to ``bool(value)`` (where the string ``"0"`` is truthy
+    and the switch could never be turned off).
+    """
+    if not isinstance(value, str) or not value.strip():
+        return default
+    text = value.strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    LOGGER.warning("Unrecognised boolean setting %r; keeping %s", value, default)
+    return default
 
 
 def _first_message_text(response: Any) -> str:

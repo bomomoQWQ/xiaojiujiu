@@ -513,6 +513,85 @@ class TestRemoteAPIProvider:
         provider.deep_refresh(DeepRefreshRequest())
         assert transport.calls[0]["body"]["grammar"] == "root ::= object"
 
+    def test_json_mode_asks_for_a_json_object(self) -> None:
+        """Both structured calls must carry the JSON Output request field.
+
+        The field is what keeps a reply from arriving as prose that has to be
+        scavenged for braces - the failure that made a real deep refresh look like
+        six empty collections rather than a broken reply.
+        """
+        transport = FakeTransport(lambda *_: _reply(GOOD_SUGGESTIONS))
+        provider = RemoteAPIProvider(
+            "https://semantic.example.com/v1", model="strong-model", api_key=SECRET,
+            transport=transport,
+        )
+        provider.deep_refresh(DeepRefreshRequest())
+        assert transport.calls[0]["body"]["response_format"] == {"type": "json_object"}
+
+    def test_json_mode_can_be_turned_off_for_a_strict_gateway(self) -> None:
+        """A gateway that rejects unknown body keys must be able to opt out."""
+        transport = FakeTransport(lambda *_: _reply(GOOD_SUGGESTIONS))
+        provider = RemoteAPIProvider(
+            "https://semantic.example.com/v1", model="strong-model", api_key=SECRET,
+            json_mode=False, transport=transport,
+        )
+        provider.deep_refresh(DeepRefreshRequest())
+        assert "response_format" not in transport.calls[0]["body"]
+
+    def test_factory_reads_the_json_mode_switch_from_the_environment(self) -> None:
+        """``CR_SEMANTIC_JSON_MODE=0`` disables the field; the default keeps it on."""
+        off = build_provider(
+            env={
+                "CR_SEMANTIC_PROVIDER": "remote_api",
+                "CR_SEMANTIC_BASE_URL": "https://semantic.example.com/v1",
+                "CR_SEMANTIC_MODEL": "strong-model",
+                "CR_SEMANTIC_API_KEY": SECRET,
+                "CR_SEMANTIC_JSON_MODE": "0",
+            }
+        )
+        on = build_provider(
+            env={
+                "CR_SEMANTIC_PROVIDER": "remote_api",
+                "CR_SEMANTIC_BASE_URL": "https://semantic.example.com/v1",
+                "CR_SEMANTIC_MODEL": "strong-model",
+                "CR_SEMANTIC_API_KEY": SECRET,
+            }
+        )
+        assert isinstance(off, RemoteAPIProvider) and off.json_mode is False
+        assert isinstance(on, RemoteAPIProvider) and on.json_mode is True
+
+    def test_empty_but_valid_json_is_an_empty_answer_not_a_degradation(self) -> None:
+        """``{}`` is a legal, quiet answer: no suggestions and nothing broken.
+
+        Pinned because the two are easy to conflate when reading a report: an
+        all-empty suggestion set with ``degraded=False`` means the model chose to
+        say nothing, which is a prompt question, not a transport failure.
+        """
+        result = _remote(lambda *_: _reply({})).deep_refresh(DeepRefreshRequest())
+        assert result is not None
+        assert result.degraded is False
+        assert result.reason == ""
+        assert result.reinterpretations == []
+        assert result.psychological_interpretation == {}
+
+    def test_the_prompt_forbids_inventing_rather_than_guessing(self) -> None:
+        """The guardrail must read "do not invent", never "stay silent if unsure".
+
+        Measured against a real 10KB backlog: a prompt ending in "return empty
+        arrays when the evidence is insufficient, do not guess" produced 57 tokens
+        of six empty collections every single time, while every phrasing that names
+        fabrication instead produced roughly a thousand tokens of usable
+        suggestions. An event that is never reinterpreted is never settled, so that
+        sentence switched off the whole deferred-interpretation path.
+        """
+        from companion_runtime.providers import DEEP_REFRESH_SYSTEM_PROMPT
+
+        assert "不要编造" in DEEP_REFRESH_SYSTEM_PROMPT
+        assert "证据不足" not in DEEP_REFRESH_SYSTEM_PROMPT
+        # JSON Output also requires the word "json" plus a shape example in-prompt.
+        assert "JSON" in DEEP_REFRESH_SYSTEM_PROMPT
+        assert '"reinterpretations"' in DEEP_REFRESH_SYSTEM_PROMPT
+
     def test_bearer_token_is_sent_but_never_stored_in_headers_dict(self) -> None:
         transport = FakeTransport(lambda *_: _reply(GOOD_SUGGESTIONS))
         provider = RemoteAPIProvider(
