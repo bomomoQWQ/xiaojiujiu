@@ -531,7 +531,7 @@ def test_plan_takes_the_earliest_anchor(runtime: Runtime) -> None:
         content="明天下午面试，结束告诉你结果。", timestamp=BASE_TIME
     )
     signals = scheduler_module.collect_signals(runtime=runtime, now=BASE_TIME)
-    planned = scheduler_module.plan(signals, config=runtime.config, rng=random.Random(0))
+    planned = scheduler_module.plan(signals, config=runtime.config)
     assert planned.next_wake_at > BASE_TIME
     assert planned.delay_seconds >= runtime.config.scheduler.min_interval_seconds
     assert planned.delay_seconds <= runtime.config.scheduler.max_interval_seconds
@@ -544,7 +544,7 @@ def test_plan_respects_the_configured_bounds(runtime: Runtime) -> None:
     signals = scheduler_module.collect_signals(
         runtime=runtime, now=BASE_TIME, hazard_wake_at=BASE_TIME + timedelta(days=30)
     )
-    planned = scheduler_module.plan(signals, config=runtime.config, rng=random.Random(0))
+    planned = scheduler_module.plan(signals, config=runtime.config)
     assert planned.delay_seconds <= runtime.config.scheduler.max_interval_seconds
 
 
@@ -597,7 +597,7 @@ def test_summary_payload_is_serialisable(runtime: Runtime) -> None:
     import json
 
     signals = scheduler_module.collect_signals(runtime=runtime, now=BASE_TIME)
-    planned = scheduler_module.plan(signals, config=runtime.config, rng=random.Random(0))
+    planned = scheduler_module.plan(signals, config=runtime.config)
     json.dumps(scheduler_module.next_wake_summary(signals, planned))
 
 

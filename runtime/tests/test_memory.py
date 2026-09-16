@@ -377,7 +377,7 @@ def test_retrieval_prefers_relevant_memories() -> None:
             unfinished_titles=["等待面试结果"],
             now=BASE_TIME,
         )
-        hits = store.retrieve(cue, limit=3, rng=random.Random(0))
+        hits = store.retrieve(cue, limit=3)
         assert hits
         assert hits[0].memory.memory_id == "mem_interview"
         assert hits[0].score >= hits[-1].score
@@ -397,7 +397,6 @@ def test_retrieval_score_has_all_documented_terms() -> None:
         hits = store.retrieve(
             memory_module.RetrievalCue(query_text="面试", now=BASE_TIME),
             limit=1,
-            rng=random.Random(0),
         )
         payload = hits[0].to_dict()
         for key in (
@@ -425,10 +424,10 @@ def test_recent_recall_is_penalised() -> None:
         _seed_memories(projection, db, config)
         store = memory_module.MemoryStore(projection, config)
         cue = memory_module.RetrievalCue(query_text="面试", now=BASE_TIME)
-        first = store.retrieve(cue, limit=3, rng=random.Random(0))
+        first = store.retrieve(cue, limit=3)
         with db.transaction() as conn:
             store.activate(conn, first[:1], now=BASE_TIME)
-        second = store.retrieve(cue, limit=3, rng=random.Random(0))
+        second = store.retrieve(cue, limit=3)
         by_id = {hit.memory.memory_id: hit for hit in second}
         assert by_id["mem_interview"].recently_recalled_penalty > 0.0
     finally:
@@ -460,7 +459,6 @@ def test_activation_pool_decays_and_is_bounded() -> None:
             hits = store.retrieve(
                 memory_module.RetrievalCue(query_text=text, now=BASE_TIME),
                 limit=3,
-                rng=random.Random(2),
             )
             with db.transaction() as conn:
                 return store.activate(conn, hits, now=BASE_TIME)
@@ -516,7 +514,7 @@ def test_retrieval_without_query_still_recalls() -> None:
             active_emotions=[],
             now=BASE_TIME,
         )
-        hits = store.retrieve(cue, limit=3, rng=random.Random(0))
+        hits = store.retrieve(cue, limit=3)
         assert hits
     finally:
         db.close()

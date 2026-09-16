@@ -1510,7 +1510,7 @@ class Runtime:
                     now=stamp,
                     situation_terms=memory_module.situation_terms(self.projections),
                 )
-                hits = self.memory_store.retrieve(cue, limit=self.config.memory.activation_pool_size, rng=self.rng)
+                hits = self.memory_store.retrieve(cue, limit=self.config.memory.activation_pool_size)
                 touched = self.memory_store.activate(conn, hits, now=stamp)
                 outcome.activated_memory_ids = [item.memory_id for item in touched]
 

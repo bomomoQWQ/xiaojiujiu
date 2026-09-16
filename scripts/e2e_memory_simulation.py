@@ -288,7 +288,6 @@ class Scenario:
         found = self.runtime.memory_store.retrieve(
             memory_module.RetrievalCue(query_text=SMALL_TALK, now=self.now),
             limit=limit,
-            rng=self.runtime.rng,
         )
         return [
             {
@@ -533,7 +532,6 @@ def phase_recall(scenario: Scenario) -> None:
     hits = scenario.runtime.memory_store.retrieve(
         memory_module.RetrievalCue(query_text="我生日是什么时候来着", now=scenario.now),
         limit=3,
-        rng=scenario.runtime.rng,
     )
     V.check(
         "a matching cue finds the faded memory",

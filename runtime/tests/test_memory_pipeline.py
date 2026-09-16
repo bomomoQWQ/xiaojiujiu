@@ -520,8 +520,8 @@ def test_the_working_situation_is_a_recall_cue() -> None:
             situation_terms=["用户最近几天工作量较大"],
             now=BASE_TIME,
         )
-        none_found = store.retrieve(sentence_only, rng=random.Random(0))
-        found = store.retrieve(with_situation, rng=random.Random(0))
+        none_found = store.retrieve(sentence_only)
+        found = store.retrieve(with_situation)
 
         # A sentence that says nothing about work scores on importance and recency
         # alone; the situation is what puts the memory at the top, and the hit says so.
@@ -694,7 +694,7 @@ def test_only_a_real_cue_match_puts_a_memory_into_the_pool() -> None:
                 ),
             )
         cue = memory_module.RetrievalCue(query_text="今天天气不错", now=BASE_TIME)
-        hits = store.retrieve(cue, rng=random.Random(0))
+        hits = store.retrieve(cue)
         unrelated = next(hit for hit in hits if hit.memory.memory_id == "mem_unrelated")
         assert unrelated.matched_tokens == 0, "nothing in the cue mentions where they live"
         with db.transaction() as conn:
@@ -704,7 +704,7 @@ def test_only_a_real_cue_match_puts_a_memory_into_the_pool() -> None:
 
         # One shared bigram in a longer sentence is a coincidence, not a recollection.
         cue = memory_module.RetrievalCue(query_text="他住在哪里呢", now=BASE_TIME)
-        hits = store.retrieve(cue, rng=random.Random(0))
+        hits = store.retrieve(cue)
         unrelated = next(hit for hit in hits if hit.memory.memory_id == "mem_unrelated")
         assert unrelated.matched_tokens == 1 and unrelated.recalled is False
         with db.transaction() as conn:
@@ -713,7 +713,7 @@ def test_only_a_real_cue_match_puts_a_memory_into_the_pool() -> None:
 
         # A real match does put it in.
         cue = memory_module.RetrievalCue(query_text="他现在住在城南吗", now=BASE_TIME)
-        hits = store.retrieve(cue, rng=random.Random(0))
+        hits = store.retrieve(cue)
         with db.transaction() as conn:
             touched = store.activate(conn, hits, now=BASE_TIME)
         assert [item.memory_id for item in touched] == ["mem_unrelated"]
@@ -723,7 +723,7 @@ def test_only_a_real_cue_match_puts_a_memory_into_the_pool() -> None:
         with db.transaction() as conn:
             store.decay_pool(conn, dt_seconds=10_000_000.0)
         short = memory_module.RetrievalCue(query_text="城南", now=BASE_TIME)
-        hits = store.retrieve(short, rng=random.Random(0))
+        hits = store.retrieve(short)
         assert next(hit for hit in hits if hit.memory.memory_id == "mem_unrelated").recalled
         with db.transaction() as conn:
             touched = store.activate(conn, hits, now=BASE_TIME)
@@ -1161,7 +1161,7 @@ def test_a_superseded_memory_is_withdrawn_and_says_why(runtime: Runtime) -> None
     cue = memory_module.RetrievalCue(query_text="咖啡", now=BASE_TIME)
     recalled = [
         hit.memory.memory_id
-        for hit in runtime.memory_store.retrieve(cue, rng=random.Random(0))
+        for hit in runtime.memory_store.retrieve(cue)
     ]
     assert recalled == [new_id], "the replaced fact must not be retrieved"
 
@@ -1299,7 +1299,7 @@ def test_a_faded_memory_leaves_the_working_set_but_a_cue_still_recalls_it() -> N
     try:
         _seed_faded_memory(projection, db)
         assert [
-            hit.memory.memory_id for hit in store.retrieve(cue, rng=random.Random(0))
+            hit.memory.memory_id for hit in store.retrieve(cue)
         ] == ["mem_coffee"]
 
         hours = _hours_to_fade(config, activation=0.5)
@@ -1314,7 +1314,7 @@ def test_a_faded_memory_leaves_the_working_set_but_a_cue_still_recalls_it() -> N
         )
 
         # ... but the cue still finds it, and being recalled reinstates it.
-        hits = store.retrieve(cue, rng=random.Random(0))
+        hits = store.retrieve(cue)
         assert [hit.memory.memory_id for hit in hits] == ["mem_coffee"]
         with db.transaction() as conn:
             store.activate(conn, hits, now=BASE_TIME + timedelta(hours=hours))

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import hashlib
 import math
 import re
 import random
@@ -151,6 +152,40 @@ DEDUPE_CONTAINMENT_RATIO = 0.8
 #: incidental: "用户为这次面试准备了很久" contains the whole topic "面试", and that is
 #: not the same fact as "用户明天要去面试".
 DEDUPE_MIN_SHARED_TOKENS = 2
+
+
+def stable_exploration_offset(memory_id: str, *, span: float) -> float:
+    """Return a memory's exploration offset: stable, spread over ``[0, span)``.
+
+    Retrieval used to add ``uniform(0, random_epsilon)`` per memory on every call, and
+    so did the *selection* path with an unseeded ``random.Random()`` (``context`` calls
+    ``retrieve`` without the Runtime's seeded rng). A cue is a Chinese sentence and the
+    lexical term is CJK bigram overlap, so several memories routinely land within the
+    0.03 band - which made the ranking a coin flip. Measured consequence: a
+    two-and-a-half-month simulation failed its cued-recall check in roughly one run in
+    nine, with the faded memory staying ``low_activation`` while eight others were
+    recalled in the same step.
+
+    The offset keeps its purpose - memories do not all collapse onto one score, and a
+    memory that is behind by less than the band is not permanently ordered by its id -
+    while being a pure function of the memory. The same cue therefore recalls the same
+    memories in every run and in every process, which is what makes a memory system
+    reproducible at all.
+
+    Args:
+        memory_id: The memory's identifier (stable across runs).
+        span: Width of the exploration band, from ``config.memory.random_epsilon``.
+
+    Returns:
+        A deterministic value in ``[0, span)``.
+    """
+    width = float(span)
+    if width <= 0.0:
+        return 0.0
+    digest = hashlib.sha256(memory_id.encode("utf-8")).digest()
+    fraction = int.from_bytes(digest[:8], "big") / float(1 << 64)
+    return fraction * width
+
 
 #: Provenance recorded when the deterministic rule path formed the memory, i.e.
 #: when the summary is the one the rule-based proposal already extracted. It must
@@ -1269,7 +1304,6 @@ class MemoryStore:
         cue: RetrievalCue,
         *,
         limit: int = 8,
-        rng: random.Random | None = None,
         candidates: Sequence[Memory] | None = None,
     ) -> list[RetrievalHit]:
         """Score and rank memories for a retrieval cue.
@@ -1284,13 +1318,11 @@ class MemoryStore:
         Args:
             cue: Retrieval cue.
             limit: Maximum number of hits.
-            rng: Random source for the exploration epsilon.
             candidates: Pre-fetched candidate memories (defaults to the recallable set).
 
         Returns:
             Hits ordered by descending score.
         """
-        source = rng or random.Random()
         pool = list(
             candidates
             if candidates is not None
@@ -1364,7 +1396,9 @@ class MemoryStore:
                 since = max(0.0, (cue.now - previous.last_recalled_at).total_seconds())
                 if since < 3600.0:
                     penalty = self._config.memory.recent_recall_penalty * (1.0 - since / 3600.0)
-            epsilon = source.uniform(0.0, self._config.memory.random_epsilon)
+            epsilon = stable_exploration_offset(
+                memory.memory_id, span=self._config.memory.random_epsilon
+            )
             score = (
                 lexical
                 + situation
