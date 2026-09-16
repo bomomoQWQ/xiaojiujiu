@@ -46,6 +46,19 @@ VALUES = {
     "CR_VALUES__CURIOSITY": "0.70",
 }
 
+#: Beta sampling cadence. A Runtime's own scheduler sleeps up to
+#: ``max_interval_seconds`` (5400 by default) and a user message does *not* wake it,
+#: so a week at the default would hold a handful of verdicts per person -- too thin
+#: to read why the character did or did not act. Lowering the ceiling does not change
+#: what she does: the hazard is integrated between decisions and is frequency
+#: independent by design (two short intervals keep the survival probability of one
+#: long one), so this only buys resolution. 900s = at least 96 verdicts per person
+#: per day, still one or two orders of magnitude below the raw event volume.
+SCHEDULER_ENV = {
+    "CR_SCHEDULER__MIN_INTERVAL_SECONDS": "60",
+    "CR_SCHEDULER__MAX_INTERVAL_SECONDS": "900",
+}
+
 
 def expand(people: str) -> list[str]:
     """Expand ``20001,20003-20010`` into a de-duplicated list of ids."""
@@ -117,6 +130,7 @@ def render(image: str, env: list[str], compose: Path, checkout: Path) -> str:
         "    environment:",
         *env,
         *[f"      {key}: {value}" for key, value in VALUES.items()],
+        *[f"      {key}: {value}" for key, value in SCHEDULER_ENV.items()],
         "    volumes:",
         f"      - {checkout}/scripts:/fleet:ro",
         f"      - {compose.parent}/fleet-data:/fleet-data",
