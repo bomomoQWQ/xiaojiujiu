@@ -91,6 +91,8 @@ def test_scenario_1_explicit_boundary(runtime: Runtime) -> None:
     _outcome, decision = _run_proactive_round(runtime, now=inside)
     assert decision["acted"] is False
     assert decision["reason"] == "blocked_by_boundary"
+    # ``all([])`` is True; without the guard this checks nothing about reporting.
+    assert decision["utilities"], "the block must be reported per candidate"
     assert all(utility["blocked"] for utility in decision["utilities"])
     assert runtime.projections.attempts.count_in_flight() == 0
     assert runtime.projections.outbox.list_items(status=OutboxStatus.PENDING.value) == []
@@ -100,6 +102,7 @@ def test_scenario_1_explicit_boundary(runtime: Runtime) -> None:
         content="在吗，你在做什么", timestamp=inside + timedelta(minutes=5)
     )
     stored = runtime.projections.boundaries.list_all()
+    assert stored, "the boundary the user declared must still be on record"
     assert all(boundary.allow_reply for boundary in stored)
 
     # Once the window lapses, proactive permission comes back on its own.
@@ -697,6 +700,7 @@ def test_invariant_5_explicit_boundaries_outrank_the_game(runtime: Runtime) -> N
     _outcome, decision = _run_proactive_round(runtime, now=BASE_TIME + timedelta(hours=72))
     assert decision["acted"] is False
     assert decision["reason"] == "blocked_by_boundary"
+    assert decision["utilities"], "the block must be reported per candidate"
     assert all(utility["total"] == float("-inf") for utility in decision["utilities"])
 
 

@@ -829,6 +829,10 @@ def test_blocked_by_boundary_is_reported_and_never_acts() -> None:
     result = _decide(allow_proactive=False)
     assert result.outcome.acted is False
     assert result.outcome.reason == "blocked_by_boundary"
+    # Guarded before being quantified: ``all([])`` is True, so without this the line
+    # below would pass on an empty assessment list and the test's own claim -- that the
+    # block *is reported* -- would go unchecked.
+    assert result.assessments, "the block must be reported per candidate"
     assert all(item.breakdown.total == float("-inf") for item in result.assessments)
 
 
@@ -836,6 +840,7 @@ def test_cooldown_suppresses_action() -> None:
     """After contact, acting again immediately is not allowed."""
     result = _decide(cooldown_active=True)
     assert result.outcome.acted is False
+    assert result.assessments, "the block must be reported per candidate"
     assert all(
         assessment.breakdown.block_reason == "cooldown_active"
         for assessment in result.assessments

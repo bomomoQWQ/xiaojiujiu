@@ -396,6 +396,31 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
   `__code__`、sqlite 错误的 `sqlite_errorname`），不是 dict 键。
   实用技巧：对挂久了的 `xfail` 跑一次 `pytest --runxfail`，它按普通测试报告真实失败原因——
   "因缺陷而红"与"因测试自己坏了而红"普通跑都是 `xfailed`，分不出来，`--runxfail` 一跑就分得清。
+
+#### 顺手做的一轮"空断言"排查（同一家族）
+
+`all([])` 是 `True`、`not any([])` 也是 `True`，所以 **`assert all(...)` / `assert not any(...)`
+对空集合会静默通过**。这是同一家族的第三个面孔：**报告说绿，实际什么都没检查**。
+（`assert any(...)` 对空集合是 `False`，会红——那是误报，不是漏报。）
+
+按这个筛全量测试，危险形式共 24 处。逐处核对集合是否保证非空后：
+
+- **大部分写对了**，而且作者**已经建立了守卫惯例**：`emotion_boundaries_unfinished`、
+  `delivery_scheduler_context`、`integration_scenarios`、`topic_boundary_gate` 里都有
+  `assert decision["utilities"]` / `assert boundaries` / `assert situation["facts"]` 这样的前置断言
+  （`motivation.py` 里也有 `elif all(...) and assessments:` 这种显式兜底）。
+- **7 处漏了守卫**，已补齐（沿用同一惯例，各一行）：
+  `test_candidate_motivation.py` ×2（`result.assessments`）、
+  `test_integration_scenarios.py` ×3（`decision["utilities"]` ×2、`stored` 边界 ×1）、
+  `test_emotion_boundaries_unfinished.py` ×2（`decision["utilities"]`）。
+- **变异证据**（两处变异，因为同一份数据有两种表示，分别构建）：
+  | 变异 | 打红 |
+  |---|---|
+  | `MotivationResult(assessments=...)` 置空 | `test_candidate_motivation.py` 的 2 条守卫 |
+  | `utilities=[a.breakdown ...]` 置空 | `integration_scenarios` + `emotion_boundaries` 共 6 条 |
+  顺带发现：`DecisionOutcome.utilities`（`typing.py`）与 `MotivationResult.assessments`
+  是**同一份数据的两处构建**（`motivation.py` 921 行 vs 三处 early return），所以一条变异
+  只能打到其中一边——这本身不是缺陷，但排查时必须两边都打。
 - **回归**：全量 1053 passed / 17 skipped / 0 failed；四套仿真 **77 / 335 / 25 / 105 全绿**
   （黑盒、韧性、记忆质量、关系递进）。老库原地升级实测：删掉 `structured_json` 列模拟旧库，
   重开补列成功，**旧行读回 `structured={}`**，不崩不丢。

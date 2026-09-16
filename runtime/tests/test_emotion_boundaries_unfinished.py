@@ -540,6 +540,7 @@ def test_permanent_boundary_never_lapses_at_any_time(runtime: Runtime, hours: fl
     assert runtime.state().allow_proactive is False
     assert decision["reason"] == "blocked_by_boundary", f"lapsed at +{hours}h"
     assert decision["acted"] is False
+    assert decision["utilities"], "the block must be reported per candidate"
     assert all(utility["blocked"] for utility in decision["utilities"])
     assert runtime.projections.attempts.count_in_flight() == 0
 
@@ -570,6 +571,7 @@ def test_boundary_outranks_every_drive_configuration(
     decision = outcome.decision["outcome"]
     assert decision["reason"] == "blocked_by_boundary"
     assert decision["acted"] is False
+    assert decision["utilities"], "the block must be reported per candidate"
     assert all(utility["total"] == float("-inf") for utility in decision["utilities"])
     assert runtime.projections.attempts.count_in_flight() == 0
     assert runtime.projections.outbox.list_items() == []
