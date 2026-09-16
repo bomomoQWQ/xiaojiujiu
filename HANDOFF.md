@@ -194,6 +194,29 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 > **不要**为了发布去改 `metadata.yaml` 或两个 README 的安装说明。
 > 两个 README 现在都写"克隆安装"，这与"尚未上架"是一致的，不是待修的缺陷。
 
+### ⚠️ 已知未修：主业务逻辑三个缺陷（2026-09-16）
+
+用户明确指示"暂时不修"，只留报告：**`runtime/docs/BUSINESS_LOGIC_AUDIT.md`**。
+要开工先读它，别从这里的一行摘要开始。三条的性质不同：
+
+1. **回复长度用绝对阈值 `<= 4` / `>= 20`**（`user_model.py:381` `:1005`，`turns` 在 `:1009`）。
+   违反设计 §29「回复速度、回复长度、对话持续长度都应相对用户自己的历史基线」。
+   **唯一在默认配置下就发生**的一条：话少但行为一致的用户，证据权重被压低 2.5 倍
+   （0.072 vs 0.180），`positive_probability` 只涨到 0.619 而非 0.700。速度那条基线已经实现了，
+   照抄即可。
+2. **硬边界可被同义词 type 绕过**（`motivation.py:855` 问的 `candidate.py:1300` 自己那份集合）。
+   `repair`/`share`/`curious_question` 会被"今天别主动联系我"拦住，同义的
+   `apology`/`emotional_expression`/`question` 不会。违反 §52/§86.5「边界是硬约束」。
+   默认配置下不可达（规则生成器不产出这三个），一开 v0.2 的 `remote_api` 就生效。
+   **最该先修**：它是安全约束。
+3. **情绪时宜性按 type 硬编码**（`runtime.py:2614` `:2616`，同族还有 `protocol.py:346`）。
+   同一个意图 `repair` 1.000 / `apology` 0.440，差 2.3 倍，而它直接进候选效用。
+
+共同根因：`TYPE_TO_BEHAVIOUR` 是唯一权威的类型→行为类映射，但**四处各自硬编码了 type 集合**
+且互相矛盾（清单在报告 §5）。所以修法不是各处改一行，而是先定义这一维度的权威语义。
+**这三条现有测试一条都查不出来**（1096 + 四套仿真全绿），因为没有任何检查要求"同义词必须等价"
+或"跨用户可比"——补检查要排在修实现之前。
+
 ### 接下来值得做的
 
 1. ~~`committed != sent` 与"平台已发出 / 结果已上报"之间的崩溃窗口~~
@@ -276,6 +299,7 @@ python scripts/blackbox_user_simulation.py --base-dir ./bb --fault leak   # 注�
 |---|---|
 | `runtime/src/companion_runtime/` | Runtime 全部代码（`api.py` 原生路由、`api_v1.py` 插件协议层） |
 | `runtime/docs/PATCH_V0.2_MAPPING.md` | 设计章节 → 代码位置 → 状态的对照，含**诚实缺口清单** |
+| `runtime/docs/BUSINESS_LOGIC_AUDIT.md` | **主业务逻辑**的三个已复现缺陷（回复长度绝对阈值 / 硬边界可被同义词绕过 / 情绪时宜性硬编码），含实测数字、可达性分析与修法方向。**未修**，复现：`runtime/.venv/bin/python scripts/business_logic_probes.py` |
 | `runtime/README.md` | 运维手册：配置项、API、降级、蓝屏恢复 |
 | `framework/` | **外接测试框架**：可控虚拟时钟 + OpenAI 兼容 mock 端点 + 变量日志 + `cf` 命令行。不改原程序，见 `framework/README.md` |
 | `scripts/` | 验证与运维脚本（**四个**仿真：黑盒 / 韧性 / 记忆质量 / 关系递进，外加 `runtime_bench.py`、`backup.ps1`、`dead_code_inventory.py`、`mutation_design_conformance.py`） |

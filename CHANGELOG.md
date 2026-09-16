@@ -28,6 +28,20 @@
 验收：`framework/tests/test_chat_history.py` 22 条 + `chat_history` 组 6 个变异全部击杀；
 全仓 31 个变异全部击杀；框架全量 **293 passed**（原 271）。
 
+### 主业务逻辑审计（只诊断，未修）
+
+新增 `runtime/docs/BUSINESS_LOGIC_AUDIT.md` + 可复跑探针 `scripts/business_logic_probes.py`。
+三个已复现的缺陷，**按用户指示暂时不修**：
+
+1. **回复长度用绝对阈值**（§29）：话少但行为一致的用户证据权重被压低 2.5 倍
+   （0.072 vs 0.180）、`positive_probability` 0.619 vs 0.700。默认配置下就发生。
+2. **硬边界可被同义词 type 绕过**（§52/§86.5）：`repair`/`share`/`curious_question` 被拦，
+   `apology`/`emotional_expression`/`question` 不被拦。默认不可达，开 `remote_api` 即生效。
+3. **情绪时宜性按 type 硬编码**：`repair` 1.000 vs `apology` 0.440（2.3 倍），直接进候选效用。
+
+共同根因：唯一的权威映射 `TYPE_TO_BEHAVIOUR` 没有被消费方使用，四处各自硬编码且互相矛盾。
+报告含"为什么 1096 条测试 + 四套仿真全绿仍存在"的盲区分析、可达性边界与修法方向。
+
 ### 文档与评估（不涉及行为）
 
 - **新增 `docs/SIMULATION_INTEGRATION.md`**：`framework/` 与 `scripts/` 该不该合并的书面评估

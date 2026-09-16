@@ -60,14 +60,19 @@ astrbot_plugin_companion_runtime/
 .scratch_*/
 /data/
 
-# Verification-script output. Both simulations write report.json, diagnostics.log,
+# Verification-script output. All four simulations write report.json, diagnostics.log,
 # transcript.md and a few runtime.sqlite3 under whatever --base-dir they are given;
-# HANDOFF §3 uses ./bb-run and ./res-run, --fault runs conventionally go to ./bb-fault.
+# HANDOFF §3 uses ./bb-run and ./res-run, --fault runs conventionally go to ./bb-fault,
+# and the memory-quality / relationship simulations are run as ./mem-run and ./res-run.
+# (mem-run was missing until 2026-09-16: running the memory simulation by the book left
+# an untracked directory behind, which is how it would have been committed by accident.)
 /bb/
 /bb-run/
 /bb-fault/
 /res/
 /res-run/
+/mem/
+/mem-run/
 
 # Editors and OS
 .vscode/
