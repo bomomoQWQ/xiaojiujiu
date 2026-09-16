@@ -169,9 +169,9 @@ def main() -> int:
         print()
         print(f"# reappraisals: {len(reappraisals)}")
         for row in reappraisals[-8:] if not args.full else reappraisals:
-            print(f"  {str(row.get('created_at'))[11:19]} {short(row.get('content'), 90)}")
+            text = row.get("new_interpretation") or row.get("content") or ""
+            print(f"  {str(row.get('created_at'))[11:19]} {short(text, 90)}")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
