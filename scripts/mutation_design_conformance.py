@@ -17,6 +17,7 @@ Groups:
     declared_unused  item ⑦, nothing declared and never produced
     redelivery       崩溃窗口, a re-leased message must say so
     chat_history     backlog ③-1, the chat window's durable history
+    boundary_synonyms 业务逻辑 B, a boundary must not be bypassable by renaming
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ API_V1 = RUNTIME_DIR / "src/companion_runtime/api_v1.py"
 FRAMEWORK_DIR = ROOT / "framework"
 CF_HISTORY = FRAMEWORK_DIR / "cf/history.py"
 CF_TUI = FRAMEWORK_DIR / "cf/tui.py"
+CANDIDATE = RUNTIME_DIR / "src/companion_runtime/candidate.py"
 
 #: Test paths for the framework suite are written ``framework_tests/...`` and run from
 #: ``framework/``; the Runtime's own suite runs from ``runtime/``. One harness, two roots.
@@ -437,6 +439,59 @@ GROUPS: dict[str, tuple[list[str], list[tuple[str, list[tuple[pathlib.Path, str,
                         CF_TUI,
                         '        self._reply_recorded = False\n        self._remember(KIND_USER, text)',
                         '        self._reply_recorded = False',
+                    )
+                ],
+            ),
+        ],
+    ),
+    # ------------------------------------------------------------------ 业务逻辑 B
+    "boundary_synonyms": (
+        ["tests/test_boundary_synonyms.py"],
+        [
+            (
+                "S1 the predicate keeps its own type list again (the original defect)",
+                [
+                    (
+                        CANDIDATE,
+                        '    return behaviour_class_of({"type": candidate.type}) not in NON_PROACTIVE_BEHAVIOUR_CLASSES',
+                        """    return candidate.type in {
+        "contact",
+        "check_in",
+        "follow_up",
+        "curious_question",
+        "share",
+        "repair",
+    }""",
+                    )
+                ],
+            ),
+            (
+                "S2 an unknown type is waved through instead of failing closed",
+                [
+                    (
+                        CANDIDATE,
+                        '    return behaviour_class_of({"type": candidate.type}) not in NON_PROACTIVE_BEHAVIOUR_CLASSES',
+                        '    return TYPE_TO_BEHAVIOUR.get(str(candidate.type or ""), "") not in NON_PROACTIVE_BEHAVIOUR_CLASSES and bool(TYPE_TO_BEHAVIOUR.get(str(candidate.type or "")))',
+                    )
+                ],
+            ),
+            (
+                "S3 a reply is folded into the blocked set",
+                [
+                    (
+                        CANDIDATE,
+                        'NON_PROACTIVE_BEHAVIOUR_CLASSES: frozenset[str] = frozenset({"reply"})',
+                        "NON_PROACTIVE_BEHAVIOUR_CLASSES: frozenset[str] = frozenset()",
+                    )
+                ],
+            ),
+            (
+                "S4 the class rule is replaced by a hand-written class list",
+                [
+                    (
+                        CANDIDATE,
+                        '    return behaviour_class_of({"type": candidate.type}) not in NON_PROACTIVE_BEHAVIOUR_CLASSES',
+                        '    return behaviour_class_of({"type": candidate.type}) in {"proactive_contact", "follow_up"}',
                     )
                 ],
             ),

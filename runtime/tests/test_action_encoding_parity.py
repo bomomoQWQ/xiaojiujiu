@@ -66,16 +66,22 @@ def client(runtime: Runtime):
 #: also learned about as proactive. ``question`` is 是否追问 (a probe the character
 #: chose), ``emotional_expression`` is 情绪暴露程度 and ``topic_shift`` is 话题. None of
 #: them may depend on the characters of the rendered sentence.
+#: NOTE: the three ``proactive`` values for ``apology`` / ``question`` /
+#: ``emotional_expression`` moved from 0 to 1 when the predicate stopped keeping its own
+#: type list and started deriving from the behaviour class - see
+#: ``docs/BUSINESS_LOGIC_AUDIT.md`` §3 and ``tests/test_boundary_synonyms.py``. This table
+#: had encoded the old classification; it was never asserting a design truth, and the
+#: parity assertions above it were unaffected by the change.
 CANONICAL_ACTION_FEATURES: dict[str, tuple[float, float, float, float, float]] = {
     "contact": (1.0, 0.0, 0.0, 0.0, 0.0),
     "check_in": (1.0, 1.0, 0.0, 1.0, 0.0),
     "follow_up": (1.0, 1.0, 0.0, 1.0, 0.0),
-    "question": (0.0, 0.0, 0.0, 1.0, 0.0),
+    "question": (1.0, 0.0, 0.0, 1.0, 0.0),
     "curious_question": (1.0, 0.0, 0.0, 1.0, 1.0),
     "share": (1.0, 0.0, 1.0, 0.0, 0.0),
-    "emotional_expression": (0.0, 0.0, 1.0, 0.0, 0.0),
+    "emotional_expression": (1.0, 0.0, 1.0, 0.0, 0.0),
     "repair": (1.0, 0.0, 0.0, 0.0, 0.0),
-    "apology": (0.0, 0.0, 0.0, 0.0, 0.0),
+    "apology": (1.0, 0.0, 0.0, 0.0, 0.0),
     "reply": (0.0, 0.0, 0.0, 0.0, 0.0),
 }
 

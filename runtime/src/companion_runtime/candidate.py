@@ -62,6 +62,7 @@ from typing import Any, Mapping, Sequence
 
 from .config import RuntimeConfig
 from .memory import DEDUPE_MIN_SHARED_TOKENS, QUESTION_MARKERS, is_superseded
+from .user_model import behaviour_class_of
 from .typing import (
     ActivatedMemory,
     Boundary,
@@ -1285,26 +1286,40 @@ class PoolApplyResult:
         }
 
 
+#: Behaviour classes that are *not* unprompted contact. ``reply`` answers a user message
+#: and is governed by ``allow_reply`` instead; every other class is initiated by the
+#: character, so a hard boundary may block it (design §52/§86.5).
+NON_PROACTIVE_BEHAVIOUR_CLASSES: frozenset[str] = frozenset({"reply"})
+
+
 def is_candidate_proactive(candidate: CandidateIntent) -> bool:
     """Return whether a candidate represents an unprompted contact.
 
     Proactive candidates are the ones a hard boundary can block outright; a reply
-    to a user message is governed by ``allow_reply`` instead.
+    to a user message is governed by ``allow_reply`` instead. A declared boundary is a
+    hard constraint, not a momentum term (design §52, §86.5), so this predicate is the
+    gate's authority and must not depend on which *spelling* the caller happened to use.
 
-    ``repair`` is proactive: an apology is initiated by the character, not asked for by
-    the user, so a "do not contact me" boundary outranks it. Until this shape had a
-    producer the distinction was moot in the shipped configuration (no rule produced a
-    repair, and the model path is disabled by default); now that one exists, letting it
-    through the hard gate would spend a commit on a message the delivery layer refuses.
+    The answer is therefore **derived from the behaviour class** rather than from a list of
+    type names. It used to be its own set - ``{contact, check_in, follow_up,
+    curious_question, share, repair}`` - which disagreed with
+    :data:`~companion_runtime.user_model.TYPE_TO_BEHAVIOUR` for exactly the three synonyms
+    that map onto a proactive class under another name: ``apology`` (class ``repair``),
+    ``question`` (class ``curious_question``) and ``emotional_expression`` (class
+    ``emotional_expression``). A user who said "don't contact me today" still got an
+    apology, because the gate only recognised the spelling ``repair``. The behaviour class
+    is the single authority now, and ``tests/test_boundary_synonyms.py`` pins the
+    equivalence so a new type cannot reintroduce the gap.
+
+    ``repair`` is proactive: an apology is initiated by the character, not asked for by the
+    user, so a "do not contact me" boundary outranks it.
+
+    Unknown types resolve through :func:`~companion_runtime.user_model.behaviour_class_of`,
+    which falls back to ``proactive_contact`` - the same default the behaviour-class lookup
+    uses everywhere else. An unrecognised behaviour is thus *blocked* rather than waved
+    through: for a hard constraint the safe default is to fail closed.
     """
-    return candidate.type in {
-        "contact",
-        "check_in",
-        "follow_up",
-        "curious_question",
-        "share",
-        "repair",
-    }
+    return behaviour_class_of({"type": candidate.type}) not in NON_PROACTIVE_BEHAVIOUR_CLASSES
 
 
 def should_refresh(    *,

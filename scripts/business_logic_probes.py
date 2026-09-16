@@ -112,7 +112,7 @@ def probe_hard_boundary_can_be_bypassed() -> None:
     the *same intention* is blocked under one spelling and allowed under another.
     """
     print("=" * 78)
-    print("probe 2 — 硬边界可被同义词 type 绕过（设计 §52 / §86.5）")
+    print("probe 2 — 硬边界与同义词 type（设计 §52 / §86.5）［已修，保留作回归观察］")
     print("=" * 78)
     behaviour_proactive = {
         "proactive_contact",
@@ -131,12 +131,13 @@ def probe_hard_boundary_can_be_bypassed() -> None:
             mismatched.append(kind)
         flag = "✓" if agree else "✗ 不一致"
         print(f"  {kind:<22}{behaviour:<22}{str(by_class):>8}{str(by_gate):>12}   {flag}")
-    print(f"\n  '今天别主动联系我' 会拦住：{sorted(k for k in TYPE_TO_BEHAVIOUR if is_candidate_proactive(_candidate(k)))}")
-    print(f"  却放过（同义词）：{mismatched}")
-    print("\n  可达性：规则生成器只产出 "
-          f"{sorted({kind for kind in ('follow_up', 'curious_question', 'share', 'repair', 'reply', 'contact')})}，")
-    print("          所以这三位只能从强语义 provider 或 POST /candidates/operations 进来——")
-    print("          默认配置（provider=disabled）下不可达，一旦按 v0.2 打开 remote_api 就生效。\n")
+    blocked = sorted(k for k in TYPE_TO_BEHAVIOUR if is_candidate_proactive(_candidate(k)))
+    print(f"\n  '今天别主动联系我' 拦住：{blocked}")
+    print(f"  同义词漏网：{mismatched}")
+    print("\n  【已修 2026-09-16】谓词不再自带一份 type 列表，改为从 TYPE_TO_BEHAVIOUR 派生：")
+    print("  主动 ⇔ 行为类 != 'reply'。未知 type 走 behaviour_class_of 的默认值（proactive_contact），")
+    print("  即**失败关闭**。验收见 tests/test_boundary_synonyms.py（8 条）。")
+    print("  改之前：apology / emotional_expression / question 三种拼写能绕过硬边界。\n")
 
 
 # ---------------------------------------------------------------------------- probe 3
