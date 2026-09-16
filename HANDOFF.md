@@ -695,6 +695,12 @@ http://runtime-fleet:8799` → fleet 13 人 → 他自己的库里只有他自�
 | `fleet_probe_refresh.sh` | 对某人强制跑一次 `/cognition/refresh` 并回读结算结果（`QQ=<QQ>`） |
 | `beta_e2e_check.sh` | 端到端验收：导出 → 回放 → 日报，一次跑完看三段输出 |
 | `fleet_probe_dashboard.sh` | 验收看板：`/fleet/status` 的 refresh 字段 + dashboard 表头与指定人的那一行 |
+| `fleet_probe_outbox.sh` | 追一条主动消息的去向：outbox / action_attempts / attempt_events（判断"提交了但没送到"卡在哪一步） |
+| `fleet_probe_real_person.sh` | 真人实例一览：最近事件、结算分布、账本、情绪/心情、状态曲线、判决 |
+| `fleet_probe_proactive.sh` | 她到底主动过几次、动机池里有什么 |
+| `fleet_runtime_usage.sh` | 容器/实例用量盘点：谁在真收消息、谁只是模拟残留、资源占用、插件路由配置 |
+| `deploy_plugin.sh` | 更新测试栈插件（服务器上是 git clone）、重启 AstrBot、等适配器连上并验加载 |
+| `fleet_final_check.sh` | 收尾体检：容器 / fleet 健康 / 镜像一致性 / 定时任务 / 磁盘一屏看完 |
 | `deploy_test_runtime.sh` / `set_semantic_budget.sh` | 重建镜像并重建 fleet / 改 fleet 语义配置并重建（`docker cp` 进 fleet 容器会报 `/proc/self/fd`，用 stdin） |
 | fleet `GET /fleet/dashboard` | 只读、30s 自刷新的总览页；`/fleet/status` 增加 unresolved / open_unfinished / deep+explain 调用数 |
 
@@ -867,8 +873,72 @@ settle_on_ingest → classify_event(粗分类)  ── 命中 → 结算 → set
 - 强制跑一次深刷新：`QQ=<QQ> bash scripts/fleet_probe_refresh.sh`
 - 看账本：`bash scripts/fleet_probe_ledger.sh`（换 QQ 改脚本里的库路径）
 - 端到端：`bash scripts/beta_e2e_check.sh`
+- 看主动消息的投递去向：`bash scripts/fleet_probe_outbox.sh`（outbox / action_attempts /
+  attempt_events 三段，能看出"提交了但没送到"的具体一步）
 - 看情绪/结算细节：`docker exec -i xxj-runtime-fleet python3 - < 一段脚本`
   （`docker cp` 往这个容器里拷文件会报 `Could not find the file /proc/self/fd`，用 stdin）
+
+### ⚠️ 主动消息在"平台链路瞬断"时会被永久丢掉（已修）
+
+**取证**（真人实例，2026-09-16T16:13 UTC）：一次 `hazard_triggered` 的主动尝试走完了
+`proposed → committed → rendering → ready_to_send`，文案也写好了——
+**"东西调试完就去睡吧。另外昵称那条我没太看明白，等你方便了再说，不急。"**
+——然后 `attempt_events` 记：
+
+```
+ready_to_send → failed : ActionExecutionError: send_message failed: ApiNotAvailable:
+```
+
+`ApiNotAvailable` 来自 **`aiocqhttp.exceptions`**（"OneBot API 不可用"），即那一刻
+**OneBot 连接做不了这次调用**——不是"消息被拒绝"，而是链路不通，**什么都没发出去**。
+但插件把它包成 `ActionExecutionError` 上报为 `failed`，Runtime 的契约是
+"任何非 ok 的 send 结果 → `mark_delivered(success=False)` → `nack(terminal=True)`"，
+于是这次尝试被**永久关闭**，消息再也不会重发。
+
+**根因是失败分类漏了一层**：插件对"Runtime 不可达"（授权拿不到答复）本来就有正确处置——
+**故意不上报**，留租约过期让 Runtime 重投，并且 `tests/test_outbox.py` 里
+`test_unavailable_authorize_leaves_the_action_retryable` 把这条契约写得很清楚
+（"silence is the only shape of 'retry this later' the contract has"）。
+但同样的道理没覆盖"**平台链路**不可用"这一层。
+
+**修法**（插件仓库 `9b574f2`）：
+- `companion_runtime/protocol.py` 新增 `TransportUnavailable`，以及纯函数
+  `is_transport_unavailable`：**按异常的名字/模块判定，不 import aiocqhttp**
+  （`companion_runtime` 必须能在没有 AstrBot 的环境里导入，这正是它能被单测的原因）。
+  `ApiNotAvailable` 名字独特，按名字认；`NetworkError` 太通用（httpx 也有），
+  只在它确实来自 `aiocqhttp` 模块时才认。
+- `astrbot_executor.send`：传输不可用 → 抛 `TransportUnavailable`，不再混进
+  `ActionExecutionError`。
+- `outbox._send`：捕获 `TransportUnavailable` → **不产生任何回报**、`stats.deferred + 1`、
+  记 warning，与授权不可达同一处置。真正的执行失败（平台拒绝 / 无 provider / `sent=False`）
+  **仍然**上报为终态，避免把坏 session 无限重试。
+- 测试 +3（延迟路径、反向保护、分类函数对同名异常的区别）；插件全量 **162 passed**（原 159）。
+
+> ⚠️ 这条对封测很关键：**主动消息是产品的一半**，而"链路抖一下"在真机上是常态
+> （NapCat 重连、QQ 会话切换）。修之前，每次抖动都会静默吃掉一条她已经决定要说的话，
+> 而且账面上只留一条 `failed`，看起来像"她不想说"。
+
+### ⚠️ 自己埋的假报警：账本把"没调 provider 的跳过"记成了降级（已修）
+
+`DeepRefreshOutcome.degraded` 默认 `True`（对调用方是保守的正确默认："没有可信建议"），
+抄进账本就成了故障计数：真人实例 5 次 `not_needed / min_interval_not_elapsed` 的跳过
+全被记成 `degraded=1`，日报会写"降级 5 次"——而 Runtime 只是选择不花钱。
+
+修法：结果对象新增 `provider_called`（真正调用 provider 前一刻置 True），账本写
+`degraded = outcome.degraded and outcome.provider_called`。两条测试锁住两侧：
+`disabled` / `provider_unavailable` 必须 0；provider 抛异常必须 1 且 `ran=0`。
+
+### 当前 runtime 用量（2026-09-17 凌晨实测）
+
+- **容器只有两个**：`xxj-runtime-fleet`（一个容器里跑 14 个 Runtime 进程，控制面 8800）
+  与 `xxj-runtime-test`（单实例回退，只在注册表不可达时兜底）。
+- **真正承载真人会话的只有 1 个实例**：`default-friendmessage-1670681411`（端口 8801）。
+  其余 13 个（`20001`–`20012`、`29999`）是验证留下的模拟号，各带 0–3 条种子消息。
+  它们最近的 `last_event` 时间戳看着很新，是**内源调度在跑**（`candidate_proposal` /
+  `proposal:deep_refresh` 等 system 事件），不是在收消息——别误读成"有人还在跟它们说话"。
+- 资源：fleet 14 进程 **622 MiB / 4% CPU**（≈44 MiB 一个），回退实例 44 MiB。
+  机器 15.5 GiB，封测 10 个真人完全不是问题。
+- 回退实例里只有它自己的 `default` 会话，没有任何人被路由过去——即注册表一直可用。
 
 ### ⚠️ 宿主坑：AstrBot 把 OneBot 的「通知」包装成空正文的消息事件
 
