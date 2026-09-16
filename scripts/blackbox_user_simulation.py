@@ -1322,7 +1322,6 @@ def build_runtime_config(directory: Path, *, faults: "Faults | None" = None) -> 
     # Simulated-time windows.
     config.drive.cooldown_seconds = 4 * 3600.0
     config.drive.max_contacts_per_day = 3
-    config.boundary.default_temporal_hours = 24.0
     config.unfinished.default_expiry_hours = 72.0
     config.outbox.lease_seconds = 900.0
     config.action.send_expiry_seconds = 3600.0
@@ -1336,7 +1335,6 @@ def build_runtime_config(directory: Path, *, faults: "Faults | None" = None) -> 
     config.scheduler.foreground_pause_seconds = 60.0
     config.utility.min_sleep_seconds = 0.02
     config.utility.max_sleep_seconds = 0.05
-    config.task.merge_window_seconds = 5.0
     if faults is not None and faults.memory_never_due:
         # A maintenance interval longer than the story: no candidate ever becomes
         # due, which is what a misconfigured deployment looks like from outside.

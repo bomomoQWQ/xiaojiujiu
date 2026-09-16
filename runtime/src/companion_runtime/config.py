@@ -78,7 +78,6 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8787
     log_level: str = "INFO"
-    request_timeout_seconds: float = 30.0
 
 
 @dataclass(slots=True)
@@ -138,7 +137,6 @@ class EmotionConfig:
     mood_recovery_rate: float = 0.06
     emotion_decay_rate: float = 0.08
     emotion_retire_threshold: float = 0.02
-    max_active_emotion_events: int = 24
     event_reactivity: float = 1.0
     #: Impacts at or below this value are not worth an emotion event at all.
     min_event_impact: float = 0.06
@@ -221,17 +219,9 @@ class UtilityConfig:
     hazard_beta: float = 4.0
     min_sleep_seconds: float = 60.0
     max_sleep_seconds: float = 1800.0
-    utility_epsilon: float = 1e-9
     #: Above this predicted boundary risk a candidate is judged conservatively.
     conservative_risk_threshold: float = 0.30
 
-
-@dataclass(slots=True)
-class BoundaryConfig:
-    """Boundary parsing and enforcement."""
-
-    default_temporal_hours: float = 24.0
-    scan_recent_events: int = 4
 
 
 @dataclass(slots=True)
@@ -293,7 +283,6 @@ class UserModelConfig:
     #: rate. One knob with two units was how the time-based path came to be missing
     #: (there was nothing to read).
     drift_half_life_hours: float = 168.0
-    min_weight: float = 0.02
     explicit_positive_weight: float = 1.0
     explicit_negative_weight: float = 1.0
     implicit_weight: float = 0.30
@@ -314,10 +303,7 @@ class UserModelConfig:
     #: to that message (it counts as unprompted contact). Waiting forever would mean
     #: the model never learns from silence at all, which is the state this replaced.
     silence_after_hours: float = 36.0
-    max_observations_in_memory: int = 400
     conservative_z: float = 1.645
-    cold_start_prior_mean: float = 0.10
-    cold_start_prior_precision: float = 0.60
 
 
 @dataclass(slots=True)
@@ -336,7 +322,6 @@ class CandidateConfig:
     contact_bias_impulse: float = 2.6
     contact_bias_pressure: float = 1.4
     contact_bias_restraint: float = 0.9
-    unfinished_relevance_weight: float = 0.6
     confidence_floor: float = 0.25
 
 
@@ -362,10 +347,7 @@ class OutboxConfig:
 class ActionConfig:
     """Action attempt state machine."""
 
-    commit_grace_seconds: float = 8.0
-    render_timeout_seconds: float = 120.0
     send_expiry_seconds: float = 900.0
-    max_committed_attempts: int = 3
 
 
 @dataclass(slots=True)
@@ -384,8 +366,6 @@ class SchedulerConfig:
 class TaskConfig:
     """Background task batching."""
 
-    merge_window_seconds: float = 15.0
-    emotion_explain_change_threshold: float = 0.12
     explain_cache_ttl_seconds: float = 1800.0
 
 
@@ -441,7 +421,6 @@ class RuntimeConfig:
     drive: DriveConfig = field(default_factory=DriveConfig)
     silence: SilenceConfig = field(default_factory=SilenceConfig)
     utility: UtilityConfig = field(default_factory=UtilityConfig)
-    boundary: BoundaryConfig = field(default_factory=BoundaryConfig)
     unfinished: UnfinishedConfig = field(default_factory=UnfinishedConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     user_model: UserModelConfig = field(default_factory=UserModelConfig)
