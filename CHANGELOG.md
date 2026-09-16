@@ -28,7 +28,30 @@
 验收：`framework/tests/test_chat_history.py` 22 条 + `chat_history` 组 6 个变异全部击杀；
 全仓 31 个变异全部击杀；框架全量 **293 passed**（原 271）。
 
-### 主业务逻辑审计（只诊断，未修）
+### 主业务逻辑：B 与 A 已修（§52/§86.5、§29）
+
+审计报告 `runtime/docs/BUSINESS_LOGIC_AUDIT.md` 里三条缺陷，先修了后果最重的两条。
+
+- **B 硬边界不再能被同义词 type 绕过（§52/§86.5，`94549a5`）。**
+  硬边界的强制点问的谓词自带一份 type 列表，与 `TYPE_TO_BEHAVIOUR` 在三个同义词上不一致：
+  `repair` 被拦而 `apology` 漏网、`share` 被拦而 `emotional_expression` 漏网、
+  `curious_question` 被拦而 `question` 漏网——**同一个意图换个写法就绕过"今天别主动联系我"**。
+  现在谓词从行为类派生（主动 ⇔ 行为类 ≠ `reply`），未知 type **失败关闭**。
+  验收 `tests/test_boundary_synonyms.py` 8 条 + 4 个变异。
+- **A 回复长度与对话轮数按用户自己的基线判（§29，`29f2328`）。**
+  设计 §29 的三个子句里，速度早已相对化，长度和轮数还是绝对阈值：`<= 4` 字符降权、
+  `<= 4` 字符扣 0.05、`min(3, turns)` 对所有人 3 轮饱和。实测同一个用户行为只改长度，
+  证据权重 0.072 vs 0.180、`positive_probability` 0.619 vs 0.700——**话少但行为一致的用户
+  被长期判为冷淡**。现在照抄 `reply_delay_baseline` 加了长度与轮数两条基线，
+  基线不可信时**不表态**（长度没有可当先验的绝对参考值），负向只能抵消已得加分。
+  冷启动曲线与旧公式逐值相同，**既有数据库判定不变**。
+  验收 `tests/test_reply_length_baseline.py` 12 条 + 8 个变异。
+- **C 情绪时宜性按 type 硬编码（`repair` 1.000 vs `apology` 0.440）仍待修**：
+  它的集合本身需要一次设计确认，见报告 §4。
+
+全仓变异数 31 → **43，全部 KILLED**；全量 1096 → **1111 passed**；四套仿真全绿。
+
+### 主业务逻辑审计（诊断）
 
 新增 `runtime/docs/BUSINESS_LOGIC_AUDIT.md` + 可复跑探针 `scripts/business_logic_probes.py`。
 三个已复现的缺陷，**按用户指示暂时不修**：

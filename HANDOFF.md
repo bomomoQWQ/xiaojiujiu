@@ -88,7 +88,7 @@ Runtime 完全靠确定性代码工作；可选的远端语义 provider 的 key 
 
 ```bash
 # 1. Runtime 离线测试
-cd runtime && .venv/bin/python -m pytest              # 期望 1096 passed
+cd runtime && .venv/bin/python -m pytest              # 期望 1111 passed
 
 # 2. 插件离线测试（在插件仓库里）
 cd ../astrbot_plugin_companion_runtime
@@ -151,7 +151,7 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 
 | 项目 | 结果 |
 |---|---|
-| Runtime 离线测试 | **1096 passed / 17 skipped**（无 DSN；PG 专项恒跳过） |
+| Runtime 离线测试 | **1111 passed / 17 skipped**（无 DSN；PG 专项恒跳过） |
 | 插件离线测试 | 143 passed + 13 subtests |
 | 高仿真故障恢复 | 335/335 |
 | 用户黑盒仿真 | **77 / 77**（退出码 0，连跑多次一致） |
@@ -194,17 +194,28 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 > **不要**为了发布去改 `metadata.yaml` 或两个 README 的安装说明。
 > 两个 README 现在都写"克隆安装"，这与"尚未上架"是一致的，不是待修的缺陷。
 
-### ⚠️ 已知未修：主业务逻辑三个缺陷（2026-09-16）
+### ⚠️ 主业务逻辑三个缺陷（2026-09-16）
 
-用户明确指示"暂时不修"，只留报告：**`runtime/docs/BUSINESS_LOGIC_AUDIT.md`**。
-要开工先读它，别从这里的一行摘要开始。三条的性质不同：
+报告：**`runtime/docs/BUSINESS_LOGIC_AUDIT.md`**（含实测数字与每条的验收方式）。
+**B 与 A 已修，C 待修**。要动 C 先读报告 §4——它的**集合本身**需要一次设计确认，
+不是机械替换。三条的性质不同：
 
-1. **回复长度用绝对阈值 `<= 4` / `>= 20`**（`user_model.py:381` `:1005`，`turns` 在 `:1009`）。
+1. ~~**回复长度用绝对阈值 `<= 4` / `>= 20`**~~ —— **已修（`29f2328`）**。
+   照抄 `reply_delay_baseline` 加了 `reply_length_baseline` 与 `reply_turns_baseline`
+   两条基线（后者只要均值：这一项是比值不是 z 分数）；两处绝对阈值替换；
+   负向只能抵消已得加分，不再把真实回复判成负面证据；冷启动曲线与旧公式**逐值相同**，
+   所以既有数据库判定不变。验收 `tests/test_reply_length_baseline.py` 12 条 + 8 个变异。
+   原始描述留档：`user_model.py:381` `:1005`，`turns` 在 `:1009`。
    违反设计 §29「回复速度、回复长度、对话持续长度都应相对用户自己的历史基线」。
    **唯一在默认配置下就发生**的一条：话少但行为一致的用户，证据权重被压低 2.5 倍
    （0.072 vs 0.180），`positive_probability` 只涨到 0.619 而非 0.700。速度那条基线已经实现了，
    照抄即可。
-2. **硬边界可被同义词 type 绕过**（`motivation.py:855` 问的 `candidate.py:1300` 自己那份集合）。
+2. ~~**硬边界可被同义词 type 绕过**~~ —— **已修（`94549a5`）**。
+   谓词不再自带 type 列表，改为从 `TYPE_TO_BEHAVIOUR` 派生（主动 ⇔ 行为类 ≠ `reply`）；
+   未知 type 走 `behaviour_class_of` 的默认值即**失败关闭**。
+   验收 `tests/test_boundary_synonyms.py` 8 条（核心那条按行为类分组断言同义词等价，
+   所以将来新加的 type 当天就被覆盖）+ 4 个变异。
+   原始描述留档：`motivation.py:855` 问的 `candidate.py:1300` 自己那份集合。
    `repair`/`share`/`curious_question` 会被"今天别主动联系我"拦住，同义的
    `apology`/`emotional_expression`/`question` 不会。违反 §52/§86.5「边界是硬约束」。
    默认配置下不可达（规则生成器不产出这三个），一开 v0.2 的 `remote_api` 就生效。
@@ -214,8 +225,9 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 
 共同根因：`TYPE_TO_BEHAVIOUR` 是唯一权威的类型→行为类映射，但**四处各自硬编码了 type 集合**
 且互相矛盾（清单在报告 §5）。所以修法不是各处改一行，而是先定义这一维度的权威语义。
-**这三条现有测试一条都查不出来**（1096 + 四套仿真全绿），因为没有任何检查要求"同义词必须等价"
-或"跨用户可比"——补检查要排在修实现之前。
+**这三条现有测试一条都查不出来**（当时的 1096 + 四套仿真全绿），因为没有任何检查要求
+"同义词必须等价"或"跨用户可比"。修复的顺序就是先补这类等价性检查、再动实现——
+两个已修项各自的第一条测试都是等价性断言，而不是把某个数字钉死。
 
 ### 接下来值得做的
 
