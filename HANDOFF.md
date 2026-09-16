@@ -390,6 +390,12 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
   教训：`xfail(strict=True)` 只抓"意外通过"，**抓不到"永远不可能失败"**——而一条长期挂着的
   预期失败正是这种缺陷最舒服的藏身处。这个文件里原本还有一个同类问题：`cue` 传的是裸字符串，
   而 `retrieve` 要 `RetrievalCue`，所以它连代码路径都进不去。两条都已修。
+  修法上用 `item["summary"]` 而不是 `.get("summary", "")`：后者同样带默认值，键一改名
+  又会静默变回空串；下标取值会让下一次形状变化**报 KeyError 而不是悄悄变绿**。
+  排查过全量测试，同形的 `getattr(x, "字面量")` 只剩两处，都是真属性访问（函数的
+  `__code__`、sqlite 错误的 `sqlite_errorname`），不是 dict 键。
+  实用技巧：对挂久了的 `xfail` 跑一次 `pytest --runxfail`，它按普通测试报告真实失败原因——
+  "因缺陷而红"与"因测试自己坏了而红"普通跑都是 `xfailed`，分不出来，`--runxfail` 一跑就分得清。
 - **回归**：全量 1053 passed / 17 skipped / 0 failed；四套仿真 **77 / 335 / 25 / 105 全绿**
   （黑盒、韧性、记忆质量、关系递进）。老库原地升级实测：删掉 `structured_json` 列模拟旧库，
   重开补列成功，**旧行读回 `structured={}`**，不崩不丢。

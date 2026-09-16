@@ -124,13 +124,19 @@ def test_question_memories_do_not_crowd_out_a_disclosure(runtime: Runtime) -> No
         store=runtime.memory_store,
         now=BASE_TIME + timedelta(hours=3),
     )
-    # ``select_memories`` returns plain dicts, so this must read the key. It used
-    # ``getattr(item, "summary", "")``, which on a dict always yields the default --
-    # making ``shown`` the empty string and the assertion below true no matter what the
+    # ``select_memories`` returns plain dicts, so this must read the key -- and it reads
+    # it with ``[...]``, not ``.get(key, "")``. The original used
+    # ``getattr(item, "summary", "")``: on a dict that always yields the default, so
+    # ``shown`` was the empty string and the assertion below was true no matter what the
     # runtime did. A mutation (disabling the recall-check exclusion in
-    # ``context.select_memories``) did not turn this red, which is how the vacuous
-    # assertion was found; it does now.
-    shown = " ".join(str(item.get("summary", "")) for item in selected)
+    # ``context.select_memories``) did not turn it red, which is how the vacuous
+    # assertion was found.
+    #
+    # ``.get(key, "")`` would have the same failure shape: rename the key and the default
+    # silently comes back. Subscripting raises ``KeyError`` instead, so the next person to
+    # change the item's shape gets told rather than getting a green test that checks
+    # nothing.
+    shown = " ".join(str(item["summary"]) for item in selected)
     assert "你还记得" not in shown, (
         f"a question memory took one of the four slots: {shown!r}"
     )
