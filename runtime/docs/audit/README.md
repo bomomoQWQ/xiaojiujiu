@@ -16,6 +16,10 @@
 
 ## 一、判定合计
 
+> ⚠️ **下表是审计时点（`8564327`）的快照，没有随修复更新**——它是"当初怎么判的"的记录，
+> 不是当前状态。当前状态看 §二 的逐条标注与 §四 的主题标注。要重新统计就得重跑一遍只读审计，
+> 那是独立的一项工作；把它按印象改数字只会让这里变成第二份不可复核的东西。
+
 | 区块 | 已实现 | 部分实现 | 未实现 | 被补丁取代 | 文档·约定 | 行数 |
 |---|---:|---:|---:|---:|---:|---:|
 | §1–§31 | 38 | 25 | 1 | 3 | 0 | 67 |
@@ -39,7 +43,7 @@
 > `observations/emotions/situations/boundaries/recent_events` 传给 `generate`，
 > `tests/test_candidate_shapes_wiring.py` 用 spy 钉住调用点；`invalidated_by_situation` 返回
 > None 时 `runtime.py` 会继续问 `invalidated_by_source_state`）。本文件的"判定合计"与 §5 的
-> 复现数字（`883 passed / 14 skipped`）同样是旧值，当前基线是 `1080 passed / 17 skipped`。
+> 复现数字（`883 passed / 14 skipped`）同样是旧值，当前基线是 `1092 passed / 17 skipped`。
 > 下面按代码现状逐条标注。
 
 1. **[已修 0.3.0/0.3.1]** 记忆永远无法形成（默认部署）。
@@ -192,7 +196,7 @@
 
 ```bash
 # 前两条在 runtime/ 下跑（命令 1 别再加 -q：pyproject 的 addopts 已带 -q，再来一个会吞掉汇总行）
-cd runtime && python -m pytest                    # 1080 passed / 17 skipped（无 DSN）
+cd runtime && python -m pytest                    # 1092 passed / 17 skipped（无 DSN）
 CR_TEST_PG_DSN=postgresql://… python -m pytest    # 对真 PG（本机无 psycopg，恒跳过）
 
 # 第三条在仓库根目录（xiaojiujiu/）跑；它自己进 runtime/ 并还原改动
