@@ -712,12 +712,13 @@ class MemoryProjection:
         now = isoformat(utcnow())
         connection.execute(
             "INSERT INTO memory_candidates(candidate_id, summary, kind, source_event_ids, value, status, "
-            "created_at, updated_at, consolidated_memory_id, topics_json, confidence) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "created_at, updated_at, consolidated_memory_id, topics_json, confidence, structured_json) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(candidate_id) DO UPDATE SET summary=excluded.summary, kind=excluded.kind, "
             "source_event_ids=excluded.source_event_ids, value=excluded.value, status=excluded.status, "
             "updated_at=excluded.updated_at, consolidated_memory_id=excluded.consolidated_memory_id, "
-            "topics_json=excluded.topics_json, confidence=excluded.confidence",
+            "topics_json=excluded.topics_json, confidence=excluded.confidence, "
+            "structured_json=excluded.structured_json",
             (
                 candidate.candidate_id,
                 candidate.summary,
@@ -730,6 +731,7 @@ class MemoryProjection:
                 candidate.consolidated_memory_id,
                 dumps(candidate.topics),
                 float(candidate.confidence),
+                dumps(candidate.structured),
             ),
         )
         return candidate.candidate_id
@@ -900,6 +902,7 @@ class MemoryProjection:
             consolidated_memory_id=data.get("consolidated_memory_id"),
             topics=data.get("topics_json") or [],
             confidence=float(data.get("confidence") or 0.5),
+            structured=data.get("structured_json") or {},
         )
 
     @staticmethod

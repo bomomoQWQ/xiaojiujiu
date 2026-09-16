@@ -12,17 +12,17 @@ and this file is that decision written down where it cannot rot:
    measured filling 4 of 10 probe turns while the disclosure the user asked about - which
    retrieval *did* return, rank 4 of 10 - lost the budget.
 
-All three are marked ``xfail(strict=True)`` because none of them holds today. That is
-deliberate: the marker turns into a failure the moment the behaviour is implemented, which
-forces the implementer to delete it, so an "expected failure" cannot outlive the work. The
-reason strings record what was measured, not what was assumed.
+All three were written as ``xfail(strict=True)`` before the behaviour existed, so that an
+"expected failure" could not quietly outlive the work: implementing it turns the marker
+into a failure and forces the implementer to delete it. That is what happened -- the three
+markers were removed in the commit that implemented the decision, and these are now
+standing regression tests.
 
-Why this is not implemented yet, honestly: `MemoryCandidate` has no ``structured`` field
-and candidates are persisted (`MemoryProjection.upsert_candidate`), so keeping the raw
-frame alongside the proposition means threading one field through four layers - the
-candidate type, its persistence, `memory.consolidate`, and the prompt selection in
-`context.select_memories`. A half-change there would leave the frame unrecoverable, which
-is exactly what the owner said not to do.
+One caveat worth recording, because it nearly went unnoticed: the third test drove
+retrieval with a bare string where ``MemoryStore.retrieve`` wants a ``RetrievalCue``, so it
+raised ``AttributeError`` and could never have passed however correct the implementation
+was. ``strict`` catches an *unexpected pass*; it says nothing about a test that is
+unsatisfiable, and a long-lived expected failure is exactly where such a defect hides.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from datetime import timedelta
 import pytest
 
 from companion_runtime import context as context_module
+from companion_runtime import memory as memory_module
 from companion_runtime.runtime import Runtime
 
 from conftest import BASE_TIME
@@ -51,10 +52,6 @@ def _summaries(runtime: Runtime) -> list[str]:
     return [memory.summary for memory in runtime.projections.memory.list_memories(limit=50)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="decided but not implemented: the frame must be stripped from the stored summary",
-)
 def test_a_question_is_stored_as_its_proposition(runtime: Runtime) -> None:
     """The fact survives without the interrogative frame riding along with it."""
     runtime.process_user_message(content=QUESTION_WITH_FACT, timestamp=BASE_TIME)
@@ -67,10 +64,6 @@ def test_a_question_is_stored_as_its_proposition(runtime: Runtime) -> None:
         assert "你还记得" not in summary, f"the frame is still stored as a fact: {summary!r}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="decided but not implemented: the frame must move out of the summary and into the record",
-)
 def test_the_frame_is_kept_as_relationship_evidence(runtime: Runtime) -> None:
     """Removing it from the summary must not remove it from the record.
 
@@ -96,10 +89,6 @@ def test_the_frame_is_kept_as_relationship_evidence(runtime: Runtime) -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="decided but not implemented: question memories must not take the four slots",
-)
 def test_question_memories_do_not_crowd_out_a_disclosure(runtime: Runtime) -> None:
     """The measured defect: four of ten sections were filled by the user's own questions."""
     for index, content in enumerate(
@@ -122,11 +111,26 @@ def test_question_memories_do_not_crowd_out_a_disclosure(runtime: Runtime) -> No
     selected = context_module.select_memories(
         runtime.projections,
         limit=4,
-        cue="团子最近怎么样？",
+        # A plain string cannot drive retrieval: ``MemoryStore.retrieve`` reads
+        # ``cue.query_text`` and ``cue.topics``, so passing the sentence itself raised
+        # ``AttributeError`` and the test could never pass no matter what the code did.
+        # ``xfail(strict=True)`` did not catch that -- it only fails on an *unexpected
+        # pass*, never on an unsatisfiable test -- which is worth remembering the next
+        # time an expected failure sits in the tree for a while.
+        cue=memory_module.RetrievalCue(
+            query_text="团子最近怎么样？",
+            now=BASE_TIME + timedelta(hours=3),
+        ),
         store=runtime.memory_store,
         now=BASE_TIME + timedelta(hours=3),
     )
-    shown = " ".join(getattr(item, "summary", "") for item in selected)
+    # ``select_memories`` returns plain dicts, so this must read the key. It used
+    # ``getattr(item, "summary", "")``, which on a dict always yields the default --
+    # making ``shown`` the empty string and the assertion below true no matter what the
+    # runtime did. A mutation (disabling the recall-check exclusion in
+    # ``context.select_memories``) did not turn this red, which is how the vacuous
+    # assertion was found; it does now.
+    shown = " ".join(str(item.get("summary", "")) for item in selected)
     assert "你还记得" not in shown, (
         f"a question memory took one of the four slots: {shown!r}"
     )

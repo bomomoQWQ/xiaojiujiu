@@ -289,6 +289,18 @@ def select_memories(
             return
         if memory_module.is_superseded(memory):
             return
+        if memory_module.is_recall_check(memory):
+            # A memory whose summary came from a question must not spend one of the
+            # four slots. These were measured filling all four while the disclosure the
+            # user actually asked about had been retrieved (rank 4 of 10) and still lost
+            # the budget, because questions about the same relationship share their
+            # wording and so recall each other in a pack.
+            #
+            # It is still retrievable -- ``MemoryStore.retrieve`` is untouched and
+            # ``_retrievable`` still reports it -- it simply does not compete for the
+            # prompt. The frame itself lives on in ``structured`` as relationship
+            # evidence, which is what the owner asked for.
+            return
         seen.add(memory.memory_id)
         selected.append(
             {

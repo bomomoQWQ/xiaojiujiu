@@ -350,52 +350,49 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
 - 遗留（不在本条范围）：镜像**写失败**时仍是"记一条警告"（`_write_mirror_or_warn`），
   契约上"忠实前缀"已成立，但"失败是否应让 `/health` 可见"没有做。
 
-**#3 + #5 用户提问进长期记忆 / 提问式记忆挤占 4 个名额**（用户已定口径，**决策已进代码库，实现未做**）
-- **决策现在有可执行的验收标准**：`runtime/tests/test_question_memories.py`（3 条
-  `xfail(strict=True)`：①提问存成命题、框架从 summary 里消失；②框架**移到记录里**（从 summary 消失
-  但可从 `memory.structured` 取回——两半一起断言，因为单看"记录里有"对现状已经成立、是空验收）；
-  ③提问式记忆不得占用那 4 个名额）。三条今天都不成立，一旦实现会 XPASS 并报错逼人摘标记。
-- **为什么还没实现（不是懒，是范围）**：`MemoryCandidate` **没有 `structured` 字段**，而候选是**要落库**的
-  （`MemoryProjection.upsert_candidate`）。所以"summary 存命题 + 原句留档"必须把**一个字段穿透四层**：
-  候选类型（`typing.py`）→ 候选持久化（`projections.py`）→ 巩固时候选转记忆（`memory.consolidate`）
-  → 提示词选择（`context.select_memories`/`build`）。半做会让原句彻底丢掉，而这正是你明确不要的
-  （"框架要留"）。我选择留下验收测试而不是留下半截实现。
-- **实现要点见下（原样保留）：**
-- **照抄即可的文件级清单（本轮已把锚点都探明，约 30 行 / 5 个文件）**：
-  1. `typing.py`：`MemoryCandidate` 加 `structured: dict[str, Any] = field(default_factory=dict)`
-     并写进它的 `to_dict()`（第 515-544 行，字段紧跟在 `confidence` 后）。
-  2. `db.py`：`memory_candidates` DDL 加 `structured_json TEXT NOT NULL DEFAULT '{}'`，
-     并在 `ADDED_COLUMNS` 加一行 `("memory_candidates", "structured_json", "TEXT")`
-     （格式就是 `("表", "列", "类型")`，旁边已有 `boundaries.subject` 那条可照抄；老库原地升级）。
-  3. `projections.py`：`MemoryProjection.upsert_candidate` 的**列清单、VALUES、`ON CONFLICT ... SET`
-     三处**都要加 `structured_json`（值用 `dumps(candidate.structured)`），候选行解码处用
-     `loads(row["structured_json"] or "{}")`。
-  4. `memory.py`：
-     - 新增 `proposition_of(text) -> tuple[str, str | None]`：返回 (命题, 疑问框架或 None)。
-       框架起点用 `(你|您)?(还|都)?记(得|不记得)|记不记得` 这类模式切；**剥完若命题短于 4 字或为空
-       就原样返回**（绝不产出半句话，`FRAME_ONLY` 那条验收测试就是钉这个）。
-     - `propose_from_event`：`summary=summarize_text(proposal)`，并把框架写进
-       `candidate.structured["recall_check"] = frame`（同时可存原句 `["raw_text"]`）。
-       注意它现在只返回**一个**候选，不要改成两个（调用方与测试都按单候选写）。
-     - `consolidate`：它已经在用 `structured=structured` 构造 `Memory`（第 ~550 行），
-       把 `candidate.structured` 并进那个 dict 即可（`.update(candidate.structured)`）。
-  5. `context.py`：`select_memories` 的每个来源在入选前跳过
-     `memory.structured.get("recall_check")` 为真的记忆——这就是"不占那 4 个名额"的落点；
-     它们**仍可被线索召回**（`_retrievable` 不动），只是不参与提示词预算。
-  6. 跑 `runtime/tests/test_question_memories.py`：三条应从 `xfailed` 变成 `passed`，
-     然后**删掉三个 `xfail` 标记**（`strict=True` 会以 XPASS 报错逼你做这件事）。
-- **原口径（用户确认，不要再问）**：
-- 现象：8 条记忆的 summary 就是提问句（如"我喜欢你这件事情，你还记得我说过吗？"）；10 次探针里
-  **4 次**的记忆区被提问式记忆占满，而被问起的那条披露**召回引擎确实返回了**
-  （`recalled=true`、排名 4/10）**却输给预算**，只进 9/10 次。
-- **用户口径（已确认，别再问）**：**命题进记忆**（剥掉疑问框架），**疑问框架本身作为独立的
-  "关系证据"保留**（用户在检查你是否记得，这本身是关系信号），**且不得占用那 4 个名额**。
-- 实现要点：`memory.propose_from_event` 的 `summary=summarize_text(text)` 目前存原句；
-  需要剥离 `你还记得…吗？` / `…你还记得我说过吗？` / `你还记得我跟你讲过它吗？` 这类框架并
-  产出通顺命题（剥不干净就**原样保留**，绝不产出半句话）；证据存成什么（新 `MemoryKind`、
-  交互观察、或 `structured` 字段）需你定夺，若加新 kind，记得 `typing.py` 里
-  `kind_importance`、durable 段成员判定、检索与 API 面都要处理；名额排除要落到
-  `context.select_memories` / `context.build`（`durable` 来源）。
+**#3 + #5 用户提问进长期记忆 / 提问式记忆挤占 4 个名额**（**已实现 + 已验证**）
+
+- **口径**（用户已确认）：命题进记忆（剥掉疑问框架），疑问框架本身作为独立的"关系证据"保留，
+  且不得占用那 4 个名额。
+- **实现**（5 个文件，约 40 行；`MemoryCandidate` 新增 `structured` 并穿透四层）：
+  1. `typing.py`：`MemoryCandidate.structured` + `to_dict()`。
+  2. `db.py`：`memory_candidates` DDL 加 `structured_json`；`ADDED_COLUMNS` 加一行；
+     **`JSON_COLUMNS["memory_candidates"]` 也要加**——这一步清单里没写，但漏了它
+     `structured_json` 读回来是字符串而不是 dict（`row_to_dict` 靠这张表决定解哪些列）。
+     PG 侧复用同一份 DDL 与列表（`db_postgres.py` 直接取 `_SqliteDatabase.ADDED_COLUMNS`），
+     所以只改 `db.py` 一处。
+  3. `projections.py`：`upsert_candidate` 的列清单/VALUES/`ON CONFLICT SET` 三处 +
+     `_to_candidate` 解码。
+  4. `memory.py`：`proposition_of()` 剥框架；`propose_from_event` 存命题并把框架写进
+     `candidate.structured["recall_check"]`（命题与原句不同时另存 `raw_text`）；
+     `consolidate` 合并 `candidate.structured`；**重复候选那条路也要合并**（`_find_duplicate`
+     命中时只强化已有记忆，不并 structured 的话框架会在那里丢掉）；新增 `is_recall_check()`。
+  5. `context.py`：`select_memories` 的 `add()` 跳过 `recall_check` 记忆——这是**所有来源共用
+     的发名额点**，所以一行覆盖四个来源；`MemoryStore.retrieve` 不动（仍可被线索召回）。
+- **一个设计判断是测试逼出来的**：`FRAME_ONLY`（"你还记得我跟你讲过它吗？"）剥完命题为空。
+  契约要求**原样保留摘要**（绝不产出半句话），但第③条又要求它**不能占名额**。所以
+  "框架探测到"和"命题剥成功"必须解耦：摘要原样留，`recall_check` 照记。
+  另加一道守卫：只有**疑问句**才认框架——"我记得你说过喜欢我"含"记得"但是陈述句，
+  误判会把它当成提问，从而把一个真实披露藏出提示词。
+- **验收**：`runtime/tests/test_question_memories.py` 三条 `xfail(strict=True)` 全部转正，
+  标记已摘。
+- **变异证据**（三处，各自精确打红对应测试）：
+  | 变异 | 打红 |
+  |---|---|
+  | 拿掉 `select_memories` 的名额排除 | ③ |
+  | `propose_from_event` 还原成存原句 | ① ② |
+  | `consolidate` 不合并 `structured` | ② ③ |
+- **⚠️ 过程中发现：那条"不占名额"的验收测试原本是不可证伪的。** 它写的是
+  `getattr(item, "summary", "")`，而 `select_memories` 返回的是 **dict**——对 dict 取属性
+  永远拿到默认值 `''`，于是 `shown` 恒为空串，`"你还记得" not in ""` 恒为真。
+  **变异测试（拿掉排除）没有打红它**，才暴露出这一点。已改成 `item.get("summary", "")`，
+  改完变异立刻咬人。
+  教训：`xfail(strict=True)` 只抓"意外通过"，**抓不到"永远不可能失败"**——而一条长期挂着的
+  预期失败正是这种缺陷最舒服的藏身处。这个文件里原本还有一个同类问题：`cue` 传的是裸字符串，
+  而 `retrieve` 要 `RetrievalCue`，所以它连代码路径都进不去。两条都已修。
+- **回归**：全量 1053 passed / 17 skipped / 0 failed；四套仿真 **77 / 335 / 25 / 105 全绿**
+  （黑盒、韧性、记忆质量、关系递进）。老库原地升级实测：删掉 `structured_json` 列模拟旧库，
+  重开补列成功，**旧行读回 `structured={}`**，不崩不丢。
 
 ### 本轮的方法论教训（重要）
 

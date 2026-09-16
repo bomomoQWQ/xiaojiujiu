@@ -526,6 +526,14 @@ class MemoryCandidate:
     consolidated_memory_id: str | None = None
     topics: list[str] = field(default_factory=list)
     confidence: float = 0.5
+    #: Extra provenance carried from the proposal to the consolidated memory.
+    #:
+    #: The one user today is a question's recall frame (see
+    #: :func:`~companion_runtime.memory.proposition_of`): the fact is stored as its
+    #: proposition and the frame is kept here as relationship evidence. It has to
+    #: survive consolidation, and candidates are persisted, so it needs a column of
+    #: its own rather than a value that only exists for the length of one call.
+    structured: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable rendering."""
@@ -541,6 +549,7 @@ class MemoryCandidate:
             "consolidated_memory_id": self.consolidated_memory_id,
             "topics": list(self.topics),
             "confidence": round(self.confidence, 6),
+            "structured": dict(self.structured),
         }
 
 

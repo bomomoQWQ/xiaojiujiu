@@ -36,6 +36,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
+import re
 import random
 import sqlite3
 from dataclasses import dataclass, field
@@ -208,6 +209,70 @@ RELATIONSHIP_MARKERS = (
 #: filed as stable knowledge about the user, which is exactly what the marker "我生日"
 #: alone did.
 QUESTION_MARKERS = ("?", "？", "吗", "呢", "什么时候", "多少", "为什么", "怎么", "哪", "记不记得", "还记")
+
+#: Phrases that ask the character to *demonstrate* memory rather than to learn
+#: something - "你还记得…吗？". The owner's decision (see
+#: ``tests/test_question_memories.py``): the proposition inside such a question is what
+#: gets remembered, and the frame itself is kept separately as relationship evidence,
+#: because a user checking whether the character remembers is itself a signal about the
+#: relationship.
+RECALL_FRAME_RE = re.compile(r"(?:你|您)?(?:还|都)?记(?:得|不记得)|记不记得")
+
+#: Shortest head that still reads as a proposition. Below this the frame is the whole
+#: sentence ("你还记得我跟你讲过它吗？"), and stripping it would leave a fragment - a
+#: memory that says "我" is worse than one that admits it was a question.
+MIN_PROPOSITION_CHARS = 4
+
+#: Structured-memory key holding a question's recall frame. Read by
+#: :func:`~companion_runtime.context.select_memories` to keep these memories out of the
+#: prompt budget: they share their wording with each other by construction, so they were
+#: measured filling four of four slots while the disclosure the user asked about lost.
+RECALL_CHECK_KEY = "recall_check"
+
+#: Structured-memory key holding the original sentence when the stored summary is a
+#: derived proposition rather than the words the user used.
+RAW_TEXT_KEY = "raw_text"
+
+
+def _looks_like_a_question(text: str) -> bool:
+    """Return whether a message is asking something rather than stating it.
+
+    Only questions can carry a recall *frame*: "我记得你说过喜欢我" contains the same
+    verb and is a statement, and treating it as a frame would file it as a question and
+    hide a real disclosure from the prompt.
+    """
+    return any(marker in text for marker in ("?", "？", "吗", "呢"))
+
+
+def proposition_of(text: str) -> tuple[str, str | None]:
+    """Split a recall-check question into ``(proposition, frame)``.
+
+    The user asking "我喜欢你这件事情，你还记得我说过吗？" has stated a fact *and* asked
+    whether it was retained. Filing the whole sentence as the fact makes the memory read
+    as a question forever, and - because such questions share their wording - lets a run
+    of them crowd the four prompt slots. So the fact is filed alone, and the frame is
+    returned separately for the caller to keep as evidence.
+
+    Args:
+        text: The user's message.
+
+    Returns:
+        ``(proposition, frame)``. ``frame`` is ``None`` when the message asks nothing
+        about memory. When stripping would leave a fragment the text is returned
+        unchanged - a half-sentence fact is worse than a question honestly filed as one
+        - but the frame is still reported, so it is still kept out of the prompt budget.
+    """
+    stripped = (text or "").strip()
+    if not stripped or not _looks_like_a_question(stripped):
+        return stripped, None
+    match = RECALL_FRAME_RE.search(stripped)
+    if match is None:
+        return stripped, None
+    frame = stripped[match.start() :].strip()
+    head = stripped[: match.start()].strip().rstrip("，,、;；:： \t")
+    if len(head) < MIN_PROPOSITION_CHARS:
+        return stripped, frame
+    return head, frame
 
 #: Markers of a durable fact about the user (design §16's "stable knowledge").
 STABLE_MARKERS = (
@@ -394,9 +459,21 @@ def propose_from_event(
         # producer at all - the kind existed only in the enum and the importance table).
         kind = MemoryKind.RELATIONSHIP.value
 
+    proposition, frame = proposition_of(text)
+    structured: dict[str, Any] = {}
+    if frame is not None:
+        # The frame is relationship evidence, not noise: a user checking whether the
+        # character remembers is telling it something about the relationship. It is kept
+        # here (and never in the summary) so that it survives consolidation, and it is
+        # what ``context.select_memories`` reads to keep these memories out of the four
+        # prompt slots.
+        structured[RECALL_CHECK_KEY] = frame
+        if proposition != text:
+            structured[RAW_TEXT_KEY] = text
+
     return MemoryCandidate(
         candidate_id=new_id("memory_candidate"),
-        summary=summarize_text(text),
+        summary=summarize_text(proposition),
         kind=kind,
         source_event_ids=[event.event_id],
         value=value.total,
@@ -404,6 +481,7 @@ def propose_from_event(
         created_at=ensure_aware(created_at) or utcnow(),
         topics=tokenize(text)[:6],
         confidence=0.5,
+        structured=structured,
     )
 
 
@@ -507,6 +585,11 @@ def consolidate(
             existing.source_event_ids = sorted(
                 set(existing.source_event_ids) | set(candidate.source_event_ids)
             )
+            if candidate.structured:
+                # The same fact asked about again is still a recall check, and the frame
+                # has to land somewhere. Merging here keeps the "the frame is never
+                # dropped" promise on the duplicate path too, not only on the insert one.
+                existing.structured = {**existing.structured, **candidate.structured}
             reinforce(projection, connection, existing, config=config, now=stamp)
             projection.upsert_memory(connection, existing)
             projection.set_candidate_status(
@@ -550,6 +633,11 @@ def consolidate(
             SUPERSEDES_KEY: supersedes,
             "topics": candidate.topics,
         }
+        # Provenance the proposal attached must reach the memory, or it is lost here --
+        # this is the last layer the recall frame passes through, and dropping it would
+        # make the frame unrecoverable while leaving the summary stripped, which is the
+        # one outcome the decision ruled out.
+        structured.update(candidate.structured)
         if superseded_by is not None:
             structured[SUPERSEDED_HINT_KEY] = superseded_by.summary
             structured[SUPERSEDED_AT_KEY] = isoformat_or_none(superseded_by.created_at)
@@ -608,6 +696,21 @@ def is_superseded(memory: Memory) -> bool:
     all skip it. It stays in the database - an old fact is history, not an error.
     """
     return bool(str(memory.structured.get(SUPERSEDED_HINT_KEY) or "").strip())
+
+
+def is_recall_check(memory: Memory) -> bool:
+    """Return whether this memory came from a question about the character's memory.
+
+    The write side is :func:`proposition_of`, which strips the interrogative frame and
+    stores it under :data:`RECALL_CHECK_KEY`. This is the read side, used by
+    :func:`~companion_runtime.context.select_memories` to keep such memories out of the
+    four prompt slots while leaving them retrievable.
+
+    They are still memories: the user did say something, and the frame is real
+    relationship evidence. They simply must not compete for the prompt budget, because a
+    run of them crowds out the disclosure the user actually asked about.
+    """
+    return bool(str(memory.structured.get(RECALL_CHECK_KEY) or "").strip())
 
 
 def supersession_record(memory: Memory) -> dict[str, Any]:

@@ -274,7 +274,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         updated_at        TEXT NOT NULL,
         consolidated_memory_id TEXT,
         topics_json       TEXT NOT NULL DEFAULT '[]',
-        confidence        REAL NOT NULL DEFAULT 0.5
+        confidence        REAL NOT NULL DEFAULT 0.5,
+        structured_json   TEXT NOT NULL DEFAULT '{}'
     )
     """,
     """
@@ -389,7 +390,7 @@ JSON_LIST_COLUMNS: frozenset[str] = frozenset(
 JSON_COLUMNS: dict[str, tuple[str, ...]] = {
     "raw_events": ("metadata_json", "source_event_ids"),
     "memories": ("structured_json", "topics_json", "source_event_ids"),
-    "memory_candidates": ("source_event_ids", "topics_json"),
+    "memory_candidates": ("source_event_ids", "topics_json", "structured_json"),
     "candidate_intents": (
         "sources_json",
         "constraints_json",
@@ -614,6 +615,13 @@ class Database(DatabaseBase):
         # below; the old rows read back as ``subject IS NULL``, which every caller
         # treats as "the referent was never established".
         ("boundaries", "subject", "TEXT"),
+        # Proposal provenance that must survive consolidation. Today's only user is a
+        # question's recall frame: the fact is filed as its proposition and the frame is
+        # kept as relationship evidence, which means the frame has to travel from the
+        # proposal through the persisted candidate to the memory. Existing databases
+        # upgrade in place; old rows read back as ``'{}'``, i.e. "no extra provenance",
+        # which is exactly what a candidate proposed before this column existed had.
+        ("memory_candidates", "structured_json", "TEXT"),
     )
 
     def migrate(self) -> int:
