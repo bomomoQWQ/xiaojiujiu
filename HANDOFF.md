@@ -644,6 +644,64 @@ http://runtime-fleet:8799` → fleet 13 人 → 他自己的库里只有他自�
 **默认回落实例已清空**（`xxj-runtime-test` 里路由生效前的 20001–20010/20099 历史已删除），
 现在它只作为回退存在，只剩下系统自己的 `default` 会话。
 
+### 封测采集（P0–P2，已完成并在测试栈验证）
+
+**为什么要有这一节**：封测的产出不是"跑了一周"，而是**能读完的数据**。动手前先核对现状，
+发现两样东西**完全没有落盘**：动机博弈的判决（效用分解、为何不动）、以及状态/情绪的时间序列；
+注入内容按设计是临时的，也没有历史。
+
+**Runtime 侧（只增加记录，不改变行为）**：
+- 新表 `decisions`：每次内源轮次一条，**acted=false 的也写**——"她今天为什么没主动说话"
+  只能从没动的那些轮次里读；payload 保留完整 `MotivationResult`（每个落选候选的
+  internal/user/relation/成本/概率都在）。
+  ⚠️ 踩过的坑：`endogenous_round` 的 **foreground_pause 分支在动机博弈之前就 return**，
+  一开始没记录 → 聊天最活跃的时段一条日志都没有。已补（`trigger=foreground_pause`）。
+- 新表 `state_samples`：每轮一个采样点（valence/arousal/stability/impulse/restraint/pressure），
+  把 `runtime_state` 的单点快照变成曲线。
+- 注入留痕：每次 `/v1/context` 写一条 `system/context_rendered` 原始事件（trigger、version、
+  总字数、**各段字数**）；全文另由 `observability.record_context_text` 控制（默认关）。
+- 配置段 `ObservabilityConfig(enabled=True, record_context_text=False)`；写入走 reducer 自己的
+  事务（不引入第二个写者），失败只告警不拖垮轮次。
+
+**采集密度（重要）**：一条用户消息**不会唤醒 Runtime 自己的调度器**，默认上限 5400s
+意味着最坏 90 分钟才有一次决策，一周每人只有几十条博弈日志。fleet 现在设
+`CR_SCHEDULER__MAX_INTERVAL_SECONDS=900`（MIN=60）——因为 hazard 是在两次决策之间积分、
+**按设计频率无关**（两个短区间与一个长区间的生存概率相同），所以**只提高分辨率、不改变行为**。
+实测：静置 5 分钟后自动多出 1 条决策。
+
+**工具（`scripts/`）**：
+| 脚本 | 用途 |
+|---|---|
+| `export_beta_data.py` | 容器内只读挂载 fleet 卷 → 每人 `events/decisions/state_samples` + 全部表 JSONL + `summary.json` + `runtime.log` + manifest |
+| `replay_session.py` | 把"用户说了什么 / 当时注入了什么（含分段字数与版本）/ 之后的决策与落选候选"并排打印 |
+| `beta_daily_report.py` | 每日每人 markdown（对话/决策原因分布/候选/未解释/状态曲线/实时健康），写 `reports/<date>.md` |
+| `snapshot_beta.py` | 优化前用 SQLite backup API 冻结整支 fleet（含 compose 与路由快照） |
+| fleet `GET /fleet/dashboard` | 只读、30s 自刷新的总览页；`/fleet/status` 增加 unresolved / open_unfinished / deep+explain 调用数 |
+
+**数据落在服务器机械盘**：`/mnt/xz/xiaojiujiu-beta/{<批次>,reports,snapshots}`（`/dev/sda1` 932G，
+519G 可用）。一次 14 人导出约 5MB。
+
+**每日流程（三条命令）**：
+```bash
+# 1) 采集（容器里读卷，写机械盘）
+docker run --rm -v astrbot_test_runtime-fleet-data:/data:ro \
+  -v /mnt/xz/xiaojiujiu-beta:/export -v ~/astrbot_test/src/xiaojiujiu/scripts:/scripts:ro \
+  python:3.12-slim python /scripts/export_beta_data.py --note "day-N"
+# 2) 读某个人这一周
+python3 ~/astrbot_test/src/xiaojiujiu/scripts/replay_session.py \
+  --export /mnt/xz/xiaojiujiu-beta/<批次>/people/<person>
+# 3) 每日汇总（--date 省略即今天）
+python3 ~/astrbot_test/src/xiaojiujiu/scripts/beta_daily_report.py \
+  --export /mnt/xz/xiaojiujiu-beta --out /mnt/xz/xiaojiujiu-beta/reports
+# 优化前先冻结基线
+python3 ~/astrbot_test/src/xiaojiujiu/scripts/snapshot_beta.py --note "before tuning" \
+  --root /mnt/xz/xiaojiujiu-beta/snapshots     # 同样挂上卷与导出盘运行
+```
+
+**证据**：`runtime/tests/test_observability.py` 7 条；`scripts/mutation_observability.py`
+4 条变异全部 KILLED（不写决策/不写曲线/不记录渲染/忽略全文开关）；runtime 全量
+**1134 passed / 17 skipped**。测试栈实测：静置后自动采样、导出→回放→日报全链路通过。
+
 ### ⚠️ 宿主坑：AstrBot 把 OneBot 的「通知」包装成空正文的消息事件
 
 真机取证（真人 QQ，14 秒内 8 条 `user_message`，其中 7 条正文为空、`message_id` 是 UUID、
