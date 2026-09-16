@@ -555,6 +555,16 @@ GROUPS: dict[str, tuple[list[str], list[tuple[str, list[tuple[pathlib.Path, str,
                 ],
             ),
             (
+                "L9 the new baselines are stored but never exposed to the operator",
+                [
+                    (
+                        USER_MODEL,
+                        '            "reply_length_baseline": self.reply_length_baseline_view(),\n            "reply_turns_baseline": self.reply_turns_baseline_view(),\n',
+                        "",
+                    )
+                ],
+            ),
+            (
                 "L7 the conversation term saturates at a hardcoded three again",
                 [
                     (

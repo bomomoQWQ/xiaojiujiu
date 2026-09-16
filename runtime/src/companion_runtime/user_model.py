@@ -1627,13 +1627,19 @@ class UserInteractionModel:
         """Return the numeric view used by the heartbeat and motivation layers.
 
         Every key the previous version returned is still here and still has the same
-        shape; ``reply_delay_baseline`` is additive.
+        shape; the three baselines are additive.
         """
         view: dict[str, Any] = {
             "observations": self._observations,
             "effective_count": round(self._effective_count, 3),
             "class_evidence": {cls: self.behaviour_evidence(cls) for cls in BEHAVIOUR_CLASSES},
+            # All three §29 baselines, side by side. They are the only per-user quantities
+            # the model learns that are not a θ vector, and an operator asking "why did it
+            # read that reply as cold?" needs to see them - including whether each one is
+            # trusted yet, because an untrusted baseline contributes nothing.
             "reply_delay_baseline": self.reply_delay_baseline_view(),
+            "reply_length_baseline": self.reply_length_baseline_view(),
+            "reply_turns_baseline": self.reply_turns_baseline_view(),
             "behaviour_offsets": {
                 behaviour_class: {
                     target: [round(value, 4) for value in vector]

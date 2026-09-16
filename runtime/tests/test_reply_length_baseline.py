@@ -378,3 +378,31 @@ def test_an_unknown_conversation_length_earns_no_credit() -> None:
         assert model.reply_turns_baseline_samples == 0, "an unknown length teaches nothing"
     finally:
         db.close()
+
+
+def test_all_three_baselines_are_visible_to_the_operator() -> None:
+    """§29's three signals must be inspectable, not just stored.
+
+    ``numeric_view`` is the design's 数值视图 (§30) - the operator's answer to "why did it
+    read that reply as cold?". An untrusted baseline contributes *nothing*, so whether each
+    one is trusted is exactly the part that has to be visible. This assertion is also the
+    one that caught the two new views being written but never wired into the view.
+    """
+    model, db = make_model()
+    try:
+        view = model.numeric_view()
+
+        for key in ("reply_delay_baseline", "reply_length_baseline", "reply_turns_baseline"):
+            assert key in view, f"{key} is not exposed"
+            assert view[key]["samples"] == 0
+            assert view[key]["trusted"] is False
+        assert view["reply_length_baseline"]["min_samples"] == REPLY_LENGTH_BASELINE_MIN_SAMPLES
+
+        learn(model, db, length=VERBOSE, count=5, turns=4)
+        refreshed = model.numeric_view()
+        assert refreshed["reply_length_baseline"]["trusted"] is True
+        assert refreshed["reply_length_baseline"]["mean_chars"] == pytest.approx(VERBOSE)
+        assert refreshed["reply_turns_baseline"]["trusted"] is True
+        assert refreshed["reply_turns_baseline"]["mean_turns"] == pytest.approx(4.0)
+    finally:
+        db.close()
