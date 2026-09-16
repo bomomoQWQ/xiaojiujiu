@@ -679,6 +679,7 @@ http://runtime-fleet:8799` → fleet 13 人 → 他自己的库里只有他自�
 | `beta_daily_collect.sh` | 上面三条的定时包装（导出 → 日报 → 收尾），crontab 每天 08:05 CST 调它 |
 | `fleet_probe_instance.sh` | 在 fleet 容器里读某个人的库：事件直方图 / 判决列表 / 采样数 / 语义状态（`QQ=<QQ>` 作环境变量传） |
 | `fleet_probe_context.sh` | 网络内直调该实例 `POST /v1/context` 并回读 `context_rendered` 是否 +1（验证埋点闭环用） |
+| `fleet_probe_semantics.sh` | 看某人"为什么情绪是平线"：结算/未结算分布、深刷新是否回写、mood 列、情绪事件计数 |
 | fleet `GET /fleet/dashboard` | 只读、30s 自刷新的总览页；`/fleet/status` 增加 unresolved / open_unfinished / deep+explain 调用数 |
 
 **数据落在服务器机械盘**：`/mnt/xz/xiaojiujiu-beta/{<批次>,reports,snapshots}`（`/dev/sda1` 932G，
@@ -758,6 +759,54 @@ CST=UTC+8。若在 CST 白天跑，`--date 今天(UTC)` 只能看到"从 CST 08:
 > 一次刚聊完（pause ≈ 60s）+ 持续对话的时段，判决可能只有个位数/小时。真人实例 50 分钟里
 > 12 提问 5 回复**只有 1 条判决**。所以日报里的"决策次数"要连着"对话轮数"一起读，
 > 别把"她在聊天"误读成"博弈没跑"；真要加密样本，调 `CR_SCHEDULER__MAX_INTERVAL_SECONDS`。
+
+### 🔴 封测主目标的缺口：真实对话几乎从不结算 ⇒ 情绪曲线是平线（2026-09-16 夜发现）
+
+**现象**：日报里 14 个实例、含真人 12 问 5 答，`mood_valence` **全是 +0.000**，
+`active_emotion_events = 0`、`emotion_explanations = 0`。真人那 12 条消息的语义状态是
+**清一色 `unresolved / potential_relevance=low / reason=no_explicit_anchor`**，
+已结算行 **0 条**，深刷新 `deep_refresh_id` 一个都没写上。
+
+**机制（`runtime.py` 1188–1202 附近，架构补丁 v0.2 的有意设计）**：
+
+```
+settle_on_ingest → classify_event(粗分类)  ── 命中 → 结算 → settlement_to_evaluation → 情绪事件
+                                          └─ 未命中 → record_unresolved(no_explicit_anchor)
+                                                       └─ 注释原话："An unresolved event yields
+                                                          no emotional after-effect yet."
+```
+即**未结算 = 零情绪事件**。而粗分类走的是 `semantic.py` 的关键词信号表
+（`谢谢 / 想你 / 太累了 / 面试过啦 / 算了 / 随便 / 哈哈 …` 几十条），日常口语
+（"调试好手上的东西就睡"、"你很好奇我在干什么吗"）**基本一条都不命中**。
+于是每条真实消息都进"待理解"队列，而队列的回头机制是深刷新，触发条件只有
+`unresolved_backlog ≥ 4`（本栈正是 4）或 `idle_refresh`（需**静默 ≥ 1 小时**，本栈设 1h）
+且最小间隔 900s。真人实例 15:34:37 确实发起过一次刷新（`last_deep_refresh_at` 有值），
+但 12 条 unresolved **一条都没被结算**，日志里也没有应用级输出（runtime.log 只有 uvicorn
+的 access log），所以只能判定：**要么 provider 批量刷新没产出可用建议，要么产出被判为
+ungrounded 后丢弃**——两者都不会更新语义状态，也都不会动情绪。
+
+**为什么这对封测是致命的**：封测要收的三样里，"情感日志变化"与"动机模块"的输入都依赖结算。
+按现在的行为，一周真人聊天会得到——对话记录完整、博弈日志稀疏（见上一条）、
+**情绪曲线全程平线**。这不是"她今天心情没变"，而是"系统没读"。
+
+**实测补充（模拟用户 20001，3 问 3 答）**：`unresolved/low=2` + `unresolved/medium=1`、
+已结算 **0**、`active_emotion_events=0`、`mood_valence=0.0`，
+`last_deep_refresh_at=15:19:19`（发起过）→ 与真人实例同形。**14 个实例没有一个存在已结算行**，
+所以这不是某个人讲话太日常，而是当前配置下的普遍行为。
+
+**三条可选路线（都还没有实施，等拍板）**：
+1. **不热路径、只加密度**：把深刷新的触发从"静默 1h"改成"对话结束后 N 分钟"
+   （`deep_refresh_idle_hours` 0.25 之类）+ 调小积压阈值。守住 v0.2 "不在热路径猜"的立场，
+   但代价是每个对话窗口一次 LLM 调用，且情绪时间戳会晚于消息本身。
+2. **热路径直连语义 provider**：每条消息调一次 `provider`（或每轮批量），解析失败就回落
+   `unresolved`。真实感最强，但要重开一条被否决过的路径，且一周 10 人的调用量与费用要算。
+3. **扩词表/规则**：把 `classify_event` 的命中率提上去（成本最低、零 LLM）。缺点是
+   它本质仍是关键词，只是把"一条都不命中"变成"命中一部分"，不解决理解问题。
+
+**诊断怎么做**（都固化在脚本里，不要再手搓 curl）：
+- 库里看曲线与语义：`QQ=<QQ> bash scripts/fleet_probe_instance.sh`
+- 看情绪/结算细节：`docker exec -i xxj-runtime-fleet python3 - < 一段脚本`
+  （`docker cp` 往这个容器里拷文件会报 `Could not find the file /proc/self/fd`，用 stdin）
 
 ### ⚠️ 宿主坑：AstrBot 把 OneBot 的「通知」包装成空正文的消息事件
 
