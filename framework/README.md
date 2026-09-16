@@ -414,7 +414,7 @@ quiet_hours                                      是否落在免打扰时段
 ```bash
 cd framework
 PY="$(cd ../runtime && pwd)/.venv/bin/python"
-"$PY" -m pytest tests          # 227 passed
+"$PY" -m pytest tests          # 271 passed（约 45s）
 ```
 
 | 文件 | 覆盖 | 需要原程序 |
@@ -448,7 +448,7 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"
 | `cf/control.py` | 控制面（仅回环，非回环地址会被拒绝） |
 | `cf/harness.py` | 组装：mock → 原程序 → uvicorn → 调度器 → 控制面 → 心跳 |
 | `cf/cli.py` | `cf` 命令 |
-| `tests/` | 102 个测试 |
+| `tests/` | 271 个测试 |
 
 ---
 

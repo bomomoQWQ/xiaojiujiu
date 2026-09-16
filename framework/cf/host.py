@@ -56,10 +56,35 @@ PLUGIN_PACKAGE = "astrbot_plugin_companion_runtime"
 #: The default session, in AstrBot's ``platform:MessageType:id`` form.
 SESSION_DEFAULT = "webchat:FriendMessage:default"
 
-#: The adapter configuration this host runs the plugin with. Copied from the
-#: shipped black-box simulation so both drive the plugin identically; the world
-#: clock moves faster than any cache TTL, so the context cache is off rather than
-#: serving a stale background block.
+#: The adapter configuration this host runs the plugin with.
+#:
+#: This started as a copy of the shipped black-box simulation's configuration
+#: (``scripts/blackbox_user_simulation.py``), but the two have since **drifted**: five
+#: values differ, and nothing anywhere records why. Two differences are *not* drift and
+#: must not be "fixed":
+#:
+#: * ``runtime_base_url`` is absent here on purpose - the black-box puts it in this same
+#:   mapping, while this host injects it at construction time
+#:   (:meth:`HostHandle.start`);
+#: * ``adapter_id`` differs because it has to.
+#:
+#: The five real divergences, against the black-box values:
+#:
+#:     context_timeout_ms     2000     (black-box 500)
+#:     context_prefetch       False    (black-box True)
+#:     request_timeout_ms     5000     (black-box 2000)
+#:     render_timeout_ms      60000    (black-box 10000)
+#:     queue_max_backoff_ms   1000     (black-box 500)
+#:
+#: An earlier comment here claimed the two "drive the plugin identically", which was not
+#: true and could not be checked from the code - this host has a hand-driven clock and a
+#: mock LLM endpoint, so longer timeouts and no prefetch are plausible *choices*, but a
+#: plausible reason is not a recorded one. Treat it as an open question (see
+#: ``docs/SIMULATION_INTEGRATION.md`` at the repository root), not as a licence to change
+#: one side quietly.
+#:
+#: ``context_cache_ttl_ms`` is 0 in both, for the reason that was always correct: the world
+#: clock moves faster than any TTL, so the cache would serve a stale background block.
 PLUGIN_CONFIG: Mapping[str, Any] = {
     "enabled": True,
     "adapter_id": "framework-host",

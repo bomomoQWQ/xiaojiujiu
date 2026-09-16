@@ -156,6 +156,7 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 | 高仿真故障恢复 | 335/335 |
 | 用户黑盒仿真 | **77 / 77**（退出码 0，连跑多次一致） |
 | 记忆质量仿真 | **25 / 25**（`scripts/e2e_memory_simulation.py`，见第 6 节） |
+| framework 测试 | **271 passed**（`framework/tests`，实测约 45s；旧文档写 227/102，已更正） |
 | 版本 | Runtime 0.3.2（进行中）；插件 0.1.0 |
 | 许可证 | GPL-3.0-or-later |
 
@@ -276,25 +277,30 @@ python scripts/blackbox_user_simulation.py --base-dir ./bb --fault leak   # 注�
 | `runtime/docs/PATCH_V0.2_MAPPING.md` | 设计章节 → 代码位置 → 状态的对照，含**诚实缺口清单** |
 | `runtime/README.md` | 运维手册：配置项、API、降级、蓝屏恢复 |
 | `framework/` | **外接测试框架**：可控虚拟时钟 + OpenAI 兼容 mock 端点 + 变量日志 + `cf` 命令行。不改原程序，见 `framework/README.md` |
-| `scripts/` | 验证与运维脚本（三个仿真、基准、备份） |
+| `scripts/` | 验证与运维脚本（**四个**仿真：黑盒 / 韧性 / 记忆质量 / 关系递进，外加 `runtime_bench.py`、`backup.ps1`、`dead_code_inventory.py`、`mutation_design_conformance.py`） |
+| `docs/SIMULATION_INTEGRATION.md` | `framework/` 与 `scripts/` **该不该合并**的书面评估：结论是「不合并套件、只共享机械件」，含两侧能力对比与全部 `file:line` 证据；§9 是父代理的独立复核 |
 | `archive/` | 已放弃的本地模型路线（留档，不参与构建，包名是历史遗留） |
 | `RECOVERY.md` | 备份 / 恢复 / 权重位置 |
 
 ### 7.1 framework/ 与 scripts/ 的区别
 
+> **要决定「要不要把它们合并」之前，先读 `docs/SIMULATION_INTEGRATION.md`** —— 那是这件事的书面
+> 评估（结论：不合并套件，只把 `free_port`、时钟重绑、源码快照、插件配置这四类无行为语义的机械件
+> 抽出来共享）。下面这段是结论的浓缩版。
+
 两者都在测 Runtime，但定位不同，别搞混：
 
-* `scripts/` 下那两个仿真脚本是**为固定剧本写死的验收**（黑盒 12 阶段 70 项、韧性 335 项检查），
+* `scripts/` 下那两个仿真脚本是**为固定剧本写死的验收**（黑盒 13 阶段 77 项、韧性 335 项检查），
   跑一次给一个是/否，改断言前先跑 `--fault` 注错确认它还会咬人。
 * `framework/` 是**可交互的实验台**：起一个 harness，然后用命令行在运行中拨时间、灌输入、看变量、
   给假端点注错。适合"我想知道改成这样会发生什么"，而不是"发布前必须全绿"。
 
-框架自带 102 个测试，其中包含用子进程跑 `cf run` 再拿客户端命令驱动它的验收测试：
+框架自带 271 个测试，其中包含用子进程跑 `cf run` 再拿客户端命令驱动它的验收测试：
 
 ```bash
 cd framework
 PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.prefix 噪音警告
-"$PY" -m pytest tests                            # 102 passed
+"$PY" -m pytest tests                            # 271 passed
 ```
 
 框架要用原程序的 venv 跑（它要启动 uvicorn），但框架代码本身只用标准库。

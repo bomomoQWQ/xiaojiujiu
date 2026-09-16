@@ -9,6 +9,21 @@
 
 按审计缺口清单继续修，顺序按"对用户行为的影响"排。
 
+### 文档与评估（不涉及行为）
+
+- **新增 `docs/SIMULATION_INTEGRATION.md`**：`framework/` 与 `scripts/` 该不该合并的书面评估
+  （backlog #2 要求的"先想清楚要合并什么"）。结论：**不合并套件，只共享无行为语义的机械件**
+  （`free_port`、进程时钟重绑、源码快照、插件配置基线）。全部结论带 `file:line`；§7 明确列出
+  未核实项，§9 是父代理的独立复核（含补齐的实测：框架 **271 passed**、黑盒 77/77、韧性 335/335）。
+- **修掉评估中发现的文档与代码不符**：
+  - `framework/cf/host.py` 的注释自称插件配置 `Copied from the shipped black-box simulation so
+    both drive the plugin identically` —— **不成立**，实测 5 个值不同（其中 `context_prefetch`
+    是**反的**：框架 `False` / 黑盒 `True`）。注释已改成列出这 5 项差异、标出 `runtime_base_url`
+    是结构差异而非漂移（框架在构造时注入，`host.py:376`），并注明**差异的理由没有任何地方记录**。
+  - 过期数字：`framework/README.md` 的 `227 passed` → **271**、`102 个测试` → **271**；
+    `HANDOFF.md` 的 `框架自带 102 个测试` → **271**、`黑盒 12 阶段 70 项` → **13 阶段 77 项**、
+    `scripts/` 的"三个仿真" → **四个**；§4 状态表补 framework 一行。
+
 ### 崩溃窗口：`committed != sent`（设计 §69 / §86.9）
 
 **平台真的发出去了这件事只有宿主知道。** 宿主在"发出"与"上报"之间死掉，Runtime 手上只剩一行
