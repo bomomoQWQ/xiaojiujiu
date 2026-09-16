@@ -970,6 +970,38 @@ ready_to_send → failed : ActionExecutionError: send_message failed: ApiNotAvai
 > `load_config()` + `Runtime(cfg)` 的复现脚本没覆盖 storage 路径，就在卷根留下了一个
 > 27 万字节的空壳库。写探针时必须显式指定 `cfg.storage.database_path`。
 
+**摘人带出的三件事（都已处理）**：
+
+1. **fleet 容器的健康检查被端口号绑住了（已修）**。镜像自带的 healthcheck 探
+   `http://127.0.0.1:8787/health`，而在 fleet 容器里 8787 **只是"恰好占用第一个空闲端口的
+   那个人"**。20001 被我摘掉后 8787 上没人监听 → 容器报 `unhealthy`，而它其实服务得好好的
+   （控制面 200、唯一实例健康）。已在 `fleet.yml` 与生成器 `build_runtime_fleet.py` 里
+   覆盖为探**控制面** `:8800/fleet/status`：这个容器的职责是 supervisor，就该为 supervisor
+   负责；每个人的健康在 `/fleet/status` 与看板上。修完容器立刻 `healthy`。
+   （教训：**别让容器健康依赖于"名单里恰好有谁"**——这种 false alarm 会把真警报淹掉。）
+2. **端口会在名册变化后重排**：名册清空后真人从 **8801 挪到了 8787**（`_next_port()` 取最小
+   空闲端口）。路由不靠端口号、靠注册表（`/fleet/routes`），插件下一次同步（≤5s）就跟上了；
+   实测该实例日志里 `POST /v1/outbox/lease` 由 AstrBot 持续打进来（27436 次）。
+   **永远别把某个人的端口写死**，要用 `/fleet/status` 现读。
+3. **历史账本订正**：修复前写入的 21 行"跳过"被错记成 `degraded=1`，会把第二天第一份日报
+   写成"降级 21 次"。已按"`reason` 属于从未调用 provider 的几种 **且** payload 里没有
+   `provider_called`（新代码必写该字段）"这条件订正为 0，改前又冻结了一份
+   （`snapshots/2026-09-16_222912`）。`/health` 的 `degraded` 随之从 21 变 0。
+
+**这一份日报就是"正常应该长什么样"的参照**（`reports/2026-09-16.md`，只剩真人一个实例）：
+
+```
+- 对话：12 提问 / 5 回复，注入渲染 1 次
+- 决策：30 次（主动 1 次），原因分布 {'no_candidate_beats_silence': 3, 'hazard_triggered': 1,
+        'cooldown_active': 2, 'hazard_not_triggered': 24}
+- 候选：7 条新建；语义：12 条，其中 unresolved 0
+- 深刷新：31 次尝试，结算 8 条，降级 0 次，原因分布 {'applied': 7,
+          'min_interval_not_elapsed': 3, 'not_needed': 21}
+- 状态曲线（30 个采样点）：valence +0.000→+0.000, impulse 0.110→0.380, restraint 0.548→0.677
+```
+注意 `valence` 仍是平的（第 3 节的机制：结算不产生情绪事件），而 `impulse`/`restraint`
+是在动的——封测第一周要盯的就是这两个：**"想说话"的冲动在涨、"克制"也在涨**。
+
 ### ⚠️ 宿主坑：AstrBot 把 OneBot 的「通知」包装成空正文的消息事件
 
 真机取证（真人 QQ，14 秒内 8 条 `user_message`，其中 7 条正文为空、`message_id` 是 UUID、
