@@ -23,6 +23,7 @@ time_scale = 1.0                          # 虚拟秒 / 真实秒；0 = 时间�
 heartbeat_interval_s = 1.0                # 心跳间隔（真实秒）；0 = 关掉，手动 /advance
 status_interval_s = 2.0                   # 状态栏刷新间隔，与心跳无关
 
+# 这个文件里所有相对路径都相对**本文件所在目录**解析，不是当前工作目录。
 [harness]
 run_dir = "runs/chat"
 program_src = "../runtime/src"
@@ -30,6 +31,10 @@ plugin_root = "../astrbot_plugin_companion_runtime"
 seed = 20260915                           # 固定种子 → 可复现
 semantics = "main_llm"                    # main_llm | mock | disabled
 session = "default"
+# 聊天窗口的持久对话记录。**不要**指向 run_dir：后者带时间戳、每次换一个，
+# 记录活不过重启就不叫记录了。留空 = 放在本文件旁边（runs/chat_history.jsonl）。
+history = "runs/chat_history.jsonl"
+recap = 6                                 # 打开窗口时回显本会话最近几条；0 = 不回显
 
 # ---------------------------------------------------------------------------
 # 人格：一个 system prompt + 一套和它相配的价值观参数。

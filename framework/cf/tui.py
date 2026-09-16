@@ -27,6 +27,13 @@ from datetime import datetime
 from typing import Any, Callable, Mapping
 
 from .clock import parse_duration, parse_when
+from .history import (
+    KIND_ASSISTANT,
+    KIND_PROACTIVE,
+    KIND_USER,
+    ChatHistory,
+    summarise,
+)
 from .host import Delivered, Platform, SESSION_DEFAULT
 
 LOGGER = logging.getLogger("cf.tui")
@@ -52,6 +59,7 @@ HELP_TEXT = """\
   /vars              看 Runtime 当前变量（心境、I·R·P、未决事项…）
   /status            看 harness 状态（端口、mock 调用数、provider）
   /session <id>      切换会话，如 /session work（默认 default）
+  /history [n]       重看本会话最近 n 轮（默认 10）
   /say <文本>        以用户身份说话（等价于直接打字）
   /quit              退出（Ctrl-D 同）"""
 
@@ -77,6 +85,11 @@ class ChatTUI:
         control: Optional mapping of slash-command name to handler, so the CLI
             can expose the harness's own operations (host/endogenous/refresh).
         session_name: Initial session name.
+        history: Durable record of the visible conversation. When given, every turn
+            that reaches the window is appended to it, and ``readline`` recall is
+            restored from it, so a restart no longer erases the conversation.
+        recap: How many turns of the current session to show when the window opens
+            (0 disables the automatic recap; ``/history`` always works).
         tty: Force terminal behaviour on or off; ``None`` detects it.
     """
 
@@ -89,6 +102,8 @@ class ChatTUI:
         status_provider: Callable[[], Mapping[str, Any]] | None = None,
         control: Mapping[str, Callable[[str], str]] | None = None,
         session_name: str = "default",
+        history: ChatHistory | None = None,
+        recap: int = 0,
         tty: bool | None = None,
     ) -> None:
         """Wire the window and take over the platform's delivery callback."""
@@ -97,6 +112,8 @@ class ChatTUI:
         self.send = send
         self.status_provider = status_provider or (lambda: {})
         self.control = dict(control or {})
+        self.history = history
+        self.recap = max(0, int(recap))
         self.session = Session(name=session_name, umo=f"webchat:FriendMessage:{session_name}")
         self._print_lock = threading.RLock()
         self._stop = threading.Event()
@@ -111,6 +128,11 @@ class ChatTUI:
         self._thinking = threading.Event()
         self._think_thread: threading.Thread | None = None
         self._think_started = 0.0
+        #: Whether the current turn's reply reached the history already. ``_say``
+        #: records it from the sender's return value, and the delivery callback sees
+        #: the same text a moment later; without this flag every answer would be
+        #: written down twice.
+        self._reply_recorded = False
         self.tty = sys.stdout.isatty() if tty is None else tty
         self.turns = 0
         self._readline: Any = None
@@ -125,6 +147,66 @@ class ChatTUI:
         previous = platform.on_deliver
         platform.on_deliver = self._on_delivered
         self._previous_on_deliver = previous
+        self._restore_line_history()
+        self._show_recap()
+
+    # ---------------------------------------------------------------- history
+
+    def _remember(self, kind: str, text: str, *, session: str | None = None) -> None:
+        """Append one visible turn, if a history is attached.
+
+        Nothing else is ever passed here: only the three kinds the operator could see
+        (see :mod:`cf.history` - hidden Runtime context is never persisted).
+        """
+        if self.history is None:
+            return
+        try:
+            self.history.record(
+                kind=kind,
+                session=session or self.session.umo,
+                text=text,
+                at=self.clock.now() if self.clock is not None else None,
+            )
+        except Exception:  # noqa: BLE001 - a full disk must not end the conversation
+            LOGGER.warning("chat turn could not be written to the history", exc_info=True)
+
+    def _restore_line_history(self) -> None:
+        """Seed ``readline`` with this session's earlier lines.
+
+        ``readline``'s history is process-global, so it is *replaced* rather than
+        appended to: mixing two sessions' lines under one up-arrow is exactly the
+        confusion this feature exists to remove.
+        """
+        if self._readline is None or self.history is None:
+            return
+        try:
+            self._readline.clear_history()
+            for text in self.history.user_texts(self.session.umo):
+                self._readline.add_history(text)
+        except Exception:  # noqa: BLE001 - recall is a convenience, never a requirement
+            LOGGER.debug("readline history could not be restored", exc_info=True)
+
+    def _show_recap(self) -> None:
+        """Print the tail of this session's conversation, once, when the window opens."""
+        if self.recap <= 0 or not self.tty or self.history is None:
+            return
+        turns = self.history.recent(self.session.umo, limit=self.recap)
+        if not turns:
+            return
+        self._write(
+            f"{DIM}—— 上次这个会话的最后 {len(turns)} 条（看全部用 /history）——{RESET}"
+        )
+        for line in summarise(turns, session=self.session.umo):
+            self._write(f"{DIM}{line}{RESET}")
+
+    def history_lines(self, limit: int = 10) -> list[str]:
+        """Return the current session's last ``limit`` turns, already rendered."""
+        if self.history is None:
+            return ["（没有接历史记录）"]
+        turns = self.history.recent(self.session.umo, limit=max(1, limit))
+        if not turns:
+            return ["（这个会话还没有记录）"]
+        return summarise(turns, session=self.session.umo)
 
     # ---------------------------------------------------------------- printing
 
@@ -253,6 +335,16 @@ class ChatTUI:
         """Show a message that arrived on its own (called from the host thread)."""
         if message.kind == "user":
             return  # the operator just typed it; echoing it twice is noise
+        # Record before the printing guards below: a turn that was already streamed to
+        # the screen is still a turn, and the file is the record of what was said, not
+        # of which print path said it.
+        if message.kind == "proactive":
+            self._remember(KIND_PROACTIVE, message.text, session=message.session)
+        elif message.kind == "reply" and not self._reply_recorded:
+            # A reply nobody asked for through ``_say`` (another terminal, ``cf say``):
+            # the delivery callback is the only place that sees it.
+            self._remember(KIND_ASSISTANT, message.text, session=message.session)
+            self._reply_recorded = True
         if (
             message.kind == "reply"
             and self._stream_shown
@@ -349,6 +441,8 @@ class ChatTUI:
         self.turns += 1
         self._streamed = ""
         self._stream_shown = False
+        self._reply_recorded = False
+        self._remember(KIND_USER, text)
         self._begin_thinking()
         try:
             reply = self.send(text, self.session.umo, self._on_delta)
@@ -359,7 +453,10 @@ class ChatTUI:
             return
         self._end_thinking()
         self._close_stream()
-        if not reply:
+        if reply:
+            self._remember(KIND_ASSISTANT, reply)
+            self._reply_recorded = True
+        else:
             self._write(f"{YELLOW if self.tty else ''}[主 LLM 没有返回内容]{RESET if self.tty else ''}")
 
     # -------------------------------------------------------------- commands
@@ -415,11 +512,39 @@ class ChatTUI:
             return False
         if name in {"session", "sessions"}:
             if not argument:
-                self._write("当前会话 " + self.session.umo + "；已打开：" + ", ".join(self.platform.sessions()))
+                known = ", ".join(self.platform.sessions())
+                recorded = ""
+                if self.history is not None:
+                    with_turns = self.history.sessions()
+                    if with_turns:
+                        recorded = "；有记录的：" + ", ".join(with_turns)
+                self._write("当前会话 " + self.session.umo + "；已打开：" + known + recorded)
                 return False
             self.session = Session(name=argument, umo=f"webchat:FriendMessage:{argument}")
             self.platform.open(self.session.umo)
             self._write(f"切到会话 {self.session.umo}")
+            # Recall and the recap both belong to the session, not to the window: an
+            # up-arrow that produced the other conversation's line would be worse than
+            # no recall at all.
+            self._restore_line_history()
+            turns = self.history.recent(self.session.umo, limit=self.recap) if self.history else []
+            if turns:
+                self._write(
+                    f"{DIM}—— 这个会话的最后 {len(turns)} 条（看全部用 /history）——{RESET}"
+                )
+                for line in summarise(turns, session=self.session.umo):
+                    self._write(f"{DIM}{line}{RESET}")
+            return False
+        if name == "history":
+            limit = 10
+            if argument:
+                try:
+                    limit = max(1, int(argument))
+                except ValueError:
+                    self._write(f"看不懂这个条数：{argument}（用法 /history 20）")
+                    return False
+            for line in self.history_lines(limit):
+                self._write(line)
             return False
         if name == "say":
             if argument:

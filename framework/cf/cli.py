@@ -41,6 +41,7 @@ from .mock_openai import MockReply, MockScript
 from .onebot import OneBotFrontend
 from .onebot_service import OneBotService, tail_transcript
 from .program import ProgramClient, ProgramError
+from .history import ChatHistory
 from .tui import ChatTUI
 
 DEFAULT_RUNS_DIR = Path("runs")
@@ -519,6 +520,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
             "status": lambda _arg: json.dumps(harness.status(), ensure_ascii=False, indent=2, default=str)[:4000],
         },
         session_name=rig.session or "default",
+        history=ChatHistory(
+            _history_path(
+                explicit=_pick(args.history, rig.history),
+                config_path=file_config.source_path,
+            )
+        ),
+        recap=int(_pick(args.recap, rig.recap, default=6)),
         tty=None if not args.no_tty else False,
     )
     tui.banner(
@@ -599,6 +607,24 @@ def _parse_values(inline: str, path: str) -> dict[str, float]:
         )
         raise SystemExit(f"未知的价值观轴：{', '.join(unknown)}\n可用的轴：\n{lines}")
     return values
+
+
+def _history_path(*, explicit: str, config_path: Any) -> Path:
+    """Return where the chat window's durable history should live.
+
+    Three cases, in order: an explicit path (``--history``, or ``[harness].history``,
+    which the config layer already resolved against the config file) wins; otherwise a
+    loaded config file puts the history *beside itself*, so an experiment carries its own
+    conversation; otherwise the cwd-relative default.
+
+    It is deliberately not derived from ``run_dir``: that is stamped per run, and a
+    history that dies with the run is not a history.
+    """
+    if explicit:
+        return Path(explicit)
+    if config_path is not None:
+        return Path(config_path).parent / DEFAULT_RUNS_DIR / "chat_history.jsonl"
+    return DEFAULT_RUNS_DIR / "chat_history.jsonl"
 
 
 def _pick(*candidates: Any, default: Any = None) -> Any:
@@ -821,6 +847,14 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--status-interval", type=float, default=None,
                       help="状态栏变量刷新间隔（真实秒），与心跳无关")
     chat.add_argument("--seed", type=int, default=None)
+    chat.add_argument(
+        "--history",
+        default="",
+        help="持久对话记录的路径（默认放在配置文件旁边；见 [harness].history）",
+    )
+    chat.add_argument(
+        "--recap", type=int, default=None, help="打开窗口时回显本会话最近几条（0 = 不回显）"
+    )
     chat.add_argument("--llm-base-url", default="", help="主 LLM 端点（默认读 CF_MAIN_LLM_BASE_URL）")
     chat.add_argument("--llm-model", default="", help="主 LLM 模型名（默认读 CF_MAIN_LLM_MODEL）")
     chat.add_argument("--system-prompt", default="", help="角色设定（宿主人格，最高优先级）")

@@ -9,6 +9,25 @@
 
 按审计缺口清单继续修，顺序按"对用户行为的影响"排。
 
+### 聊天窗口：持久对话记录（backlog ③-1）
+
+`framework/README.md` §8 的"历史跨会话持久化"缺口：`readline` 只记得敲过的行、活不过进程，
+重开 `cf chat` 对话就没了，`/session work` 两个会话也分不出来。
+
+新增 `framework/cf/history.py`（JSONL 追加式，一行一个 turn），`ChatTUI` 接上它——用户说的、
+角色回的、主动发来的都写；重开窗口回显本会话最近 `recap` 条；新增 `/history [n]`；
+`/session` 切换时**按会话**重建 `readline` 上翻历史。配置 `[harness].history` / `.recap`，
+命令行 `--history` / `--recap`。**不放进 `run_dir`**：它带时间戳、每次换一个，记录活不过重启
+就不叫记录，默认放在配置文件旁边。
+
+**只记可见的三类**，且把这条设计不变量（§2.6/§86.10：隐藏背景块永不落盘）做成**构造**而不是
+纪律：`record()` 对白名单以外的 `kind` 直接抛 `ValueError`，因为这种写入一旦发生是**静默**的。
+另：流式打印与投递回调看到同一段回复，用标记让一条回复只落一次，同时保留"没经过 `_say` 的
+回复"由回调记录，两种情形各有一条测试。
+
+验收：`framework/tests/test_chat_history.py` 22 条 + `chat_history` 组 6 个变异全部击杀；
+全仓 31 个变异全部击杀；框架全量 **293 passed**（原 271）。
+
 ### 文档与评估（不涉及行为）
 
 - **新增 `docs/SIMULATION_INTEGRATION.md`**：`framework/` 与 `scripts/` 该不该合并的书面评估

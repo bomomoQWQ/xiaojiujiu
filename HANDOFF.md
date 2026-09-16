@@ -156,7 +156,7 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 | 高仿真故障恢复 | 335/335 |
 | 用户黑盒仿真 | **77 / 77**（退出码 0，连跑多次一致） |
 | 记忆质量仿真 | **25 / 25**（`scripts/e2e_memory_simulation.py`，见第 6 节） |
-| framework 测试 | **271 passed**（`framework/tests`，实测约 45s；旧文档写 227/102，已更正） |
+| framework 测试 | **293 passed**（`framework/tests`，实测约 50s；旧文档写 227/102，已更正） |
 | 版本 | Runtime 0.3.2（进行中）；插件 0.1.0 |
 | 许可证 | GPL-3.0-or-later |
 
@@ -201,8 +201,9 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
    剩下的是 host 侧选择（至多一次需要落盘的"已发出"表），以及两个**有意留着**的判断。
 2. framework/ 与 scripts/ 两个仿真脚本的整合（见 §7.1 的分工说明；
    目前两者互不依赖，这是有意的，整合前先想清楚要合并什么）。
-3. 聊天窗口还没做的部分：多行输入、跨会话历史、全屏 curses 版本、
-   回复的 Markdown 着色（清单见 `framework/README.md` §8）。
+3. ~~跨会话历史~~ **已完成**（见下"聊天窗口：持久对话记录"一节）。
+   聊天窗口还剩：多行输入、全屏 curses 版本、回复的 Markdown 着色（清单见
+   `framework/README.md` §8）。
 
 **已修复但值得记住的形状**：渲染 prompt 里曾有两行同名指令。背景块自己也有
 `- 想做的事：…`，内容是 Runtime 当前持有的意图——对一条主动消息来说往往是**上一次**
@@ -295,12 +296,12 @@ python scripts/blackbox_user_simulation.py --base-dir ./bb --fault leak   # 注�
 * `framework/` 是**可交互的实验台**：起一个 harness，然后用命令行在运行中拨时间、灌输入、看变量、
   给假端点注错。适合"我想知道改成这样会发生什么"，而不是"发布前必须全绿"。
 
-框架自带 271 个测试，其中包含用子进程跑 `cf run` 再拿客户端命令驱动它的验收测试：
+框架自带 293 个测试，其中包含用子进程跑 `cf run` 再拿客户端命令驱动它的验收测试：
 
 ```bash
 cd framework
 PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.prefix 噪音警告
-"$PY" -m pytest tests                            # 271 passed
+"$PY" -m pytest tests                            # 293 passed
 ```
 
 框架要用原程序的 venv 跑（它要启动 uvicorn），但框架代码本身只用标准库。
@@ -450,6 +451,45 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
   小活，直接做更快。
 - 另：提交前对**全仓**扫一次 `git grep -n "MUTATION\|PROBE"`——我在 `6f2b146` 里误带了子代理
   正在树里的临时变异（`GET /schedule` 又被加回推进时钟的 tick），已用 `79e66ee` 更正。
+
+---
+
+## 聊天窗口：持久对话记录（backlog ③-1，已完成）
+
+**病**：`framework/README.md` §8 里列着"历史跨会话持久化"——`readline` 只记得操作员**敲过**的行，
+且活不过进程：重开 `cf chat` 对话就没了，`/session work` 两个会话也分不出来。对一个主张"长期连续性"
+的项目，操作员看不到昨天那段对话，就没法判断这个东西到底成不成立。
+
+**改法**（只动框架，不碰原程序）：
+
+- 新增 `framework/cf/history.py`：JSONL 追加式记录，**一行一个 turn**（`at`/`kind`/`session`/`text`），
+  与 `trace.jsonl` 同形，可直接 `tail`/`grep`。
+- `ChatTUI` 接上它：用户说的、角色回的、主动发来的都写；重开窗口回显本会话最近 `recap` 条；
+  新增 `/history [n]`；`/session` 切换时**按会话**重建 `readline` 的上翻历史（不这么做，
+  上翻会翻出另一个会话的行，比没有 recall 更糟）。
+- 配置：`[harness].history` / `[harness].recap`，命令行 `--history` / `--recap`。
+- **不放进 `run_dir`**：`run_dir` 带时间戳、每次换一个，记录活不过重启就不叫记录。默认放在
+  配置文件旁边；`--history` 显式给出时以它为准。
+
+**一条设计不变量，做成了构造而不是纪律**：只记可见的三类。运行时的隐藏背景块**永远不写进来**
+（§2.6 / §86.10）。`record()` 对白名单以外的 `kind` **直接抛 ValueError**——因为这种写入一旦发生是
+**静默**的：文件里多了一段不该有的内容，没有任何症状，只有下次有人读它时才发现。
+变异 H1（把守卫改成 `if False`）就是专门验证这一点的。
+
+**另一条容易错的地方**：流式打印与投递回调看到的是**同一段回复文本**，两边都写就让每个回答翻倍。
+用 `_reply_recorded` 标记让一条回复只落一次；又保留"没经过 `_say` 的回复"（别的终端、`cf say`）
+由回调记录，否则那种回复会丢掉。两种情形各有一条测试。
+
+**测试为什么都在 `tty=False` 下跑**：回显只在 tty 下自动发生（管道里重放一段旧对话只会污染抓下来的
+转写），但**记录**与命令处理与 tty 无关——那才是会错的部分。
+
+**证据**：`framework/tests/test_chat_history.py` 22 条（12 条存储层 + 10 条 TUI 集成）；
+`scripts/mutation_design_conformance.py` 的 `chat_history` 组 6 个变异全部 KILLED
+（守卫失效 / 回复记两遍 / 读时不筛会话 / 空行也算一条 / 坏行直接抛 / 用户那侧不写）；
+全仓 **31 个变异全部 KILLED**。框架全量 **293 passed**（原 271）。
+
+**顺带**：harness 现在支持跨根跑测试（`framework_tests/...` 从前缀映射到 `framework/` 下的
+`tests/...` 并在该目录执行），所以框架的验收测试也能进同一套变异框架。
 
 ---
 

@@ -16,6 +16,7 @@ Groups:
     priors           item ⑤, what the cold-start priors claim
     declared_unused  item ⑦, nothing declared and never produced
     redelivery       崩溃窗口, a re-leased message must say so
+    chat_history     backlog ③-1, the chat window's durable history
 """
 
 from __future__ import annotations
@@ -35,6 +36,13 @@ REDUCER = RUNTIME_DIR / "src/companion_runtime/reducer.py"
 PROJECTIONS = RUNTIME_DIR / "src/companion_runtime/projections.py"
 TYPING = RUNTIME_DIR / "src/companion_runtime/typing.py"
 API_V1 = RUNTIME_DIR / "src/companion_runtime/api_v1.py"
+FRAMEWORK_DIR = ROOT / "framework"
+CF_HISTORY = FRAMEWORK_DIR / "cf/history.py"
+CF_TUI = FRAMEWORK_DIR / "cf/tui.py"
+
+#: Test paths for the framework suite are written ``framework_tests/...`` and run from
+#: ``framework/``; the Runtime's own suite runs from ``runtime/``. One harness, two roots.
+FRAMEWORK_TESTS_PREFIX = "framework_tests/"
 
 #: ``group -> (test paths, [(label, [(path, old, new), ...]), ...])``. Multi-edit mutations
 #: are grouped so every mutation is a *plausible* alternative implementation, not a syntax
@@ -363,6 +371,77 @@ GROUPS: dict[str, tuple[list[str], list[tuple[str, list[tuple[pathlib.Path, str,
             ),
         ],
     ),
+    # ------------------------------------------------------------------ ③-1 聊天历史
+    "chat_history": (
+        ["framework_tests/test_chat_history.py"],
+        [
+            (
+                "H1 the recorder accepts any kind (hidden context could be persisted)",
+                [
+                    (
+                        CF_HISTORY,
+                        """        if kind not in VISIBLE_KINDS:
+            raise ValueError(""",
+                        """        if False:
+            raise ValueError(""",
+                    )
+                ],
+            ),
+            (
+                "H2 a delivered reply is recorded a second time",
+                [
+                    (
+                        CF_TUI,
+                        '        elif message.kind == "reply" and not self._reply_recorded:',
+                        '        elif message.kind == "reply":',
+                    )
+                ],
+            ),
+            (
+                "H3 reading ignores the session",
+                [
+                    (
+                        CF_HISTORY,
+                        "        for turn in self:\n            if turn.session == session:\n                kept.append(turn)",
+                        "        for turn in self:\n            kept.append(turn)",
+                    )
+                ],
+            ),
+            (
+                "H4 a blank line becomes a turn",
+                [
+                    (
+                        CF_HISTORY,
+                        "        if not body or not session:\n            return None",
+                        "        if not session:\n            return None",
+                    )
+                ],
+            ),
+            (
+                "H5 a damaged line takes the whole history down",
+                [
+                    (
+                        CF_HISTORY,
+                        """            except ValueError:
+                self._malformed += 1
+                continue""",
+                        """            except ValueError:
+                raise""",
+                    )
+                ],
+            ),
+            (
+                "H6 the user's own turn is not written down",
+                [
+                    (
+                        CF_TUI,
+                        '        self._reply_recorded = False\n        self._remember(KIND_USER, text)',
+                        '        self._reply_recorded = False',
+                    )
+                ],
+            ),
+        ],
+    ),
 }
 
 
@@ -392,8 +471,17 @@ def _invalidate_bytecode(paths) -> None:
                 cached.unlink()
 
 
+def _resolve_root(tests_paths: list[str]) -> tuple[list[str], pathlib.Path]:
+    """Return the test paths and the directory they must run from."""
+    if tests_paths and all(p.startswith(FRAMEWORK_TESTS_PREFIX) for p in tests_paths):
+        # "framework_tests/foo.py" -> "tests/foo.py", run from framework/
+        return ["tests/" + p[len(FRAMEWORK_TESTS_PREFIX) :] for p in tests_paths], FRAMEWORK_DIR
+    return tests_paths, RUNTIME_DIR
+
+
 def run_tests(tests_paths: list[str]) -> tuple[bool, str]:
     """Run one group's acceptance tests; return (green?, summary line)."""
+    tests_paths, cwd = _resolve_root(tests_paths)
     env = dict(os.environ)
     # Belt and braces with _invalidate_bytecode: a test run must never *create* the stale
     # cache entry that a later restore would silently accept.
@@ -408,7 +496,7 @@ def run_tests(tests_paths: list[str]) -> tuple[bool, str]:
             "no:randomly",
             "--tb=no",
         ],
-        cwd=RUNTIME_DIR,
+        cwd=cwd,
         capture_output=True,
         text=True,
         env=env,

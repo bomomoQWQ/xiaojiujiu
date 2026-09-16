@@ -129,6 +129,14 @@ class HarnessSettings:
     semantics: str = "main_llm"
     session: str = "default"
     echo_logs: bool = False
+    #: Where the chat window's durable history lives. Empty means "decide at start-up":
+    #: beside the config file when one was loaded (so the history stays with the
+    #: experiment it belongs to), otherwise ``runs/chat_history.jsonl``. It is *not*
+    #: derived from ``run_dir``, because that is timestamped per run and a history that
+    #: dies with the run would not be a history.
+    history: str = ""
+    #: How many turns of the current session to show when the window opens.
+    recap: int = 6
 
 
 @dataclass
@@ -204,6 +212,8 @@ class ClientConfig:
                 "seed": self.harness.seed,
                 "semantics": self.harness.semantics,
                 "session": self.harness.session,
+                "history": self.harness.history,
+                "recap": self.harness.recap,
             },
         }
 
@@ -342,6 +352,8 @@ def _build(data: Mapping[str, Any], *, base: Path) -> ClientConfig:
         semantics=str(harness_table.get("semantics") or "main_llm").lower(),
         session=str(harness_table.get("session") or "default"),
         echo_logs=bool(harness_table.get("echo_logs", False)),
+        history=_resolve_relative(harness_table.get("history"), base),
+        recap=int(harness_table.get("recap", HarnessSettings.recap)),
     )
     if harness.semantics not in SEMANTIC_SOURCES:
         raise ConfigError(
@@ -570,6 +582,10 @@ plugin_root = "{plugin_root}"
 seed = 20260915                           # 固定种子 → 可复现
 semantics = "main_llm"                    # main_llm | mock | disabled
 session = "default"
+# 聊天窗口的持久对话记录。**不要**指向 run_dir：后者带时间戳、每次换一个，
+# 记录活不过重启就不叫记录了。留空 = 放在本文件旁边（runs/chat_history.jsonl）。
+history = "runs/chat_history.jsonl"
+recap = 6                                 # 打开窗口时回显本会话最近几条；0 = 不回显
 
 # ---------------------------------------------------------------------------
 # 人格：一个 system prompt + 一套和它相配的价值观参数。
