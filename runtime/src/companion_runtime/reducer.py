@@ -1188,8 +1188,18 @@ class Reducer:
         (``reclaim_expired``) or when a worker reports an unretryable fault. In
         both cases the referenced work can never be completed, so leaving the
         attempt in ``committed``/``rendering``/``ready_to_send`` is a leak with
-        consequences: the attempt counts as in flight forever, the scheduler
-        gate stops dispatching new rounds, and the candidate stays active.
+        consequences: the attempt counts as in flight forever, and the scheduler
+        gate stops dispatching new rounds.
+
+        What this does **not** do is retire the candidate the attempt came from. An
+        earlier version of this docstring listed "the candidate stays active" among the
+        consequences of the leak, which read as if terminating the attempt also settled
+        the candidate; it does not, and it is measured (`docs/REDELIVERY.md` §5.2). That
+        is deliberate rather than forgotten: retiring the candidate would drop an
+        intention whose delivery never happened, while leaving it active lets the
+        character say the same thing again when the message *was* delivered. Both
+        directions are defensible, so the choice is left open and documented instead of
+        being decided by accident here.
 
         Every sibling row of the attempt is cancelled as well, so a render row
         that failed cannot be followed by a send row that tries to deliver the

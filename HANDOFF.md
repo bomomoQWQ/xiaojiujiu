@@ -88,7 +88,7 @@ Runtime 完全靠确定性代码工作；可选的远端语义 provider 的 key 
 
 ```bash
 # 1. Runtime 离线测试
-cd runtime && .venv/bin/python -m pytest              # 期望 1092 passed
+cd runtime && .venv/bin/python -m pytest              # 期望 1096 passed
 
 # 2. 插件离线测试（在插件仓库里）
 cd ../astrbot_plugin_companion_runtime
@@ -151,7 +151,7 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 
 | 项目 | 结果 |
 |---|---|
-| Runtime 离线测试 | **1092 passed / 17 skipped**（无 DSN；PG 专项恒跳过） |
+| Runtime 离线测试 | **1096 passed / 17 skipped**（无 DSN；PG 专项恒跳过） |
 | 插件离线测试 | 143 passed + 13 subtests |
 | 高仿真故障恢复 | 335/335 |
 | 用户黑盒仿真 | **77 / 77**（退出码 0，连跑多次一致） |
@@ -195,8 +195,9 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 
 ### 接下来值得做的
 
-1. `committed != sent` 与"平台已发出 / 结果已上报"之间的崩溃窗口
-   （需要平台回执或宿主持久化幂等日志）。
+1. ~~`committed != sent` 与"平台已发出 / 结果已上报"之间的崩溃窗口~~
+   **已做（部分）**：Runtime 侧能做的部分做完了 —— 见下"崩溃窗口"一节。
+   剩下的是 host 侧选择（至多一次需要落盘的"已发出"表），以及两个**有意留着**的判断。
 2. framework/ 与 scripts/ 两个仿真脚本的整合（见 §7.1 的分工说明；
    目前两者互不依赖，这是有意的，整合前先想清楚要合并什么）。
 3. 聊天窗口还没做的部分：多行输入、跨会话历史、全屏 curses 版本、
@@ -443,6 +444,66 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
   小活，直接做更快。
 - 另：提交前对**全仓**扫一次 `git grep -n "MUTATION\|PROBE"`——我在 `6f2b146` 里误带了子代理
   正在树里的临时变异（`GET /schedule` 又被加回推进时钟的 tick），已用 `79e66ee` 更正。
+
+---
+
+## 崩溃窗口（`committed != sent`，0.3.2 进行中）
+
+设计 §69/§86.9 的窗口：**平台真的发出去了**这件事只有 host 知道；host 在"发出"与"上报"之间死掉，
+Runtime 手上就只剩一行 `leased` 的 send 与一个停在 `ready_to_send` 的 attempt。
+
+### 做了什么：让歧义可见（Runtime 侧）
+
+租约过期后 `outbox.reclaim_expired`：`attempts < max_attempts`（默认 3）就重新入队，否则该行
+`failed`、attempt 被 `close_settled_outbox_attempts` 终结。**所以 send 是"至少一次"，最多重复
+`max_attempts` 次**——这是刻意的（反方向会在"领取后立刻崩溃、消息根本没发"时静默丢意图，
+而 Runtime 分不出这两种崩溃）。
+
+**实测**（`lease_seconds=45`）：
+```text
+第1次领取: attempts=1  过期后 pending attempts=1
+第2次领取: attempts=2  过期后 pending attempts=2
+第3次领取: attempts=3  过期后 failed  attempts=3
+attempt 最终: failed
+```
+
+问题不在于重发，在于 **host 连"我正在被重发"都看不出来**：`attempts` 只被编进 `lease_id` 的第三段
+（`{adapter}:{outbox_id}:{attempts}`，那是防旧租约续期的失效令牌），协议里没有这个字段。
+于是 host 既不能记录这个歧义，也无法实现任何策略。
+
+**改法**：`POST /v1/outbox/lease` 的每个 item 增加 `attempts` 与 `redelivery`（`attempts > 1`）。
+它读的是**领取计数**，所以 render 行是同一个口径。新增 `runtime/docs/REDELIVERY.md`：讲清窗口位置、
+至少一次/至多一次两种 host 策略，以及**至多一次必须先落盘再发送**的顺序要求（顺序反了只是把窗口
+挪个位置）。也写明插件当前的重试队列是**内存**的（`main.py::_report_action` 失败即 `queue.put`，
+进程一死就没），所以它现在只能做至少一次；要做至多一次得换成落盘队列，那是插件侧的独立工作。
+
+**证据**：`tests/test_redelivery_visibility.py` 4 条（含"第一次领取不得标成 redelivery""计数与
+标志必须一致""标志不是 send 专有概念"），`scripts/mutation_design_conformance.py` 的 `redelivery`
+组 4 个变异全部 KILLED（含"标志恒 False""字段整个不输出""计数写死 1""差一错误"）。
+
+**为什么这条测试必须用真时钟**：`/v1/outbox/lease` 自己盖 `utcnow()` 且内部 tick 有 5s 限流，
+所以租约过期没法用 `lazy_tick(BASE_TIME+…)` 伪造（会撞上单调时钟钳制，行永远不回到可领取）。
+测试把 `lease_seconds` 压到 0.05s，用 `reclaim_expired` 只补"租约已过期"这一步，
+整个文件跑 0.7s。
+
+### 两个有意留着的判断（有实测证据，没动代码）
+
+同一窗口的两条间接后果，**两个方向都说得通，属于产品判断**，所以只记录不擅自改：
+
+1. **耗尽后 attempt 落成 `failed`，用户真的回复了也不被归属。** 回复归属只看最新的 `sent`
+   attempt，而静默清扫也只扫 `sent`。实测：
+   ```text
+   attempt: failed   candidate: active
+   用户发言后 observations: 0 -> 0   该 attempt 有 observation: False
+   ```
+   后果是：一条**真的送达、用户也真的回了**的消息，对用户模型的教学量是 0。
+   把它当"未知"去归属，会在消息其实没送达时把用户的一句普通发言误记成回复。
+2. **attempt 终结了，candidate 仍 `active`。** `close_settled_outbox_attempts` 的 docstring 曾把
+   "candidate stays active"列为**它要修的泄漏后果**，但实测终结 attempt 后 candidate 仍是
+   `active`，之后某一轮会被重新选中 → 同一件事被再说一次（意图层重来，不是传输层重发）。
+   退役它会让"从未送达"的意图消失；留着它会在"其实已送达"时重复。
+
+两处的 docstring 已改成与实测一致，并指向 `docs/REDELIVERY.md` §5。
 
 ---
 

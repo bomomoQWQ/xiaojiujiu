@@ -7,7 +7,29 @@
 
 ## 0.3.2 — 2026-09-15（进行中）
 
-按审计缺口清单继续修，顺序按"对用户行为的影响"排。本版目前完成三条。
+按审计缺口清单继续修，顺序按"对用户行为的影响"排。
+
+### 崩溃窗口：`committed != sent`（设计 §69 / §86.9）
+
+**平台真的发出去了这件事只有宿主知道。** 宿主在"发出"与"上报"之间死掉，Runtime 手上只剩一行
+`leased` 的 send 与一个停在 `ready_to_send` 的 attempt。租约过期后
+`outbox.reclaim_expired` 会重新入队（`attempts < max_attempts`，默认 3），否则把该行标成
+`failed` 并终结 attempt——也就是说 send 是**至少一次**，最多重复 3 次。这个方向是刻意的：
+反方向（领过就不再发）会在"领取后立刻崩溃、消息根本没发出去"时静默丢掉意图，而 Runtime
+分不出这两种崩溃。
+
+问题不在重发，在于**宿主连"我正在被重发"都看不出来**：`attempts` 只被编进 `lease_id` 的第三段
+（那是防旧租约续期的失效令牌），协议里没有这个字段。现在 `POST /v1/outbox/lease` 的每个 item
+增加 `attempts` 与 `redelivery`（`attempts > 1`，读的是领取计数，render 行同一口径）。
+新增 `runtime/docs/REDELIVERY.md`：窗口位置、至少一次/至多一次两种宿主策略、
+以及"至多一次必须先落盘再发送"的顺序要求。验收：`tests/test_redelivery_visibility.py` 4 条 +
+`redelivery` 组 4 个变异全部击杀。
+
+**同一个窗口的两条间接后果，只记录不擅改**（两个方向都说得通，属产品判断，见
+`REDELIVERY.md` §5）：① 耗尽后 attempt 落成 `failed`，于是**用户真的回复了也不被归属**
+（实测 `observations: 0 -> 0`）——一条真的送达、用户也真的回了的消息教学量为 0；
+② attempt 终结了 candidate 仍 `active`，之后会被重新选中、同一件事被再说一次。
+相关的 docstring 已改成与实测一致（原先把"candidate stays active"写成已修）。
 
 ### 修复
 

@@ -663,6 +663,7 @@ def _leased_action(
     if action_type == ACTION_RENDER:
         payload = _render_payload(runtime, settings, item, payload, now)
     expires_at = ensure_aware(item.lease_expires_at)
+    attempts = int(item.attempts or 0)
     return {
         "action_id": item.outbox_id,
         "action_type": action_type,
@@ -673,6 +674,19 @@ def _leased_action(
         "attempt_id": _text(payload.get("attempt_id")).strip(),
         "lease_ttl_ms": _remaining_ms(expires_at, now, settings),
         "deadline_at": isoformat(expires_at) or "",
+        # ``committed != sent`` (design §69, §86.9) leaves a window the Runtime cannot see
+        # into: between "the platform sent it" and "the report arrived" a host can die, and
+        # the Runtime is left holding a leased row for a message that may already be in the
+        # user's chat. Retrying is the deliberate choice - the alternative risks dropping a
+        # message nobody sent - but on *this* protocol a host could not even tell that it was
+        # being handed a retry: the claim counter only rode along inside ``lease_id``, where
+        # it reads as a staleness token rather than as a signal. (The legacy
+        # ``POST /outbox/claim`` returns ``OutboxItem.to_dict()``, which has always carried
+        # ``attempts``; this router is what the adapter actually calls.) These two fields
+        # make the ambiguity visible, so a host can log it and a host with a durable
+        # "already sent" record can act on it. See ``docs/REDELIVERY.md``.
+        "attempts": attempts,
+        "redelivery": attempts > 1,
         "payload": payload,
     }
 

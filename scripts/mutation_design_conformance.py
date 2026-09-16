@@ -15,6 +15,7 @@ Groups:
     encoding         item ①, observation/prediction describe a behaviour the same way
     priors           item ⑤, what the cold-start priors claim
     declared_unused  item ⑦, nothing declared and never produced
+    redelivery       崩溃窗口, a re-leased message must say so
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ API = RUNTIME_DIR / "src/companion_runtime/api.py"
 REDUCER = RUNTIME_DIR / "src/companion_runtime/reducer.py"
 PROJECTIONS = RUNTIME_DIR / "src/companion_runtime/projections.py"
 TYPING = RUNTIME_DIR / "src/companion_runtime/typing.py"
+API_V1 = RUNTIME_DIR / "src/companion_runtime/api_v1.py"
 
 #: ``group -> (test paths, [(label, [(path, old, new), ...]), ...])``. Multi-edit mutations
 #: are grouped so every mutation is a *plausible* alternative implementation, not a syntax
@@ -311,6 +313,52 @@ GROUPS: dict[str, tuple[list[str], list[tuple[str, list[tuple[pathlib.Path, str,
                         "            EventType.REAPPRAISAL,",
                         "            EventType.SYSTEM,",
                     ),
+                ],
+            ),
+        ],
+    ),
+    # ------------------------------------------------------------------ 崩溃窗口
+    "redelivery": (
+        ["tests/test_redelivery_visibility.py"],
+        [
+            (
+                "R1 the redelivery flag is never set (the original gap)",
+                [
+                    (
+                        API_V1,
+                        '        "redelivery": attempts > 1,',
+                        '        "redelivery": False,',
+                    )
+                ],
+            ),
+            (
+                "R2 the claim counter is not surfaced at all",
+                [
+                    (
+                        API_V1,
+                        '        "attempts": attempts,\n        "redelivery": attempts > 1,\n',
+                        "",
+                    )
+                ],
+            ),
+            (
+                "R3 redelivery is hard-coded as if every lease were the first",
+                [
+                    (
+                        API_V1,
+                        "    attempts = int(item.attempts or 0)",
+                        "    attempts = 1",
+                    )
+                ],
+            ),
+            (
+                "R4 the flag off by one (first claim reads as a redelivery)",
+                [
+                    (
+                        API_V1,
+                        '        "redelivery": attempts > 1,',
+                        '        "redelivery": attempts > 0,',
+                    )
                 ],
             ),
         ],

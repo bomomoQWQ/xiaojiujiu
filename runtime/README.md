@@ -215,6 +215,11 @@ learning_rate = 0.35
 lease_seconds = 45
 max_attempts = 3
 retry_backoff_seconds = 0   # 0 = nack 后立即可再领取（推荐；节流交给宿主重试队列）
+# lease_seconds 到期 → 领取计数 < max_attempts 就重新入队，否则该行 failed、attempt 终结。
+# 也就是说 send 是「至少一次」：宿主在「平台已发出 / 回执未上报」之间崩溃，消息最多被发
+# max_attempts 次。`POST /v1/outbox/lease` 的每个 item 会回 `attempts` 与 `redelivery`
+# （`attempts > 1`），宿主据此可以记录歧义、或配合自己的落盘「已发出」表实现至多一次。
+# 详见 docs/REDELIVERY.md。
 
 [semantic]                    # 【v0.2】两个时间尺度的策略（全部有默认值）
 provider = "disabled"         # disabled | remote_api

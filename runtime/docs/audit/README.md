@@ -43,7 +43,7 @@
 > `observations/emotions/situations/boundaries/recent_events` 传给 `generate`，
 > `tests/test_candidate_shapes_wiring.py` 用 spy 钉住调用点；`invalidated_by_situation` 返回
 > None 时 `runtime.py` 会继续问 `invalidated_by_source_state`）。本文件的"判定合计"与 §5 的
-> 复现数字（`883 passed / 14 skipped`）同样是旧值，当前基线是 `1092 passed / 17 skipped`。
+> 复现数字（`883 passed / 14 skipped`）同样是旧值，当前基线是 `1096 passed / 17 skipped`。
 > 下面按代码现状逐条标注。
 
 1. **[已修 0.3.0/0.3.1]** 记忆永远无法形成（默认部署）。
@@ -196,11 +196,11 @@
 
 ```bash
 # 前两条在 runtime/ 下跑（命令 1 别再加 -q：pyproject 的 addopts 已带 -q，再来一个会吞掉汇总行）
-cd runtime && python -m pytest                    # 1092 passed / 17 skipped（无 DSN）
+cd runtime && python -m pytest                    # 1096 passed / 17 skipped（无 DSN）
 CR_TEST_PG_DSN=postgresql://… python -m pytest    # 对真 PG（本机无 psycopg，恒跳过）
 
 # 第三条在仓库根目录（xiaojiujiu/）跑；它自己进 runtime/ 并还原改动
-runtime/.venv/bin/python scripts/mutation_design_conformance.py   # ①⑤⑦ 的 21 个变异，应全部 KILLED
+runtime/.venv/bin/python scripts/mutation_design_conformance.py   # ①⑤⑦+崩溃窗口 的 25 个变异，应全部 KILLED
 runtime/.venv/bin/python scripts/dead_code_inventory.py            # A/B/C 三段；A 与 C 应为 0
 ```
 
