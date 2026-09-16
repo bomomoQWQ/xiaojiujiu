@@ -619,12 +619,12 @@ transport/bridge/outbox 轮询器；优先级 = 显式 `session_routes` > 注册
 本角色一版（已进 fleet env）：`user_care .90 / relationship_maintenance .85 / boundary_respect .92 /
 stability_commitment .85 / emotional_expression .30 / conflict_directness .55 / autonomy .75 / curiosity .70`。
 
-**当前测试栈布局**：`astrbot-test`(6186/6299) + `xxj-onebot`(6300) + `xxj-napcat-test`(6098，未登录) +
-`xxj-runtime-fleet`(控制面 8800；内部 8787–8798 共 12 人) + `xxj-runtime-test`(默认回落实例)。
+**当前测试栈布局**：`astrbot-test`(6186/6299) + `xxj-onebot`(6300) + `xxj-napcat-test`(6098，真 QQ 已登录) +
+`xxj-runtime-fleet`(控制面 8800；内部 8787–8799 + 8801，共 14 人) + `xxj-runtime-test`(默认回落实例)。
 旧的 9 个 per-person 容器与 `runtime-b` 已回收，卷已 tar 备份到 `~/astrbot_test/backups/fleet-migration-*`。
 
 **加一个人（AstrBot 不动）**：
-`curl -XPOST http://127.0.0.1:8800/fleet/provision -H 'Content-Type: application/json' -d '{"session":"default:FriendMessage:<QQ>"}'`
+`curl -XPOST http://192.168.1.15:8800/fleet/provision -H 'Content-Type: application/json' -d '{"session":"default:FriendMessage:<QQ>"}'`
 ——插件在下一次同步（≤5s，或该人第一条消息时立刻触发）自动接上。
 
 **更省事：已经不需要手动 provision 了。** `route_auto_provision: true`（默认 false，测试实例已开）
@@ -676,12 +676,24 @@ http://runtime-fleet:8799` → fleet 13 人 → 他自己的库里只有他自�
 | `replay_session.py` | 把"用户说了什么 / 当时注入了什么（含分段字数与版本）/ 之后的决策与落选候选"并排打印 |
 | `beta_daily_report.py` | 每日每人 markdown（对话/决策原因分布/候选/未解释/状态曲线/实时健康），写 `reports/<date>.md` |
 | `snapshot_beta.py` | 优化前用 SQLite backup API 冻结整支 fleet（含 compose 与路由快照） |
+| `beta_daily_collect.sh` | 上面三条的定时包装（导出 → 日报 → 收尾），crontab 每天 08:05 CST 调它 |
+| `fleet_probe_instance.sh` | 在 fleet 容器里读某个人的库：事件直方图 / 判决列表 / 采样数 / 语义状态（`QQ=<QQ>` 作环境变量传） |
+| `fleet_probe_context.sh` | 网络内直调该实例 `POST /v1/context` 并回读 `context_rendered` 是否 +1（验证埋点闭环用） |
 | fleet `GET /fleet/dashboard` | 只读、30s 自刷新的总览页；`/fleet/status` 增加 unresolved / open_unfinished / deep+explain 调用数 |
 
 **数据落在服务器机械盘**：`/mnt/xz/xiaojiujiu-beta/{<批次>,reports,snapshots}`（`/dev/sda1` 932G，
 519G 可用）。一次 14 人导出约 5MB。
 
 **每日流程（三条命令）**：
+
+> 已经装成定时任务了，正常不用手打：`bomomo` 的 crontab 里一条
+> `5 8 * * * /home/bomomo/astrbot_test/beta_daily_collect.sh`（= 08:05 CST = 00:05 UTC，
+> 见下"为什么是这个钟点"）。包装脚本在服务器 `~/astrbot_test/beta_daily_collect.sh`，
+> 仓库同源副本 `scripts/beta_daily_collect.sh`；日志按 UTC 时间戳落在
+> `/mnt/xz/xiaojiujiu-beta/logs/<UTC>.log`（脚本自己 `exec >>` 重定向，不依赖 cron 邮件）。
+> 日志里显式 `LANG=C.UTF-8`：cron 的 locale 是 POSIX，不钉死会写出乱码甚至 UnicodeEncodeError。
+> 手跑一次：`ssh bomomo@192.168.1.15 '~/astrbot_test/beta_daily_collect.sh'`。
+
 ```bash
 # 1) 采集（容器里读卷，写机械盘）
 docker run --rm -v astrbot_test_runtime-fleet-data:/data:ro \
@@ -698,9 +710,54 @@ python3 ~/astrbot_test/src/xiaojiujiu/scripts/snapshot_beta.py --note "before tu
   --root /mnt/xz/xiaojiujiu-beta/snapshots     # 同样挂上卷与导出盘运行
 ```
 
+**为什么是这个钟点**：`events.created_at` 是 UTC，日报按 **UTC 日期前缀**过滤，而服务器是
+CST=UTC+8。若在 CST 白天跑，`--date 今天(UTC)` 只能看到"从 CST 08:00 到现在"的半截；
+所以定时任务固定 **08:05 CST**（= 00:05 UTC）跑，取 `--date 昨天(UTC)`——报告覆盖的是
+一个**刚刚走完的完整 UTC 日**。代价：当天 00:00–08:00 CST（= 前一天 16:00–24:00 UTC）
+的聊天要等第二天早上才进报告，急事直接看下面那个看板。
+
+**看板地址（完整端点）**——宿主 `192.168.1.15`，控制面把 8800 发布在 `0.0.0.0`，
+局域网内任何机器直接开：
+
+| 端点 | 是什么 | 是否只读 |
+|---|---|---|
+| `http://192.168.1.15:8800/fleet/dashboard` | HTML 总览页，30s 自刷新（每人 health/端口/事件数/unresolved/未了事项/deep+explain 调用/重启次数/uptime） | 只读 |
+| `http://192.168.1.15:8800/fleet/status` | 上面那张表的 JSON（`count` + `people[]`），`beta_daily_report.py --fleet` 也吃这个 | 只读 |
+| `http://192.168.1.15:8800/fleet/routes` | 会话 → `http://runtime-fleet:<port>` 的路由表，插件同步的就是它 | 只读 |
+| `http://192.168.1.15:8800/fleet/provision` / `restart/<port>` / `deprovision/<port>` | **会改状态**（建人/重启/删人） | ⚠️ 写 |
+
+> ⚠️ 控制面**没有鉴权**，且 8800 发布在 `0.0.0.0` ⇒ 同一局域网内谁都能 POST
+> `/fleet/deprovision/<port>`。测试期这样最省事；封测给外部人之前，要么把这三条写端点
+> 收进 docker 内网（只留 dashboard/status/routes 对外），要么直接别在不可信网络里开。
+> 各人的 8787+/8801 只在 docker 内网（`astrbot_test_test_net`），宿主没发布，从别的机器
+> 打不到——想手工调某个实例，得进容器：`docker exec xxj-runtime-fleet python3 - <脚本>`。
+
 **证据**：`runtime/tests/test_observability.py` 7 条；`scripts/mutation_observability.py`
 4 条变异全部 KILLED（不写决策/不写曲线/不记录渲染/忽略全文开关）；runtime 全量
 **1134 passed / 17 skipped**。测试栈实测：静置后自动采样、导出→回放→日报全链路通过。
+
+**定时任务与看板的实测（2026-09-16 夜）**：
+- crontab 已装（`5 8 * * *`，`systemctl is-active cron` = active），包装脚本与仓库副本
+  **md5 一致**（`abb54b15d60009bf73919dc96d050c08`），并用 `env -i`（只给 PATH/HOME 的
+  最小环境，模拟 cron）跑通：`exit=0`，日志落 `/mnt/xz/xiaojiujiu-beta/logs/2026-09-16_1535.log`。
+- 三项控制面从**本机（Windows）**访问 `http://192.168.1.15:8800/fleet/dashboard` =
+  `HTTP 200`，标题 `小九九 fleet`，14 实例全 `health=ok`；`/fleet/status`、`/fleet/routes`
+  同样 200。
+- **"调用→落库"闭环实测**：在网络内对真人实例（8801）调一次 `POST /v1/context`
+  （`{"session":"default:FriendMessage:1670681411","trigger":"llm_request"}`）→ `HTTP 200`，
+  返回 2901 字、`version=684`、四段（进入本轮前的长期状态 / 当前工作局势 / 必要记忆 / 时间连续性），
+  库里 `context_rendered` **0 → 1**。即仪表本身是好的。
+- 顺带澄清一个假警报：真人实例某次导出显示 `context_renders=0`，疑似注入没记录。实际是
+  **早期（自动开通生效前）那些 `/v1/context` 打到了共享/回退实例**，后来该人被分到自己的库
+  （卷里 `default-friendmessage-1670681411/` 的 mtime 22:44 就是那一刻），旧调用自然不在他的新库里。
+  卷根只残留一个 `raw_events.jsonl`（容器默认路径的产物，443B），可以删。
+
+> ⚠️ **埋点密度提醒（封测第一周要盯的第一个数字）**：一条用户消息**不产生** `decisions` 记录
+> ——它把状态推进、把 `foreground_pause` 续上，但动机判决只在**内源轮次**里发生
+> （`trigger=endogenous_round` / `foreground_pause` 那个提前 return 分支）。以 900s 上限估算，
+> 一次刚聊完（pause ≈ 60s）+ 持续对话的时段，判决可能只有个位数/小时。真人实例 50 分钟里
+> 12 提问 5 回复**只有 1 条判决**。所以日报里的"决策次数"要连着"对话轮数"一起读，
+> 别把"她在聊天"误读成"博弈没跑"；真要加密样本，调 `CR_SCHEDULER__MAX_INTERVAL_SECONDS`。
 
 ### ⚠️ 宿主坑：AstrBot 把 OneBot 的「通知」包装成空正文的消息事件
 
