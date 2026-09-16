@@ -93,10 +93,23 @@ BEHAVIOUR_CLASSES: tuple[str, ...] = (
     "reply",
 )
 
-#: Reasonable starting beliefs; symmetric where the Runtime should stay agnostic.
-#: The ``boundary_risk`` cold start is deliberately *neutral* rather than
-#: suspicious: risk rises only once a boundary is actually known
-#: (``after_boundary``) or the user is provably busy.
+#: Reasonable starting beliefs about how a person reacts to a companion character,
+#: before this user has said anything.
+#:
+#: These are *not* neutral defaults, and an earlier version of this comment ("symmetric
+#: where the Runtime should stay agnostic") described a property the literal below does not
+#: have: every column is non-zero, which is the point - a belief that multiplies a feature
+#: is never neutral, so the honest thing is to say what it claims rather than to call it
+#: symmetric. ``tests/test_user_model_priors.py`` holds the claims and the numbers
+#: together: it fails if a feature acquires a prior without a documented reason, and it
+#: checks the one property this comment *does* assert.
+#:
+#: That asserted property is the absence of suspicion, not the absence of opinion:
+#: cold-start ``boundary_risk`` for a first contact is far below
+#: ``utility.conservative_risk_threshold`` (measured 0.175), so design §31's "低风险安全
+#: 探索" is expressed as a low risk prior rather than as a permission flag. Risk rises only
+#: once a boundary is actually known (``after_boundary``, +1.60) or the user is provably
+#: busy (+0.30).
 DEFAULT_THETA: dict[str, tuple[float, ...]] = {
     "reply_probability": (0.30, -0.35, 0.25, -0.10, 0.20, 0.05, -0.60, -1.10, 0.25, -0.15, -0.30, 0.05, 0.80),
     "positive_probability": (0.35, 0.05, 0.10, -0.10, 0.05, -0.05, -0.45, -0.50, 0.05, -0.20, -0.55, 0.05, 0.60),

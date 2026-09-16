@@ -452,12 +452,75 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
 | | 问题 | 设计依据 | 状态 |
 |---|---|---|---|
 | ① | 观察侧 / 预测侧的行为特征编码不一致 | §22.1 / §25 / §27 | **已修**，见下 |
-| ② | 深层刷新的 8 条触发规则没有 tick 内调用方（`evaluate_triggers` 只在宿主调端点时才跑，而 §21 的判据全在 Runtime 手里） | 补丁 §21 | 待做 |
-| ③ | 重解释不派生四类下游、也不发 `EventType.REAPPRAISAL`（设计明文要求触发情绪更新/未尽之事/候选检查/用户模型重归因） | §67 | 待做 |
-| ④ | §86.10（隐藏心理上下文不进永久历史）在两个仓库都没有断言 | §86.10 | 待做 |
-| ⑤ | `DEFAULT_THETA` 注释自称 symmetric/agnostic，字面值不对称；设计 §31 从未授权方向性先验 | §31 | 待做 |
-| ⑥ | §22.1「消息长度」是死字段（`_action_spec` 曾算出 `length`，`phi` 不读） | §22.1 | ① 里已从编码器移除，**是否作为真特征**待定 |
+| ② | ~~深层刷新的 8 条触发规则没有 tick 内调用方~~ | 补丁 §21 | **撤回——误判**，见下 |
+| ③ | ~~重解释不派生四类下游、也不发 `EventType.REAPPRAISAL`~~ | §67 | **大部分撤回**，只剩"`reappraisals` 没有读取方"并入 ⑦ |
+| ④ | ~~§86.10（隐藏心理上下文不进永久历史）在两个仓库都没有断言~~ | §86.10 | **撤回——误判**，见下 |
+| ⑤ | `DEFAULT_THETA` 注释自称 symmetric/agnostic，字面值不对称 | §31 | **已修**，见下 |
+| ⑥ | §22.1「消息长度」是死字段 | §22.1 | ① 里已从编码器移除；**是否作为真特征**见下 |
 | ⑦ | 死旋钮 / 零调用函数清理（含 `_last_proactive_context`——一个零调用的**第三种** A 编码器） | — | 待做 |
+
+### ⚠️ 核实后撤回的三条（②③④）—— 教训写在这里
+
+我第一版清单里的 ②③④ **是错的**，而且错法完全一样：**我用自己想出来的词去 grep，而不是读那段
+代码的属主，并且直接信了审计文档的状态标签**。逐条交代：
+
+- **② 不是缺陷。** `runtime.py::endogenous_round` 第 1475 行就写着
+  `if deep_refresh: outcome.deep_refresh = self.deep_refresh(now=stamp).to_dict()`——
+  tick **本来就**会跑一次触发判定。`tests/test_refresh_scheduling.py::TestRefreshRunsUnattended`
+  5 条测试一直存在，文件名字面上就叫"refresh scheduling"。我之所以没看到，是因为我
+  `grep deep_refresh runtime.py | head -30` 被断管截断，恰好只看到方法定义那一处，
+  又从没打开过那个测试文件。`docs/PATCH_V0.2_MAPPING.md` 也把这条记成"已修复"。
+- **③ 大部分不成立。** 设计 §67 说的四类下游（情绪更新 / 未尽之事 / 候选检查 / 用户模型重归因）
+  **已经存在**：它们是 `reducer._apply_deep_refresh` 处理的六种 operation kind
+  （`candidate_intent`/`unfinished_matter`/`user_model_evidence`/`psychological_interpretation`
+  等），而深层刷新是重解释的唯一生产者。`reappraisals` 只是这条链的审计留痕。真正剩下的只有
+  "这张表没有读取方、`EventType.REAPPRAISAL` 枚举成员从未被发出"——并入 ⑦。
+- **④ 不是缺陷，而且实现得很对。** 插件 `main.py::_inject_context` 用
+  `TextPart(...).mark_as_temp()` 注入，并且在 `mark_as_temp` 不可用时**拒绝注入**并只警告一次
+  （"Without mark_as_temp the hidden context could be written into permanent history, which the
+  architecture forbids. Skip instead."）——失败关闭，正是应有的形状。断言也有：
+  `tests/test_plugin_integration.py::test_context_is_injected_as_a_temporary_part` 直接断言
+  `part._no_save`。我 grep 的是 `hide_ctx` / `context_pollution` 这种**我自己编的词**，
+  自然一条都搜不到。
+
+**教训**：要断言"没有调用方/没有生产方/没有测试"，必须给出**文件级**证据（读那个属主的函数体、
+读那个名字最像的测试文件、`ls` 一遍测试目录），而不是关键词命中为空。审计文档的状态标签同样
+不可信——本文件 §"状态校正"一节已经列出它标错的另外三条（#2/#5/#7）。
+
+### ⑤ 先验注释与它自己的字面值（已修，0.3.2 进行中）
+
+原来的注释写 "symmetric where the Runtime should stay agnostic"，但**每一列都是非零的**——
+乘在一个特征上的信念从来不可能是中性的。设计 §31 也只授权"低风险安全探索"，没有说过先验应当对称。
+
+修法不是把先验清零（那会抹掉冷启动的探索倾向，属于行为变更），而是**让那句话可执行**：
+
+- 注释改成陈述真正的性质：**没有 suspicion ≠ 没有 opinion**；冷启动 `boundary_risk` 实测
+  **0.175**，远低于 `utility.conservative_risk_threshold`（0.30）；风险只因**已知边界**
+  （`after_boundary` +1.60）或**确证忙碌**（`busy` +0.30）上升。设计 §31 的"低风险安全探索"
+  因此是**先验里的低风险**，而不是一个许可开关。
+- `tests/test_user_model_priors.py` 5 条把这个说法变成断言：
+  「带意见的特征必须有写下来的理由」（`DOCUMENTED_PRIORS` 与"哪些列非零"必须相等——**新增或
+  抹掉一条先验而不改理由就红**）、冷启动不得把首次接触判成可能越界、边界与忙碌必须抬升风险、
+  `explicit_permission` 必须是最强正向、`recent_contact_ratio` 必须**比它更强地**是负向
+  （后两条是设计 §26.1 / §29 点名的两个极端证据）。
+
+**证据**：5 条测试 + `priors` 组 7 个变异全部 KILLED（含"把 novelty 抹成 0 却不改理由"、
+"让冷启动变可疑"、"让疲劳比许可更弱"）。
+
+### ⑥ §22.1 里未实现的 A 字段（已决定：留档不改）
+
+设计 §22.1 把 `A_i` 列成 8 栏：是否主动 / 意图类型 / 话题 / 是否追问 / **表达强度** /
+情绪暴露程度 / **消息长度** / **是否允许用户退出**。特征向量实现了前四项（加上 `C`/`Z` 的部分），
+后三项没有对应特征。① 里已经把那个"算出来又被 `phi` 静默丢弃"的 `length` 键删掉。
+
+**为什么现在不加**：`FEATURE_NAMES` 的注释自己写着"Keep the order stable: it is persisted"。
+加一个特征 = 改变持久化向量长度，`user_model._load` 会 `LOGGER.warning("Discarding malformed
+parameter vector for %s")` 并**回退到先验**——也就是**每个既有用户已经学到的 θ 被静默丢弃**
+（有日志，但不阻止）。这是产品级取舍，不该顺手做。要做的话需要一条真正的迁移
+（按索引重排 + 新特征先验），那是独立的一项。
+
+`tests/test_user_model_priors.py` 里的 `test_every_prior_vector_matches_the_feature_layout`
+与 `DOCUMENTED_PRIORS` 的相等断言，保证**将来加特征时会被强制写下来**。
 
 ### ① 行为特征编码统一（已修，0.3.2 进行中）
 
@@ -493,7 +556,7 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
 **证据**：`tests/test_action_encoding_parity.py` 27 条（按 `TYPE_TO_BEHAVIOUR` 的每个类型
 断言**绝对**编码值，而不是"和预测一致"——后者在两边一起改错时仍会通过；另有"标点不得进入特征
 向量"一条，用 `contact`（canonical question=0）因为只有它会让标点启发式**改变**向量）。
-`scripts/mutation_action_encoding.py`（仓库根目录）8 个变异**全部 KILLED**，包括"观察侧退回薄 A"
+`scripts/mutation_design_conformance.py`（仓库根目录）8 个变异**全部 KILLED**，包括"观察侧退回薄 A"
 （19 failed）与"用标点判 是否追问"（1 failed）。全量 **1080 passed / 17 skipped / 0 failed**。
 
 **遗留**：`_last_proactive_context` 里还有第三份、且**零调用**的 A 编码器——留给 ⑦ 删除

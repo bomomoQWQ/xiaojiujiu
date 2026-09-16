@@ -152,18 +152,25 @@
    投递回执 + 用户回复归属 + 「无 attempt 的显式反应」）与 API 入口全部走它，
    `describe_supplied_action` 负责把调用方的描述规范化（派生的三个标志重算、`type`/`proactive`
    是调用方对行为的描述、未知键保留）。`tests/test_action_encoding_parity.py` 27 条，按类型断言
-   **绝对**编码值（避免"两边一起改错"也能通过），`scripts/mutation_action_encoding.py` 8 个变异全部击杀。
+   **绝对**编码值（避免"两边一起改错"也能通过），`scripts/mutation_design_conformance.py` 8 个变异全部击杀。
 4. **恒真测试**（上面第 15 条）。**[部分复现 0.3.2]** 同一族里新发现一条**没有断言的不变量**：
    设计 §86 的十条"实现时建议写成自动测试"里，§86.10（隐藏心理上下文不进入永久对话历史）在
    Runtime 与插件两个仓库**都没有任何断言**；`CONTEXT_TAG`（plugin `bridge.py`）只有构造处，
    没有任何地方剥离或校验它。属于"没有断言"而非"已证明违反"，但按本项目的标准是同一族缺陷。
 5. **写入口不推进时间**（上面第 2 条）。
 6. **PG 分支不完整却没有守卫**（上面第 12 条）。
-7. **文档自述与代码不符**（0.3.2 新增）：`DEFAULT_THETA` 的注释写"symmetric where the Runtime
-   should stay agnostic"，字面值却不对称（`reply_probability` 里 `emotional_expression` −0.10、
-   `question` +0.20、`topic_shift` +0.05），而设计 §31 只授权"低风险安全探索"、从未说过先验应当
-   对称或中性；本文件的判定合计与 §5 复现数字也长期停在旧值。这条主题本身就是审计存在的理由
-   的另一面：**能自证的描述才可复核**，注释和本文件都该被当成断言来对待。
+7. **文档自述与代码不符**（0.3.2 新增，同日已修）：`DEFAULT_THETA` 的注释曾写"symmetric where
+   the Runtime should stay agnostic"，字面值却不对称（`reply_probability` 里
+   `emotional_expression` −0.10、`question` +0.20、`topic_shift` +0.05），而设计 §31 只授权
+   "低风险安全探索"、从未说过先验应当对称或中性；本文件的判定合计与 §5 复现数字也长期停在旧值。
+   **[已修]** 注释改为陈述真正的性质（没有 suspicion ≠ 没有 opinion：冷启动 `boundary_risk`
+   实测 0.175，远低于 `conservative_risk_threshold`；风险只因**已知边界**（+1.60）或
+   **确证忙碌**（+0.30）上升），并把那句话变成可执行的断言 ——
+   `tests/test_user_model_priors.py` 5 条 + 7 个变异：带意见的特征必须有写下来的理由
+   （新增或抹掉一条先验而未改理由即红）、冷启动不得把首次接触判成可能越界、边界与忙碌必须抬升
+   风险、`explicit_permission` 必须是最强正向、`recent_contact_ratio` 必须比它更强地是负向。
+   这条主题本身就是审计存在的理由的另一面：**能自证的描述才可复核** —— 注释和本文件都该被
+   当成断言来对待，而不是散文。
 
 ## 五、怎么复核
 
@@ -173,7 +180,7 @@ cd runtime && python -m pytest                    # 1080 passed / 17 skipped（�
 CR_TEST_PG_DSN=postgresql://… python -m pytest    # 对真 PG（本机无 psycopg，恒跳过）
 
 # 第三条在仓库根目录（xiaojiujiu/）跑；它自己进 runtime/ 并还原改动
-runtime/.venv/bin/python scripts/mutation_action_encoding.py   # ① 的 8 个变异，应全部 KILLED
+runtime/.venv/bin/python scripts/mutation_design_conformance.py   # ①⑤ 的 15 个变异，应全部 KILLED
 ```
 
 每一条判定都能用分册里的 `file.py::symbol:line` 定位；若某条与当前代码不符，以代码为准并在

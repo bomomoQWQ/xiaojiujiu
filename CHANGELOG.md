@@ -47,8 +47,30 @@
   `describe_supplied_action` 给 API 入口规范化（`type`/`proactive` 是调用方对行为的描述，
   其余行为特征重算、伪造无效，未知键保留）；编码器里删掉了那个一直被 φ 静默丢弃的 `length`。
   验收：`tests/test_action_encoding_parity.py` 27 条（按类型断言**绝对**编码值，而不是
-  "与预测一致"——后者在两边一起改错时仍会通过），`scripts/mutation_action_encoding.py`
+  "与预测一致"——后者在两边一起改错时仍会通过），`scripts/mutation_design_conformance.py`
   （仓库根目录，8 个变异）全部击杀。详见 `HANDOFF.md` 的"设计一致性清单"一节。
+
+- **冷启动先验的注释不再自称中立，那句话变成了可执行的断言（设计 §31）。**
+  `DEFAULT_THETA` 上方的注释原先写 "symmetric where the Runtime should stay agnostic"，
+  而**每一列都是非零的**——乘在一个特征上的信念从来不可能是中性的，设计 §31 也只授权
+  "低风险安全探索"、没说过先验应当对称。修法不是把先验清零（那会抹掉冷启动的探索倾向，
+  是行为变更），而是让说法可执行：注释改为陈述真正的性质（**没有 suspicion ≠ 没有 opinion**；
+  冷启动 `boundary_risk` 实测 0.175，远低于 `conservative_risk_threshold`；风险只因**已知边界**
+  （+1.60）或**确证忙碌**（+0.30）上升），`tests/test_user_model_priors.py` 5 条把它变成断言：
+  带意见的特征必须有写下来的理由（`DOCUMENTED_PRIORS` 与"哪些列非零"必须相等，新增或抹掉一条
+  先验而不改理由就红）、冷启动不得把首次接触判成可能越界、边界与忙碌必须抬升风险、
+  `explicit_permission` 必须是最强正向、`recent_contact_ratio` 必须比它更强地是负向。
+  验收：5 条测试 + `priors` 组 7 个变异全部击杀。
+
+- **撤回三条自己报错的缺陷（②③④）——记在这里以免再犯。**
+  ② "深层刷新没有 tick 内调用方"：`runtime.py::endogenous_round` 第 1475 行本来就会跑一次
+  触发判定，`tests/test_refresh_scheduling.py::TestRefreshRunsUnattended` 五条测试一直在。
+  ③ "重解释不派生四类下游"：那四类下游就是 `reducer._apply_deep_refresh` 处理的六种 operation
+  kind，本来就存在；只剩"`reappraisals` 没有读取方"并入死代码清理。
+  ④ "§86.10 没有断言"：插件在 `mark_as_temp` 不可用时**拒绝注入**（失败关闭且只警告一次），
+  `test_context_is_injected_as_a_temporary_part` 直接断言 `part._no_save`。
+  三条都是**用自己编的词 grep、又直接信了审计文档的状态标签**造成的误判；教训写在
+  `HANDOFF.md` 的"核实后撤回的三条"一节。
 
 - **"被无视"这条证据终于有人产生（审计 #4 / 设计 §22.3）。**
   此前反馈回路只有**正面一半**：用户下次开口时，回复被归属到最新一条已发出的主动消息并结算；
