@@ -955,7 +955,7 @@ Reducer 侧还有三条安全规则：
 | POST | `/render/fail` | 上报渲染失败；返回 `attempt_state`（结果状态，重复上报幂等） |
 | POST | `/rendered` | 直接路径：给 attempt 附文本并入队发送 |
 | POST | `/delivery` | 上报发送结果（可附带 reaction） |
-| POST | `/observations` | 记录一次用户反应 |
+| POST | `/observations` | 记录一次用户反应。`action` 里 `type`/`proactive` 是**调用方对行为的描述**，其余行为特征由 Runtime 按 `type` 重算（伪造无效），未知键原样保留 |
 | GET | `/state` | 当前运行时投影 |
 | GET | `/candidates` | 候选意图池 |
 | POST | `/candidates/operations` | 通过池管理器应用 ADD/UPDATE/RETIRE/REINTERPRET |

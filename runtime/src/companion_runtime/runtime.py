@@ -39,6 +39,7 @@ from . import motivation as motivation_module
 from . import pool as pool_module
 from . import protocol as protocol_module
 from . import unfinished as unfinished_module
+from . import user_model as user_model_module
 from .config import RuntimeConfig, StorageConfig
 from .db import Database, open_database
 from .db_base import ConflictError
@@ -733,11 +734,7 @@ class Runtime:
             reaction.busy_probability = busy
             observation = self.user_model.observe(
                 conn,
-                action={
-                    "type": candidate.type if candidate else "contact",
-                    "proactive": True,
-                    "question": bool(candidate and "?" in (candidate.intent or "")),
-                },
+                action=self._action_spec(candidate),
                 context=self._situation_context(now),
                 reaction=reaction,
                 now=now,
@@ -2266,11 +2263,7 @@ class Runtime:
                     if attempt.candidate_id
                     else None
                 )
-                action_spec = {
-                    "type": candidate.type if candidate else "contact",
-                    "proactive": True,
-                    "question": bool(candidate and "?" in (candidate.intent or "")),
-                }
+                action_spec = self._action_spec(candidate)
                 observation = self.user_model.observe(
                     conn,
                     action=action_spec,
@@ -2414,7 +2407,7 @@ class Runtime:
             reaction.busy_probability = busy
             observation = self.user_model.observe(
                 conn,
-                action={"type": "reply", "proactive": False},
+                action=user_model_module.describe_action(type="reply", proactive=False),
                 context=self._situation_context(now),
                 reaction=reaction,
                 now=now,
@@ -2439,10 +2432,7 @@ class Runtime:
                 reaction.boundary_touched = True
             observation = self.user_model.observe(
                 conn,
-                action={
-                    "type": candidate.type if candidate else "contact",
-                    "proactive": True,
-                },
+                action=self._action_spec(candidate),
                 context=self._situation_context(now),
                 reaction=reaction,
                 now=now,
@@ -2652,16 +2642,28 @@ class Runtime:
             return clamp(0.4 + top.intensity)
         return clamp(0.2 + 0.3 * top.intensity)
 
-    def _action_spec(self, candidate: CandidateIntent) -> dict[str, Any]:
-        """Convert a candidate into the action description the user model expects."""
-        return {
-            "type": candidate.type,
-            "proactive": candidate_module.is_candidate_proactive(candidate),
-            "emotional_expression": candidate.type == "share",
-            "question": candidate.type in {"follow_up", "curious_question", "check_in"},
-            "topic_shift": candidate.type == "curious_question",
-            "length": len(candidate.intent or ""),
-        }
+    def _action_spec(self, candidate: CandidateIntent | None) -> dict[str, Any]:
+        """Convert a candidate into the canonical action record ``A`` (design §22.1).
+
+        This is the *only* place the Runtime builds an ``A``, and every observation path
+        calls it with the same candidate the prediction scored. Design §25 features a
+        candidate as ``x = phi(A, C, Z)`` and §27 reuses that ``X_i`` in the posterior, so
+        a second, thinner description on the observation side would teach the model about
+        a feature vector it never scored. Before this was shared, three of the five
+        action-derived features disagreed between the two paths (see
+        :func:`~companion_runtime.user_model.describe_action`).
+
+        ``proactive`` comes from :func:`candidate_module.is_candidate_proactive`, the same
+        predicate the hard-boundary gate uses, so a behaviour blocked as proactive is also
+        learned about as proactive. A missing candidate means "a message the character
+        sent that no live candidate accounts for", which is an unprompted contact.
+        """
+        if candidate is None:
+            return user_model_module.describe_action(type="contact", proactive=True)
+        return user_model_module.describe_action(
+            type=candidate.type,
+            proactive=candidate_module.is_candidate_proactive(candidate),
+        )
 
     def _expire_candidates(self, conn: Any, *, now: datetime) -> list[str]:
         """Expire candidates past their deadline."""

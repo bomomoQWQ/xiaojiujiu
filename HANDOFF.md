@@ -88,7 +88,7 @@ Runtime 完全靠确定性代码工作；可选的远端语义 provider 的 key 
 
 ```bash
 # 1. Runtime 离线测试
-cd runtime && .venv/bin/python -m pytest              # 期望 828 passed
+cd runtime && .venv/bin/python -m pytest              # 期望 1080 passed
 
 # 2. 插件离线测试（在插件仓库里）
 cd ../astrbot_plugin_companion_runtime
@@ -151,12 +151,12 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 
 | 项目 | 结果 |
 |---|---|
-| Runtime 离线测试 | 914 passed / 14 skipped（接 `CR_TEST_PG_DSN` 时 PG 专项不再跳过） |
+| Runtime 离线测试 | **1080 passed / 17 skipped**（无 DSN；PG 专项恒跳过） |
 | 插件离线测试 | 143 passed + 13 subtests |
 | 高仿真故障恢复 | 335/335 |
 | 用户黑盒仿真 | **77 / 77**（退出码 0，连跑多次一致） |
 | 记忆质量仿真 | **25 / 25**（`scripts/e2e_memory_simulation.py`，见第 6 节） |
-| 版本 | Runtime 0.3.1；插件 0.1.0 |
+| 版本 | Runtime 0.3.2（进行中）；插件 0.1.0 |
 | 许可证 | GPL-3.0-or-later |
 
 > **换机器复现记录**（Linux / Python 3.14.7 / 全新 venv，2026-09-15）：0.2.0 时点上的四行
@@ -432,4 +432,70 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
   小活，直接做更快。
 - 另：提交前对**全仓**扫一次 `git grep -n "MUTATION\|PROBE"`——我在 `6f2b146` 里误带了子代理
   正在树里的临时变异（`GET /schedule` 又被加回推进时钟的 tick），已用 `79e66ee` 更正。
+
+---
+
+## 设计一致性清单（0.3.2 进行中，一次修一条）
+
+**起因**：把仓库里那两份设计文件（`内源主动型长期陪伴AI_Runtime_完整架构设计.md`、
+`PATCH_v0.2_即时演出与持久认知分离_移除本地2B核心依赖.md`，与外部传来的副本 sha256 一致）
+逐条对着代码核了一遍。核完先更正了三处**审计文档自己写错**的状态：
+
+| 审计原文 | 代码现状 | 证据 |
+|---|---|---|
+| #2「[在飞]」9 个写库入口不推进时间 | **已修** | `LAST_DECISION_META_KEY` + `_record_decision`/`_last_decision`，`tests/test_hazard_anchor.py`，落 `6f2b146`。§50「不依赖心跳频率」正是该修法的依据 |
+| #5「[部分]」runtime 侧接线待落 | **已修** | `_refresh_candidates` 已把 `observations/emotions/situations/boundaries/recent_events` 交给 `generate`；`tests/test_candidate_shapes_wiring.py` 用 spy 钉住 |
+| #7「[部分]」`invalidated_by_source_state` 未接线 | **已修** | 文本匹配返回 None 时 `runtime.py` 继续问来源级判据 |
+
+**待办（按设计依据的硬度排序，一条一条修）**：
+
+| | 问题 | 设计依据 | 状态 |
+|---|---|---|---|
+| ① | 观察侧 / 预测侧的行为特征编码不一致 | §22.1 / §25 / §27 | **已修**，见下 |
+| ② | 深层刷新的 8 条触发规则没有 tick 内调用方（`evaluate_triggers` 只在宿主调端点时才跑，而 §21 的判据全在 Runtime 手里） | 补丁 §21 | 待做 |
+| ③ | 重解释不派生四类下游、也不发 `EventType.REAPPRAISAL`（设计明文要求触发情绪更新/未尽之事/候选检查/用户模型重归因） | §67 | 待做 |
+| ④ | §86.10（隐藏心理上下文不进永久历史）在两个仓库都没有断言 | §86.10 | 待做 |
+| ⑤ | `DEFAULT_THETA` 注释自称 symmetric/agnostic，字面值不对称；设计 §31 从未授权方向性先验 | §31 | 待做 |
+| ⑥ | §22.1「消息长度」是死字段（`_action_spec` 曾算出 `length`，`phi` 不读） | §22.1 | ① 里已从编码器移除，**是否作为真特征**待定 |
+| ⑦ | 死旋钮 / 零调用函数清理（含 `_last_proactive_context`——一个零调用的**第三种** A 编码器） | — | 待做 |
+
+### ① 行为特征编码统一（已修，0.3.2 进行中）
+
+**病**：不是审计摘要说的"1 个特征对不上"，是 5 个里 3 个。`user_model.extract_features`
+的 docstring 自己写着 `x = phi(A, C, Z)`（与 §25 一字不差），所以 φ 只有一个、双方都调它——
+分歧在**调用方交给它的 `A`**：预测侧给 `emotional_expression`/`question`/`topic_shift`，
+观察侧一个都不给；两处观察点还用 **ASCII** `"?"` 判 `question`，而候选 intent 全是中文模板
+（`candidate.py` 的 `f"询问{matter.title}"`、`"没有具体事项，只是想和用户建立联系"`），
+所以那个特征在观察侧**恒为 0**。设计 §39 自己举的例子
+`{"type": "follow_up", "intent": "询问用户今天的面试结果"}` 就落在不一致里（预测 1.0 / 观察 0.0）。
+
+对着设计文档还查出三处只有比着 §22.1 才看得出的矛盾：
+
+1. `TYPE_TO_BEHAVIOUR` 把 `share` 与 `emotional_expression` 映到同一个行为类，但特征标志只认
+   `share`；同理 `question` 映到 `curious_question` 却被排除在提问集合外——**预测侧自相矛盾**。
+2. 观察侧把 `proactive` 硬编码为 `True`，而 `reply` 候选的 `is_candidate_proactive` 是 `False`。
+3. `POST /observations` 把调用方给的 `action` 原样透传，等于**从前门再开一次同样的口子**。
+
+**修法**（只加不改语义）：
+
+- `user_model.describe_action(*, type, proactive)` 成为**唯一**的 `A` 构造器，
+  三个类型集合 `QUESTION_TYPES` / `EMOTIONAL_EXPRESSION_TYPES` / `TOPIC_SHIFT_TYPES`
+  是 §22.1 那三栏的可读形式；`ACTION_FEATURE_NAMES` 与测试共享。
+- `runtime._action_spec(candidate)` 改为调它（`proactive` 仍来自
+  `candidate_module.is_candidate_proactive`，保持边界门的唯一权威），
+  **五个**路径统一走它：预测、沉默清扫 `_record_absent_replies`、投递回执 `observe_reply`、
+  用户回复归属 `_attribute_user_reply`、以及「无 attempt 的显式反应」分支（它直接
+  `describe_action(type="reply", proactive=False)`）。
+- `user_model.describe_supplied_action(action)` 给 API 入口规范化：`type`/`proactive` 是
+  调用方对行为的描述，其余行为特征**重算**（伪造无效），未知键保留。
+- 编码器里**删掉** `length`（它一直被 `phi` 静默丢弃，见 ⑥）。
+
+**证据**：`tests/test_action_encoding_parity.py` 27 条（按 `TYPE_TO_BEHAVIOUR` 的每个类型
+断言**绝对**编码值，而不是"和预测一致"——后者在两边一起改错时仍会通过；另有"标点不得进入特征
+向量"一条，用 `contact`（canonical question=0）因为只有它会让标点启发式**改变**向量）。
+`scripts/mutation_action_encoding.py`（仓库根目录）8 个变异**全部 KILLED**，包括"观察侧退回薄 A"
+（19 failed）与"用标点判 是否追问"（1 failed）。全量 **1080 passed / 17 skipped / 0 failed**。
+
+**遗留**：`_last_proactive_context` 里还有第三份、且**零调用**的 A 编码器——留给 ⑦ 删除
+（改它无法用测试证伪，删它才是可证伪的收尾）。
 

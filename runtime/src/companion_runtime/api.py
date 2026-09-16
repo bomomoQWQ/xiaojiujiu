@@ -48,6 +48,7 @@ from . import context as context_module
 from . import memory as memory_module
 from . import protocol as protocol_module
 from . import scheduler as scheduler_module
+from . import user_model as user_model_module
 from .authorize import AuthorizeRequest, authorize
 from .config import RuntimeConfig, redact
 from .typing import (
@@ -751,7 +752,7 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
             state = runtime.state()
             observation = runtime.user_model.observe(
                 conn,
-                action=payload.get("action") or {"type": "contact", "proactive": True},
+                action=user_model_module.describe_supplied_action(payload.get("action")),
                 context=payload.get("context") or {},
                 reaction=reaction,
                 now=now,

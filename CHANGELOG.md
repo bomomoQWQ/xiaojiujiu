@@ -30,6 +30,26 @@
   变异测试三处各自精确打红对应测试。详见 `HANDOFF.md` 的 #3+#5 一节，其中记了
   "这条验收测试原本不可证伪"的发现。
 
+- **用户模型学到的行为特征，和它打分时用的特征，现在是同一个（设计 §22.1 / §25 / §27）。**
+  `extract_features` 的 docstring 自己写着 `x = phi(A, C, Z)`（与 §25 一字不差），φ 只有一个、
+  预测与观察都调它——不一致的是**交给它的 `A`**：预测侧给
+  `emotional_expression`/`question`/`topic_shift`，观察侧一个都不给；两处观察点还用 **ASCII**
+  `"?"` 判 `question`，而候选 intent 全是中文模板（`candidate.py` 的 `f"询问{matter.title}"`、
+  `"没有具体事项，只是想和用户建立联系"`），所以那个特征在观察侧**恒为 0**。
+  设计 §39 自己举的例子 `{"type": "follow_up", "intent": "询问用户今天的面试结果"}`
+  就落在不一致里（预测 1.0 / 观察 0.0）。对着设计文档还查出三处内部矛盾：
+  `TYPE_TO_BEHAVIOUR` 把 `share`/`emotional_expression` 映到同一行为类、把 `question` 映到
+  `curious_question`，特征标志却只认 `share` 和另外三个类型；观察侧把 `proactive` 硬编码为
+  `True`，而 `reply` 候选的 `is_candidate_proactive` 是 `False`；`POST /observations`
+  又把调用方给的 `action` 原样透传，等于从前门再开一次同样的口子。
+  现在 `user_model.describe_action` 是唯一的 `A` 构造器，运行时**五个**路径
+  （预测、沉默清扫、投递回执、用户回复归属、无 attempt 的显式反应）全部走它；
+  `describe_supplied_action` 给 API 入口规范化（`type`/`proactive` 是调用方对行为的描述，
+  其余行为特征重算、伪造无效，未知键保留）；编码器里删掉了那个一直被 φ 静默丢弃的 `length`。
+  验收：`tests/test_action_encoding_parity.py` 27 条（按类型断言**绝对**编码值，而不是
+  "与预测一致"——后者在两边一起改错时仍会通过），`scripts/mutation_action_encoding.py`
+  （仓库根目录，8 个变异）全部击杀。详见 `HANDOFF.md` 的"设计一致性清单"一节。
+
 - **"被无视"这条证据终于有人产生（审计 #4 / 设计 §22.3）。**
   此前反馈回路只有**正面一半**：用户下次开口时，回复被归属到最新一条已发出的主动消息并结算；
   而一条**发出后石沉大海**的消息不留任何痕迹——`no_reply_weight` 那条路径在生产里**永远不可达**，

@@ -118,6 +118,112 @@ TYPE_TO_BEHAVIOUR: Mapping[str, str] = {
     "reply": "reply",
 }
 
+#: Candidate types whose behaviour is a probe - design §22.1's "是否追问". A property of
+#: what the character chose to do, never of how the sentence happens to be punctuated.
+QUESTION_TYPES: frozenset[str] = frozenset(
+    {"follow_up", "check_in", "question", "curious_question"}
+)
+
+#: Candidate types that expose feeling - design §22.1's "情绪暴露程度". Both names of the
+#: same behaviour class are listed: :data:`TYPE_TO_BEHAVIOUR` maps ``share`` and
+#: ``emotional_expression`` onto one class, so treating only the first as exposure made
+#: the feature disagree with the behaviour class it is meant to describe.
+EMOTIONAL_EXPRESSION_TYPES: frozenset[str] = frozenset({"share", "emotional_expression"})
+
+#: Candidate types that move the subject - design §22.1's "话题".
+TOPIC_SHIFT_TYPES: frozenset[str] = frozenset({"curious_question"})
+
+#: The members of :data:`FEATURE_NAMES` that come from ``A`` alone (design §22.1); the
+#: rest of the vector comes from ``C``/``Z``. ``follow_up`` is listed because
+#: :func:`extract_features` derives it from ``type``: it is a property of the behaviour,
+#: so no caller may supply it either.
+ACTION_FEATURE_NAMES: tuple[str, ...] = (
+    "proactive",
+    "follow_up",
+    "emotional_expression",
+    "question",
+    "topic_shift",
+)
+
+#: Keys :func:`describe_supplied_action` always takes from the canonical encoder, so a
+#: host cannot describe a behaviour inconsistently with the type it reports.
+_CANONICAL_ACTION_KEYS: frozenset[str] = frozenset(ACTION_FEATURE_NAMES) | {"type"}
+
+
+def describe_action(*, type: str, proactive: bool) -> dict[str, Any]:
+    """Build the canonical action record ``A`` for one behaviour (design §22.1).
+
+    Every path that produces an ``A`` goes through here. Design §25 features a candidate
+    as ``x = phi(A, C, Z)`` and §27 reuses that same ``X_i`` in the posterior, so a
+    behaviour described one way when it is predicted and another way when its outcome is
+    observed teaches the model about a feature vector it never scored: the ``theta`` for
+    that feature is pulled towards a value learned from inputs the prediction never used.
+
+    That is not hypothetical. The prediction path passed ``emotional_expression``,
+    ``question`` and ``topic_shift``; every observation path passed only ``type`` and
+    ``proactive``, and two of them derived ``question`` from an ASCII ``"?"`` in the
+    intent text. No candidate template contains one, so the observed feature was ``0.0``
+    for every real behaviour while the predicted feature was ``1.0`` for a follow-up -
+    including the design document's own example, ``{"type": "follow_up", "intent":
+    "询问用户今天的面试结果"}`` (design §39).
+
+    Args:
+        type: The candidate's type. An unknown type is described conservatively (no
+            exposure, no probe, no topic shift) rather than optimistically.
+        proactive: Whether the character initiated this, i.e.
+            :func:`~companion_runtime.candidate.is_candidate_proactive`. It is passed in
+            rather than derived here because that predicate is the hard-boundary gate's
+            authority and has to stay in one place.
+
+    Returns:
+        A mapping carrying the action-derived members of :data:`FEATURE_NAMES`.
+        ``length`` (design §22.1's "消息长度") is deliberately absent: it is not a
+        feature, and a key that :func:`extract_features` silently ignores is worse than
+        no key at all.
+    """
+    kind = str(type or "contact")
+    return {
+        "type": kind,
+        "proactive": bool(proactive),
+        "emotional_expression": kind in EMOTIONAL_EXPRESSION_TYPES,
+        "question": kind in QUESTION_TYPES,
+        "topic_shift": kind in TOPIC_SHIFT_TYPES,
+    }
+
+
+def describe_supplied_action(action: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return the canonical ``A`` for a behaviour a *caller* described.
+
+    The public observation endpoint lets a host report what the character did, and the
+    host is not the authority on how a behaviour maps onto features - design §25's ``phi``
+    is. Passing the payload through verbatim reopened the same divergence at the API
+    boundary: ``{"type": "share", "proactive": true}`` carried no
+    ``emotional_expression`` and was therefore learned as if the character had shown
+    nothing, while the same candidate scored ``1.0`` when the Runtime predicted it.
+
+    Unknown keys are preserved so the record stays extensible (design §79's version
+    fields, or anything a future host wants to record); the action-derived features are
+    recomputed from ``type``/``proactive`` and cannot be overridden.
+
+    Args:
+        action: The caller's description, or ``None``. A non-mapping is treated as
+            absent rather than raising: the endpoint must not answer a malformed body
+            with a 500, and "there was no description" is the honest reading.
+
+    Returns:
+        A canonicalised action record.
+    """
+    supplied = dict(action) if isinstance(action, Mapping) else {}
+    canonical = describe_action(
+        type=str(supplied.get("type") or "contact"),
+        proactive=bool(supplied.get("proactive", True)),
+    )
+    extras = {
+        key: value for key, value in supplied.items() if key not in _CANONICAL_ACTION_KEYS
+    }
+    return extras | canonical
+
+
 # --------------------------------------------------------------------------------------
 # Relative reply-delay scoring (§29)
 #

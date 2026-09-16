@@ -31,18 +31,29 @@
 > **2026-09-15 状态更新（0.3.2）**：每条前面标出当前状态与证据；**原始判定文字保持原样**，
 > 便于对照"当初是怎么判的"。约定：**[已修]** = 有回归测试或变异证据；**[部分]** = 关键一半已做、
 > 另一半有意留待（写明是什么）；**[在飞]** = 正在改；**[未修]** = 尚未动。
+>
+> **2026-09-16 状态校正（0.3.2 期间复核）**：上面那行"状态更新"本身已经落后于代码。逐条重核后：
+> **#2 已是 [已修]**（`LAST_DECISION_META_KEY` + `_record_decision` / `_last_decision`，
+> `tests/test_hazard_anchor.py`，落在 `6f2b146`；§50 的"不依赖心跳频率"正是该修法的依据）；
+> **#5、#7 的"未做"那一半也已接线**（`runtime.py::_refresh_candidates` 已把
+> `observations/emotions/situations/boundaries/recent_events` 传给 `generate`，
+> `tests/test_candidate_shapes_wiring.py` 用 spy 钉住调用点；`invalidated_by_situation` 返回
+> None 时 `runtime.py` 会继续问 `invalidated_by_source_state`）。本文件的"判定合计"与 §5 的
+> 复现数字（`883 passed / 14 skipped`）同样是旧值，当前基线是 `1080 passed / 17 skipped`。
+> 下面按代码现状逐条标注。
 
 1. **[已修 0.3.0/0.3.1]** 记忆永远无法形成（默认部署）。
    证据：`Runtime.consolidate` + `endogenous_round` 分支 + CLI `consolidate`（0.3.0）；
    随后 0.3.1 又修掉"形成后 12 小时就再也检索不到"等 9 条——**八条是新的记忆质量仿真先抓到的**
    （`scripts/e2e_memory_simulation.py`，25 项检查 + 两种注错自证）。变异：摘掉轮次里的调用 → 6 条失败。
-2. **[在飞，且真因与原文不同]** 9 个写库入口不推进时间（§86.4）。
+2. **[已修 0.3.2]** 9 个写库入口不推进时间（§86.4）。
    实测发现真正的问题不是"哪个入口该 tick"：`endogenous_round` 的 hazard 区间是
    `stamp - state.last_tick_at`，**任何推进时钟的入口都会吃掉角色的等待窗口**——A/B 实测
    （同一三天窗口）里先 `GET /schedule` 一次，`delta_t` 从 260000 s 变成 **0.002 s**，
    `action_probability` 0.999999 → ~0；而候选效用对比**逐字节相同**（1.32705 vs 沉默 0.908808）。
    一次只读轮询清零三天开口冲动。修法：hazard 区间改为"距上次**决策**的时间"（持久化在
-   `RuntimeState.meta`），且**只读端点不推进世界**。写入口仍不 tick（claim/render/deliver 是
+   `RuntimeState.meta`，`LAST_DECISION_META_KEY`，`_record_decision`/`_last_decision`），
+   且**只读端点不推进世界**（`tests/test_hazard_anchor.py`）。写入口仍不 tick（claim/render/deliver 是
    outbox 生命周期的一步，中间积分时间会与自己的上报步骤抢跑——实测让韧性两条不变量变红）。
 3. **[已修 0.3.2]** 用户模型缺少时间性（§28/§29）。
    `tick_drift(dt)`（按 `exp(-rate·dt)` 只衰减超出先验的精度）已由 `Runtime` 的 tick 调用；
@@ -56,21 +67,24 @@
    attempt 记 `replied=False` 弱证据并像回复一样消费它。**比原文更严重的一点**：此前那条 attempt
    永远停在 `sent`，而"有在途 attempt"会堵死该会话后续全部派发——一条没人回的消息 = 该会话永久静音。
    "用户说过自己忙"现在会真的软化这条证据（此前只有回复归属路径读 busy 标记）。变异：摘掉清扫 → 3 条失败。
-5. **[部分]** 候选生成只产出三种形状（§37–§43）。
+5. **[已修 0.3.2]** 候选生成只产出三种形状（§37–§43）。
    `share`/`repair`/`reply` 已有规则产出（`share` 来自关于用户的激活记忆、`repair` 来自负向观察或
    已声明边界、`reply` 来自未被回答的用户提问），`emotion:`/`situation:` 也有了生产者，41 条测试。
-   **未做**：任何内部派发 `TaskKind.CANDIDATE_GEN`（那是 provider 路径），**runtime 侧接线**
-   （把 observations/emotions/situations/boundaries/recent_events 传给 `generate`）待落。
+   **runtime 侧接线也已落地**：`runtime.py::_refresh_candidates` 把
+   `observations/emotions/situations/boundaries/recent_events` 一并交给 `candidate_module.generate`，
+   `tests/test_candidate_shapes_wiring.py` 用 spy 钉住这五个输入——"规则存在但生产从不喂它"曾让
+   这三种形状只在测试里可达。内部仍不派发 `TaskKind.CANDIDATE_GEN`（那是 provider 路径）。
 6. **[已修 0.3.2]** 话题级边界不参与决策门（§52）。
    `Boundary.subject` 在声明那一刻绑定"这个"（含 `ADDED_COLUMNS` 迁移），绑定**优先用事件身份**
    （未尽之事 `source_event_ids`）而非文本重叠——实测「我明天下午三点面试，结束了告诉你」与标题
    「等待面试结果」只共享 1 个 bigram；决策门在效用比较**之前**剔除违规候选并报出原因；
    绑定不出来时**不猜、不拦**。16 条测试；实测还纠正了我的第一版（`repeated_interrogation` 曾拦掉
    所有提问型候选 72 小时，"话题级"被做成"全面禁问"，韧性仿真立刻抓到）。
-7. **[部分]** `invalidate_when` 是 4 条硬编码关键词表。
+7. **[已修 0.3.2]** `invalidate_when` 是 4 条硬编码关键词表。
    已改为由来源派生（未尽之事了结/记忆归档或被取代/问题已被回答/边界已撤回/情绪已过去），
-   未知条件不再静默失效（审计 D4）。**未做**：runtime 侧在文本匹配为 None 时问
-   `invalidated_by_source_state` 的接线。
+   未知条件不再静默失效（审计 D4）。**来源级回退也已接线**：文本匹配返回 `None` 时
+   `runtime.py` 继续问 `invalidated_by_source_state`（与 `invalidated_by_situation` 的
+   docstring 承诺一致）。
 8. **[已修 0.3.2]** 保守分位数未接线（§47）。
    决策路径改用模型自己的下界 `conservative_bound(prediction, quantile=config.utility.downside_quantile)`，
    硬编码 `z=0.12` 与不可达的 `0.25` 分支（缺陷 D3）已删除；`downside_quantile` 现在有真实读者，
@@ -124,15 +138,42 @@
    `dormant`、`reappraisals`、`proposed_by`。
 3. **两套不一致的编码**：行为特征在"预测"与"观察"两条路径上编码不同（question 一个按类型、
    一个按问号），模型学的与模型用的是同一个词的不同含义。
-4. **恒真测试**（上面第 15 条）。
+   **[已修 0.3.2]** 但实际情况比这一行摘要严重：不是 1 个特征对不上，是**5 个里有 3 个**——
+   预测侧给 `emotional_expression`/`question`/`topic_shift`，观察侧一个都不给；两处观察点还用
+   **ASCII** `"?"` 判 `question`，而候选 intent 全是中文模板（`f"询问{matter.title}"`、
+   `"没有具体事项，只是想和用户建立联系"`），所以那个特征在观察侧**恒为 0**。设计 §39 自己举的
+   例子 `{"type": "follow_up", "intent": "询问用户今天的面试结果"}` 就落在不一致里（预测 1.0 / 观察 0.0）。
+   还有两处只有对着设计文档才看得出的内部矛盾：`TYPE_TO_BEHAVIOUR` 把 `share` 与
+   `emotional_expression` 映到同一行为类、把 `question` 映到 `curious_question`，但特征标志只认
+   `share` 和另外三个类型；`proactive` 在观察侧被硬编码为 `True`，而 `reply` 候选的
+   `is_candidate_proactive` 是 `False`；`POST /observations` 还把调用方给的 `action` 原样透传，
+   等于从前门再开一次同样的口子。
+   修法：`user_model.describe_action` 成为唯一的 `A` 构造器，运行时五个路径（预测 + 沉默清扫 +
+   投递回执 + 用户回复归属 + 「无 attempt 的显式反应」）与 API 入口全部走它，
+   `describe_supplied_action` 负责把调用方的描述规范化（派生的三个标志重算、`type`/`proactive`
+   是调用方对行为的描述、未知键保留）。`tests/test_action_encoding_parity.py` 27 条，按类型断言
+   **绝对**编码值（避免"两边一起改错"也能通过），`scripts/mutation_action_encoding.py` 8 个变异全部击杀。
+4. **恒真测试**（上面第 15 条）。**[部分复现 0.3.2]** 同一族里新发现一条**没有断言的不变量**：
+   设计 §86 的十条"实现时建议写成自动测试"里，§86.10（隐藏心理上下文不进入永久对话历史）在
+   Runtime 与插件两个仓库**都没有任何断言**；`CONTEXT_TAG`（plugin `bridge.py`）只有构造处，
+   没有任何地方剥离或校验它。属于"没有断言"而非"已证明违反"，但按本项目的标准是同一族缺陷。
 5. **写入口不推进时间**（上面第 2 条）。
 6. **PG 分支不完整却没有守卫**（上面第 12 条）。
+7. **文档自述与代码不符**（0.3.2 新增）：`DEFAULT_THETA` 的注释写"symmetric where the Runtime
+   should stay agnostic"，字面值却不对称（`reply_probability` 里 `emotional_expression` −0.10、
+   `question` +0.20、`topic_shift` +0.05），而设计 §31 只授权"低风险安全探索"、从未说过先验应当
+   对称或中性；本文件的判定合计与 §5 复现数字也长期停在旧值。这条主题本身就是审计存在的理由
+   的另一面：**能自证的描述才可复核**，注释和本文件都该被当成断言来对待。
 
 ## 五、怎么复核
 
 ```bash
-cd runtime && python -m pytest                    # 883 passed / 14 skipped（无 DSN）
-CR_TEST_PG_DSN=postgresql://… python -m pytest    # 897 passed（对真 PG）
+# 前两条在 runtime/ 下跑（命令 1 别再加 -q：pyproject 的 addopts 已带 -q，再来一个会吞掉汇总行）
+cd runtime && python -m pytest                    # 1080 passed / 17 skipped（无 DSN）
+CR_TEST_PG_DSN=postgresql://… python -m pytest    # 对真 PG（本机无 psycopg，恒跳过）
+
+# 第三条在仓库根目录（xiaojiujiu/）跑；它自己进 runtime/ 并还原改动
+runtime/.venv/bin/python scripts/mutation_action_encoding.py   # ① 的 8 个变异，应全部 KILLED
 ```
 
 每一条判定都能用分册里的 `file.py::symbol:line` 定位；若某条与当前代码不符，以代码为准并在
