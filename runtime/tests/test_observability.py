@@ -95,6 +95,26 @@ def test_the_state_curve_has_one_sample_per_round() -> None:
         runtime.close()
 
 
+def test_a_paused_round_is_recorded_as_a_verdict() -> None:
+    """The commonest verdict of an active conversation: "she is talking, hold back".
+
+    This path returns before the motivational game, so without its own write the
+    busiest hours of the week would leave no decision rows at all.
+    """
+    runtime = _runtime()
+    try:
+        runtime.process_user_message(content="在吗", timestamp=BASE_TIME)
+        runtime.endogenous_round(now=BASE_TIME + timedelta(seconds=5))
+
+        rows = runtime.projections.observability.list_decisions(limit=10)
+        assert rows, "a paused round is still a verdict"
+        assert rows[-1]["reason"] == "foreground_pause"
+        assert rows[-1]["acted"] == 0
+        assert runtime.projections.observability.list_state_samples(limit=10), "curve too"
+    finally:
+        runtime.close()
+
+
 def test_the_context_render_is_recorded() -> None:
     """What the host was told, per render: version, size, section sizes."""
     runtime = _runtime()

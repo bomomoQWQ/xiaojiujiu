@@ -1426,6 +1426,13 @@ class Runtime:
         """
         if not self.config.observability.enabled:
             return
+        if connection is None:
+            # Called from a path that owns no transaction (the paused round): open one.
+            with self._db.transaction() as own_connection:
+                self._record_observability(
+                    own_connection, stamp, outcome=outcome, state=state, trigger=trigger,
+                )
+            return
         # ``outcome`` is ``MotivationResult.to_dict()``: the verdict under
         # ``outcome`` plus every assessment. Index the verdict, keep the whole thing
         # as the payload -- the losers are the reason this table exists.
@@ -1614,6 +1621,16 @@ class Runtime:
                 # A paused round still took a verdict (to hold back), so it starts the
                 # next hazard interval - the same thing its tick used to do.
                 outcome.version = self._record_decision(stamp)
+                # The most frequent verdict of an active conversation is "she is
+                # talking, so hold back". Recording it is what makes "why did she
+                # never speak today?" answerable without re-reading the transcripts.
+                self._record_observability(
+                    None,
+                    stamp,
+                    outcome=outcome.decision,
+                    state=state,
+                    trigger="foreground_pause",
+                )
                 # A paused foreground silences speech, not maintenance: memory
                 # formation is exactly the kind of work that must still happen
                 # while the character is being quiet.
