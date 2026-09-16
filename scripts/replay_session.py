@@ -9,6 +9,11 @@ things that belong together on the same lines:
 * what the motivational game did about it -- the verdict, the hazard, and the
   candidates that lost (from ``decisions.jsonl``).
 
+The tail adds the two ledgers a week is judged from: the deep-refresh attempts
+(``refresh_runs.jsonl``, declined attempts included) and the reappraisals they
+produced, because "the mood curve is flat" is answered by whether anything ever
+came back to settle the backlog.
+
 Reads only the export, so it needs neither Docker nor the Runtime to be running::
 
     python scripts/replay_session.py --export /mnt/xz/xiaojiujiu-beta/<run>/people/<person>
@@ -78,9 +83,13 @@ def main() -> int:
 
     events = read_jsonl(root / "events.jsonl")
     decisions = read_jsonl(root / "decisions.jsonl")
+    refreshes = read_jsonl(root / "refresh_runs.jsonl")
+    reappraisals = read_jsonl(root / "tables" / "reappraisals.jsonl")
+    semantics = read_jsonl(root / "tables" / "event_semantics.jsonl")
     if args.since:
         events = [row for row in events if str(row.get("created_at") or "") >= args.since]
         decisions = [row for row in decisions if str(row.get("decided_at") or "") >= args.since]
+        refreshes = [row for row in refreshes if str(row.get("ran_at") or "") >= args.since]
 
     width = None if args.full else 68
     printed = 0
@@ -130,6 +139,37 @@ def main() -> int:
         if row.get("acted"):
             print(f"      chose {row.get('chosen_candidate_id')} "
                   f"({short(payload.get('outcome', {}).get('reason'), 40)})")
+
+    # The deferred-interpretation ledger. A person's mood only moves when an event is
+    # settled, so these two blocks answer the question the daily report raises: did
+    # anything ever come back for the backlog, and what did it decide it meant?
+    unresolved = sum(1 for row in semantics if row.get("semantic_status") == "unresolved")
+    print()
+    print(f"# deep refreshes: {len(refreshes)} · settled "
+          f"{sum(int(row.get('settled_events') or 0) for row in refreshes)} events · "
+          f"{unresolved} still unresolved")
+    for row in refreshes[-12:] if not args.full else refreshes:
+        payload = row.get("payload_json") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        applied = payload.get("applied") or row.get("applied") or {}
+        applied_text = ",".join(f"{k}:{v}" for k, v in applied.items()) or "-"
+        print(f"  {str(row.get('ran_at'))[11:19]} ran={int(row.get('ran') or 0)} "
+              f"{str(row.get('reason')):<20} trigger={short(row.get('trigger'), 22):<22} "
+              f"ops={row.get('operations')} settled={row.get('settled_events')} "
+              f"degraded={int(row.get('degraded') or 0)} applied={applied_text} "
+              f"{row.get('latency_ms')}ms")
+        violations = payload.get("violations") or []
+        if violations:
+            first = violations[0]
+            print(f"      violations={len(violations)} first={first.get('kind')}/"
+                  f"{first.get('reason')}")
+
+    if reappraisals:
+        print()
+        print(f"# reappraisals: {len(reappraisals)}")
+        for row in reappraisals[-8:] if not args.full else reappraisals:
+            print(f"  {str(row.get('created_at'))[11:19]} {short(row.get('content'), 90)}")
     return 0
 
 

@@ -2063,6 +2063,65 @@ class Runtime:
         force: bool = False,
         trigger_context: dict[str, Any] | None = None,
     ) -> DeepRefreshOutcome:
+        """Run one low-frequency deep cognition refresh and record the attempt.
+
+        The recording wrapper exists so that *every* attempt leaves a row, including
+        the ones that decline or fail: the interesting question after a week is not
+        "how many refreshes ran" but "why did the ones that ran accomplish nothing",
+        and an attempt that returns early is exactly the case a log has to keep.
+
+        Args:
+            now: Reference time; defaults to the wall clock.
+            force: Skip the trigger check (diagnostics and tests).
+            trigger_context: Extra trigger signals, e.g. ``matter_due``.
+
+        Returns:
+            A :class:`DeepRefreshOutcome` describing what happened and why.
+        """
+        stamp = ensure_aware(now) or utcnow()
+        outcome = self._deep_refresh(now=stamp, force=force, trigger_context=trigger_context)
+        self._record_refresh_run(stamp, outcome)
+        return outcome
+
+    def _record_refresh_run(self, stamp: datetime, outcome: "DeepRefreshOutcome") -> None:
+        """Persist one deep-refresh attempt for the beta's read-back.
+
+        Observability is not the product: a failure here is logged and swallowed
+        rather than allowed to take the refresh down with it.
+        """
+        if not self.config.observability.enabled:
+            return
+        try:
+            payload = outcome.to_dict()
+            trigger = payload.get("trigger") or {}
+            with self._db.transaction() as conn:
+                self.projections.observability.record_refresh_run(
+                    conn,
+                    {
+                        "ran_at": stamp,
+                        "runtime_version": int(self.projections.runtime.read().version),
+                        "conversation_id": self.config.conversation_id,
+                        "trigger": str(trigger.get("reason") or ""),
+                        "ran": outcome.ran,
+                        "reason": outcome.reason,
+                        "provider": outcome.provider,
+                        "degraded": outcome.degraded,
+                        "operations": outcome.operations,
+                        "settled_events": outcome.settled_events,
+                        "latency_ms": outcome.latency_ms,
+                        "payload": payload,
+                    },
+                )
+        except Exception:
+            LOGGER.warning("Recording the deep refresh run failed; continuing", exc_info=True)
+
+    def _deep_refresh(
+        self,
+        *,
+        now: datetime | None = None,
+        force: bool = False,
+        trigger_context: dict[str, Any] | None = None,
+    ) -> DeepRefreshOutcome:
         """Run one low-frequency deep cognition refresh (patch v0.2 §18-§21).
 
         This is the *only* place a semantic provider may influence state, and it

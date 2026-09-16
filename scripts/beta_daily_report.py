@@ -85,12 +85,19 @@ def person_report(people_dir: Path, day: str, live: dict[str, Any]) -> list[str]
             row for row in read_jsonl(person_dir / "tables" / "event_semantics.jsonl")
             if str(row.get("created_at") or "").startswith(day)
         ]
+        refreshes = [
+            row for row in read_jsonl(person_dir / "refresh_runs.jsonl")
+            if str(row.get("ran_at") or "").startswith(day)
+        ]
         user_turns = sum(1 for row in events if row.get("event_type") == "user_message")
         assistant_turns = sum(1 for row in events if row.get("event_type") == "assistant_message")
         renders = sum(1 for row in events if row.get("content") == "context_rendered")
         acted = sum(1 for row in decisions if row.get("acted"))
         unresolved = sum(1 for row in semantics if row.get("semantic_status") == "unresolved")
         reasons = Counter(str(row.get("reason")) for row in decisions)
+        settled = sum(int(row.get("settled_events") or 0) for row in refreshes)
+        degraded = sum(1 for row in refreshes if row.get("degraded"))
+        refresh_reasons = Counter(str(row.get("reason")) for row in refreshes)
 
         totals["user_turns"] += user_turns
         totals["assistant_turns"] += assistant_turns
@@ -112,6 +119,16 @@ def person_report(people_dir: Path, day: str, live: dict[str, Any]) -> list[str]
         lines.append(f"- 决策：{len(decisions)} 次（主动 {acted} 次）"
                      + (f"，原因分布 {dict(reasons)}" if reasons else ""))
         lines.append(f"- 候选：{len(candidates)} 条新建；语义：{len(semantics)} 条，其中 unresolved {unresolved}")
+        if refreshes:
+            lines.append(
+                f"- 深刷新：{len(refreshes)} 次尝试，结算 {settled} 条，降级 {degraded} 次"
+                + (f"，原因分布 {dict(refresh_reasons)}" if refresh_reasons else "")
+            )
+        elif unresolved:
+            # The one shape that used to be invisible: a backlog nobody ever came
+            # back for. Not an error -- the deferred path is allowed to wait -- but a
+            # week of it is why a mood curve can be flat while the chat looks healthy.
+            lines.append(f"- 深刷新：0 次尝试，但 {unresolved} 条仍未结算 —— 没人回头读")
         if mood:
             lines.append(f"- 状态曲线（{len(samples)} 个采样点）：{mood}")
         if live_row:

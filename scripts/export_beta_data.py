@@ -57,6 +57,9 @@ EXTRA_TABLES = (
     "background_tasks",
     "user_model_params",
     "runtime_state",
+    # The deep-refresh ledger: one row per attempt, declined ones included. Without
+    # it a week of "the refresh ran and settled nothing" is invisible.
+    "refresh_runs",
 )
 
 
@@ -111,11 +114,19 @@ def export_person(db_path: Path, target: Path, log_path: Path | None) -> dict[st
                 row["payload_json"] = json.loads(row["payload_json"])
             except json.JSONDecodeError:
                 pass
+    refreshes = table_rows(connection, "refresh_runs")
+    for row in refreshes:
+        if isinstance(row.get("payload_json"), str):
+            try:
+                row["payload_json"] = json.loads(row["payload_json"])
+            except json.JSONDecodeError:
+                pass
 
     counts = {
         "events.jsonl": write_rows(target / "events.jsonl", events),
         "decisions.jsonl": write_rows(target / "decisions.jsonl", decisions),
         "state_samples.jsonl": write_rows(target / "state_samples.jsonl", samples),
+        "refresh_runs.jsonl": write_rows(target / "refresh_runs.jsonl", refreshes),
     }
     for table in EXTRA_TABLES:
         rows = table_rows(connection, table)
@@ -131,9 +142,17 @@ def export_person(db_path: Path, target: Path, log_path: Path | None) -> dict[st
     for row in decisions:
         key = str(row.get("reason") or "?")
         reasons[key] = reasons.get(key, 0) + 1
+    refresh_reasons: dict[str, int] = {}
+    for row in refreshes:
+        key = str(row.get("reason") or "?")
+        refresh_reasons[key] = refresh_reasons.get(key, 0) + 1
     user_turns = sum(1 for row in events if row.get("event_type") == "user_message")
     assistant_turns = sum(1 for row in events if row.get("event_type") == "assistant_message")
     renders = sum(1 for row in events if row.get("content") == "context_rendered")
+    unresolved = sum(
+        1 for row in table_rows(connection, "event_semantics")
+        if row.get("semantic_status") == "unresolved"
+    )
     summary = {
         "person": target.name,
         "exported_at": datetime.now(timezone.utc).isoformat(),
@@ -145,6 +164,14 @@ def export_person(db_path: Path, target: Path, log_path: Path | None) -> dict[st
         "decisions_acted": sum(1 for row in decisions if row.get("acted")),
         "decision_reasons": reasons,
         "state_samples": len(samples),
+        # The deferred-interpretation scoreboard. ``settled_events`` is the number
+        # that matters: a person can have dozens of refresh attempts and still a flat
+        # mood curve if none of them ever settled an event.
+        "refresh_runs": len(refreshes),
+        "refresh_degraded": sum(1 for row in refreshes if row.get("degraded")),
+        "refresh_reasons": refresh_reasons,
+        "refresh_settled_events": sum(int(row.get("settled_events") or 0) for row in refreshes),
+        "unresolved_open": unresolved,
         "first_event_at": events[0]["created_at"] if events else None,
         "last_event_at": events[-1]["created_at"] if events else None,
     }

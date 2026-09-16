@@ -359,6 +359,46 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
             "items": runtime.projections.semantics.list_unresolved(limit=limit),
         }
 
+    @router.get("/cognition/refreshes", tags=["cognition"])
+    def cognition_refreshes(limit: int = 100, since: str = "") -> dict[str, Any]:
+        """Return past deep-refresh attempts, declined ones included.
+
+        The companion to ``/cognition/backlog``: the backlog says what is still
+        waiting, this says what the Runtime already tried to do about it and why it
+        may have accomplished nothing. A run with ``ran=true`` and
+        ``settled_events=0`` is the shape of "the provider answered and every
+        suggestion was dropped", which is otherwise invisible.
+        """
+        return {
+            "runs": runtime.projections.observability.list_refresh_runs(
+                limit=limit, since=since or None
+            ),
+        }
+
+    @router.get("/observability/decisions", tags=["observability"])
+    def observability_decisions(
+        limit: int = 200, acted_only: bool = False, since: str = ""
+    ) -> dict[str, Any]:
+        """Return the motivational verdicts taken so far, oldest first.
+
+        Read back by the beta's export and replay tools; the same rows the daily
+        report counts. ``acted_only`` narrows it to the rounds that actually spoke.
+        """
+        return {
+            "decisions": runtime.projections.observability.list_decisions(
+                limit=limit, acted_only=acted_only, since=since or None
+            ),
+        }
+
+    @router.get("/observability/state-samples", tags=["observability"])
+    def observability_state_samples(limit: int = 500, since: str = "") -> dict[str, Any]:
+        """Return the mood/impulse curve the Runtime has been sampling."""
+        return {
+            "samples": runtime.projections.observability.list_state_samples(
+                limit=limit, since=since or None
+            ),
+        }
+
     # ------------------------------------------------------------------ render
 
     @router.post("/render", tags=["render"])

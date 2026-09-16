@@ -2314,6 +2314,63 @@ class ObservabilityProjection:
         )
         return [row_to_dict(row, "state_samples") for row in reversed(rows)]
 
+    def record_refresh_run(self, connection: Any, entry: dict[str, Any]) -> str:
+        """Append one deep-refresh attempt, declined attempts included.
+
+        A refresh that declines is the normal case and the reason it declined is the
+        interesting part ("nothing was worth spending on" versus "the provider
+        answered with nothing" versus "everything it said failed grounding"). Without
+        a row per attempt, those are indistinguishable after the fact -- which is
+        exactly how a refresh that silently applied nothing went unnoticed until the
+        mood curve came out flat.
+
+        Returns:
+            The run id.
+        """
+        run_id = entry.get("run_id") or new_id("refresh")
+        connection.execute(
+            "INSERT INTO refresh_runs(run_id, ran_at, runtime_version, conversation_id, trigger, "
+            "ran, reason, provider, degraded, operations, settled_events, latency_ms, "
+            "payload_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                run_id,
+                _as_stamp(entry.get("ran_at")),
+                int(entry.get("runtime_version") or 0),
+                str(entry.get("conversation_id") or ""),
+                str(entry.get("trigger") or ""),
+                1 if entry.get("ran") else 0,
+                str(entry.get("reason") or ""),
+                str(entry.get("provider") or ""),
+                1 if entry.get("degraded") else 0,
+                int(entry.get("operations") or 0),
+                int(entry.get("settled_events") or 0),
+                int(entry.get("latency_ms") or 0),
+                dumps(entry.get("payload") or {}),
+                _as_stamp(entry.get("created_at") or entry.get("ran_at")),
+            ),
+        )
+        return run_id
+
+    def list_refresh_runs(
+        self,
+        *,
+        limit: int = 200,
+        since: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return recent deep-refresh attempts, oldest first."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if since:
+            clauses.append("ran_at >= ?")
+            params.append(since)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(max(1, int(limit)))
+        rows = self.db.query(
+            "SELECT * FROM refresh_runs" + where + " ORDER BY ran_at DESC LIMIT ?",
+            tuple(params),
+        )
+        return [row_to_dict(row, "refresh_runs") for row in reversed(rows)]
+
 
 class Projections:
     """Convenience bundle of every projection object."""

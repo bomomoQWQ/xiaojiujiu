@@ -410,6 +410,25 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_state_samples_at ON state_samples(sampled_at)",
+    """
+    CREATE TABLE IF NOT EXISTS refresh_runs (
+        run_id           TEXT PRIMARY KEY,
+        ran_at           TEXT NOT NULL,
+        runtime_version  INTEGER NOT NULL DEFAULT 0,
+        conversation_id  TEXT,
+        trigger          TEXT NOT NULL DEFAULT '',
+        ran              INTEGER NOT NULL,
+        reason           TEXT NOT NULL DEFAULT '',
+        provider         TEXT NOT NULL DEFAULT '',
+        degraded         INTEGER NOT NULL,
+        operations       INTEGER NOT NULL DEFAULT 0,
+        settled_events   INTEGER NOT NULL DEFAULT 0,
+        latency_ms       INTEGER NOT NULL DEFAULT 0,
+        payload_json     TEXT NOT NULL DEFAULT '{}',
+        created_at       TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_refresh_runs_at ON refresh_runs(ran_at)",
 )
 
 #: JSON columns that hold arrays; every other JSON column holds an object.
@@ -446,10 +465,13 @@ JSON_COLUMNS: dict[str, tuple[str, ...]] = {
     "background_tasks": ("source_event_ids",),
     "interpretation_versions": ("source_event_ids",),
     "reappraisals": ("source_event_ids",),
-    # The two observability tables a closed beta is read back through: the full
-    # motivational verdict (including every candidate that lost) and the state curve.
+    # The observability tables a closed beta is read back through: the full
+    # motivational verdict (including every candidate that lost), the state curve,
+    # and one row per deep-refresh attempt -- including the attempts that declined,
+    # because "the refresh kept silently doing nothing" is invisible otherwise.
     "decisions": ("payload_json",),
     "state_samples": ("payload_json",),
+    "refresh_runs": ("payload_json",),
 }
 
 

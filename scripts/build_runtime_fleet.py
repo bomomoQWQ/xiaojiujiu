@@ -46,6 +46,19 @@ VALUES = {
     "CR_VALUES__CURIOSITY": "0.70",
 }
 
+#: Completion budget for one structured provider call.
+#:
+#: A ceiling, not a spend: only generated tokens are billed, so there is no reason to
+#: run it close to the wire. The API accepts 1..384K and defaults to 8K in
+#: non-thinking mode; 65536 sits far above anything a bounded refresh prompt can
+#: produce (measured 481-1200 tokens) while staying well under the model's maximum,
+#: so the budget can never be what truncates the reply. It mattered: at the code
+#: default of 1024 the deep refresh ended mid-JSON, JSON Output only guarantees valid
+#: JSON when the reply is complete, and the whole refresh silently degraded to empty.
+SEMANTIC_ENV = {
+    "CR_SEMANTIC_MAX_TOKENS": "65536",
+}
+
 #: Beta sampling cadence. A Runtime's own scheduler sleeps up to
 #: ``max_interval_seconds`` (5400 by default) and a user message does *not* wake it,
 #: so a week at the default would hold a handful of verdicts per person -- too thin
@@ -131,6 +144,7 @@ def render(image: str, env: list[str], compose: Path, checkout: Path) -> str:
         *env,
         *[f"      {key}: {value}" for key, value in VALUES.items()],
         *[f"      {key}: {value}" for key, value in SCHEDULER_ENV.items()],
+        *[f"      {key}: {value}" for key, value in SEMANTIC_ENV.items()],
         "    volumes:",
         f"      - {checkout}/scripts:/fleet:ro",
         f"      - {compose.parent}/fleet-data:/fleet-data",
