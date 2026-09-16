@@ -317,6 +317,11 @@ class DeepRefreshOutcome:
     trigger: dict[str, Any] = field(default_factory=dict)
     provider: str = ""
     degraded: bool = True
+    #: Whether a provider call was actually made. ``degraded`` defaults to ``True``
+    #: as the safe answer for consumers ("no trustworthy suggestions"), which is
+    #: right for a caller deciding whether to act on the result and wrong for a
+    #: ledger: a refresh that declined before spending is not a degraded one.
+    provider_called: bool = False
     operations: int = 0
     applied: dict[str, int] = field(default_factory=dict)
     violations: list[dict[str, Any]] = field(default_factory=list)
@@ -331,6 +336,7 @@ class DeepRefreshOutcome:
             "trigger": dict(self.trigger),
             "provider": self.provider,
             "degraded": self.degraded,
+            "provider_called": self.provider_called,
             "operations": self.operations,
             "applied": dict(self.applied),
             "violations": [dict(item) for item in self.violations],
@@ -2115,7 +2121,11 @@ class Runtime:
                         "ran": outcome.ran,
                         "reason": outcome.reason,
                         "provider": outcome.provider,
-                        "degraded": outcome.degraded,
+                        # ``degraded`` only means something once a provider was asked:
+                        # the outcome defaults it to True, which is the safe answer for
+                        # a caller and a false alarm in a report. A refresh that
+                        # declined to spend is described by ``reason``, not by this.
+                        "degraded": outcome.degraded and outcome.provider_called,
                         "operations": outcome.operations,
                         "settled_events": outcome.settled_events,
                         "latency_ms": outcome.latency_ms,
@@ -2189,6 +2199,7 @@ class Runtime:
 
         request = build_request(runtime=self, now=stamp, limit=config.max_operations_per_refresh)
         started = time.monotonic()
+        outcome.provider_called = True
         try:
             suggestions = self.semantic_provider.deep_refresh(request)
         except Exception:  # noqa: BLE001 - a provider fault is never fatal

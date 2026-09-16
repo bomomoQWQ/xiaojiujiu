@@ -131,6 +131,49 @@ def test_recording_can_be_switched_off(runtime: Runtime) -> None:
     assert _runs(runtime) == []
 
 
+def test_a_declined_refresh_is_not_recorded_as_degraded(runtime: Runtime) -> None:
+    """``degraded`` must mean "a provider was asked and its answer was unusable".
+
+    ``DeepRefreshOutcome.degraded`` defaults to ``True`` because that is the safe
+    answer for a caller deciding whether to trust a result. Copied into a ledger it
+    becomes a false alarm: every declined attempt (nothing needed doing, pacing not
+    elapsed, no provider configured) would be counted as a degradation, and the
+    daily report would claim a fault where the Runtime simply chose not to spend.
+    """
+    runtime.config.semantic.deep_refresh_enabled = False
+    runtime.deep_refresh(force=True)
+    declined = _runs(runtime)[-1]
+    assert declined["reason"] == "disabled"
+    assert declined["degraded"] == 0
+
+    runtime.config.semantic.deep_refresh_enabled = True
+    runtime.semantic_provider = DisabledProvider()
+    runtime.deep_refresh(force=True)
+    unavailable = _runs(runtime)[-1]
+    assert unavailable["reason"] == "provider_unavailable"
+    assert unavailable["degraded"] == 0, "never asking a provider cannot be a degradation"
+
+
+def test_a_provider_that_raises_is_recorded_as_degraded(runtime: Runtime) -> None:
+    """The other side of the same rule: a call that failed *is* a degradation."""
+
+    class _Boom:
+        name = "boom"
+
+        def available(self) -> bool:
+            return True
+
+        def deep_refresh(self, request: DeepRefreshRequest, **_: object):
+            raise RuntimeError("upstream went away")
+
+    runtime.semantic_provider = _Boom()  # type: ignore[assignment]
+    outcome = runtime.deep_refresh(force=True)
+    assert outcome.reason == "provider_error"
+    row = _runs(runtime)[-1]
+    assert row["degraded"] == 1
+    assert row["ran"] == 0
+
+
 def test_health_carries_the_scoreboard_a_monitor_can_poll(runtime: Runtime) -> None:
     """``/health`` has to answer "is the persistent half doing anything".
 
