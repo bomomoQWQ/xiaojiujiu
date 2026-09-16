@@ -181,6 +181,7 @@ class RuntimeProcess:
         payload = self.health()
         stats = payload.get("semantic_provider") or {}
         semantics = payload.get("semantics") or {}
+        refresh = payload.get("deep_refresh") or {}
         return {
             "person": self.slug,
             "session": self.session,
@@ -195,6 +196,15 @@ class RuntimeProcess:
             "unresolved": semantics.get("unresolved"),
             "semantic_calls": (stats.get("stats") or {}).get("deep_refresh_calls"),
             "explain_calls": (stats.get("stats") or {}).get("explain_calls"),
+            # The deferred-interpretation scoreboard, straight from the ledger: how
+            # many attempts, how many of them settled an event, and how the last one
+            # went. "Attempts > 0, settled == 0" is the shape that used to be
+            # invisible from outside the database.
+            "deep_refresh_attempts": refresh.get("attempts"),
+            "deep_refresh_settled": refresh.get("settled_events"),
+            "deep_refresh_degraded": refresh.get("degraded"),
+            "last_refresh_reason": refresh.get("last_reason"),
+            "last_refresh_at": refresh.get("last_at"),
             "health": payload.get("status"),
         }
 
@@ -356,19 +366,35 @@ def render_dashboard(people: list[dict[str, object]]) -> str:
     looks at during a week-long run (activity, unresolved backlog, whether the
     autonomous side is alive), no script beyond a meta refresh, no styling beyond
     what a browser does by itself.
+
+    The refresh columns are the ones that answer "is the persistent half doing
+    anything": ``attempts`` with ``settled`` under it is the deferred-interpretation
+    scoreboard, and a backlog that keeps growing while ``settled`` stays at zero is
+    the flat-mood curve -- which is why that cell is coloured rather than left to
+    be noticed.
     """
     rows = []
     for item in people:
         healthy = item.get("health") == "ok"
         colour = "#0a0" if healthy else "#c00"
+        attempts = item.get("deep_refresh_attempts") or 0
+        settled = item.get("deep_refresh_settled") or 0
+        unresolved = item.get("unresolved") or 0
+        # A backlog nobody ever came back for is the failure this page exists to make
+        # obvious: warn only when there IS a backlog and nothing was ever settled.
+        stalled = bool(unresolved) and not settled
+        refresh_colour = "#c60" if stalled else "#000"
         rows.append(
             "<tr>"
             f"<td><b>{item.get('person')}</b><br><small>{item.get('session')}</small></td>"
             f"<td style='color:{colour}'>{item.get('health')}</td>"
             f"<td>{item.get('port')}</td>"
             f"<td>{item.get('raw_events')}</td>"
-            f"<td>{item.get('unresolved')}</td>"
+            f"<td style='color:{refresh_colour}'>{unresolved}</td>"
             f"<td>{item.get('open_unfinished')}</td>"
+            f"<td style='color:{refresh_colour}'>{attempts} / {settled}</td>"
+            f"<td>{item.get('deep_refresh_degraded') or 0}</td>"
+            f"<td>{item.get('last_refresh_reason') or '-'}</td>"
             f"<td>{item.get('semantic_calls')} / {item.get('explain_calls')}</td>"
             f"<td>{item.get('restarts')}</td>"
             f"<td>{item.get('uptime_s')}s</td>"
@@ -381,7 +407,8 @@ def render_dashboard(people: list[dict[str, object]]) -> str:
         f"<h2>小九九 fleet — {len(people)} runtime(s)</h2>"
         "<table border='1' cellpadding='6' cellspacing='0'>"
         "<tr><th>person</th><th>health</th><th>port</th><th>events</th>"
-        "<th>unresolved</th><th>open matters</th><th>deep/explain calls</th>"
+        "<th>unresolved</th><th>open matters</th><th>refresh attempts / settled</th>"
+        "<th>degraded</th><th>last refresh</th><th>deep/explain calls</th>"
         "<th>restarts</th><th>uptime</th></tr>"
         + "".join(rows)
         + "</table><p>auto-refresh 30s · "

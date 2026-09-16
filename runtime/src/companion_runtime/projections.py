@@ -2371,6 +2371,32 @@ class ObservabilityProjection:
         )
         return [row_to_dict(row, "refresh_runs") for row in reversed(rows)]
 
+    def refresh_stats(self) -> dict[str, Any]:
+        """Return the deep-refresh scoreboard for ``/health`` and the fleet dashboard.
+
+        Kept to counts because it rides on a health poll: ``attempts`` versus
+        ``settled_events`` is the pair that decides whether the deferred half of the
+        system is doing anything at all, and ``last_reason`` says how the most recent
+        attempt went without a second request.
+        """
+        row = row_to_dict(
+            self.db.query_one(
+                "SELECT COUNT(*) AS attempts, SUM(settled_events) AS settled,"
+                " SUM(degraded) AS degraded, SUM(operations) AS operations FROM refresh_runs"
+            )
+        ) or {}
+        last = row_to_dict(
+            self.db.query_one("SELECT reason, ran_at FROM refresh_runs ORDER BY ran_at DESC LIMIT 1")
+        ) or {}
+        return {
+            "attempts": int(row.get("attempts") or 0),
+            "settled_events": int(row.get("settled") or 0),
+            "degraded": int(row.get("degraded") or 0),
+            "operations": int(row.get("operations") or 0),
+            "last_reason": str(last.get("reason") or ""),
+            "last_at": str(last.get("ran_at") or ""),
+        }
+
 
 class Projections:
     """Convenience bundle of every projection object."""

@@ -129,3 +129,29 @@ def test_recording_can_be_switched_off(runtime: Runtime) -> None:
     runtime.config.observability.enabled = False
     runtime.deep_refresh(force=True)
     assert _runs(runtime) == []
+
+
+def test_health_carries_the_scoreboard_a_monitor_can_poll(runtime: Runtime) -> None:
+    """``/health`` has to answer "is the persistent half doing anything".
+
+    The dashboard reads this endpoint once per person; without the aggregate there,
+    "attempts > 0 but nothing was ever settled" is only visible by opening every
+    database, which is how a whole evening of silent no-ops went unnoticed.
+    """
+    runtime.deep_refresh(force=True)
+    stats = runtime.projections.observability.refresh_stats()
+    assert stats["attempts"] == 1
+    assert stats["settled_events"] == 0
+    # This fixture has no provider, which is the honest default in tests; the point
+    # here is that the aggregate carries the last reason at all.
+    assert stats["last_reason"] == "provider_unavailable"
+    assert stats["last_at"]
+
+    from fastapi.testclient import TestClient
+
+    from companion_runtime.api import create_app
+
+    with TestClient(create_app(runtime, runtime.config)) as client:
+        body = client.get("/health").json()
+    assert body["deep_refresh"]["attempts"] == 1
+    assert body["deep_refresh"]["last_reason"] == "provider_unavailable"

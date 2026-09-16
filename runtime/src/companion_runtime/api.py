@@ -197,6 +197,12 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
             # unresolved backlog is normal operation, not an error.
             "semantic_provider": runtime.semantic_provider.health(),
             "semantics": runtime.projections.semantics.stats(),
+            # The deferred-interpretation scoreboard, on the endpoint every monitor
+            # already polls: attempts, how many of them settled an event, and how
+            # many came back degraded. A week where this stays at zero settled while
+            # the backlog grows is the flat-mood curve, visible without opening a
+            # database.
+            "deep_refresh": runtime.projections.observability.refresh_stats(),
             "raw_events": runtime.events.count(),
         }
 
