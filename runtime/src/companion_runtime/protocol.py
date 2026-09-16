@@ -41,6 +41,7 @@ from .typing import (
     ReconcileAction,
     TaskKind,
 )
+from .user_model import QUESTION_TYPES
 from .utility import delta_seconds, ensure_aware, utcnow
 
 LOGGER = logging.getLogger("companion_runtime.protocol")
@@ -343,7 +344,11 @@ def reconcile(
         event_tokens = _topic_tokens(text)
 
         # 1. The user did the thing we were about to ask about.
-        if candidate_type in {"follow_up", "curious_question", "check_in"} and event_tokens & intent_tokens:
+        # Question-shaped candidates only: the user may have just answered the very thing
+        # this intent was going to ask about. Read from the shared vocabulary rather than a
+        # fourth hand-written list - the old set here omitted ``question``, which is a
+        # synonym of ``curious_question`` (docs/BUSINESS_LOGIC_AUDIT.md §4).
+        if candidate_type in QUESTION_TYPES and event_tokens & intent_tokens:
             if _satisfies(text, candidate_type):
                 return ReconcileDecision(
                     action=ReconcileAction.RESOLVED.value,

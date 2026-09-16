@@ -2607,13 +2607,28 @@ class Runtime:
         return clamp(sign * (abs(state.mood_valence) * 0.6 + intensity * 0.4))
 
     def _emotion_alignment(self, candidate: CandidateIntent, active: Sequence[EmotionEvent]) -> float:
-        """Return how well a candidate matches the current emotional needs."""
+        """Return how well a candidate matches the current emotional needs (design §7).
+
+        The match is decided by the candidate's **behaviour class**, not by its type
+        spelling. The two hand-written sets this replaced (``{repair, follow_up, check_in}``
+        for a negative mood, ``{share, curious_question, contact}`` for a positive one) had
+        no relationship to :data:`~companion_runtime.user_model.TYPE_TO_BEHAVIOUR`, so the
+        *same intention* scored 1.000 as ``repair`` and 0.440 as ``apology``. The number
+        goes into the candidate's utility (design §45), so the spelling changed which
+        candidate the character picked (``docs/BUSINESS_LOGIC_AUDIT.md`` §4).
+
+        An unknown type gets the generic value rather than either match. That is the
+        opposite of :func:`~companion_runtime.candidate.is_candidate_proactive`, and
+        deliberately so: this is a matter of proportion, not a hard constraint, so "I do not
+        recognise this shape" must not earn a bonus.
+        """
         if not active:
             return 0.2
         top = max(active, key=lambda e: e.intensity)
-        if top.direction == "-" and candidate.type in {"repair", "follow_up", "check_in"}:
+        behaviour = user_model_module.TYPE_TO_BEHAVIOUR.get(str(candidate.type or ""))
+        if top.direction == "-" and behaviour in user_model_module.MOOD_MATCH_NEGATIVE_CLASSES:
             return clamp(0.4 + top.intensity)
-        if top.direction == "+" and candidate.type in {"share", "curious_question", "contact"}:
+        if top.direction == "+" and behaviour in user_model_module.MOOD_MATCH_POSITIVE_CLASSES:
             return clamp(0.4 + top.intensity)
         return clamp(0.2 + 0.3 * top.intensity)
 

@@ -146,6 +146,25 @@ EMOTIONAL_EXPRESSION_TYPES: frozenset[str] = frozenset({"share", "emotional_expr
 #: Candidate types that move the subject - design §22.1's "话题".
 TOPIC_SHIFT_TYPES: frozenset[str] = frozenset({"curious_question"})
 
+#: Behaviour classes whose *shape* answers a negative mood (design §7): an apology, a
+#: follow-up about something that is still pending, or simply turning up. These are the
+#: class-level form of what used to be a hand-written set of type names
+#: (``{repair, follow_up, check_in}``), which is why ``apology`` used to score 0.440 where
+#: ``repair`` scored 1.000 for the identical intention.
+MOOD_MATCH_NEGATIVE_CLASSES: frozenset[str] = frozenset({"repair", "follow_up", "proactive_contact"})
+
+#: Behaviour classes whose shape rides a positive mood (design §7): showing feeling, being
+#: curious about them, or turning up. The class-level form of the old
+#: ``{share, curious_question, contact}``.
+#:
+#: ``proactive_contact`` appears in **both** tables, and that is not an oversight: the two
+#: hand-written sets put ``check_in`` in the negative one and ``contact`` in the positive
+#: one, and both are this class. Turning up is appropriate when the user is low *and* when
+#: they are up.
+MOOD_MATCH_POSITIVE_CLASSES: frozenset[str] = frozenset(
+    {"emotional_expression", "curious_question", "proactive_contact"}
+)
+
 #: The members of :data:`FEATURE_NAMES` that come from ``A`` alone (design §22.1); the
 #: rest of the vector comes from ``C``/``Z``. ``follow_up`` is listed because
 #: :func:`extract_features` derives it from ``type``: it is a property of the behaviour,

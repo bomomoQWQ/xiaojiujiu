@@ -19,6 +19,7 @@ Groups:
     chat_history     backlog ③-1, the chat window's durable history
     boundary_synonyms 业务逻辑 B, a boundary must not be bypassable by renaming
     reply_length    业务逻辑 A, reply length judged against the user's own habit
+    mood_classes    业务逻辑 C, mood matching decided by behaviour class
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ FRAMEWORK_DIR = ROOT / "framework"
 CF_HISTORY = FRAMEWORK_DIR / "cf/history.py"
 CF_TUI = FRAMEWORK_DIR / "cf/tui.py"
 CANDIDATE = RUNTIME_DIR / "src/companion_runtime/candidate.py"
+PROTOCOL = RUNTIME_DIR / "src/companion_runtime/protocol.py"
 
 #: Test paths for the framework suite are written ``framework_tests/...`` and run from
 #: ``framework/``; the Runtime's own suite runs from ``runtime/``. One harness, two roots.
@@ -579,6 +581,52 @@ GROUPS: dict[str, tuple[list[str], list[tuple[str, list[tuple[pathlib.Path, str,
                         USER_MODEL,
                         "        delta = REPLY_LENGTH_TARGET_WEIGHT * self.relative_length_signal(int(reaction.reply_length))\n        if delta >= 0.0:\n            return delta\n        return -min(-delta, max(0.0, positive - 0.5))",
                         "        return REPLY_LENGTH_TARGET_WEIGHT * self.relative_length_signal(int(reaction.reply_length))",
+                    )
+                ],
+            ),
+        ],
+    ),
+    # ------------------------------------------------------------------ 业务逻辑 C
+    "mood_classes": (
+        ["tests/test_mood_matching_by_class.py"],
+        [
+            (
+                "C1 the alignment keeps its own type sets again (the original defect)",
+                [
+                    (
+                        RUNTIME,
+                        '        behaviour = user_model_module.TYPE_TO_BEHAVIOUR.get(str(candidate.type or ""))\n        if top.direction == "-" and behaviour in user_model_module.MOOD_MATCH_NEGATIVE_CLASSES:\n            return clamp(0.4 + top.intensity)\n        if top.direction == "+" and behaviour in user_model_module.MOOD_MATCH_POSITIVE_CLASSES:',
+                        '        behaviour = str(candidate.type or "")\n        if top.direction == "-" and behaviour in {"repair", "follow_up", "check_in"}:\n            return clamp(0.4 + top.intensity)\n        if top.direction == "+" and behaviour in {"share", "curious_question", "contact"}:',
+                    )
+                ],
+            ),
+            (
+                "C2 an unknown type earns the bonus instead of the generic value",
+                [
+                    (
+                        RUNTIME,
+                        '        behaviour = user_model_module.TYPE_TO_BEHAVIOUR.get(str(candidate.type or ""))',
+                        '        behaviour = user_model_module.behaviour_class_of({"type": candidate.type})',
+                    )
+                ],
+            ),
+            (
+                "C3 a behaviour class is dropped from the negative table",
+                [
+                    (
+                        USER_MODEL,
+                        'MOOD_MATCH_NEGATIVE_CLASSES: frozenset[str] = frozenset({"repair", "follow_up", "proactive_contact"})',
+                        'MOOD_MATCH_NEGATIVE_CLASSES: frozenset[str] = frozenset({"repair", "follow_up"})',
+                    )
+                ],
+            ),
+            (
+                "C4 the protocol classifier goes back to its own shorter list",
+                [
+                    (
+                        PROTOCOL,
+                        "        if candidate_type in QUESTION_TYPES and event_tokens & intent_tokens:",
+                        '        if candidate_type in {"follow_up", "curious_question", "check_in"} and event_tokens & intent_tokens:',
                     )
                 ],
             ),

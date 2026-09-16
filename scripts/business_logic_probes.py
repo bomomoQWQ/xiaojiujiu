@@ -150,7 +150,7 @@ def probe_emotion_alignment_ignores_synonyms() -> None:
     emotional expression. Spelling it the other way costs most of the alignment bonus.
     """
     print("=" * 78)
-    print("probe 3 — 情绪对齐按 type 硬编码，同义词被区别对待（runtime.py:2614-2616）")
+    print("probe 3 — 情绪对齐是否按行为类（runtime.py:2614-2616）［已修，保留作回归观察］")
     print("=" * 78)
     runtime = _runtime()
     try:
@@ -168,8 +168,12 @@ def probe_emotion_alignment_ignores_synonyms() -> None:
             print(f"  {context_label:<12} {canonical:<18}={left:.3f}   {synonym:<22}={right:.3f}   （{ratio:.1f}×）")
     finally:
         runtime.close()
-    print("\n  同一个意图、不同的写法，时宜性差 2.3 倍。")
-    print("  同族还有 protocol.py:346 的分类器，它只认 {follow_up, curious_question, check_in}。\n")
+    print("\n  改之前同一个意图、不同的写法时宜性差 2.3 倍（1.000 vs 0.440）。")
+    print("  同族还有 protocol.py:346 的分类器，它只认 {follow_up, curious_question, check_in}，")
+    print("  漏了同义的 question。")
+    print("  【已修 2026-09-16】时宜性改按行为类判（MOOD_MATCH_*_CLASSES），未知 type 拿通用值")
+    print("  （与硬边界的失败关闭方向相反：这是分寸问题，不认识就不该加分）；")
+    print("  protocol 那边改成复用 QUESTION_TYPES。验收见 tests/test_mood_matching_by_class.py（7 条）。\n")
 
 
 def probe_conversation_length_saturation() -> None:
