@@ -658,10 +658,21 @@ http://runtime-fleet:8799` → fleet 13 人 → 他自己的库里只有他自�
   一开始没记录 → 聊天最活跃的时段一条日志都没有。已补（`trigger=foreground_pause`）。
 - 新表 `state_samples`：每轮一个采样点（valence/arousal/stability/impulse/restraint/pressure），
   把 `runtime_state` 的单点快照变成曲线。
+- 新表 `refresh_runs`：**每次深刷新尝试一行，被跳过的也写**。列 `ran_at / trigger / ran /
+  reason / provider / degraded / operations / settled_events / latency_ms` + 完整 payload
+  （含 `trigger` 对象与 `violations`）。补得晚，代价是一整晚的排查靠手搓脚本：
+  之前只有 `runtime_state.meta.last_deep_refresh_at` 一个时间戳，于是"刷新跑了但什么都没结算"
+  和"刷新压根没跑"在数据上完全一样。注意 `ran` 的语义是"有提案走到 reducer"，
+  要和 `reason` 成对读（`ran=0 + empty_suggestions` = 模型什么都没说）。
 - 注入留痕：每次 `/v1/context` 写一条 `system/context_rendered` 原始事件（trigger、version、
   总字数、**各段字数**）；全文另由 `observability.record_context_text` 控制（默认关）。
 - 配置段 `ObservabilityConfig(enabled=True, record_context_text=False)`；写入走 reducer 自己的
   事务（不引入第二个写者），失败只告警不拖垮轮次。
+- 读回端点（不必再进步进容器）：`GET /cognition/backlog`（还剩什么没结算）、
+  `GET /cognition/refreshes`（为此做过什么）、`GET /observability/decisions`、
+  `GET /observability/state-samples`。注意这些在**各人自己的端口**上（8787+/8801），
+  而那个端口只在 docker 内网里 —— 要读就先看 `GET /fleet/status` 拿端口，
+  再从 fleet 容器内部访问。
 
 **采集密度（重要）**：一条用户消息**不会唤醒 Runtime 自己的调度器**，默认上限 5400s
 意味着最坏 90 分钟才有一次决策，一周每人只有几十条博弈日志。fleet 现在设
@@ -672,14 +683,18 @@ http://runtime-fleet:8799` → fleet 13 人 → 他自己的库里只有他自�
 **工具（`scripts/`）**：
 | 脚本 | 用途 |
 |---|---|
-| `export_beta_data.py` | 容器内只读挂载 fleet 卷 → 每人 `events/decisions/state_samples` + 全部表 JSONL + `summary.json` + `runtime.log` + manifest |
-| `replay_session.py` | 把"用户说了什么 / 当时注入了什么（含分段字数与版本）/ 之后的决策与落选候选"并排打印 |
-| `beta_daily_report.py` | 每日每人 markdown（对话/决策原因分布/候选/未解释/状态曲线/实时健康），写 `reports/<date>.md` |
+| `export_beta_data.py` | 容器内只读挂载 fleet 卷 → 每人 `events/decisions/state_samples/refresh_runs` + 全部表 JSONL + `summary.json` + `runtime.log` + manifest |
+| `replay_session.py` | 把"用户说了什么 / 当时注入了什么（含分段字数与版本）/ 之后的决策与落选候选"并排打印，尾部附**深刷新账本与 reappraisal** |
+| `beta_daily_report.py` | 每日每人 markdown（对话/决策原因分布/候选/未解释/**深刷新次数与结算条数**/状态曲线/实时健康），写 `reports/<date>.md` |
 | `snapshot_beta.py` | 优化前用 SQLite backup API 冻结整支 fleet（含 compose 与路由快照） |
 | `beta_daily_collect.sh` | 上面三条的定时包装（导出 → 日报 → 收尾），crontab 每天 08:05 CST 调它 |
 | `fleet_probe_instance.sh` | 在 fleet 容器里读某个人的库：事件直方图 / 判决列表 / 采样数 / 语义状态（`QQ=<QQ>` 作环境变量传） |
 | `fleet_probe_context.sh` | 网络内直调该实例 `POST /v1/context` 并回读 `context_rendered` 是否 +1（验证埋点闭环用） |
 | `fleet_probe_semantics.sh` | 看某人"为什么情绪是平线"：结算/未结算分布、深刷新是否回写、mood 列、情绪事件计数 |
+| `fleet_probe_ledger.sh` | 直接打印 `refresh_runs` 账本（谁触发的、跑没跑、结算几条、降级没） |
+| `fleet_probe_refresh.sh` | 对某人强制跑一次 `/cognition/refresh` 并回读结算结果（`QQ=<QQ>`） |
+| `beta_e2e_check.sh` | 端到端验收：导出 → 回放 → 日报，一次跑完看三段输出 |
+| `deploy_test_runtime.sh` / `set_semantic_budget.sh` | 重建镜像并重建 fleet / 改 fleet 语义配置并重建（`docker cp` 进 fleet 容器会报 `/proc/self/fd`，用 stdin） |
 | fleet `GET /fleet/dashboard` | 只读、30s 自刷新的总览页；`/fleet/status` 增加 unresolved / open_unfinished / deep+explain 调用数 |
 
 **数据落在服务器机械盘**：`/mnt/xz/xiaojiujiu-beta/{<批次>,reports,snapshots}`（`/dev/sda1` 932G，
@@ -760,7 +775,7 @@ CST=UTC+8。若在 CST 白天跑，`--date 今天(UTC)` 只能看到"从 CST 08:
 > 12 提问 5 回复**只有 1 条判决**。所以日报里的"决策次数"要连着"对话轮数"一起读，
 > 别把"她在聊天"误读成"博弈没跑"；真要加密样本，调 `CR_SCHEDULER__MAX_INTERVAL_SECONDS`。
 
-### 🔴 封测主目标的缺口：真实对话几乎从不结算 ⇒ 情绪曲线是平线（2026-09-16 夜发现）
+### ✅ 曾经的封测主目标缺口：情绪曲线是平线 —— 根因是深刷新被一句提示词打哑（已修）
 
 **现象**：日报里 14 个实例、含真人 12 问 5 答，`mood_valence` **全是 +0.000**，
 `active_emotion_events = 0`、`emotion_explanations = 0`。真人那 12 条消息的语义状态是
@@ -778,33 +793,69 @@ settle_on_ingest → classify_event(粗分类)  ── 命中 → 结算 → set
 即**未结算 = 零情绪事件**。而粗分类走的是 `semantic.py` 的关键词信号表
 （`谢谢 / 想你 / 太累了 / 面试过啦 / 算了 / 随便 / 哈哈 …` 几十条），日常口语
 （"调试好手上的东西就睡"、"你很好奇我在干什么吗"）**基本一条都不命中**。
-于是每条真实消息都进"待理解"队列，而队列的回头机制是深刷新，触发条件只有
-`unresolved_backlog ≥ 4`（本栈正是 4）或 `idle_refresh`（需**静默 ≥ 1 小时**，本栈设 1h）
-且最小间隔 900s。真人实例 15:34:37 确实发起过一次刷新（`last_deep_refresh_at` 有值），
-但 12 条 unresolved **一条都没被结算**，日志里也没有应用级输出（runtime.log 只有 uvicorn
-的 access log），所以只能判定：**要么 provider 批量刷新没产出可用建议，要么产出被判为
-ungrounded 后丢弃**——两者都不会更新语义状态，也都不会动情绪。
+于是每条真实消息都进"待理解"队列，回头结算只能靠深刷新（触发：积压 ≥ 4 或静默 ≥ 1h，
+最小间隔 900s）。**未结算 = 情绪曲线平线**——不是"她今天心情没变"，是"系统没读"。
 
-**为什么这对封测是致命的**：封测要收的三样里，"情感日志变化"与"动机模块"的输入都依赖结算。
-按现在的行为，一周真人聊天会得到——对话记录完整、博弈日志稀疏（见上一条）、
-**情绪曲线全程平线**。这不是"她今天心情没变"，而是"系统没读"。
+**根因（2026-09-16 夜，全部对着线上实例实测）**：深刷新每次都以
+`{"ran":false,"reason":"empty_suggestions","degraded":false}` 结束。顺着四步定位：
 
-**实测补充（模拟用户 20001，3 问 3 答）**：`unresolved/low=2` + `unresolved/medium=1`、
-已结算 **0**、`active_emotion_events=0`、`mood_valence=0.0`，
-`last_deep_refresh_at=15:19:19`（发起过）→ 与真人实例同形。**14 个实例没有一个存在已结算行**，
-所以这不是某个人讲话太日常，而是当前配置下的普遍行为。
+1. 用 runtime 自己的 `build_request` 复现：**请求是好的**——12 条 unresolved 带正文、
+   3 条 `key_quotes`、mood、`situation.facts`，10KB，provider 是 `remote_api/deepseek-chat`。
+2. 直接问 provider：raw reply 只有 **212 字节**、六个字段全是空数组/空对象、
+   `finish_reason=stop`、`completion_tokens=57`。**是模型主动选择"没什么可说的"，
+   不是截断**（`max_tokens` 1024→4096，回复仍是同样的 57 token）。
+3. 逐句 bisect 提示词，定位到唯一一句：**"证据不足时返回空数组或空对象，不要猜测。"**
+   加上它 → 57 token 空结构；去掉它 → 1300+ token 的真实解读。
+   这句本意是"不许编造"，但模型读成"看不懂就别解读"——而深刷新的全部价值就是解读
+   "没锚点"的消息，**那句提示词正好把这条路径关了**。
+4. 三种改写实测都通，取了最贴近原意、产出最多的
+   **"不要编造输入中没有的事件、会话或时间戳。"**：
+   1030 completion token、3 reinterpretations / 3 memories / 1 candidate /
+   2 user-model / 5 psych。
 
-**三条可选路线（都还没有实施，等拍板）**：
-1. **不热路径、只加密度**：把深刷新的触发从"静默 1h"改成"对话结束后 N 分钟"
-   （`deep_refresh_idle_hours` 0.25 之类）+ 调小积压阈值。守住 v0.2 "不在热路径猜"的立场，
-   但代价是每个对话窗口一次 LLM 调用，且情绪时间戳会晚于消息本身。
-2. **热路径直连语义 provider**：每条消息调一次 `provider`（或每轮批量），解析失败就回落
-   `unresolved`。真实感最强，但要重开一条被否决过的路径，且一周 10 人的调用量与费用要算。
-3. **扩词表/规则**：把 `classify_event` 的命中率提上去（成本最低、零 LLM）。缺点是
-   它本质仍是关键词，只是把"一条都不命中"变成"命中一部分"，不解决理解问题。
+**修复（commits：提示词两处 + JSON Output + 账本）**：
+- 提示词防编造措辞改写（`DEEP_REFRESH_SYSTEM_PROMPT`、`EXPLAIN_STATE_SYSTEM_PROMPT`），
+  并按 JSON Output 的硬性要求补 JSON 样例（官方要求提示词里含 `json` 字样与格式样例）。
+- **JSON Output**（用户提议，采用）：provider 增加 `json_mode`
+  （`response_format={"type":"json_object"}`），深刷新与情绪解释两条结构化调用都带上；
+  `CR_SEMANTIC_JSON_MODE=0` 可关（给不接受未知 body 字段的网关）。它保证拿到合法 JSON，
+  正好堵住这轮踩的"半截/空对象被静默当成有效结果"那条路。
+- **提示词必须写全条目键名**：只列六个顶层字段名时，模型把事件 id 放在 `event_id` 上，
+  而 grounding 只认 `sources/source_ids/source_event_ids` → 每条解读都被判
+  `missing_sources` 丢掉，刷新"ran=true"却结算 0 条。现在样例里五种条目各带 `sources`。
+- **`max_tokens` 要留足**：模型肯说话之后输出涨到 900–1200 token，1024 会把 JSON 从中间截断
+  （JSON Output 只在**没被截断**时才保证合法）→ 整个刷新降级为空。fleet 现在设
+  `CR_SEMANTIC_MAX_TOKENS=65536`（API 允许 1~384K，未设默认 8K；**只按实际生成计费**，
+  上限不是开销）。这是配置项，不改代码。
+- 6 条新测试锁住契约：JSON 字段真的发出去、能关、env 开关两条路都通、
+  `{}` 是"安静的回答"而非降级、提示词必须写"不许编造"且不得再出现"证据不足"、
+  样例里五个字段都带 `sources`。
+- 复现/验证用的探针固化在 `scripts/fleet_probe_refresh*.sh`、`fleet_probe_prompt_*.sh`、
+  `fleet_probe_max_tokens.sh`、`fleet_probe_provider.sh`、`fleet_probe_env.sh`、
+  `fleet_probe_stop_seq.sh`——下次怀疑 provider 层，先跑这些，别重头猜
+  （顺带排除了一条猜想：stop 序列没必要，模型本来就自然收尾 `finish=stop`）。
+
+**端到端验收（2026-09-17 凌晨，全部在测试栈实跑）**：
+- 真人实例 `1670681411`：12 条消息从 **12 unresolved / 0 settled** →
+  两次刷新后 **12 resolved / 0 unresolved**，`interpretation_versions` 12 条、
+  `reappraisals` 12 条、`memories` 3 条、`unfinished_matters` 1 条。
+- 账本：`refresh_runs` 两行（`applied` / `forced`，`settled_events` 8 与 0）。
+- 读回链路：`export → summary.json`（`refresh_settled_events` 等字段齐全）→
+  `replay_session.py`（账本 + reappraisal 段）→ `beta_daily_report.py`
+  （每人一行"深刷新：2 次尝试，结算 8 条，降级 0 次"；模拟用户 20001 显示
+  "0 次尝试，但 3 条仍未结算 —— 没人回头读"）。
+
+> ⚠️ 排查教训：`extract_json` 会"取第一个 `{` 到最后一个 `}`"。一个被截断的 JSON
+> 因此能变成一个**合法但残缺**的对象，于是 `degraded=false`、`reason=""`，
+> 报表上看起来像"模型选择了沉默"。看到 `empty_suggestions` 时，先确认
+> `finish_reason` 与 `completion_tokens`，再看请求体。
 
 **诊断怎么做**（都固化在脚本里，不要再手搓 curl）：
-- 库里看曲线与语义：`QQ=<QQ> bash scripts/fleet_probe_instance.sh`
+- 库里看曲线与语义：`QQ=<QQ> bash scripts/fleet_probe_instance.sh`、
+  `QQ=<QQ> bash scripts/fleet_probe_semantics.sh`
+- 强制跑一次深刷新：`QQ=<QQ> bash scripts/fleet_probe_refresh.sh`
+- 看账本：`bash scripts/fleet_probe_ledger.sh`（换 QQ 改脚本里的库路径）
+- 端到端：`bash scripts/beta_e2e_check.sh`
 - 看情绪/结算细节：`docker exec -i xxj-runtime-fleet python3 - < 一段脚本`
   （`docker cp` 往这个容器里拷文件会报 `Could not find the file /proc/self/fd`，用 stdin）
 
