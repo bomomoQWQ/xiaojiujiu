@@ -686,9 +686,15 @@ def run_tests(tests_paths: list[str]) -> tuple[bool, str]:
     # Belt and braces with _invalidate_bytecode: a test run must never *create* the stale
     # cache entry that a later restore would silently accept.
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # The interpreter that runs this harness is the one that can run the tests: it is
+    # correct by construction and it is the only choice that works on both platforms.
+    # This used to hardcode ``runtime/.venv/bin/python``, which does not exist on Windows
+    # (the venv layout there is ``Scripts/python.exe``), so the whole harness died with
+    # `WinError 2` before running a single mutation - the numbers it produced were only
+    # ever reproducible on the machine that wrote it.
     proc = subprocess.run(
         [
-            str(RUNTIME_DIR / ".venv/bin/python"),
+            sys.executable,
             "-m",
             "pytest",
             *tests_paths,
