@@ -193,6 +193,14 @@ git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git `
 > 只在单会话下用默认值才是安全的。相关推导与测试见
 > `runtime/tests/test_proactive_routing.py`。
 
+> **⚠️ 装了插件却"什么都没发生"时，先查 AstrBot 的插件白名单 `plugin_set`。**
+> 它不是"启用列表"而是**处理器白名单**：AstrBot 在唤醒检查之前就会丢掉不在名单里的
+> 插件的所有 handler，于是插件照样被加载、`initialize()` 照样执行、outbox 照样轮询
+> Runtime（日志里有 `adapter started`），但消息既不上报也不注入，且**没有任何报错**。
+> `plugin_set` 为 `["*"]`（默认）时一切正常；一旦你在 WebUI 里存成了具体名单，
+> 就必须把 `astrbot_plugin_companion_runtime` 加进去。插件启动时会自检并打一条
+> WARNING 指出来（`grep companion_runtime` 看日志），详见插件仓库 README 的「白名单」一节。
+
 ### 4.3 本地 venv（开发 / 调试）
 
 ```powershell

@@ -379,7 +379,7 @@ python scripts/blackbox_user_simulation.py --base-dir ./bb --fault leak   # 注�
 | `runtime/docs/BUSINESS_LOGIC_AUDIT.md` | **主业务逻辑**的三个已复现缺陷（回复长度绝对阈值 / 硬边界可被同义词绕过 / 情绪时宜性硬编码），含实测数字、可达性分析与修法方向。**未修**，复现：`runtime/.venv/bin/python scripts/business_logic_probes.py` |
 | `runtime/README.md` | 运维手册：配置项、API、降级、蓝屏恢复 |
 | `framework/` | **外接测试框架**：可控虚拟时钟 + OpenAI 兼容 mock 端点 + 变量日志 + `cf` 命令行。不改原程序，见 `framework/README.md` |
-| `scripts/` | 验证与运维脚本（**四个**仿真：黑盒 / 韧性 / 记忆质量 / 关系递进，外加 `runtime_bench.py`、`backup.ps1`、`dead_code_inventory.py`、`mutation_design_conformance.py`） |
+| `scripts/` | 验证与运维脚本（**四个**仿真：黑盒 / 韧性 / 记忆质量 / 关系递进，外加 `runtime_bench.py`、`backup.ps1`、`dead_code_inventory.py`、`mutation_design_conformance.py`、`mutation_assistant_report.py`、`inspect_runtime_backend.py`、`send_test_message.py`） |
 | `docs/SIMULATION_INTEGRATION.md` | `framework/` 与 `scripts/` **该不该合并**的书面评估：结论是「不合并套件、只共享机械件」，含两侧能力对比与全部 `file:line` 证据；§9 是父代理的独立复核 |
 | `archive/` | 已放弃的本地模型路线（留档，不参与构建，包名是历史遗留） |
 | `RECOVERY.md` | 备份 / 恢复 / 权重位置 |
@@ -416,6 +416,87 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
 
 `scripts/relationship_progression_simulation.py`（0.3.2 新增，陌生人→恋人 + 模拟时钟 + 后台审视）
 首次跑通后报出 7 条产品问题。当前进度、证据与**未完成部分的确切状态**如下。
+
+### 远程 Docker 端到端：插件与 Runtime 之间有**两处静默断点**（本节点，已修）
+
+用测试前端（`POST /send`）驱动远程 Docker 测试栈时，出现"前端能聊、Runtime 收不到任何东西"
+（`raw_events` 一直 43、`memories` 0、镜像 43 行、消息不在镜像里）。**两个原因叠加，两个都不会报错。**
+
+**断点 A：`plugin_set` 白名单（AstrBot 侧配置，最隐蔽）**
+- `star_handlers_registry.get_handlers_by_event_type()` 在**唤醒检查之前**就把"不在
+  `plugin_set` 里的插件"的**所有 handler 丢掉**（`star_handler.py:169-184`，非保留插件一律 `continue`）。
+- 于是插件**照样被加载、`initialize()` 照样执行、outbox 照样轮询**（日志里能看到
+  `adapter started (observe_mode=all)` 与成百上千条 `POST /v1/outbox/lease`），
+  但 `on_message_observed` / `on_llm_request` / `on_llm_response` **一次都不跑**：
+  `POST /v1/events` 与 `/v1/context` 在 Runtime 侧**计数为 0**。
+- 测试实例的 `plugin_set` 是 `["astrbot_plugin_zvv","astrbot_plugin_math_plotter","astrbot_plugin_gptimg"]`
+  （三个本实例里根本不存在的插件名，疑似从另一台机器带过来的配置）。
+  加进本插件并重启后**立刻通了**：`v1/events` 0→1、`v1/context` 0→1，
+  `/companion_runtime` 指令有回复，`raw_events` 出现带 `"source":"v1","adapter":{...}` 的真实事件。
+- **产品侧加固（已做）**：`main.py::_warn_if_whitelisted_out()` 在 `initialize()` 自检并在
+  被漏掉时打一条 WARNING（把"看起来健康、其实全静默"变成一行日志）。
+  测试：`test_an_unwhitelisted_plugin_warns_at_startup` / `test_a_whitelisted_plugin_stays_quiet`。
+  文档：插件 README 新增「白名单」一节。
+
+**断点 B：流式输出下根本不存在"发送后"钩子（插件侧缺陷，已修）**
+- AstrBot 默认开流式：`respond` 阶段走 `send_streaming()` 后**直接 return**（`respond/stage.py:217-231`），
+  因此 `@filter.after_message_sent()` **永不触发**；同一个流式结果在 `result_decorate`
+  阶段也**提前 return**（`stage.py:134`），`on_decorating_result` 同样不触发。
+- 实测：连续 10 轮真实对话后 `raw_events` 里 `assistant_message` = **0**
+  （`event_*` 只有 `user_message`/`system`/`candidate_proposal`）。
+  日志佐证：`Applying streaming output (default)` + `Prepare to send - ...: `（消息链为空）。
+- **改法**：改从 `on_llm_response` 上报这一轮答复（agent runner 在任何投递模式下**每轮恰好调用一次**，
+  拿到模型最终文本；流式下就是用户看到的那段话）；`after_message_sent` 保留用于
+  "没经过 LLM 的回复"（指令输出等），同一轮用 `event.set_extra()` 标记去重。
+- 测试：`test_streamed_turn_is_reported_from_the_llm_response`、
+  `test_a_reported_turn_is_not_reported_twice`、`test_a_reply_without_an_llm_turn_is_still_reported`。
+  变异证据：M1（`on_llm_response` 不上报）/M2（去掉去重）/M3（不跑自检）/M4（自检不看名字）
+  四条**全部 KILLED**（`scripts/mutation_assistant_report.py`，本节点新增，跨平台）。
+- 已知代价（写在 README）：长回复被 t2i 渲染成图片时，上报的是模型原始文本而不是那张图片。
+
+**顺带确认的两件事（都不是缺陷）**
+- `memories` 短时间恒为 0 是**设计**：候选要先等
+  `memory.consolidation_interval_seconds`（默认 3600s）之后的下一个内源轮次才合并，
+  或由 `companion-runtime --base-dir /data consolidate` 手动跑一趟。真正的中间态在
+  `memory_candidates`（`status: pending`）与 `working_situation_items` 里，实测都在正常增长。
+- **测试工具自己的坑（记下来，别再踩）**：Windows 上 `Invoke-RestMethod` 直接发字符串 body 会把
+  中文变成 `?`（AstrBot 自己的 `core.event_bus` 日志也是 `????,???????????,?????`，
+  即损坏发生在**离开发送端之前**）。必须显式编码：
+  `[System.Text.Encoding]::UTF8.GetBytes($json)` 作为 `-Body`。
+  本节点把两件工具固化进了 `scripts/`，以后不要再手搓：
+  - `scripts/send_test_message.py`：往测试前端发消息（内部就是 UTF-8 字节，跨平台），
+    `--transcript` 读回机器人回答；
+  - `scripts/inspect_runtime_backend.py`：只读打印后台（各表行数、**宿主到底发了哪些事件**、
+    会话、候选/记忆/激活池/工作局势/runtime_state/outbox），
+    本地 `--db <file>` 或 `docker exec -i <容器> python - < scripts/inspect_runtime_backend.py`。
+  之前那批 `?` 事件因此污染了测试用 Runtime 的时间锚。
+
+**远程回归（本次，在部署 checkout 上跑）**
+- Runtime：**1127 passed / 17 skipped / 0 failed**（Python 3.12.3，`~/xiaojiujiu_test/runtime/.venv`，
+  该 venv 是指向 `~/xiaojiujiu_test/runtime/src` 的 editable 安装，与部署 checkout 同为 `4829e60`）。
+- 插件（部署克隆 `3861678`）：**148 passed / 13 subtests passed**。
+  注意：那个 venv 里原本缺 `pyyaml`，`tests/test_packaging.py` 会**收集失败**
+  （`ModuleNotFoundError: No module named 'yaml'`）→ 按 §3 的说明 `pip install pyyaml pytest-subtests` 即可。
+- 本地同一条数：Runtime 1127/17，插件 148+13 —— 两边完全一致。
+- 四个仿真（本地）：blackbox **77/77**、resilience **335/335**、memory **25/25**、
+  relationship **105/105 但会偶发 1 条红**（见下）。
+
+**仍存在：relationship 仿真的"召回后必须回到 active"偶发红（未修，已定位到 harness 层）**
+- 今天 11 次运行里红了 2 次（1/4 与 1/6 两批）。红的那条永远是
+  `PHASE 3 ... asking about the acquaintance-stage facts brings each memory back into the working set`，
+  但**失败的记忆每次不同**（一次是 `通勤`，一次是 `团子`）；同一次运行里另一个同样
+  `low_activation` 的记忆（`医院`）却成功回到了 `active`。
+- 已经排掉的：打分不再是随机 —— `retrieve` 的 epsilon 已是 `memory_id` 的纯函数，
+  `Scheduler` 的 ±5% 抖动在仿真里是**显式播种**的（`rng=random.Random(SCHEDULER_SEED)`，
+  脚本 1575 行）。
+- 剩下的唯一时钟是**真时钟**：`config.scheduler.min_interval_seconds=0.02 /
+  max_interval_seconds=0.05`（脚本 1670-1671 行）是**真实秒**，而检查要求
+  "推进两个模拟分钟后，恰好**一轮**自主回合看到用户刚说的那句话"（脚本 2226-2231 行注释）。
+  在 20–50 ms 的真实间隔下，这两分钟里实际跑了几轮是真实调度竞态 → 关键那一轮的线索
+  有时不是用户刚说的句子，于是那条记忆没被重新召回。
+- 结论：**这是 harness 的竞态，不是打分的不确定性**，所以没有改产品代码，也没留假绿的测试。
+  要根治应让 harness 自己驱动回合（而不是靠真实定时器），或把断言从"必须回到 active"
+  放宽成"这一轮确实以用户那句话为线索"。
 
 ### 已修并验证（本节点）
 
