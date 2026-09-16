@@ -87,7 +87,7 @@ def test_the_trigger_reason_is_kept_next_to_the_outcome(runtime: Runtime) -> Non
     row = runs[-1]
     assert row["ran"] == 0
     assert row["reason"] == "empty_suggestions"
-    assert row["trigger"], "the trigger reason has to be recorded with the outcome"
+    assert row["trigger"] == "forced", "a forced run must not look like a scheduled one"
     payload = row["payload_json"]
     assert isinstance(payload, dict)
     assert payload["trigger"]["reason"]

@@ -2080,14 +2080,24 @@ class Runtime:
         """
         stamp = ensure_aware(now) or utcnow()
         outcome = self._deep_refresh(now=stamp, force=force, trigger_context=trigger_context)
-        self._record_refresh_run(stamp, outcome)
+        self._record_refresh_run(stamp, outcome, forced=force)
         return outcome
 
-    def _record_refresh_run(self, stamp: datetime, outcome: "DeepRefreshOutcome") -> None:
+    def _record_refresh_run(
+        self, stamp: datetime, outcome: "DeepRefreshOutcome", *, forced: bool = False
+    ) -> None:
         """Persist one deep-refresh attempt for the beta's read-back.
 
         Observability is not the product: a failure here is logged and swallowed
         rather than allowed to take the refresh down with it.
+
+        Args:
+            stamp: Reference time of the attempt.
+            outcome: What the refresh did.
+            forced: Whether the trigger check was skipped by the caller. Recorded,
+                because ``outcome.trigger`` in that case describes the pacing check
+                that was overridden, not a reason to spend -- a diagnostic refresh
+                and a scheduled one must not look alike in the ledger.
         """
         if not self.config.observability.enabled:
             return
@@ -2101,7 +2111,7 @@ class Runtime:
                         "ran_at": stamp,
                         "runtime_version": int(self.projections.runtime.read().version),
                         "conversation_id": self.config.conversation_id,
-                        "trigger": str(trigger.get("reason") or ""),
+                        "trigger": "forced" if forced else str(trigger.get("reason") or ""),
                         "ran": outcome.ran,
                         "reason": outcome.reason,
                         "provider": outcome.provider,
