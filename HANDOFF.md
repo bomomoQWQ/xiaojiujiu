@@ -694,6 +694,7 @@ http://runtime-fleet:8799` → fleet 13 人 → 他自己的库里只有他自�
 | `fleet_probe_ledger.sh` | 直接打印 `refresh_runs` 账本（谁触发的、跑没跑、结算几条、降级没） |
 | `fleet_probe_refresh.sh` | 对某人强制跑一次 `/cognition/refresh` 并回读结算结果（`QQ=<QQ>`） |
 | `beta_e2e_check.sh` | 端到端验收：导出 → 回放 → 日报，一次跑完看三段输出 |
+| `fleet_probe_dashboard.sh` | 验收看板：`/fleet/status` 的 refresh 字段 + dashboard 表头与指定人的那一行 |
 | `deploy_test_runtime.sh` / `set_semantic_budget.sh` | 重建镜像并重建 fleet / 改 fleet 语义配置并重建（`docker cp` 进 fleet 容器会报 `/proc/self/fd`，用 stdin） |
 | fleet `GET /fleet/dashboard` | 只读、30s 自刷新的总览页；`/fleet/status` 增加 unresolved / open_unfinished / deep+explain 调用数 |
 
@@ -750,7 +751,10 @@ CST=UTC+8。若在 CST 白天跑，`--date 今天(UTC)` 只能看到"从 CST 08:
 
 **证据**：`runtime/tests/test_observability.py` 7 条；`scripts/mutation_observability.py`
 4 条变异全部 KILLED（不写决策/不写曲线/不记录渲染/忽略全文开关）；runtime 全量
-**1134 passed / 17 skipped**。测试栈实测：静置后自动采样、导出→回放→日报全链路通过。
+**1151 passed / 15 skipped**。测试栈实测：静置后自动采样、导出→回放→日报全链路通过。
+
+> 测试计数的两次变化都对应新加的观测面：1141（JSON Output + 提示词契约 6 条）、
+> 1150（深刷新账本 5 条 + 读回工具 3 条）、1151（refresh 计分板进 `/health`）。
 
 **定时任务与看板的实测（2026-09-16 夜）**：
 - crontab 已装（`5 8 * * *`，`systemctl is-active cron` = active），包装脚本与仓库副本
@@ -759,6 +763,13 @@ CST=UTC+8。若在 CST 白天跑，`--date 今天(UTC)` 只能看到"从 CST 08:
 - 三项控制面从**本机（Windows）**访问 `http://192.168.1.15:8800/fleet/dashboard` =
   `HTTP 200`，标题 `小九九 fleet`，14 实例全 `health=ok`；`/fleet/status`、`/fleet/routes`
   同样 200。
+- **看板已加 refresh 计分板**（2026-09-17 凌晨）：`/fleet/status` 每人多出
+  `deep_refresh_attempts / deep_refresh_settled / deep_refresh_degraded /
+  last_refresh_reason / last_refresh_at`，dashboard 相应多三列。**当"有积压但从未结算过"
+  时两格标黄** —— 封测里最该被抓到的形状就是它。实测真人那一行 `2 / 8`、`last refresh
+  applied`；模拟用户 20001 则标黄（`3` unresolved、`0 / 0`）。
+  数据源是 `/health` 新增的 `deep_refresh` 段（`observability.refresh_stats()` 的 SQL 聚合，
+  进健康轮询不心疼）。
 - **"调用→落库"闭环实测**：在网络内对真人实例（8801）调一次 `POST /v1/context`
   （`{"session":"default:FriendMessage:1670681411","trigger":"llm_request"}`）→ `HTTP 200`，
   返回 2901 字、`version=684`、四段（进入本轮前的长期状态 / 当前工作局势 / 必要记忆 / 时间连续性），
