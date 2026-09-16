@@ -940,6 +940,36 @@ ready_to_send → failed : ActionExecutionError: send_message failed: ApiNotAvai
   机器 15.5 GiB，封测 10 个真人完全不是问题。
 - 回退实例里只有它自己的 `default` 会话，没有任何人被路由过去——即注册表一直可用。
 
+### 移除模拟实例（2026-09-17 凌晨，已做）
+
+- 动作：`POST /fleet/deprovision/<slug>` × 13（`20001`–`20012`、`29999`）。
+  摘之前先冻结：`/mnt/xz/xiaojiujiu-beta/snapshots/2026-09-16_222134`（14 人）。
+- 结果：`/fleet/status` 14 → **1**、`/fleet/routes` 与 `people.json` 都只剩
+  `default:FriendMessage:1670681411`；真人实例（8801）健康、events 64、
+  刷新 31 次/结算 8 条。`deprovision` 本身**只停进程、保留数据**。
+- **卷也收干净了**：13 个目录移到 `/data/_retired/`（数据不删，但不再被扫到），
+  并删掉 `/data` 根下两个探针空壳（`companion.sqlite3`、`raw_events.jsonl`）。
+  导出随即变成 `found 1 runtimes`，日报只剩真人的一段。
+
+> ⚠️ **踩到的两个真实缺口（都没改代码，先记下来）**：
+>
+> 1. **导出/日报是按卷里的目录 glob 的，不是按名册**（`export_beta_data.py` 的
+>    `data_root.glob("*/companion.sqlite3")`）。所以 `deprovision` 保留在原地的人，
+>    第二天会**照旧出现在日报里**——摘了等于没摘。本次靠"把它们移进 `_retired/`"绕过。
+>    正经修法：导出改为以**在用名册**（`people.json` 或 `/fleet/routes`）为准，
+>    另给 `--all` 兜底读历史。注意导出容器现在没挂 `fleet-data`，要走这条得一起改
+>    `beta_daily_collect.sh` 的挂载。
+> 2. **插件的注册表同步只加不删**（`_sync_registry_once` 里只有 `_ensure_target`，
+>    没有移除路径）。摘掉的人会留下"僵尸 target"，其 outbox 轮询器**永远**去敲已经不存在的
+>    端口，失败只在 debug 级别记（`outbox.run` 的 backoff 里），所以日志上看不见、但一直在做。
+>    影响很小（十几条连接 + 退避），修法是"连续 N 次成功同步都不在注册表里才剪掉"，
+>    不要一看到不在就删——注册表短暂返回不完整会把好 target 一起拆掉。
+>
+> ⚠️ 另一个坑（本次清理时才发现）：**用默认配置实例化 Runtime 会在镜像的默认路径建库**
+> （`CR_STORAGE__DATABASE_PATH=/data/companion.sqlite3`）。我早期那次
+> `load_config()` + `Runtime(cfg)` 的复现脚本没覆盖 storage 路径，就在卷根留下了一个
+> 27 万字节的空壳库。写探针时必须显式指定 `cfg.storage.database_path`。
+
 ### ⚠️ 宿主坑：AstrBot 把 OneBot 的「通知」包装成空正文的消息事件
 
 真机取证（真人 QQ，14 秒内 8 条 `user_message`，其中 7 条正文为空、`message_id` 是 UUID、
