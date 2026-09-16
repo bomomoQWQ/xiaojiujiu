@@ -69,23 +69,39 @@ MUTATIONS = [
     (
         "settings",
         "M5: every session resolves to the default Runtime (routing is dead)",
-        """        if not self.session_routes:
-            return self.base_url
-        for prefix, url in self.session_routes:
+        """        for prefix, url in self.session_routes:
             if session.startswith(prefix):
                 return url
-        return self.base_url""",
-        """        return self.base_url  # MUTATION M5""",
+        return None""",
+        """        return None  # MUTATION M5""",
         "test_sessions_route_to_their_own_runtime",
     ),
     (
         "main",
         "M6: the context bridge ignores the route (reads the default cache)",
-        """        target = self._targets.get(self._settings.target_for(session))
+        """        target = self._targets.get(self._target_url(session))
         return target.bridge if target is not None else None""",
         """        target = self._targets.get(self._settings.base_url)  # MUTATION M6
         return target.bridge if target is not None else None""",
         "test_sessions_route_to_their_own_runtime",
+    ),
+    (
+        "main",
+        "M7: the registry is never consulted (a new person is never routed)",
+        """        return self._registry_routes.get(session, self._settings.base_url)""",
+        """        return self._settings.base_url  # MUTATION M7""",
+        "test_the_registry_adds_a_target_without_a_restart",
+    ),
+    (
+        "main",
+        "M8: an unknown session falls back instead of waiting (blending is back)",
+        """        return (
+            self._settings.registry_configured
+            and self._registry_seen
+            and not self._route_known(session)
+        )""",
+        """        return False  # MUTATION M8""",
+        "test_a_message_for_an_unprovisioned_person_waits_for_the_registry",
     ),
 ]
 

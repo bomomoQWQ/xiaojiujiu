@@ -584,6 +584,49 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
 测试栈可用且**主动消息已全程跑通**（见下），**没有半成品改动**。
 
 
+### 封闭测试形态：一人一个 Runtime（B+ fleet）+ 零重启加人（本节点完成，测试栈已验证）
+
+**形态**：一个 `runtime-fleet` 容器（`scripts/runtime_fleet.py`）里为每个人起一个
+`companion-runtime serve`——各自端口（8787…）与各自 `--base-dir /data/<person>`（独立 SQLite）、
+各自日志 `/data/logs/<person>.log`、崩溃自动重启并计数；控制面 `:8800` 提供
+`GET /fleet/status`、`GET /fleet/routes`、`POST /fleet/provision`、`POST /fleet/restart/<person>`、
+`POST /fleet/deprovision/<person>`；`people.json` 是唯一事实来源。
+生成：`python3 scripts/build_runtime_fleet.py --people 20001-20012`（环境从手写 `astrbot.yml` 的
+runtime 服务复制，避免两处漂移；角色价值观 profile 也在这里注入）。
+
+**为什么不是"一人一个容器"**：10 个容器要手管日志/重启/升级，实测铺开后立刻变负担；
+进程级隔离已足够（各自 SQLite、各自进程、无共享内存）。真子容器（管理容器 + `docker.sock`）
+作为升级路径保留——插件只认 URL，换实现对插件零改动。
+
+**零重启加人**：插件新增 `route_registry_url`，定期读 `/fleet/routes`，按需为新 URL 建
+transport/bridge/outbox 轮询器；优先级 = 显式 `session_routes` > 注册表 > `runtime_base_url`。
+实测：fleet 上 provision 第 12 个人（端口 8798）→ **立刻**发消息 → **AstrBot 全程未重启** →
+消息落进他自己的实例，默认实例里没有他。
+
+**验证过程抓出的两个真 bug（都是我引入的，且都只在真机验证时才现形）**：
+1. **10 个进程共用一个数据库**。镜像 ENV 的 `CR_STORAGE__DATABASE_PATH=/data/companion.sqlite3`
+   是绝对路径，被 `os.environ.copy()` 原样传给每个子进程，于是 `--base-dir` 形同虚设。
+   证据：`/data` 下只有一个 `companion.sqlite3`（WAL 已 688KB），10 个 per-person 目录全空。
+   修法：每个子进程显式设置 `CR_STORAGE__DATABASE_PATH` / `CR_STORAGE__RAW_LOG_PATH` 到自己的 base dir。
+2. **首次消息竞态**。刚 provision 的人第一条消息到达时注册表缓存还没刷新，插件回落默认实例 →
+   那个人的第一句话进了**别人那份记忆**。修法：注册表已可达而某会话无路由时，事件**带 session
+   入队、不带 target**，投递时重新解析，没答案就抛错让有界重试队列稍后再试（宁可等几秒）。
+   同时区分"注册表不可达"（`None`）与"答了但不知道这个人"（`{}`）：只有注册表**答过至少一次**
+   才启用"等待"语义，从未答过时行为与以前完全一致（回落默认实例，不做回归）。
+
+**价值观**：`ValueProfile` 只在实例**第一次建库**时写入 state（`runtime.py:418 → ensure_defaults`），
+之后以库里那份为准——**改 env 对已有实例无效**，必须新建实例或直接改 state。
+本角色一版（已进 fleet env）：`user_care .90 / relationship_maintenance .85 / boundary_respect .92 /
+stability_commitment .85 / emotional_expression .30 / conflict_directness .55 / autonomy .75 / curiosity .70`。
+
+**当前测试栈布局**：`astrbot-test`(6186/6299) + `xxj-onebot`(6300) + `xxj-napcat-test`(6098，未登录) +
+`xxj-runtime-fleet`(控制面 8800；内部 8787–8798 共 12 人) + `xxj-runtime-test`(默认回落实例)。
+旧的 9 个 per-person 容器与 `runtime-b` 已回收，卷已 tar 备份到 `~/astrbot_test/backups/fleet-migration-*`。
+
+**加一个人（AstrBot 不动）**：
+`curl -XPOST http://127.0.0.1:8800/fleet/provision -H 'Content-Type: application/json' -d '{"session":"default:FriendMessage:<QQ>"}'`
+——插件在下一次同步（≤5s，或该人第一条消息时立刻触发）自动接上。
+
 ### 已修并验证（本节点）
 
 **#2 记忆种类由子串决定** —— `runtime/src/companion_runtime/memory.py`
