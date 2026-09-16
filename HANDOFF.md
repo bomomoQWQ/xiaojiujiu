@@ -627,6 +627,23 @@ stability_commitment .85 / emotional_expression .30 / conflict_directness .55 / 
 `curl -XPOST http://127.0.0.1:8800/fleet/provision -H 'Content-Type: application/json' -d '{"session":"default:FriendMessage:<QQ>"}'`
 ——插件在下一次同步（≤5s，或该人第一条消息时立刻触发）自动接上。
 
+**更省事：已经不需要手动 provision 了。** `route_auto_provision: true`（默认 false，测试实例已开）
+让插件在遇到"注册表里没有的会话"时自己向 fleet 发一次
+`POST /fleet/provision {session}`（每会话一次，上限 64），拿到地址后再同步一次，
+于是**陌生人的第一句话就落进为他新建的实例**。实测：
+`29999` 从没被 provision 过 → 插件日志 `fleet provisioned default:FriendMessage:29999 at
+http://runtime-fleet:8799` → fleet 13 人 → 他自己的库里只有他自己的会话。
+
+> ⚠️ **测试坑（本轮实际踩到）**：`docker restart astrbot-test` 之后，插件日志里的
+> `adapter started` 出现在**平台适配器连接之前**（本次相差约 10 秒，日志里等的是
+> `aiocqhttp(OneBot v11) 适配器已连接`）。在这个窗口里往测试前端发消息：
+> 前端 HTTP 会返回 200（它只负责投进自己的 WS 队列），但 **AstrBot 一条都收不到**，
+> 前端 `/state` 的 `errors` 会涨。**等"适配器已连接"再发**，否则会得出"功能没生效"的假结论
+> （本轮就是这样误判了一次）。
+
+**默认回落实例已清空**（`xxj-runtime-test` 里路由生效前的 20001–20010/20099 历史已删除），
+现在它只作为回退存在，只剩下系统自己的 `default` 会话。
+
 ### 已修并验证（本节点）
 
 **#2 记忆种类由子串决定** —— `runtime/src/companion_runtime/memory.py`

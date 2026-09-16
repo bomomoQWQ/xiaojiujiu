@@ -103,6 +103,15 @@ MUTATIONS = [
         """        return False  # MUTATION M8""",
         "test_a_message_for_an_unprovisioned_person_waits_for_the_registry",
     ),
+    (
+        "main",
+        "M9: auto-provision never asks the fleet (a newcomer never gets an instance)",
+        """        if self._registry_transport is None or not self._settings.route_auto_provision:
+            return""",
+        """        if True:  # MUTATION M9
+            return""",
+        "test_an_unknown_person_is_provisioned_automatically",
+    ),
 ]
 
 
