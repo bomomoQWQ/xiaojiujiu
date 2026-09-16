@@ -519,7 +519,32 @@ PY="$(cd ../runtime && pwd)/.venv/bin/python"   # 绝对路径，避免 sys.pref
 两条方法论：**多步异步链路的观察窗口至少 1–2 分钟**；**直读 DB 的瞬时快照只能证伪"已发生"，
 不能证明"不会发生"**。
 
-### 待做：按会话路由到不同 Runtime（已勘察，未开工；异地接手可直接执行）
+### 按会话路由到不同 Runtime（**已实现并在测试栈验证**）
+
+**结论**：插件 `44250be` 起支持 `session_routes`，一人一个 Runtime，记忆不再混。
+
+真机验证（测试栈加第二个 Runtime：`runtime-b` + 独立卷，`session_routes =
+{"default:FriendMessage:20002": "http://runtime-b:8787"}`）：
+- 插件启动日志：`targets=http://runtime:8787, http://runtime-b:8787`（两个目标都在跑）；
+- 默认 Runtime：`raw_events 44 / memories 9`，新到的只有**小林**那句；
+- `runtime-b`：`raw_events 4 / memory_candidates 1 / memories 0`，**只有小周的新事实**
+  （"我是小周，我养了一只叫团子的橘猫，它三岁了。"），**一条小林的东西都没有**；
+- `runtime-b` 自己在收 `POST /v1/outbox/lease`（每个目标各自一个轮询器，实测在跑）。
+- 注意：默认 Runtime 里**历史上**已经有小周的旧数据（路由生效之前写进去的）；要让实例彻底干净，
+  清那个卷重来即可。
+
+**过程中踩到两个真实故障（都是"本地全绿、上机直接炸"）**：
+
+1. **AstrBot 会删掉 schema 里没声明的配置键**。先把 `session_routes` 写进插件配置、后部署代码，
+   AstrBot 加载时直接 `Config key removed: session_routes` 把它清掉 → 路由静默不生效。
+   **顺序必须是：先部署带 schema 的代码，再写配置。**
+2. **插件 schema 里 `"object"` ≠ 自由映射**，它会让**整个插件加载失败**（不是降级）：
+   `astrbot_config.py::_parse_schema` 对 `object` 无条件递归 `v["items"]`，没有 `items`
+   就 `KeyError: 'items'` → `Failed to load plugin`。自由映射要用 `"type": "dict"`
+   （`check_config_integrity` 的注释写明了）。已修，并把 `test_packaging` 那条类型检查
+   补强成与 AstrBot 解析器同规则（`object` 必须带 `items`），否则下一个人还会踩。
+
+**已勘察的接口事实（留档）**：
 
 **为什么需要**：`memories` / `memory_candidates` 表**没有 `conversation_id` 列**（列是
 `memory_id/kind/summary/structured_json/topics_json/importance/confidence/status/source_event_ids/created_at/updated_at/archived_at`），

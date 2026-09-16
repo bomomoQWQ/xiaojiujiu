@@ -21,14 +21,17 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-TARGET = ROOT / "astrbot_plugin_companion_runtime" / "main.py"
-BACKUP = TARGET.with_suffix(".py.mutation-backup")
 PLUGIN_DIR = ROOT / "astrbot_plugin_companion_runtime"
+TARGETS = {
+    "main": PLUGIN_DIR / "main.py",
+    "settings": PLUGIN_DIR / "companion_runtime" / "settings.py",
+}
 TEST_FILE = "tests/test_plugin_integration.py"
 
-#: ``(label, anchor, replacement, test that must go red)``.
+#: ``(file key, label, anchor, replacement, test that must go red)``.
 MUTATIONS = [
     (
+        "main",
         "M1: on_llm_response reports nothing (a streamed turn is lost)",
         """            text = as_str(getattr(response, "completion_text", "")).strip()
             if text and self._report_assistant(event, text):
@@ -38,6 +41,7 @@ MUTATIONS = [
         "test_streamed_turn_is_reported_from_the_llm_response",
     ),
     (
+        "main",
         "M2: after_message_sent ignores the already-reported marker",
         """            if self._assistant_reported(event):
                 return
@@ -46,6 +50,7 @@ MUTATIONS = [
         "test_a_reported_turn_is_not_reported_twice",
     ),
     (
+        "main",
         "M3: the whitelist self-check never runs",
         """        self._start()
         self._warn_if_whitelisted_out()""",
@@ -53,12 +58,34 @@ MUTATIONS = [
         "test_an_unwhitelisted_plugin_warns_at_startup",
     ),
     (
+        "main",
         "M4: the whitelist check does not compare plugin names",
         """        if entries == ["*"] or name in entries:
             return""",
         """        if True:  # MUTATION M4
             return""",
         "test_an_unwhitelisted_plugin_warns_at_startup",
+    ),
+    (
+        "settings",
+        "M5: every session resolves to the default Runtime (routing is dead)",
+        """        if not self.session_routes:
+            return self.base_url
+        for prefix, url in self.session_routes:
+            if session.startswith(prefix):
+                return url
+        return self.base_url""",
+        """        return self.base_url  # MUTATION M5""",
+        "test_sessions_route_to_their_own_runtime",
+    ),
+    (
+        "main",
+        "M6: the context bridge ignores the route (reads the default cache)",
+        """        target = self._targets.get(self._settings.target_for(session))
+        return target.bridge if target is not None else None""",
+        """        target = self._targets.get(self._settings.base_url)  # MUTATION M6
+        return target.bridge if target is not None else None""",
+        "test_sessions_route_to_their_own_runtime",
     ),
 ]
 
@@ -84,29 +111,35 @@ def run_test(name: str) -> tuple[bool, str]:
 
 def main() -> int:
     """Run every mutation and report survivors."""
-    original = TARGET.read_text(encoding="utf-8")
-    shutil.copyfile(TARGET, BACKUP)
+    originals = {key: path.read_text(encoding="utf-8") for key, path in TARGETS.items()}
+    backups = {key: path.with_suffix(".py.mutation-backup") for key, path in TARGETS.items()}
+    for key, path in TARGETS.items():
+        shutil.copyfile(path, backups[key])
+
     survivors: list[str] = []
     try:
-        for label, anchor, replacement, test_name in MUTATIONS:
+        for file_key, label, anchor, replacement, test_name in MUTATIONS:
+            target = TARGETS[file_key]
+            original = originals[file_key]
             if anchor not in original:
                 print(f"{label}: ANCHOR MISSING (the code moved; update this script)")
                 survivors.append(label)
                 continue
-            TARGET.write_text(original.replace(anchor, replacement, 1), encoding="utf-8")
+            target.write_text(original.replace(anchor, replacement, 1), encoding="utf-8")
             try:
                 passed, tail = run_test(test_name)
             finally:
-                TARGET.write_text(original, encoding="utf-8")
+                target.write_text(original, encoding="utf-8")
             print(f"{label}: {'GREEN (survived!)' if passed else 'RED (killed)'} -> {tail}")
             if passed:
                 survivors.append(label)
     finally:
-        TARGET.write_text(original, encoding="utf-8")
-        if TARGET.read_text(encoding="utf-8") != original:
-            print("restore failed; the backup is next to the file")
-            return 2
-        BACKUP.unlink(missing_ok=True)
+        for key, path in TARGETS.items():
+            path.write_text(originals[key], encoding="utf-8")
+            if path.read_text(encoding="utf-8") != originals[key]:
+                print(f"restore failed for {path.name}; the backup is next to the file")
+                return 2
+            backups[key].unlink(missing_ok=True)
 
     if survivors:
         print(f"mutations survived: {survivors}")
