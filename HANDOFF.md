@@ -88,7 +88,7 @@ Runtime 完全靠确定性代码工作；可选的远端语义 provider 的 key 
 
 ```bash
 # 1. Runtime 离线测试
-cd runtime && .venv/bin/python -m pytest              # 期望 1123 passed
+cd runtime && .venv/bin/python -m pytest              # 期望 1124 passed
 
 # 2. 插件离线测试（在插件仓库里）
 cd ../astrbot_plugin_companion_runtime
@@ -151,7 +151,7 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 
 | 项目 | 结果 |
 |---|---|
-| Runtime 离线测试 | **1123 passed / 17 skipped**（无 DSN；PG 专项恒跳过） |
+| Runtime 离线测试 | **1124 passed / 17 skipped**（无 DSN；PG 专项恒跳过） |
 | 插件离线测试 | 143 passed + 13 subtests |
 | 高仿真故障恢复 | 335/335 |
 | 用户黑盒仿真 | **77 / 77**（退出码 0，连跑多次一致） |

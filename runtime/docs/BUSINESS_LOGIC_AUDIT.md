@@ -354,7 +354,7 @@ MOOD_MATCH_POSITIVE_CLASSES = {"emotional_expression", "curious_question", "proa
 | | 提交 | 内容 | 验收 |
 |---|---|---|---|
 | **B** | `94549a5` | 谓词改从 `TYPE_TO_BEHAVIOUR` 派生（主动 ⇔ 行为类 ≠ `reply`）；未知 type 失败关闭 | `tests/test_boundary_synonyms.py` 8 条 + 4 变异 |
-| **A** | `29f2328` | 长度与对话轮数两条基线；两处绝对阈值替换；负向只能抵消加分 | `tests/test_reply_length_baseline.py` 12 条 + 8 变异 |
+| **A** | `29f2328` | 长度与对话轮数两条基线；两处绝对阈值替换；负向只能抵消加分 | `tests/test_reply_length_baseline.py` 13 条 + 9 变异 |
 | **C** | `545ddc8` | 时宜性按行为类两张表；未知 type 不加成；protocol 复用 `QUESTION_TYPES` | `tests/test_mood_matching_by_class.py` 7 条 + 4 变异 |
 
-全仓变异数从 31 增至 **47，全部 KILLED**。
+全仓变异数从 31 增至 **48，全部 KILLED**。
