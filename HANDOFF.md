@@ -93,7 +93,7 @@ cd runtime && .venv/bin/python -m pytest              # 期望 1124 passed
 # 2. 插件离线测试（在插件仓库里）
 cd ../astrbot_plugin_companion_runtime
 PYTHONPATH=tests/stubs:. ../runtime/.venv/bin/python -m pytest tests -q
-#                                                      # 期望 143 passed, 13 subtests passed
+#                                                      # 期望 170 passed, 13 subtests passed
 
 # 3. 用户黑盒仿真：真实 uvicorn + 文件 SQLite(WAL) + 真插件钩子，只断言用户可见事实
 cd ..
@@ -1648,4 +1648,103 @@ parameter vector for %s")` 并**回退到先验**——也就是**每个既有�
 它同时暴露了清点工具自己的一个假阴性：**prose 里提到一个私有函数，会把它从"死代码"里藏起来**
 ——我自己的交接文档写了这个名字，于是第一次扫描没发现它。工具现已改为"私有名字只由代码保活"，
 并且"引用"不只算调用（`resolvable=self._is_resolvable` 就是被当作值传出去的）。
+
+### 🔴 封测反馈"把句号剔除"的真根因：她的回复被切成了**纯标点**（2026-09-17 定位并修复）
+
+反馈原文：「可以用正则把句号给剔除，以及可以配置一下输入防抖，不然一个消息一回复有点难受」。
+
+**第一项不是"气泡太多"，是正文被丢光了。** 测试栈 `astrbot-test` 的
+`/AstrBot/data/cmd_config.json` 里 `platform_settings.segmented_reply.regex` 被人从默认的
+
+```
+.*?[。？！~…]+|.+$          # 匹配"整句(含结束标点)"
+```
+
+改成了
+
+```
+[。？]+                     # 只匹配分隔符本身
+```
+
+而 `result_decorate/stage.py:228-234` 用的是 **`re.findall(regex, text)`**：正则命中什么，
+什么就成为一条消息。命中的只有标点，于是她每一句回复都被切成 `["。", "。"]` 这样的
+**纯标点消息**发出去。用她自己 60 条真实历史发言离线复算：旧规则 121 个气泡里绝大多数是
+`"。"`/`"？"`，新规则 117 个气泡全部是正文。
+
+为什么感觉"时好时坏"：`words_count_threshold=60`，**超过 60 字的回复不分段**（整条发出），
+所以长回复一直正常，短回复（大多数）全是标点。这也解释了为什么反馈是模糊的"有点难受"。
+
+**修法（配置，不动 AstrBot 代码）**：
+
+| 项 | 旧 | 新 | 理由 |
+|---|---|---|---|
+| `segmented_reply.regex` | `[。？]+` | `[^\n]+` | 按换行/段落切，一个段落一条，句号不再切 |
+| `segmented_reply.content_cleanup_rule` | `""` | `[。]+$` | 每段结尾的句号剔除（v3.4.28 起的能力） |
+
+两个坑：切分正则是 `findall`，**不能带捕获组**（否则返回的是组），而 `content_cleanup_rule`
+走 `re.sub`，可以带；`cmd_config.json` 带 BOM，读写都要 `utf-8-sig`，且文件是 **root 属主**
+（`bomomo` 改不了，必须 `docker exec -u 0`）。
+
+### ✅ 输入防抖：做在**我们自己的插件里**，不是再装一个第三方插件（2026-09-17 完成）
+
+市场里至少有 8 个"消息防抖/合并"插件（`continuous_message` / `chat_buffer` / `message_merger` /
+`smoothchat` / `wakepro` …）。核心 AstrBot **没有**原生防抖（`防抖|debounce` 全仓只在 Telegram
+适配器和 WebUI 搜索里命中）。最后没装第三方，理由：
+
+- `continuous_message` 依赖太重（`curl_cffi`/`bilibili-api-python`/`Pillow`…），为了合并几条消息
+  引进这些不值得；
+- `chat_buffer` 只有 165 行、零依赖，但它是 **v1.0**，内部用 `task.cancel()` + 锁，有竞态；
+  真出问题只能 fork 它——正是"自己维护一个版本"那种傻逼事；
+- 我们插件的 `on_llm_request` **本来就在**（注入上下文），防抖放同一个位置最自然，且能进我们自己的
+  测例与变异测试。
+
+**实现**：`input_debounce_ms`（默认 **0 = 关闭**，范围 0–30000，建议 2000–3000）+
+`input_debounce_max_chars`（默认 4000）。`main.py` 里新增
+`@filter.on_llm_request(priority=100)`：同一会话的请求先等一个安静窗口，窗口内又来新消息时，
+**只有最后一条**真的触发 LLM，前面几条的正文按到达顺序合并进 `req.prompt`，被取代的
+`event.stop_event()`。用 generation 计数让位，**不显式 cancel 任何 task**，所以没有竞态。
+
+三个必须记住的点（README §3「input_debounce_ms」也写了）：
+
+1. **必须合并文本，不能只取消旧请求。** AstrBot 把「用户消息 + 助手回复」作为**一对**、在 LLM
+   回答**之后**才写进会话历史（`pipeline/process_stage/method/agent_sub_stages/internal.py:644`
+   的 `update_conversation`）。所以在 `on_llm_request` 里被停掉的那一轮**永远进不了历史**：只取消
+   不合并，用户那几句话就从模型视野里永久消失，而 Runtime 侧仍然记着它们（`on_message_observed`
+   发生在收到消息时），两边不一致。反过来，也正因为被停掉的轮次没进历史，合并**不会**造成重复。
+2. **原始事件不受影响。** 观察在收消息时，不在 LLM 阶段：连发三条仍是三条 raw event，Runtime 的
+   认知输入不因防抖变粗，变的只是"触发几次 LLM"。
+3. **它不接管"要不要说话"。** 只管用户发消息后的这一轮；Runtime 的主动消息走 outbox，完全不过这里。
+
+**部署与验证**（`scripts/deploy_and_verify_debounce.sh`）：
+
+```
+adapter started (..., observe_mode=wake, outbox=on, debounce=2500ms, ...)
+```
+
+`debounce=` 是我为这件事专门加进启动日志的（`9efd25d`）——**防抖没加载和防抖在正常工作，
+日志上完全一样（都是安静的）**，不写出来就只能靠"行为像不像"猜。
+
+### ⚠️ 实测修正：刚接触完的 1 小时内，advantage 会被重复接触惩罚打到 0.08
+
+之前按状态手算估 adv≈0.30–0.40；冷却结束后第一轮真实判决（`2026-09-17T11:03:13`）是
+**adv=+0.0795**（`hazard=2.6e-05`，即每 891s 一轮只有 **2.3%** 命中）。逐项对下来：
+
+| 项 | 10:01:19（接触前） | 11:03:13（接触后） |
+|---|---|---|
+| internal | 0.7674 | 0.7674（不变） |
+| **user** | **0.2998** | **0.0425**（−86%） |
+| relation | 0.3321 | 0.3120 |
+| reply / pos / cont | 0.590 / 0.619 / 0.637 | 0.404 / 0.532 / 0.544 |
+| risk | 0.2679 | 0.3498 |
+| **U_max** | **1.1629** | **0.8515** |
+| U_silence | 0.7450 | 0.7719 |
+
+崩的是 `user` 项，而 `reply` 只掉了 32%：`user = 0.85·reply·(0.55·good + 0.45·cont − conf·(0.85·neutral + 1.4·bad))`
+——`boundary_risk` 上升把预测的负面结局份额推高，被 `NEGATIVE_OUTCOME_WEIGHT=1.4` **减**掉了。
+驱动它的是 `recent_contact_ratio`：`repeat_window_seconds=3600`，她 10:22 刚发过，11:03 在窗口内，
+所以 feature=0.5（`repeat_cost` 本身是 0，`tolerance=2` 还没到；起作用的是**预测**）。
+
+**含义**：主动联系后的 1 小时内，hazard 只有正常值的 ~60%；11:22:09（`10:22 + 3600s`）之后
+`recent_contact_count` 归零，应该回到 adv≈0.3 一档。所以"下次多久开口"不能用一个常数 λ 算，
+得按"刚联系过"和"已过窗口"两段分别看。
 
