@@ -928,6 +928,46 @@ ready_to_send → failed : ActionExecutionError: send_message failed: ApiNotAvai
 `degraded = outcome.degraded and outcome.provider_called`。两条测试锁住两侧：
 `disabled` / `provider_unavailable` 必须 0；provider 抛异常必须 1 且 `ran=0`。
 
+### ⚠️ 未尽之事被重复创建（看板查出来的，已修）
+
+**怎么发现的**：按用户要求核对看板时，`open matters = 10` 这个数字不对——它不是 10 件事，
+**是同样两件事各被创建了 5 次**：
+
+```
+来源事件只有 2 个：
+  evt_0672dfff…  "🫡，当个事办"      → 5 条未完之事
+  evt_82a2632f…  "同 qq 昵称"        → 5 条未完之事
+创建时间 15:57 / 16:03 / 22:57 / 01:57 / 03:02（每次深刷新各一轮）
+非 open 条数 = 0 —— 从来没有一条被解决过
+```
+
+**根因**：`unfinished.create` 是无条件新建（`new_id` + `upsert`）。规则路径有去重
+（`detect(existing=subject_guards(...))` + `_same_subject`），但**深刷新那条
+`reducer._apply_unfinished_suggestion` 完全没接**——而深刷新**每次都重读同一批 unresolved**，
+模型就用新措辞把同一件事重新提一遍（措辞变化到标题比对抓不住），两条路也互不知道对方。
+
+**为什么这不是小事**：一周按 ~10 条/天/人 无界增长（10 人 ≈ 700 条），而**每一条都会进注入块**、
+还会参与候选的 grounding——等于往她的提示词里持续灌重复内容。
+
+**修法**（`b17af1c`）：
+- `unfinished.py` 新增 `already_spoken_for(title, sources, matters)`，两种重述都挡：
+  ①**来源事件已经产出过一条**（深刷新的病根：同事件重读、措辞不同）；
+  ②**主题已被占用**（`_same_subject`，覆盖"同一件事从另一个事件提出来"）。
+- `reducer._apply_unfinished_suggestion` 先查 `subject_guards(list_all(200))`，命中则不建并返回
+  False；调用方记 `skipped:unfinished_matter:already_spoken_for`、**不计入 applied**，
+  但**仍把这批来源事件算作已理解**（它们确实被理解了，否则积压会永远为它重触发刷新）。
+- 6 条新测试，其中一条是写测试时发现的**第三条路**：`"面试完告诉你结果"` 入站时就被**规则**
+  建成 `"等待面试结果"`，深刷新再读同一事件又提一遍——两条路同时创建同一条，实测正是这样
+  攒出 5 份的。
+- 历史数据清理：10 条 → 保留最早 2 条，其余 8 条标 `invalidated`（`resolution_note` 指向保留项，
+  写明是 b17af1c 之前的重复）。改前快照 `snapshots/2026-09-17_035608`。
+- 部署后实测：`open matters 2`、`unresolved 0`、0 条 error，且重启窗口没有丢消息
+  （03:59 那次刷新把 3 条待理解的结算了，对话历史连续）。
+
+> 教训：**看板上一列"看起来只是有点大"的数字，值得追到底**。10 这个数不算离谱，
+> 但它背后的形状（2 个事件 → 10 条记录、0 条曾解决）才是问题。这也是当初把
+> `open matters` 放进看板的理由。
+
 ### 当前 runtime 用量（2026-09-17 凌晨实测）
 
 - **容器只有两个**：`xxj-runtime-fleet`（一个容器里跑 14 个 Runtime 进程，控制面 8800）
