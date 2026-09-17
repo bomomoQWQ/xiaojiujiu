@@ -288,12 +288,59 @@ def _same_subject(candidate_title: str, existing_title: str) -> bool:
     left = _subject_core(candidate_title)
     right = _subject_core(existing_title)
     if left and right:
-        return left == right or left in right or right in left
+        if left == right or left in right or right in left:
+            return True
+        # Model-written titles (the deep refresh) contain none of the template
+        # words, so the test above is *exact equality* for them and every
+        # re-wording opens another copy of the same obligation. Measured on the
+        # test deployment: three open matters about one milk-tea invitation,
+        # worded "无糖奶茶" / "奶茶/去糖奶茶" / "奶茶邀约尚未落地".
+        return _nearly_identical(left, right)
     if not left and not right:
         return candidate_title == existing_title
     # One side is pure template; only treat it as the same subject when the other
     # side is empty of meaning too.
     return False
+
+
+#: Token overlap at which two stripped prose cores are candidates for "same
+#: obligation". Calibrated on the measured pairs below (they are also the test
+#: cases); 0.6 is not enough on *this* basis -- the "奶茶" -> "咖啡" pair scores
+#: 0.70 and would have to be caught by the second bar alone.
+SUBJECT_BIGRAM_THRESHOLD = 0.77
+
+#: ...and how much of the core may actually differ. Overlap alone over-merges: two
+#: *different* topics can share a long boilerplate tail, which lifts the overlap
+#: just as high. Measured on the stripped cores:
+#:
+#:     same topic, re-worded   奶茶/去糖奶茶 vs 无糖奶茶      0.800  22.2%
+#:     same topic, one clause  「当个事办」…轻量确认 + 不必…   0.808  19.2%
+#:     different topic         奶茶/去糖奶茶 vs 咖啡          0.700  33.3%
+#:     different topic         「我试试什么（）」vs「换个头像」 0.737  29.4%
+#:
+#: So the differing share is the discriminator, and both bars are set to the
+#: middle of their measured gap (leaving roughly three points on each side).
+SUBJECT_DIFF_RATIO_LIMIT = 0.26
+
+
+def _nearly_identical(left: str, right: str) -> bool:
+    """Return whether two prose titles are one sentence with a small edit.
+
+    Args:
+        left: First title (already stripped of template words).
+        right: Second title (already stripped of template words).
+
+    Returns:
+        ``True`` when the two share most of their tokens and differ only slightly.
+    """
+    first = topic_tokens(left)
+    second = topic_tokens(right)
+    if not first or not second:
+        return False
+    if len(first & second) / len(first | second) < SUBJECT_BIGRAM_THRESHOLD:
+        return False
+    changed = len(first - second) + len(second - first)
+    return changed / max(len(first), len(second)) <= SUBJECT_DIFF_RATIO_LIMIT
 
 
 # --------------------------------------------------------------------------------------

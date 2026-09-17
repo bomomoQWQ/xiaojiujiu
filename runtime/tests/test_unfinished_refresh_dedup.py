@@ -206,3 +206,95 @@ def test_two_matters_from_one_batch_do_not_duplicate_each_other(runtime: Runtime
     )
     runtime.deep_refresh(force=True)
     assert len(_open_titles(runtime)) == 1
+
+
+def test_a_prose_restatement_of_the_same_topic_is_refused(runtime: Runtime) -> None:
+    """A model-written title carries no template words, so it needs the token guard.
+
+    Measured on the test deployment: one milk-tea invitation became three open
+    matters ("无糖奶茶" / "奶茶/去糖奶茶" / "奶茶邀约尚未落地"), because every mention
+    produced a fresh, differently-worded title and the substring test read each one
+    as a new subject. These two titles differ by 15% of their tokens, which is the
+    re-wording the guard exists for; the sources differ on purpose, so nothing but
+    the subject comparison can refuse the second one.
+    """
+    client = TestClient(create_app(runtime, runtime.config))
+    first_event = _ingest(client, "🫡，当个事办")
+    second_event = _ingest(client, "对了，那件事我记着呢")
+
+    runtime.semantic_provider = _provider(  # type: ignore[assignment]
+        {
+            "title": "用户邀请角色尝试奶茶/去糖奶茶，角色是否接受、后续是否真的会一起喝，尚未有结果。",
+            "sources": [first_event],
+        }
+    )
+    runtime.deep_refresh(force=True)
+    assert len(_open_titles(runtime)) == 1
+
+    runtime.semantic_provider = _provider(  # type: ignore[assignment]
+        {
+            "title": "用户邀请角色尝试无糖奶茶，角色是否接受、后续是否真的会一起喝，尚未有结果。",
+            "sources": [second_event],
+        }
+    )
+    runtime.deep_refresh(force=True)
+    assert len(_open_titles(runtime)) == 1, "a re-wording is not a new obligation"
+
+
+def test_a_shared_boilerplate_tail_does_not_merge_two_topics(runtime: Runtime) -> None:
+    """The token guard must not become a topic blender.
+
+    Two *different* topics written by the same model share a long tail
+    ("…，角色是否接受、后续是否真的会一起喝，尚未有结果。"), which lifts the token
+    overlap to 0.79 by itself -- above the 0.6 bar. Only the differing share of the
+    title separates that case (22%) from a genuine re-wording (15%), so this test is
+    what keeps the second bar honest.
+    """
+    client = TestClient(create_app(runtime, runtime.config))
+    first_event = _ingest(client, "🫡，当个事办")
+    second_event = _ingest(client, "在想一件事")
+
+    runtime.semantic_provider = _provider(  # type: ignore[assignment]
+        {
+            "title": "用户邀请角色尝试奶茶/去糖奶茶，角色是否接受、后续是否真的会一起喝，尚未有结果。",
+            "sources": [first_event],
+        }
+    )
+    runtime.deep_refresh(force=True)
+
+    runtime.semantic_provider = _provider(  # type: ignore[assignment]
+        {
+            "title": "用户邀请角色尝试咖啡，角色是否接受、后续是否真的会一起喝，尚未有结果。",
+            "sources": [second_event],
+        }
+    )
+    runtime.deep_refresh(force=True)
+    titles = _open_titles(runtime)
+    assert len(titles) == 2, "sharing a boilerplate tail is not sharing a subject"
+    assert any("咖啡" in title for title in titles)
+
+
+def test_template_subjects_are_still_told_apart(runtime: Runtime) -> None:
+    """The pre-existing guarantee, unchanged: different subjects stay different.
+
+    "面试" and "考试" are the example the substring rule was written for: they
+    share the character 试 and the whole tail 试结果. The token bar must not blur
+    them either.
+    """
+    client = TestClient(create_app(runtime, runtime.config))
+    first_event = _ingest(client, "🫡，当个事办")
+    second_event = _ingest(client, "在想一件事")
+
+    runtime.semantic_provider = _provider(  # type: ignore[assignment]
+        {"title": "等待面试结果", "sources": [first_event]}
+    )
+    runtime.deep_refresh(force=True)
+
+    runtime.semantic_provider = _provider(  # type: ignore[assignment]
+        {"title": "等待考试结果", "sources": [second_event]}
+    )
+    runtime.deep_refresh(force=True)
+    titles = _open_titles(runtime)
+    assert len(titles) == 2
+    assert any("面试" in title for title in titles)
+    assert any("考试" in title for title in titles)

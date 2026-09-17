@@ -120,6 +120,20 @@ DEEP_REFRESH_SYSTEM_PROMPT = (
     "\"user_model_evidence_suggestions\": [{\"sources\": [\"evt_x\"], \"trait\": \"推断出的特征\", "
     "\"weight\": 0.3}]}"
     "你只提供建议，不决定任何状态变更，不生成台词，不创造输入中不存在的事件；"
+    # The three suggestion kinds used to be named and nothing more, so the model
+    # had to guess where a statement belonged. Measured on the test deployment:
+    # 45% of one person's open matters were restatements of the same topic
+    # ("用户对回应形式的偏好…" recorded twice; one milk-tea invitation three
+    # times), which inflates the pool with equal-scoring follow-ups and is what
+    # makes the character re-open settled subjects.
+    "三类产出的分工要分清："
+    "unfinished_matter_suggestions 只放必须等用户回答才能了结的具体问题"
+    "（他答应过要告诉你结果、他问了你什么你还没答、有件事悬着没有下文）；"
+    "他的偏好、身份、习惯、已经说过的事实属于 memory_suggestions，不要写成未完之事；"
+    "你自己打算做的事属于 candidate_intent_operations。"
+    "输入 unfinished 列出的是这个人当前还没了结的事："
+    "同一件事不要重复输出，换个说法也不行；"
+    "新的理解放进记忆、候选或重新解释里。"
     # The guardrail here has to be phrased as "do not invent", never as "stay silent
     # when unsure". The earlier wording ("return empty arrays when the evidence is
     # insufficient, do not guess") read as "if the intent is not explicit, say
