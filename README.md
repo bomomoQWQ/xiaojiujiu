@@ -1,19 +1,23 @@
 # 小九九 · 内源主动型长期陪伴 AI Runtime
 
-一个**跨时间连续**的陪伴角色系统：宿主 Bot 负责"现在这一刻怎么回应"，
-小九九负责"这一刻过去以后留下什么"，以及"要不要开口"。
+一个**跨时间连续**的情感分析主动系统：宿主 Bot 负责"现在这一刻怎么回应"，小九九负责
+"这一刻过去以后留下什么"，以及"要不要开口"。
 
 名字取自"心里的小九九"：它确实整天在打小九九——候选意图、效用打分、危险率、
-边界成本，排队算出"现在说这句话值不值"。仓库名 `xiaojiujiu`，旧代号「理解痞老板」。
+边界成本，排队算出"现在说这句话值不值"。灵感来源于群里聊天，原本我想叫"理解痞老板"来着。
 
 设计目标不是让机器人更会聊天，而是让它**记得住、沉得下、会自己想开口**，
 并且**不会因此发疯**——不骚扰、不越界、不把沉默误读成恶意、不忘掉发生过的事。
+
+> **先说清楚现在是什么状态**：它在作者的机器上长期跑得住，有 1151 项离线测试、
+> 四套仿真相一个外接测试框架守着；但它**不是**一个开箱即用的产品——
+> **目前没有为自部署做优化**（§5.4 把这件事讲透）。想要"部署就能用"的体验，现在还不是。
 
 ---
 
 ## 1. 它解决什么问题
 
-普通聊天机器人的"人格"活在上下文窗口里：窗口一滑，上一轮的情绪、承诺、
+普通聊天机器人的"人格"活在上下文窗口里：窗口一换，上一轮的情绪、承诺、
 没说完的事全部消失。于是它永远只有"此刻"，没有"这几天"。
 
 本项目把状态从上下文里搬出来，放进一个独立的持久认知进程：
@@ -37,10 +41,151 @@
 | 回答什么 | "用户现在说了这句话，我这一刻怎么反应？" | "这件事结束以后，它在我身上留下了什么？" |
 | 时间尺度 | 毫秒～秒 | 小时～天 |
 | 是否依赖模型 | 是（就是主 LLM 本身） | **否**（确定性代码） |
+| 出错时 | 回复难看 | 记错/越界/骚扰 |
+
+**为什么不能合成一层**：合成意味着每次回复都要把"我是谁、我记得什么、我现在什么心情"
+重新塞进提示词。那样既有上下文长度上限，也没有可审计性——你无法回答"它为什么这么说"，
+只能读一遍提示词猜。把状态搬出来，代价是多一个进程，换来的是状态可以被观察、被测试、
+被重放，以及"不回复"也能是一个正式决定。
 
 ---
 
-## 2. 三条不变量
+## 2. 设计思路
+
+这一节讲的是**为什么这样设计**。逐机制的细节（每个模块更新什么、怎么算）在
+`runtime/README.md` §4；原始推理链在 `内源主动型长期陪伴AI_Runtime_完整架构设计.md`
+与 `PATCH_v0.2_….md`。
+
+### 2.1 主 LLM 只做最后一层表达，不做整个"脑子"
+
+系统的核心原则是：**主 LLM 只负责最后的语言表现**。
+
+不让主 LLM 兼任情绪数据库、记忆数据库、动机算法和主动性状态机，理由有三个：
+
+1. **它没有跨时间状态。** 上下文一换，它就不记得了。你没法用提示词实现"记得住"。
+2. **它不可审计。** 想解释"角色为什么今天突然不说话"，读提示词是读不出来的。
+3. **它很贵。** 把每个认知问题都交给它，等于每轮都调一次大模型——而大部分认知问题
+   用确定性代码就能回答，且答案更稳定。
+
+所以角色的人格来自宿主（角色设定、价值观参数），但**状态**由 Runtime 维护，
+每轮只把一小段"当前状态"临时注入给主 LLM 去演。
+
+### 2.2 两个时间尺度：即时演出 / 持久认知
+
+这是现行架构（patch v0.2）的中心，也是它推翻自己上一版的地方。
+
+原本的设计里，每一轮都要先同步调一个本地小模型做"事件评价 → 情绪数值 → 心理解释"，
+再把这些喂给主 LLM。补丁指出**这一步本身是多余的**：主 LLM 当场就能看到用户原话、
+上下文、人格和已有的持久状态，它自己就能理解"算了，也没什么"这句话是什么意思。
+
+> **主 LLM 负责"现在这一刻怎么反应"；Runtime 负责"这一刻过去以后留下些什么"。**
+
+由此得出一条重要推论：**Runtime 不要求当前轮语义完备，只要求长期状态连续**。
+听不懂可以先记下来（留 `unresolved`），但不能丢证据，也不能瞎猜。
+
+这也直接解释了**为什么砍掉本地模型路线**：实测在目标硬件上单次评价要数秒、
+常驻约 2 GB，而且它做的事和主 LLM 重复。原因与实测数据留档在 `archive/README.md`。
+
+### 2.3 数值负责动力学，语言负责语义
+
+系统内部的状态是数值：冲动、节制、压力、心境、边界风险、候选显著性……
+但**这些数字不能直接喂给主 LLM**。
+
+原因很实际：大模型对"心理文本"远比对其余上下文敏感。给它看 `anger = 0.72`，
+它会开始围绕这个数字表演，而不是自然地表现。所以中间有一层解释器，把结构化状态
+压成一段自然语言的"心理上下文"，主 LLM 看到的是"有点失落，但不想打扰你"，
+而不是一串小数。
+
+反向的分工同样明确：**数值负责随时间怎么变**（衰减、惯性、饱和、恢复），
+**语言只负责读起来像什么**。叙事不能反过来决定状态。
+
+### 2.4 事实、推断、解释必须分开
+
+同一句"用户 6 小时没回复"，可以读成"他可能很忙"，也可以读成"他开始冷淡了"。
+前者是**观察**，后者是**归因**。系统必须把它们分开存，并且——
+
+> **解释不能冒充事实。**
+
+同一个原则贯穿三层：
+
+- **原始事件是不可变历史。** 用户说过什么、机器人发过什么，永远追加，永不改写。
+- **解释允许升级。** 后来才想明白的事，是**追加一个新版本**并声明它取代了旧版本，
+  而不是回头改掉当时的那条。
+- **推断必须有来源。** 每条解释、每个记忆都要能追溯回真实发生过的事；
+  追溯不到的，就不许进档案。
+
+好处是"当时没懂、后来才想明白"变成了可审计的历史，而不是偷偷修改过去。
+另外，**不懂的时候宁可留 `unresolved`**：语义模糊的事件不猜，等以后有依据了再回头结算。
+
+### 2.5 一轮认知的闭环
+
+一次完整的认知循环是这样走的，每一步都有它存在的理由：
+
+```text
+用户消息
+  → 写入不可变事件日志        先落证据，否则后面全都不可审计
+  → 推进时间（lazy_tick）     "过了 8 小时"必须真的存在，否则没有余味
+  → 情绪 / 关系 / 未尽之事演化  让上一次的影响留下来，而不是下一轮清零
+  → 记忆激活                  让"它记得我"在下一轮真的出现在它面前
+  → 生成候选意图              先提出"可能想做的事"，不直接决定说不说
+  → 动机博弈                  在候选之间比较，并且允许"什么都不说"
+  → 主 LLM 表达               只有这一步用大模型
+  → 用户反馈回到状态           回没回、回得多快多长，是唯一的学习信号
+```
+
+两个容易被忽略的设计点：
+
+- **"沉默"是一个正式的选项，不是一个失败。** 博弈里沉默有它自己的效用，
+  大多数时候它应该赢——否则角色会变成一个不停找话说的东西。
+- **反馈是观察，不是判决。** "6 小时没回复"只记录成"延迟 6 小时"，不记成"负反馈"。
+  这一点由不变量守着（§3）。
+
+### 2.6 用危险率，而不是阈值
+
+"要不要主动开口"这件事，很容易写成一个阈值：分数超过某个数就发，没过就不发。
+那个做法有个致命毛病——分数 0.799 和 0.801 会产生完全不同的行为，
+而且**改一下心跳频率，行为就变了**（同一段沉默被检查了 10 次还是 100 次，结果不同）。
+
+所以系统用的是**行动危险率**：把"要不要开口"变成时间的连续函数。
+直觉上：
+
+- 压力高、冲动强时，自然更容易开口；
+- 平静时可以很久不醒；
+- 沉默时间越长，同样强度下越倾向于开口（这就是"积累"）；
+- **心跳快慢不改变期望行为**——这条有专门的测试守着。
+
+顺带一个真实后果：因为它是逐拍抽样的，一次跳 30 小时只等于抽了一次。
+要演"离开两天"，得分成小步走。
+
+### 2.7 边界是硬约束，不参与博弈
+
+用户说"今天别来找我"，这不是一个"成本项"。
+
+如果边界只是一个很高的成本，那么理论上"压力足够大"就能压过去——
+而系统里压力确实会累积变大，于是"今天"会被自己破坏。
+所以边界在效用比较**之前**剪枝：违反边界的候选根本不进入打分环节，
+连"值不值"都不讨论。
+
+这条也有一个失败方向的教训：边界是**按行为类**判的，不是按名字。
+同一个意图换个说法（"道歉" vs "修复"）必须得到相同的裁决——
+否则"别来找我"可以被一个同义词绕过。
+
+### 2.8 模型数量的取舍
+
+原则是：**不给每个认知问题都塞一个模型。**
+
+| 谁 | 做什么 | 频率 |
+|---|---|---|
+| 宿主主 LLM | 即时表达、本轮怎么回应 | 每轮 |
+| 可选强语义端口 | 候选意图、重解旧事件、心理状态语言化 | 低频、可关 |
+| Runtime 本身 | 其余全部认知 | 每轮，**确定性代码** |
+
+默认部署**不需要任何模型**：语义端口是关的，系统靠规则、统计和状态机工作，
+关键路径在毫秒级。想更强语义时再打开那个可选端口——它是**加法**，不是前提。
+
+---
+
+## 3. 三条不变量
 
 整个系统的价值都压在这三条上，它们各自有专门的回归测试：
 
@@ -52,462 +197,194 @@
    只有宿主回执才算发出。显式边界在效用计算**之前**剪枝，不进博弈——
    压力再大也不能越过"别来找我"。
 
+还有一条容易被忽略的：**隐藏的心理上下文绝不进入永久对话历史**。
+它是每轮临时注入的，用完即弃；宿主在无法保证"临时"时会拒绝注入而不是将就。
+
 ---
 
-## 3. 仓库结构
+## 4. 仓库结构
 
 ```text
 .
-├── runtime/                          # ★ 持久认知 sidecar（独立进程，Python 3.11+）
-│   ├── src/companion_runtime/        #   31 个模块（含协议 v1 兼容层 api_v1.py）
-│   ├── tests/                        #   914 项离线测试（14 项按环境跳过）
-│   ├── docs/PATCH_V0.2_MAPPING.md    #   设计章节 → 代码位置 → 状态（含诚实缺口清单）
-│   └── README.md                     #   操作者手册（配置 / API / 蓝屏恢复 / 降级）
-│
-├── astrbot_plugin_companion_runtime/ # ★ AstrBot 薄插件：**独立仓库**，本地克隆（不进本仓库 Git）
-│   ├── main.py                       #   监听 / 临时注入 / outbox 消费
-│   └── tests/                        #   143 项离线测试（另含 13 个子测试，带 AstrBot 桩）
-│                                     #   → https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime
-│
-├── Dockerfile                        # ★ Runtime 镜像（非 root，状态全在 /data 卷）
-├── docker-compose.yml                # ★ runtime + astrbot 两个容器，端口只发布到 loopback
-│
-├── AstrBot/                          # 上游 AstrBot 4.28.1，**零修改**（不进镜像、不进 Git）
-│
-├── archive/                          # 已放弃的本地模型路线（留档，不参与构建）
-│   └── README.md                     #   为什么放弃 + 实测数据
-│
-├── scripts/                          # 运维与验证脚本
-│   ├── backup.ps1                    #   跨盘原子快照（蓝屏防护）
-│   ├── runtime_bench.py              #   关键路径延迟基准
-│   ├── e2e_patch_v02.py              #   28 项基础真机验证
-│   ├── e2e_resilience_simulation.py  #   335 项高仿真：并发 / 重启 / 断网恢复
-│   └── blackbox_user_simulation.py   #   用户黑盒仿真：只断言用户看得见的事实
-│
+├── runtime/                       # ★ 持久认知 sidecar（独立进程，Python 3.11+）
+│   ├── src/companion_runtime/     #   32 个模块（含协议 v1 兼容层 api_v1.py）
+│   ├── tests/                     #   1151 项离线测试（17 项按环境跳过）
+│   ├── docs/                      #   设计→代码对照、缺口审计、崩溃窗口、业务逻辑审计
+│   └── README.md                  #   ★ 逐机制说明 + 配置 / API / 恢复 / 降级
+├── astrbot_plugin_companion_runtime/  # ★ 宿主薄插件：独立仓库，本地克隆（不进本仓库 Git）
+├── framework/                     # ★ 外接测试框架：可控时钟 + OpenAI 兼容 mock（不修改原程序）
+├── scripts/                       # 验证脚本、运维脚本、封测（fleet）脚本
+├── docs/                          # 跨仓评估（framework 与 scripts 该不该合并等）
+├── Dockerfile / docker-compose.yml
+├── AstrBot/                       # 上游 AstrBot，**零修改**（不进镜像、不进 Git）
+├── archive/                       # 已放弃的本地模型路线（留档，不参与构建）
+├── 人格设定.md                     # 当前封测角色的角色卡
 ├── 内源主动型长期陪伴AI_Runtime_完整架构设计.md   # 原始设计（97 节）
-├── PATCH_v0.2_即时演出与持久认知分离...md        # 现行架构补丁
-├── CHANGELOG.md                      # 版本与改动（0.2.0 起）
-├── HANDOFF.md                        # 换机器接手手册
-├── LICENSE                           # GPL-3.0-or-later
-└── RECOVERY.md                       # 备份 / 恢复 / 权重位置
+├── PATCH_v0.2_….md                # 现行架构补丁（两层分离）
+├── CHANGELOG.md / HANDOFF.md       # 改动记录 / 换机器接手手册
+└── LICENSE (GPL-3.0-or-later) / RECOVERY.md
 ```
 
+`scripts/` 里最值得先看的四个：`blackbox_user_simulation.py`（用户可见行为，77 项）、
+`e2e_resilience_simulation.py`（坏天气，335 项）、`mutation_design_conformance.py`
+（把 bug 放回去看测试红不红）、`dead_code_inventory.py`（找没人读的东西）。
+
 **`AstrBot/` 是上游代码，任何情况下都不修改。** 所有集成通过公开 API 完成，
-升级 AstrBot 只需替换该目录。详细边界见 `runtime/README.md` 与插件 README。
-它在 `.gitignore` 与 `.dockerignore` 里都被显式排除——既不会进仓库，也不会进镜像。
+升级 AstrBot 只需替换该目录。它在 `.gitignore` 与 `.dockerignore` 里都被显式排除。
 
-**本项目由两个仓库组成**，刻意分开维护：
-
-| 仓库 | 内容 | 为什么分开 |
-|---|---|---|
-| [`xiaojiujiu`](https://github.com/bomomoQWQ/xiaojiujiu)（本仓库） | Runtime sidecar、Docker 部署、设计文档、验证脚本 | 主逻辑：跨时间的持久认知 |
-| [`astrbot_plugin_companion_runtime`](https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime) | 宿主侧薄插件（`main.py` + 插件核心 + `metadata.yaml`） | 插件要单独发到 AstrBot 插件市场，生命周期与主程序无关；发布 zip 只应包含插件本身 |
-
-插件仓库的 `metadata.yaml` 里 `repo` 指向它自己的地址（市场会校验
-`https://github.com/{owner}/{repo}` 形式），`author` 是 `bomomoQWQ`，
-`plugin_id` 为 `bomomoQWQ/astrbot_plugin_companion_runtime`。
-本仓库的 `docker-compose.yml` 会把 `./astrbot_plugin_companion_runtime` 挂进 AstrBot 容器，
-所以本地要有一份克隆（`git clone` 即可），该目录已在 `.gitignore` 中排除。
+**本项目由两个仓库组成**，刻意分开维护：本仓库是主程序（Runtime、部署、设计文档、
+验证脚本），插件仓库是宿主侧的薄插件——它要单独发到 AstrBot 插件市场，生命周期与主程序无关。
 
 ---
 
-## 4. 部署
+## 5. 快速开始
 
-### 4.1 Docker（推荐）
-
-Runtime 与 AstrBot 是两个容器：Runtime 是持久认知 sidecar（本仓库核心），
-AstrBot 只多装一个薄插件。仓库根的 `Dockerfile` 与 `docker-compose.yml` 就是这套组合。
+### 5.1 Docker（推荐）
 
 ```bash
-# 两个仓库：本仓库是主程序，插件在独立仓库里
 git clone https://github.com/bomomoQWQ/xiaojiujiu.git
 cd xiaojiujiu
 git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git
-
 docker compose up -d --build
-docker compose ps
 curl http://127.0.0.1:8787/health
 ```
 
-起来之后：AstrBot WebUI 在 `http://127.0.0.1:6185`，Runtime 在 `http://127.0.0.1:8787`。
+起来之后：AstrBot WebUI 在 `127.0.0.1:6185`，Runtime 在 `127.0.0.1:8787`。
 
-**首次启动必做两步**（都在 AstrBot WebUI 里）：
+**首次启动必须手改两处**（都在 AstrBot WebUI 里）：
 
-1. 把插件配置里的 `runtime_base_url` 改成 `http://runtime:8787`——容器网络内用服务名
-   解析；插件默认值 `http://127.0.0.1:8787` 只在同主机/同容器部署时才对。
+1. 插件配置的 `runtime_base_url` → 容器网络内要用服务名 `http://runtime:8787`；
 2. **多会话部署**：把 Runtime 的 `conversation_id` 设成会话的 `unified_msg_origin`
-   （如 `aiocqhttp:FriendMessage:10001`），用环境变量 `CR_CONVERSATION_ID` 或 `--config` 指定。
+   （如 `aiocqhttp:FriendMessage:10001`），否则主动消息不知道该投给谁。
 
-数据落在两个 named volume：`runtime-data`（SQLite WAL + `raw_events.jsonl`）与
-`astrbot-data`（AstrBot 自己的配置与插件数据）。两个端口默认只发布到 `127.0.0.1`：
-**不要把 8787 直接暴露到公网**，Runtime 没有面向公网的鉴权设计，远程访问请在
-AstrBot WebUI 前放反代。
+两个端口默认只发布到 `127.0.0.1`。**不要把 8787 暴露到公网**：Runtime 没有面向公网的
+鉴权设计，远程访问请在 AstrBot WebUI 前放反代。API key 只从环境变量读，
+不要写进任何仓库文件。
 
-只要 Runtime 一个容器：
+### 5.2 装插件
 
-```bash
-docker build -t xiaojiujiu .
-docker run -d --name xiaojiujiu \
-  -p 127.0.0.1:8787:8787 \
-  -v xiaojiujiu-data:/data \
-  xiaojiujiu
-docker logs -f xiaojiujiu
-```
-
-默认**不需要任何模型**：`SemanticProvider` 是 `disabled`，Runtime 靠确定性代码工作。
-要接远程语义 provider（可选）：
+插件在独立仓库里，**尚未提交到 AstrBot 插件市场**（所以市场里搜不到）：
 
 ```bash
-docker run -d --name xiaojiujiu -p 127.0.0.1:8787:8787 -v xiaojiujiu-data:/data \
-  -e CR_SEMANTIC_PROVIDER=remote_api \
-  -e CR_SEMANTIC_BASE_URL=https://api.example.com/v1 \
-  -e CR_SEMANTIC_MODEL=your-model \
-  -e CR_SEMANTIC_API_KEY=... \
-  xiaojiujiu
+git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git \
+  AstrBot/data/plugins/astrbot_plugin_companion_runtime
 ```
 
-API key **只从环境变量读**：配置对象里写的 key 会被刻意忽略，也不要把它写进
-`docker-compose.yml` 或任何仓库文件。
+然后在 WebUI 里确认 `runtime_base_url` 指向 Runtime，重启 AstrBot。
 
-镜像以非 root 用户（uid 10001）运行，`/data` 是唯一的持久卷，容器内自带的
-healthcheck 打 `/health`；`docker ps` 里的 `healthy` 就是可信的存活判据。
+### 5.3 本地 venv（开发 / 调试）
 
-### 4.2 安装薄插件
-
-插件在**独立仓库**里维护：<https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime>。
-
-克隆到 AstrBot 的插件目录即可（本插件尚未提交到 AstrBot 插件市场，所以市场里搜不到）：
-
-```powershell
-git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git `
-  AstrBot\data\plugins\astrbot_plugin_companion_runtime
-```
-
-然后在 AstrBot WebUI 里确认插件的 `runtime_base_url` 指向 Runtime 地址（同主机部署时
-插件与 Runtime 的默认值均为 `http://127.0.0.1:8787`；两个容器同在 compose 网络里时是
-`http://runtime:8787`）；若 Runtime 改过监听地址，再同步修改该项并重启 AstrBot。
-
-> **多会话部署必做**：把 Runtime 的 `conversation_id` 设成会话的
-> `unified_msg_origin`（如 `aiocqhttp:FriendMessage:10001`）。
-> 主动消息会投递到「形成这个意图的会话」，而 Runtime 需要知道自己是哪个会话——
-> 只在单会话下用默认值才是安全的。相关推导与测试见
-> `runtime/tests/test_proactive_routing.py`。
-
-> **⚠️ 装了插件却"什么都没发生"时，先查 AstrBot 的插件白名单 `plugin_set`。**
-> 它不是"启用列表"而是**处理器白名单**：AstrBot 在唤醒检查之前就会丢掉不在名单里的
-> 插件的所有 handler，于是插件照样被加载、`initialize()` 照样执行、outbox 照样轮询
-> Runtime（日志里有 `adapter started`），但消息既不上报也不注入，且**没有任何报错**。
-> `plugin_set` 为 `["*"]`（默认）时一切正常；一旦你在 WebUI 里存成了具体名单，
-> 就必须把 `astrbot_plugin_companion_runtime` 加进去。插件启动时会自检并打一条
-> WARNING 指出来（`grep companion_runtime` 看日志），详见插件仓库 README 的「白名单」一节。
-
-### 4.3 本地 venv（开发 / 调试）
-
-```powershell
-cd F:\理解痞老板\runtime
-
-# 建独立环境（不污染 AstrBot 的环境）
-uv venv .venv --python 3.12
-uv pip install --python .venv\Scripts\python.exe -e ".[test]"
-
-# 自检
-.venv\Scripts\python.exe -m pytest tests -q          # 期望 828 passed
-
-# 起服务（只监听 loopback）
-.venv\Scripts\python.exe -m companion_runtime.cli --base-dir . serve --host 127.0.0.1 --port 8787
-```
-
-`--base-dir` 是**全局参数，必须写在子命令前面**，用来解析相对存储路径
-（默认数据库 `<base-dir>/data/runtime.sqlite3`、镜像文件 `<base-dir>/data/raw_events.jsonl`）。
-要换路径用 `--config <file.toml>`，或环境变量 `CR_STORAGE__DATABASE_PATH`：
-
-```powershell
-.venv\Scripts\python.exe -m companion_runtime.cli --config .\deploy\runtime.toml serve
-```
-
-### 4.4 验证
-
-```powershell
-# 真机端到端（会起一个真实 HTTP 服务并打真实请求）
-python scripts\e2e_patch_v02.py --base-dir E:\companion_runtime_backup\e2e-v02
-
-# 关键路径延迟
-python scripts\runtime_bench.py --rounds 200
-```
-
----
-
-## 5. Runtime 的 HTTP 接口
-
-47 条路由（完整表格见 `runtime/README.md`）。分两套契约：
-
-**内部接口（Runtime 自己的形状）**
-
-| 分组 | 代表端点 | 用途 |
-|---|---|---|
-| 事件 | `POST /events`、`GET /events/{id}` | 追加原始事件、读取历史 |
-| 上下文 | `POST /context/render-block`、`POST /explain` | 生成**本轮临时**注入块 |
-| 主动发送 | `POST /outbox/claim`、`POST /render`、`POST /delivery` | 租约 → 渲染 → 投递三段式 |
-| 授权 | `POST /authorize` | 发送前最后一道闸门（fail-closed） |
-| 认知 | `POST /cognition/refresh`、`GET /cognition/backlog` | 低频深层刷新与未解释积压 |
-| 运维 | `GET /health`、`POST /maintenance/*` | 健康、校验、检查点、备份、恢复 |
-
-**协议 v1（薄插件使用的形状）**
-
-插件走 `/v1/events`、`/v1/context`、`/v1/outbox/lease`、
-`/v1/outbox/{id}/heartbeat`、`/v1/actions/{id}/authorize`、`/v1/outbox/{id}/result`
-六条路径，由 `runtime/src/companion_runtime/api_v1.py` 翻译到内部接口。
-
-两套契约的分工是刻意的：v1 是**宿主适配契约**（租约、心跳、发送前授权、结果幂等），
-内部接口是 Runtime 自己的资源形状。翻译层负责幂等、fail-open / fail-closed 分类，
-以及保证 `committed != sent` 在跨进程边界上依然成立。
-
----
-
-## 6. 持久认知里到底有什么
-
-| 机制 | 做什么 | 代码 |
-|---|---|---|
-| `lazy_tick(now)` | 闭式时间推进：心境、情绪衰减、I/R/P 动力学、冷却、期限 | `runtime.py` |
-| 粗粒度语义结算 | 显式事件给出方向 + 强度档；**模糊事件留 `unresolved` 不猜** | `semantic.py` |
-| 情绪余波 | 评级 → 数值影响 → 衰减，带余味 | `emotion.py` |
-| 边界状态机 | 4 类边界，硬闸门优先于一切动机 | `boundaries.py` |
-| 未尽之事 | 检测 / 等待 / 到期 / 了结的状态机 | `unfinished.py` |
-| 记忆 | 候选评分 → 巩固 → 激活 → 检索（当前为词法降级） | `memory.py` |
-| 用户模型 | 在线加权 Logistic + 分层部分池化 + 保守分位数 | `user_model.py` |
-| 候选意图 | 生成 → 接地校验 → 池管理（ADD/UPDATE/RETIRE） | `candidate.py`、`pool.py` |
-| 动机博弈 | 7 项效用分解、沉默效用、**危险率**触发、softmax 选择 | `motivation.py` |
-| 深层刷新 | 低频回头理解旧事件，建议集经接地校验后交 Reducer | `deep_refresh.py`、`providers.py` |
-
-**为什么用危险率而不是阈值**：阈值会让 `0.799` 和 `0.801` 产生完全不同的行为，
-而且改心跳频率就改行为。危险率 `λ(t) = λ₀·softplus(β·D)` 把决策变成时间的连续函数，
-心跳快慢不影响期望行为——这一点有专门的测试守着。
-
----
-
-## 7. 关于模型
-
-**Runtime 不依赖任何生成式模型。** 默认 `SemanticProvider = disabled`，
-所有认知由确定性代码完成；关键路径 `p50 ≈ 1 ms`。
-
-需要更强语义时，可选接一个 **远端** OpenAI 兼容端点，只用于**低频深层认知刷新**
-（重解释旧事件、心理状态语言化），永远不在即时路径上：
-
-```powershell
-$env:CR_SEMANTIC_PROVIDER = "remote_api"
-$env:CR_SEMANTIC_BASE_URL = "https://api.example.com/v1"
-$env:CR_SEMANTIC_API_KEY  = "..."      # 只从环境变量读，绝不落盘/落日志
-```
-
-> **本地模型路线已被放弃。** 实测在目标硬件上单次评价要数秒、常驻约 2 GB，
-> 且最小量化也无法在 1 GB VPS 上运行；架构上它也与主 LLM 重复。
-> 原因、实测数据与留档位置见 `archive/README.md`。
-> 环境里若仍导出 `local_cpu` / `local_gpu` 等退役名字，Runtime 会打印一条
-> WARNING 说明该路线已移除，然后回落到 `disabled`——不会静默失败。
-
----
-
-## 8. 目标硬件
-
-设计目标是**便宜、长期稳定、可维护**的部署：
-
-| 组件 | 常驻内存 | 说明 |
-|---|---:|---|
-| Runtime sidecar | **约 29 MiB** | 纯 Python + SQLite，无 GPU |
-| AstrBot + 主 LLM | 取决于宿主 | 由 AstrBot 自身决定 |
-| 数据库 | 单文件 SQLite | WAL 模式 |
-
-实测（i7-13700H，200 轮完整对话）：
-
-```text
-ingress    p50 0.95 ms   p95 1.32 ms
-lazy_tick  p50 0.38 ms   p95 0.56 ms
-CPU        0.45 s / 200 轮
-```
-
-**弱 VPS 上不需要跑模型**——这也正是放弃本地路线的原因之一。
-
----
-
-## 9. 数据安全与蓝屏恢复
-
-蓝屏/断电是 Windows 上的现实风险，所以持久化按"最坏情况"设计：
-
-- SQLite **WAL + `synchronous=NORMAL` + `BEGIN IMMEDIATE`**：断电可能丢掉最后几个已提交事务，
-  但**数据库永不损坏**（WAL 帧校验和不通过就丢弃尾部）。
-- 一个完整认知轮 = 一个事务：不会出现"改了一半"的状态。
-- `backup` 用 SQLite 在线备份 API，可在**不停机**的情况下拿到一致快照，
-  先写临时文件再原子重命名。
-- `verify` 除 `integrity_check` 外还查 6 项结构一致性（悬空引用、孤儿转移、
-  无过期时间的租约等），损坏时退出码 3 而不是抛裸异常。
-
-```powershell
-# 备份（destination 是位置参数；默认写到数据库同级的 backups/ 下，--keep N 保留最近 N 份）
-companion-runtime --base-dir . backup E:\companion_runtime_backup\manual
-companion-runtime --base-dir . verify --json
-companion-runtime --base-dir . recover --backup-dir E:\companion_runtime_backup
-
-# 容器部署下不需要进容器：在宿主上对卷里的数据库做一致性检查
-docker run --rm -v xiaojiujiu-data:/data xiaojiujiu-runtime:local verify --json
-docker run --rm -v xiaojiujiu-data:/data -v E:\companion_runtime_backup:/backup \
-  xiaojiujiu-runtime:local backup /backup/manual
-```
-
-`--base-dir` 是全局参数（必须写在子命令前）；数据库路径由 `--config` 或
-`CR_STORAGE__DATABASE_PATH` 决定，CLI 本身没有 `--db` 选项。
-
-跨盘快照与完整恢复流程见 `RECOVERY.md`；源码快照在 `E:\companion_runtime_backup\`。
-
----
-
-## 10. 测试
-
-```powershell
+```bash
 cd runtime
-.venv\Scripts\python.exe -m pytest tests -q          # 914 passed, 14 skipped
-
-# 插件测试在插件仓库里（先 git clone，见 §4.2）
-cd ..\astrbot_plugin_companion_runtime
-$env:PYTHONPATH="$PWD\tests\stubs;$PWD"
-python -m pytest tests -q                            # 143 passed + 13 subtests
-
-cd ..
-python scripts\e2e_patch_v02.py                      # 28 项基础真机检查
-python scripts\e2e_resilience_simulation.py --base-dir E:\companion_runtime_backup\resilience-final
-                                                     # 335 项高仿真检查（并发 / 重启 / 断网恢复）
-python scripts\blackbox_user_simulation.py --base-dir E:\companion_runtime_backup\blackbox
-                                                     # 77 项用户黑盒检查（见下，13 个阶段）
-python scripts\e2e_memory_simulation.py --base-dir E:\companion_runtime_backup\memory
-                                                     # 25 项记忆质量检查（见下，8 个阶段）
+python -m venv .venv && .venv/bin/pip install -e ".[test]"
+.venv/bin/python -m pytest tests                 # 1151 passed, 17 skipped
+.venv/bin/python -m companion_runtime.cli --base-dir . serve --host 127.0.0.1 --port 8787
 ```
 
-**用户黑盒仿真**（`scripts/blackbox_user_simulation.py`）是这套验证里最"像用户"的一层：
-它起真的 uvicorn、真的文件 SQLite(WAL)、真的 Scheduler，并通过**插件自身的钩子**收发消息，
-但**只承认用户看得见的事实**——聊天记录里收到了什么、宿主的回复是什么、公开 HTTP 面回答了什么。
-它不读 `runtime.projections.*`、不查库、不 import 内部状态来断言（这是刻意的约束）。
+`--base-dir` 是**全局参数，必须写在子命令前面**，用来解析相对存储路径。
 
-它演的是一个人的十几天：打招呼闲聊 → 说一件有时限的事并保持沉默 → 在没开口的情况下收到主动关心
-→ 回复结果 → 划边界 → 换话题恢复 → 有条主动消息故意不回 → 第二个会话隔离 → 重启 → 重放
-→ 最后回放整条用户视角聊天记录，并审计全局契约：
+### 5.4 ⚠️ 目前没有为自部署做优化
 
-| 契约 | 判定方式 |
+这一条必须说清楚，否则你会以为踩到的是 bug，其实是"还没做"。
+
+**现在的定位是"作者自己能长期跑得住"，不是"别人能顺利部署"。** 具体表现：
+
+| 现象 | 说明 |
 |---|---|
-| 不刷屏 | 任意 24 小时窗口内的主动消息 ≤ 配置上限；相邻两条 ≥ 冷却 |
-| 边界即静默 | 划边界后的窗口内零主动消息，且不再出现被禁话题 |
-| 不重复 | 用户可见消息去重比较；重启与重放都不产生第二份 |
-| **不泄漏** | 用户可见文本里永不出现 `<companion_runtime_context`、「以下是 Runtime 注入」、`companion_runtime`、`api_key`、`Bearer`、`sk-`，以及 `evt_/obx_/att_/cnd_/unf_/emo_/obs_` 形式的内部 id |
-| 会话隔离 | 一个会话的消息不出现在另一个；进程默认会话永不作为收件人 |
-| 每条主动消息都有来由 | 必须落在剧本里"本该发生"的窗口内，且不能出现在静默窗口 |
-| **记得住** | 用户顺口说过一次的事实，过一阵子必须真的被记住，并且**下一次回复时被摆在模型面前**（读的是宿主实际构造的那次请求）；同时每一条记忆都必须能追溯到用户自己打过的话 |
+| 文档和脚本仍按作者的环境写 | 里面还有 `F:\理解痞老板\runtime`、`E:\companion_runtime_backup\` 这类本机路径；换机器要自己替换 |
+| 没有安装向导 / 一键部署 | compose 起来之后必须手改两处配置（`runtime_base_url`、`conversation_id`），改错的表现是"角色永不主动"或"消息投错会话" |
+| 插件不在市场里 | 只能手动 `git clone`，升级靠 `git pull` |
+| 没有 CI、没有版本化发布 | 镜像要自己 build；没有定期发布的 tag 或镜像仓库 |
+| **不是多租户** | 状态是单租户全局的。多人使用要"一人一个 Runtime"（封测用的 fleet 形态就是这么做的），那是运行期的做法，不是产品化的多租户 |
+| 该懂的开关不少 | 语义端口、时间尺度、价值观轴、心跳间隔……默认值能用，但想调就得理解它们 |
+| 端口 / 路径 / 密钥都要自己配 | 而且 8787 一律不能暴露公网 |
 
-最后一行是唯一读宿主请求内容的检查，因为"它记得我"在聊天窗口里的含义就是：
-**下一次它开口时，这件事在它面前**。判定时会把 `【必要记忆】` 那一段单独切出来看，
-而不是在整块注入文本里找关键词——用户刚说过的话本来就在注入文本里，
-不切开就会把"复读上一句"误判成"记住了"。
+**为什么会这样**：这个项目的重心一直在"认知机制对不对"，不在"部署顺不顺"。
+每一条机制都要有测试、仿真和反证（见 §6），这部分吃掉了绝大部分精力。
+部署相关的打磨（向导、发布、文档去本机化）是明确的欠账，**不是有意留的坑**。
 
-它自带 `--fault leak|duplicate|topic|guilt|cross_session|default_session|memory` 七种注错，
-用来证明这些检查**真的会失败**（不是恒真的断言）；`memory` 把维护间隔配到超出整个剧本长度，
-于是三条记忆检查必然失败。0.2.0 就是靠这套仿真抓到两个单元测试完全没覆盖的缺陷：
-已了结的义务被同一句话重新打开、以及群聊里形成的承诺被投递到私聊。
-
-窗口归属按**投递顺序 + 时钟**判定，而不是只看时间戳：世界钟按 2 小时一步走，
-在用户开口同一瞬间、但投递更早的消息，用时间戳会被算进"用户说完之后"的窗口——
-那曾让两条断言随机误报（产品行为本身是对的）。
-
-两个端到端脚本都会**导入插件仓库的代码**（它们驱动的是真实的插件传输层），
-所以本地必须有 `astrbot_plugin_companion_runtime/` 这份克隆；插件缺失时脚本会明确报错，
-而不是悄悄跳过。
-
-**记忆质量仿真**（`scripts/e2e_memory_simulation.py`）是另一层：它不问"接口对不对"，
-只问"它到底记住了什么"。真文件 SQLite(WAL)、出厂默认配置（无模型无密钥）、一个多星期的普通对话，
-25 项检查照着设计文档写：
-
-| 契约 | 判定方式 |
-|---|---|
-| 不是每句话都值得记（§15） | 问候/闲聊/"今天中午吃炒饭"/"嗯" 都不许变成记忆；明确说过的偏好必须记住 |
-| 四类长期记忆（§16） | 偏好 / 稳定知识 / 关系经历 / 情景各自可达，且分类正确 |
-| 修正（§18） | 旧说法被**撤回而不是删除**，新说法记下它取代了谁，角色只相信其中一条 |
-| 两天后还记不记得 | 说过一次的事实两天后仍 `active`，且仍在提示词里 |
-| 淡出≠忘记（§19） | 一周后降为 `low_activation`，但直接相关的问句仍能召回它，召回后回到工作集 |
-| 刚学到的在不在提示词里 | 刚形成的记忆必须出现在 `【必要记忆】` 里（工作集会饱和，不靠排名） |
-| 遗忘不删除（§19） | 所有形成过的记忆都还在，只是状态不同；淡出的不进提示词 |
-| 没有凭空捏造 | 每条记忆都能追溯到用户自己打过的话，原始事件一条不少 |
-
-它只读两个面：**运维面**（`GET /memories`）与**提示词块**（宿主实际拿到的那段）。
-`--fault trivia`（门限归零）与 `--fault no_maintenance`（维护永不运行）用来证明检查会咬。
-
-测试覆盖的重点不是行数，而是**几类容易悄悄坏掉的东西**：
-
-- **不变量**：原始事件不可改、推断不能变成事实、边界压过一切动机、
-  `committed ≠ sent`、隐藏上下文不进永久历史、每个入口都先 `lazy_tick`。
-- **性质**：tick 分解一致性、危险率与心跳频率无关、分层退化、softmax 熵单调。
-- **降级**：模型不可用/超时/返回垃圾/返回非法 JSON 时，系统必须继续工作。
-- **回归**：每个被真实运行抓到过的缺陷都有一条对应的测试。例如：
-  - 一次深层刷新只结算它**真正引用过**的事件，无关积压保持不变；
-  - 主动消息必须投递回**形成该意图的会话**，而不是进程默认会话；
-  - 未尽之事的去重按主题而非单字，否则「面试」和「考试」会因共用「试」而被合并；
-  - 插件状态命令读的字段名必须与 Runtime 实际返回的一致
-    （这条曾因测试桩用了另一个名字而漏过）；
-  - `serve` 必须真的把内源调度跑起来（曾经只监听了 HTTP，角色在标准部署下永不醒来）；
-  - 一条主动消息只算一次当日接触，且只在**投递成功**时计；
-  - 用户的回复只结算**最新一条已发出**的 attempt，且只结算一次；
-  - 授权环节断网（拿不到裁决）不能被当成"业务拒绝"而把意图判死；
-  - `POST /rendered` 在积压超过 100 行时仍要找到本次 attempt 的行，而不是退化成直接路径；
-  - 报表重复、并发重复、进程重启都必须是幂等的。
-
-`scripts/e2e_resilience_simulation.py` 用真实 uvicorn + 真实文件 SQLite(WAL) + 真实插件
-传输层跑 335 项检查，覆盖并发上报、租约过期、断网恢复、多会话路由与重启续跑——
-单元测试证明"这条路径对"，它证明"这套部署在坏天气下也对"。
-
-`runtime/docs/PATCH_V0.2_MAPPING.md` 把设计文档的每一节映射到代码位置与状态，
-并**如实列出未实现的部分**——那份清单比测试数量更能说明现在到哪了。
+如果你要自部署：先读 `runtime/README.md` §15 的弱 VPS 建议，
+再照着 `runtime/README.md` §17 的快速自检确认服务真的活着。
+遇到文档里的本机路径，那是欠账，欢迎提 issue 或直接改。
 
 ---
 
-## 11. 已知边界
+## 6. 验证：它凭什么说自己是对的
+
+验证分四层，每层回答不同的问题：
+
+```bash
+cd runtime && .venv/bin/python -m pytest                       # 1151 passed / 17 skipped
+cd ../framework && ../runtime/.venv/bin/python -m pytest tests  # 293 passed
+
+cd ..   # 四套仿真：都真的起服务、真的走 HTTP
+runtime/.venv/bin/python scripts/blackbox_user_simulation.py --base-dir ./bb-run     # 77/77
+runtime/.venv/bin/python scripts/e2e_resilience_simulation.py --base-dir ./res-run   # 335/335
+runtime/.venv/bin/python scripts/e2e_memory_simulation.py --base-dir ./mem-run       # 25/25
+runtime/.venv/bin/python scripts/relationship_progression_simulation.py --base-dir ./rel-run  # 105/105
+```
+
+| 层 | 回答的问题 | 特点 |
+|---|---|---|
+| 离线测试 | "这条路径对不对" | 快、多，但不证明真机 |
+| 黑盒仿真 | "用户看得见的行为对不对" | 起真 uvicorn + 真 SQLite + **真插件钩子**，只承认聊天记录里的事实 |
+| 韧性仿真 | "坏天气下对不对" | 并发上报、租约过期、断网恢复、重启续跑 |
+| 外接框架 | "改成这样会发生什么" | 运行中拨时间、灌输入、看变量、注错；不改原程序 |
+
+**光"全绿"不够，还要证明检查会咬人**，所以另有三件反证工具：
+
+```bash
+runtime/.venv/bin/python scripts/mutation_design_conformance.py   # 把 bug 放回去：48 个变异应全部变红
+runtime/.venv/bin/python scripts/dead_code_inventory.py            # 无调用方函数 / 无读者配置 / 从未发出的事件
+runtime/.venv/bin/python scripts/business_logic_probes.py          # 三个已修缺陷的改前/改后对照
+```
+
+为什么值得这么麻烦：**这些检查抓到过单元测试完全没覆盖的缺陷，而且都是在"所有测试都绿"
+的时候抓到的**——已了结的义务被同一句话重新打开、群聊里形成的承诺被投递到私聊（黑盒仿真）；
+"长期记忆"的实际有效期只有半天，因为记忆形成约 12 小时后就掉出工作集、再想不起相关问句
+（记忆质量仿真，0.3.1 的十条修复里有八条是它先抓到的）。
+判定方式见 `runtime/README.md` §12 与各脚本头部注释。
+
+---
+
+## 7. 已知边界
 
 诚实列出，避免误以为已经完备：
 
 | 边界 | 影响 |
 |---|---|
+| **没有为自部署优化**（见 §5.4） | 文档带本机路径、无安装向导、无 CI/发布 |
 | 记忆检索是词法降级，无 embedding | 语义相近但用词不同的记忆检索不到 |
 | 没有常驻记忆巩固 worker | 巩固由调用方驱动 |
-| 深层刷新的触发信号部分需调用方提供 | `major_event` / `history_suspect` 等 Runtime 无法自行判断，默认按"不成立"处理 |
-| `user_model_evidence` 只存为解释版本 | 不并入数值用户模型——那只能由真实交互观测训练，否则模型猜测会覆盖实测行为 |
-| 无 Prometheus 导出 | 运维需自己抓 `/health` |
-| 单租户全局状态 | 多会话共用一个 `runtime_state`，`conversation_id` 已贯穿全表，拆分留给后续 |
-| 「平台已发出」与「结果已上报」之间存在崩溃窗口 | 插件在发出前不写结果，若恰好在两步之间被杀，Runtime 只能靠租约到期重投，理论上会重复一条主动消息；真正消除需要平台投递回执或宿主持久化幂等日志 |
-| 授权环节断网时插件保持沉默 | 不写任何结果（fail-closed 也 fail-silent），靠 Runtime 的租约到期回收重投；这会把长时间断网消耗在 attempt 预算上，预算耗尽后按设计终止 |
-| 逾期未回复的 `sent` attempt 不做过期清理 | `sent→resolved` 是唯一合法迁移，超时会凭空捏造历史；它只由用户回复或边界关闭 |
+| 深层刷新的部分触发信号需调用方提供 | "重大事件""历史解释可能错了"这类判断 Runtime 自己下不了，默认按不成立处理 |
+| 单租户全局状态 | 多人要一人一个 Runtime；`conversation_id` 已贯穿全表，拆分留给后续 |
+| "平台已发出"与"结果已上报"之间有崩溃窗口 | 恰好在两步之间被杀时，Runtime 只能靠租约到期重投，理论上会重复一条主动消息。已把"这是重发"暴露给宿主，但真正消除需要平台回执或宿主落盘幂等日志 |
+| 授权环节断网时插件保持沉默 | 靠租约到期回收重投；长时间断网会消耗 attempt 预算，耗尽后按设计终止 |
+| 逾期未回复的已发送尝试不做过期清理 | 那会凭空捏造历史；它只由用户回复或边界关闭 |
 
 ---
 
-## 12. 许可证
+## 8. 许可证
 
-**GNU General Public License v3.0 or later（GPL-3.0-or-later）**，全文见 `LICENSE`。
-Copyright (C) 2026 bomomoQWQ。
+**GPL-3.0-or-later**（全文见 `LICENSE`）。Copyright (C) 2026 bomomoQWQ。
 
-对你实际意味着什么：
-
-- **自己跑、自己改、自己用**：随便用，没有额外义务。GPL 的 copyleft 只在**分发**时触发，
-  把 Runtime 部署成自己的服务（哪怕改了代码）不需要开源你的改动。
-- **把改了的东西发出去**（发二进制、发镜像、发 fork、随产品一起交付）：必须按 GPL-3.0
-  提供对应源码，并保留同样的许可与版权声明。Docker 镜像属于"分发"，所以发布镜像时
-  要一并提供构建它的源码。
-- **"or later"**：你可以选择 GPL-3.0，也可以选 FSF 之后发布的任何更新版本。
-- 上游 AstrBot 是独立项目、独立许可证，本仓库不对它主张任何权利；本仓库只包含通过其
-  公开 API 集成的薄插件。
+自己跑、自己改、自己用随便用——copyleft 只在**分发**时触发，把 Runtime 部署成自己的服务
+（哪怕改了代码）不需要开源你的改动。分发（发镜像、发 fork、随产品交付）则必须按 GPL-3.0
+提供对应源码并保留同样的许可声明。上游 AstrBot 是独立项目、独立许可证，本仓库不对它主张权利。
 
 ---
 
-## 13. 从这里往下读
+## 9. 从这里往下读
 
 | 想了解 | 读 |
 |---|---|
+| **每个认知机制到底怎么工作** | `runtime/README.md` §4（数值动力学、记忆、用户模型、候选与博弈） |
+| Runtime 怎么配、怎么运维、怎么恢复 | `runtime/README.md` §3 / §10 / §17 |
+| HTTP 接口与两套契约 | `runtime/README.md` §9 |
 | 原始设计意图（97 节） | `内源主动型长期陪伴AI_Runtime_完整架构设计.md` |
 | 现行架构与改动理由 | `PATCH_v0.2_即时演出与持久认知分离_移除本地2B核心依赖.md` |
-| Runtime 怎么配、怎么运维 | `runtime/README.md` |
-| 设计 → 代码 → 状态对照 | `runtime/docs/PATCH_V0.2_MAPPING.md` |
-| 插件侧契约与隐私边界 | `astrbot_plugin_companion_runtime/README.md` |
-| 备份、恢复、权重位置 | `RECOVERY.md` |
+| 设计 → 代码 → 状态对照（含缺口） | `runtime/docs/PATCH_V0.2_MAPPING.md` |
+| 业务逻辑审计（三个已修缺陷） | `runtime/docs/BUSINESS_LOGIC_AUDIT.md` |
+| 换机器接手 | `HANDOFF.md` |
 | 为什么不做本地模型 | `archive/README.md` |
+| 备份、恢复、权重位置 | `RECOVERY.md` |
