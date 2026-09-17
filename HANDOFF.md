@@ -615,9 +615,31 @@ transport/bridge/outbox 轮询器；优先级 = 显式 `session_routes` > 注册
    才启用"等待"语义，从未答过时行为与以前完全一致（回落默认实例，不做回归）。
 
 **价值观**：`ValueProfile` 只在实例**第一次建库**时写入 state（`runtime.py:418 → ensure_defaults`），
-之后以库里那份为准——**改 env 对已有实例无效**，必须新建实例或直接改 state。
-本角色一版（已进 fleet env）：`user_care .90 / relationship_maintenance .85 / boundary_respect .92 /
-stability_commitment .85 / emotional_expression .30 / conflict_directness .55 / autonomy .75 / curiosity .70`。
+之后以库里那份为准——**改 env 对已有实例无效**，必须直接改 `runtime_state.values_json`。
+两处都要改：库里那份管已存在的人，`fleet.yml` 那份管新开通的人。
+工具：`scripts/set_value_profile.sh`（改顶部 PROFILE 块即可，自带预测/快照/逐实例核对/同步 fleet.yml）。
+
+当前画像（2026-09-17 起，高依附版）：`boundary_respect .05 / user_care 1.0 /
+relationship_maintenance 1.0 / stability_commitment 1.0 / conflict_directness 1.0 /
+curiosity 1.0 / emotional_expression 1.0 / autonomy .05`
+（旧的是 `br .92 / uc .90 / rm .85 / sc .85 / ee .30 / cd .55 / auto .75 / cur .70`）。
+
+> ⚠️ **8 个轴里有两个是死代码**：`emotional_expression` 与 `autonomy` 只出现在
+> `emotion.appraise_event`，而该函数**没有生产调用方**（入口走
+> `semantic.settlement_to_evaluation`），所以它们目前**不产生任何行为差异**。
+> 设置它们只是为了记录意图。真正生效的是另外 6 个（见下）。
+
+> ⚠️ **"只改价值观"的真实效果是"行动变便宜"，不是"憋不住"**（我一开始算错过，这里记正解）：
+> 价值观只改 restraint / impulse 的**目标值**（`target_drives`，motivation.py:654-681），
+> 而这两个是**状态变量**，以 `tau_restraint 9000s` / `tau_impulse 5400s` 收敛 ⇒ 效果以小时计。
+> 真正的沉默效用是 `motivation.py:214-221`：
+> `U = 0.28 + 0.45*restraint + 0.30*risk + 0.25*cooldown + 0.42*impulse - 1.2*pressure²`。
+> 把 restraint 目标从 sigmoid(0.45)=0.611 压到 sigmoid(-0.2625)=0.435，只让沉默效用降约 0.08；
+> 而 impulse 升高又因 `impulse_gain` 为**正**（有意的设计：想说话让"憋着"更贵）把它加回约 0.05
+> ⇒ **净变化仅约 -0.03**。真正被拉动的是行动侧：`boundary_cost = 0.75*br*max(...)` 随 br .92→.05
+> **塌掉 87%**，实测首条新判决 `advantage` +0.13~+0.20（例：0.3652 → 0.5693）。
+> 所以现在**闸门是 hazard 而不是 utility**：新判决仍是 `hazard_not_triggered`（hazard~5e-5），
+> 她要等 hazard 触发才会开口。想让"憋不住"也变，得动 `CR_SILENCE__*` 系数（用户明确说先不动）。
 
 **当前测试栈布局**：`astrbot-test`(6186/6299) + `xxj-onebot`(6300) + `xxj-napcat-test`(6098，真 QQ 已登录) +
 `xxj-runtime-fleet`(控制面 8800；内部 8787–8799 + 8801，共 14 人) + `xxj-runtime-test`(默认回落实例)。
