@@ -940,6 +940,84 @@ ready_to_send → failed : ActionExecutionError: send_message failed: ApiNotAvai
 > （NapCat 重连、QQ 会话切换）。修之前，每次抖动都会静默吃掉一条她已经决定要说的话，
 > 而且账面上只留一条 `failed`，看起来像"她不想说"。
 
+### 🔴 主动消息**从来没有一条送出去过** —— 根因是"两个 OneBot 客户端"(2026-09-17 定位并验证)
+
+**现象**：6 个实例里 4 个触发了主动（`hazard_triggered` + `acted=1`），文案全部渲染成功
+（`render = delivered`），**发送全部失败**。最早那条（09-16 16:13）是
+`ActionExecutionError: send_message failed: ApiNotAvailable`；其余全是
+`outbox_failed: lease expired` —— 而且**四次都是 137 秒**，正好
+`lease_seconds 45 × max_attempts 3`。
+
+**先说清楚两件事**：
+1. **不是发错人**。对账测试前端 transcript 的 376 条 `send_private_msg`，**全是它自己的模拟号**
+   （20001/20005/20010/20012/29999），真人该收的文案一条都没进去。是"卡在出口"，不是"投给别人"。
+2. **也不是 QQ 掉线**。失败窗口中间（14:46）**有一条回复成功送出**。
+
+**根因（AstrBot 侧，非我们代码）**：主动发送不带 `self_id`。
+
+```python
+# astrbot/core/platform/sources/aiocqhttp/aiocqhttp_message_event.py:103-105
+routing_params = {}
+if isinstance(event, Event) and event.get("self_id"):
+    routing_params["self_id"] = event["self_id"]
+```
+- **回复**：有 event ⇒ 带上 `self_id` ⇒ aiocqhttp 按号找到连接（`api_impl.py:131`
+  `self._api_clients[str(self_id)]`）⇒ 正常。
+- **主动**：`send_by_session` 传的是 **`event=None`**（适配器注释："这里不需要 event"）
+  ⇒ `routing_params` 为空 ⇒ 只能靠 `UnifiedApi.call_action` 在 `_wsr_api` / `_http_api`
+  之间兜底，两者都 `ApiNotAvailable` 就 `raise ApiNotAvailable`。
+  而本栈 NapCat 配置里 `httpServers: []`（没配 HTTP API）。
+
+**为什么兜底会失败**：这个平台上**同时挂着两个 OneBot 客户端** —— 真 QQ（`xxj-napcat-test`，
+反向 WS）和测试前端 `xxj-onebot`（self_id 10001，反向 WS）。"不指定发给谁"遇上"两个客户端"，
+就挑不出来。
+
+**验证**：`docker stop xxj-onebot` 之后，**第一条主动消息真的送达了**：
+
+```
+18:21:56 render leased → 18:22:08 render delivered → 18:22:09 ready_to_send -> sent → delivered
+文案：“对了，之前你提到"同 qq 昵称"，我还没太对上——是指哪个昵称、要同步到哪里呀？不急，你方便再说。”
+```
+
+**现状与后续**：
+- 测试前端**保持停止**（它已完成使命：13 个模拟号早已摘除）。封测期不要把它开回来 ——
+  **一开回来主动投递很可能再次全灭**。
+- 真正的修法在**插件侧**：主动发送不要用 `context.send_message(umo, chain)`（它丢 self_id），
+  而是解析平台实例、按回复路径的写法显式带上 `self_id`。这样就不依赖"平台上恰好只有一个客户端"。
+  未实施。
+- ⚠️ **样本只有 1 次**（改前 5 次全失败、改后第 1 次成功），机制解释与现象一致，但严格说还需复现。
+
+### ⚠️ 已 failed 的 attempt 无法复活（设计不变量，试过两次）
+
+想"只测投递这一跳"时走过这条路，结论值得记下：
+- 把 outbox 行 `failed → pending` ⇒ 2 秒内又 `failed`，错误 `attempt_terminal:failed`。
+- 再把 attempt `failed → ready_to_send`（附审计事件）⇒ **同一条错误**，2 秒内又 `failed`。
+- 判定处是 `authorize.py:208`：`attempt.state in TERMINAL_STATES → "attempt_terminal:{state}"`，
+  且它是**现读库**（`authorize.py:132`）。
+
+⇒ **投递失败一次后，那条消息在系统里不可恢复**，只能等下一条新决定。这是"终态就是终态"的
+刻意不变量，不是 bug。也正因如此，上面那个 `ApiNotAvailable` 修复的价值在于**让这种失败不再发生**，
+而不是"事后能救"。
+
+### ⚠️ 跳时钟做 hazard 实验的四个坑（都踩过）
+
+为了在有限时间里触发一次主动，用 `POST /endogenous {"force":true,"now":"<未来>"}` 推时钟：
+
+1. **一次 45 分钟只值 12%**：`P = 1 − exp(−hazard × Δt)`，`hazard ≈ 4.8e-5`。
+   要到 90% 得 **Δt ≈ 13 小时** —— 无论怎么切片都躲不开这个总量（`hazard_base = 3e-5` 的设计代价）。
+   实测 7 轮 × 45 分钟（累计 57% 把握）**一次都没中**，符合概率。
+2. **冷却会挡住**：刚动作过就有 40 分钟 `cooldown_until`，`force` 只绕过前台屏障和调度闸门，
+   **不绕冷却**（第一次强制就撞在 `cooldown_active` 上）。
+3. **新 outbox 行的 `available_at` 落在未来** ⇒ 插件按挂钟 claim（`available_at <= now`）
+   **永远领不到**，看起来像"插件不工作"。跳钟后必须把 pending 行的 `available_at` 拉回挂钟。
+4. 跳完还要**调和时钟锚点**（`updated_at` / `last_tick_at` / `cooldown_until` /
+   `meta.last_decision_at` / `meta.last_deep_refresh_at`），否则 `last_decision_at` 在未来会让
+   hazard 区间算成负数，**她会被冻结十几个小时**。历史行（decision/attempt）保持原样，
+   只在文档里说明那段是模拟的。
+
+工具：`scripts/hazard_jump_13h.sh`、`scripts/deliver_after_jump.sh`、`scripts/reconcile_clock.sh`。
+快照：`snapshots/2026-09-17_101227`（复活实验前）、`2026-09-17_101901`（跳钟前）。
+
 ### ⚠️ 自己埋的假报警：账本把"没调 provider 的跳过"记成了降级（已修）
 
 `DeepRefreshOutcome.degraded` 默认 `True`（对调用方是保守的正确默认："没有可信建议"），
