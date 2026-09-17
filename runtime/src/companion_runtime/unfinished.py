@@ -328,6 +328,46 @@ SETTLED_MATTER_STATUSES: frozenset[str] = frozenset(
 SETTLED_SUBJECT_RESERVATION_SECONDS = 3 * 24 * 3600.0
 
 
+def already_spoken_for(
+    title: str,
+    sources: Sequence[str],
+    matters: Sequence[UnfinishedMatter],
+) -> bool:
+    """Return whether a proposal restates something a matter already holds.
+
+    Two different ways a proposal can be a restatement, and the deep refresh needs
+    both because it re-reads the *same* unresolved events on every run:
+
+    * **the same source event already produced a matter.** This is the one that
+      actually bites. A refresh that re-reads an event it has already understood will
+      derive the same obligation again, worded differently enough that a title
+      comparison misses it.
+    * **the subject is taken** (:func:`_same_subject`), which catches the same
+      obligation arriving from a *different* event - the wording-independent case.
+
+    Measured on the test deployment before this guard existed: ten open matters
+    traced to two events, five each, created over twelve hours, and not one of them
+    was ever the same matter twice. Nothing resolved them either, so the open set
+    only grew - and every one of them is injected into the context block.
+
+    Args:
+        title: The proposed matter's title.
+        sources: Events the proposal is grounded in.
+        matters: Matters that still own a subject; pass
+            :func:`subject_guards` rather than the open set.
+
+    Returns:
+        ``True`` when the proposal should be dropped as already covered.
+    """
+    wanted = {str(item) for item in sources if item}
+    for matter in matters:
+        if wanted and wanted & set(matter.source_event_ids or ()):
+            return True
+        if _same_subject(title, matter.title):
+            return True
+    return False
+
+
 def subject_guards(
     matters: Sequence[UnfinishedMatter],
     *,

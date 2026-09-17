@@ -655,7 +655,15 @@ class Reducer:
                 elif kind == "memory":
                     self._apply_memory_suggestion(conn, body, sources)
                 elif kind == "unfinished_matter":
-                    self._apply_unfinished_suggestion(conn, body, sources)
+                    created = self._apply_unfinished_suggestion(conn, body, sources)
+                    if not created:
+                        # A restated obligation is not a failure -- it is the refresh
+                        # re-reading something already understood -- so it is recorded
+                        # as a skip rather than counted as an applied operation. The
+                        # source events still count as understood: they were.
+                        skipped.append(f"{kind}:already_spoken_for")
+                        touched.update(sources)
+                        continue
                 elif kind == "user_model_evidence":
                     self._apply_user_model_evidence(conn, body, sources)
                 else:
@@ -827,11 +835,29 @@ class Reducer:
         conn: sqlite3.Connection,
         body: Mapping[str, Any],
         sources: Sequence[str],
-    ) -> None:
-        """Create an unfinished matter proposed by a deep refresh."""
+    ) -> bool:
+        """Create an unfinished matter proposed by a deep refresh.
+
+        Returns:
+            ``True`` when a matter was created, ``False`` when the proposal restated
+            one that already exists.
+
+        The guard is not optional here the way it is on the ingest path. A refresh
+        re-reads the same unresolved events on every run, so an event it has already
+        understood gets interpreted again and the model re-derives the same
+        obligation with fresh wording. Measured: ten open matters from two events,
+        five each, over twelve hours, none resolved. Unbounded growth in the open set
+        is not cosmetic - every matter is injected into the context block and feeds
+        the candidate grounding.
+        """
         title = str(body.get("title") or "").strip()
         if not title:
             raise ValueError("unfinished suggestion requires a title")
+        existing = unfinished_module.subject_guards(
+            self._p.unfinished.list_all(limit=200), now=utcnow()
+        )
+        if unfinished_module.already_spoken_for(title, sources, existing):
+            return False
         unfinished_module.create(
             self._p.unfinished,
             conn,
@@ -847,6 +873,7 @@ class Reducer:
             config=self._config,
             now=utcnow(),
         )
+        return True
 
     def _apply_user_model_evidence(
         self,
