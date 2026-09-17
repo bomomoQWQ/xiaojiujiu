@@ -1649,41 +1649,77 @@ parameter vector for %s")` 并**回退到先验**——也就是**每个既有�
 ——我自己的交接文档写了这个名字，于是第一次扫描没发现它。工具现已改为"私有名字只由代码保活"，
 并且"引用"不只算调用（`resolvable=self._is_resolvable` 就是被当作值传出去的）。
 
-### 🔴 封测反馈"把句号剔除"的真根因：她的回复被切成了**纯标点**（2026-09-17 定位并修复）
+### ⚠️ 封测反馈两项：我先给了一个**错的**结论，这是被纠正后的版本（2026-09-17）
 
 反馈原文：「可以用正则把句号给剔除，以及可以配置一下输入防抖，不然一个消息一回复有点难受」。
 
-**第一项不是"气泡太多"，是正文被丢光了。** 测试栈 `astrbot-test` 的
-`/AstrBot/data/cmd_config.json` 里 `platform_settings.segmented_reply.regex` 被人从默认的
+**我错在哪。** 我先查了 `platform_settings.segmented_reply.regex`，发现它被从默认的
+`.*?[。？！~…]+|.+$`（匹配整句）改成了 `[。？]+`（只匹配分隔符本身）。而
+`result_decorate/stage.py:230` 用的是 `re.findall(regex, text)` —— 命中什么就发什么，命中只有标点，
+于是**逻辑上**她的短回复会被切成 `["。","。"]` 这样的纯标点消息。我据此下了结论：
+"测试者一直收到的是「。」"。
+
+**这个结论是错的。** 用户当场纠正"测试者消息接收是正常的"，NapCat 的发送日志也证实：
+重启前测试者收到的每条都是正文（`没有，冲高回落了。` / `哪部？` / `…不是我看过的片子。`），
+只是**条条带句号**。把"配置是坏的"直接当成了"症状是它造成的"。
+
+**那条坏配置为什么没生效**（两层闸门，任一层都足以让它变成死配置）：
+
+1. `provider_settings.streaming_response = true`，而 `result_decorate/stage.py` 在流式下两次提前 return：
+   `if result.result_content_type == ResultContentType.STREAMING_RESULT: return`（:134-135），
+   以及 `if is_stream: return  # 流式输出不执行下面的逻辑`（:191-193）——**分段回复那段（:208 起）根本到不了**。
+2. 即使不流式，`segmented_reply` 还有平台白名单与 `words_count_threshold` 两道条件。
+
+真实机制是 **`provider_settings.unsupported_streaming_strategy = "realtime_segmenting"`**：
+QQ 的 `support_streaming_message=False`（`aiocqhttp_platform_adapter.py:33`），AstrBot 对这类平台改为
+"边收边发"的实时分段（`respond/stage.py:217-231` → `event.send_streaming(stream, realtime_segmenting=True)`）。
+**多气泡和"每条结尾带句号"都是这条路上的，跟 `segmented_reply` 一点关系都没有。**
+
+**正确的开关**在 `internal.py:347`：
+
+```python
+stream_to_general = (unsupported_streaming_strategy == "turn_off"
+                     and not event.platform_meta.support_streaming_message)
+```
+
+把策略从 `realtime_segmenting` 改成 **`turn_off`**：QQ 这类平台改走普通（缓冲）分支
+（`internal.py:487` 的 `else`，而不是 :452 的流式分支），结果类型不再是 STREAMING_RESULT，
+`result_decorate` 才会执行 —— 先前设的那两条分段配置这时才**第一次真正生效**：
+
+| 项 | 旧 | 新 |
+|---|---|---|
+| `segmented_reply.regex` | `[。？]+` | `[^\n]+`（按段落切，句号不再切） |
+| `segmented_reply.content_cleanup_rule` | `""` | `[。]+$`（剔结尾句号） |
+| `provider_settings.unsupported_streaming_strategy` | `realtime_segmenting` | `turn_off` |
+
+**真人流量验收**（NapCat 发送日志，重启于 19:21:40）：
 
 ```
-.*?[。？！~…]+|.+$          # 匹配"整句(含结束标点)"
+重启前：19:17:49 ✨AstrBot 1群✨。  19:18:10 …有点瘆得慌。  19:18:26 行，就这一句，你听完别让我重来。
+重启后：19:22:22 9月17号，周四      19:22:24 普通的一天，没什么特别。你问这个干嘛
 ```
 
-改成了
+重启后两条：**末尾句号没了**，中间的句号保留（`[。]+$` 只锚定结尾），且按段落分成两条。
 
-```
-[。？]+                     # 只匹配分隔符本身
-```
-
-而 `result_decorate/stage.py:228-234` 用的是 **`re.findall(regex, text)`**：正则命中什么，
-什么就成为一条消息。命中的只有标点，于是她每一句回复都被切成 `["。", "。"]` 这样的
-**纯标点消息**发出去。用她自己 60 条真实历史发言离线复算：旧规则 121 个气泡里绝大多数是
-`"。"`/`"？"`，新规则 117 个气泡全部是正文。
-
-为什么感觉"时好时坏"：`words_count_threshold=60`，**超过 60 字的回复不分段**（整条发出），
-所以长回复一直正常，短回复（大多数）全是标点。这也解释了为什么反馈是模糊的"有点难受"。
-
-**修法（配置，不动 AstrBot 代码）**：
-
-| 项 | 旧 | 新 | 理由 |
-|---|---|---|---|
-| `segmented_reply.regex` | `[。？]+` | `[^\n]+` | 按换行/段落切，一个段落一条，句号不再切 |
-| `segmented_reply.content_cleanup_rule` | `""` | `[。]+$` | 每段结尾的句号剔除（v3.4.28 起的能力） |
-
-两个坑：切分正则是 `findall`，**不能带捕获组**（否则返回的是组），而 `content_cleanup_rule`
-走 `re.sub`，可以带；`cmd_config.json` 带 BOM，读写都要 `utf-8-sig`，且文件是 **root 属主**
+两个实现细节：切分正则走 `findall`，**不能带捕获组**（否则返回的是组）；`content_cleanup_rule`
+走 `re.sub`，可以带。`cmd_config.json` 带 BOM，读写都用 `utf-8-sig`，而且是 **root 属主**
 （`bomomo` 改不了，必须 `docker exec -u 0`）。
+
+## 这件事的教训（比修法本身更值得记）
+
+1. **"配置是坏的"≠"症状是它造成的"。** 必须先证明这段配置所在的代码路径**真的被执行**。
+   AstrBot 里至少两条独立闸门（流式提前 return、平台能力开关）就能让一段配置静默失效。
+   同一类错误今天还犯过两次：镜像 HEALTHCHECK 探错端口、`/schedule` 把 `sent` 算进"准备中"。
+   **先拿"这段代码跑没跑"的证据（日志、产物、真人现象），再谈因果。**
+2. 用户一句纠正比我一整套推理值钱 —— 他手上有我没有的观测面（测试者的实收）。
+3. 顺手记下：`segmented_reply.regex` 的上游 WebUI 提示语（`core/config/default.py:4526`）把
+   `content_cleanup_rule` 的说明复制了过来（"如填写 `[。？！]` 将移除所有的句号、问号、感叹号"），
+   照它填就会**把整条消息换成标点**。测试栈和**线上那台 `astrbot`** 都填了 `[。？]+` ——
+   这是一颗埋在**两台机器**上的哑雷：现在不响（流式挡着），哪天谁关掉流式，短回复立刻变纯标点。
+   值得给上游提 issue。
+4. 另外核实过：测试栈容器能通 `qq.com` 与 `api.deepseek.com`，但 **`github.com` 连接被拒**
+   （`Connection refused`）。所以插件更新必须走**宿主机** `git pull`（`deploy_plugin.sh` 就是这么做的），
+   别在容器里拉代码。
 
 ### ✅ 输入防抖：做在**我们自己的插件里**，不是再装一个第三方插件（2026-09-17 完成）
 
@@ -1723,6 +1759,16 @@ adapter started (..., observe_mode=wake, outbox=on, debounce=2500ms, ...)
 
 `debounce=` 是我为这件事专门加进启动日志的（`9efd25d`）——**防抖没加载和防抖在正常工作，
 日志上完全一样（都是安静的）**，不写出来就只能靠"行为像不像"猜。
+
+**验证到什么程度（别夸大）**：
+
+- ✅ 已证：8 条新单测通过（窗口内三连只触发一次且合并顺序正确、被取代者确实 `stop_event`、
+  超上限丢最早的一条、窗口过后是新一轮、burst 不残留）；部署后启动日志确认
+  `debounce=2500ms`（即配置真的被解析了）。
+- ❌ **未证：真实连发被合并。** 部署后测试者只发了单条消息，没有连发可观察。
+  想常态化验证的话，可以在合并发生时补一行 INFO 日志（"merged N messages into one turn"）——
+  这与我给 `debounce=` 加日志是同一个理由：**安静的成功和安静的没生效长得一模一样**。
+  待做，不要当成已完成。
 
 ### ⚠️ 实测修正：刚接触完的 1 小时内，advantage 会被重复接触惩罚打到 0.08
 
