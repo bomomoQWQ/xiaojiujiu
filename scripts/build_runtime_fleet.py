@@ -35,15 +35,37 @@ SESSION_TEMPLATE = "default:FriendMessage:{person}"
 #: The character's values profile. Values are seeded into a Runtime's state *once*,
 #: when its database is created, so the fleet sets them here -- a person
 #: provisioned later gets them too, and an existing instance is unaffected.
+#: The character's values profile. Values are seeded into a Runtime's state *once*,
+#: when its database is first created (``runtime.py`` -> ``ensure_defaults``); after
+#: that the copy in the database is authoritative, so **changing these does nothing to
+#: an instance that already exists** -- an existing person needs the stored
+#: ``runtime_state.values_json`` edited (see ``scripts/set_yandere_values.sh``).
+#:
+#: The profile below is the "high attachment" one: it is tuned through the axes that
+#: actually reach production code, and only those. Two of the eight are inert today --
+#: ``emotional_expression`` and ``autonomy`` appear only in ``emotion.appraise_event``,
+#: which has no production caller (the ingest path settles through
+#: ``semantic.settlement_to_evaluation``, which carries no values). They are set anyway
+#: so the intent is recorded and a future wiring picks it up.
+#:
+#: What each live axis does (file:line at the time of writing):
+#:   boundary_respect      motivation.py:469 action cost against a boundary,
+#:                         :666 pressure suppresses action, :673 silence utility +0.75x
+#:   user_care             motivation.py:657 drive to resolve an unfinished matter
+#:   relationship_maintenance  motivation.py:664 pull grows with absence,
+#:                         memory.py:414 emotional salience of relationship memories
+#:   stability_commitment  emotion.py:326 feelings decay slower, memory.py:404 long-term memory
+#:   conflict_directness   motivation.py:675 silence utility -0.25x (speaks up instead)
+#:   curiosity             motivation.py:665 approach drive +0.20x
 VALUES = {
-    "CR_VALUES__USER_CARE": "0.90",
-    "CR_VALUES__RELATIONSHIP_MAINTENANCE": "0.85",
-    "CR_VALUES__BOUNDARY_RESPECT": "0.92",
-    "CR_VALUES__STABILITY_COMMITMENT": "0.85",
-    "CR_VALUES__EMOTIONAL_EXPRESSION": "0.30",
-    "CR_VALUES__CONFLICT_DIRECTNESS": "0.55",
-    "CR_VALUES__AUTONOMY": "0.75",
-    "CR_VALUES__CURIOSITY": "0.70",
+    "CR_VALUES__USER_CARE": "0.97",
+    "CR_VALUES__RELATIONSHIP_MAINTENANCE": "0.97",
+    "CR_VALUES__BOUNDARY_RESPECT": "0.35",
+    "CR_VALUES__STABILITY_COMMITMENT": "0.95",
+    "CR_VALUES__EMOTIONAL_EXPRESSION": "0.82",
+    "CR_VALUES__CONFLICT_DIRECTNESS": "0.80",
+    "CR_VALUES__AUTONOMY": "0.35",
+    "CR_VALUES__CURIOSITY": "0.90",
 }
 
 #: Completion budget for one structured provider call.
