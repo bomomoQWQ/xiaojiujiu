@@ -982,10 +982,26 @@ if isinstance(event, Event) and event.get("self_id"):
 **现状与后续**：
 - 测试前端**保持停止**（它已完成使命：13 个模拟号早已摘除）。封测期不要把它开回来 ——
   **一开回来主动投递很可能再次全灭**。
+- **已加防护**：`astrbot.yml` 里给 `frontend` 服务加了
+  `profiles: ["legacy-frontend"]`，所以裸的 `docker compose up -d` **不会**再把它带回来
+  （只是 `docker stop` 挡不住 `up`，这一层拦住那个静默回归）。要跑模拟测试时显式启用：
+  ```bash
+  docker compose -p astrbot_test -f astrbot.yml --profile legacy-frontend up -d frontend
+  ```
+  校验过：默认 `config --services` 是 `runtime, astrbot, napcat-test, runtime-b`（不含 frontend），
+  带 profile 才出现 frontend，其它服务未变。
+- （同一类隐患，但无害，未动：`runtime-b` 也还在 compose 里，裸 `up` 会多起一个单实例
+  Runtime —— 它不接平台，不会影响投递。）
 - 真正的修法在**插件侧**：主动发送不要用 `context.send_message(umo, chain)`（它丢 self_id），
   而是解析平台实例、按回复路径的写法显式带上 `self_id`。这样就不依赖"平台上恰好只有一个客户端"。
   未实施。
 - ⚠️ **样本只有 1 次**（改前 5 次全失败、改后第 1 次成功），机制解释与现象一致，但严格说还需复现。
+- **人格热更新：本轮搁置**（用户 2026-09-17 决定"先算了"）。结论仍然有效、随时可用：
+  人格存在 `data_v4.db` 的 `personas.system_prompt`，但 `get_persona_v3_by_id` 读的是
+  **启动时加载的内存副本**，**直接改库不生效**；只有 `persona_mgr.update_persona()`
+  会顺便重建缓存（`self.personas[i] = persona` + `get_v3_persona_data()`），
+  所以**走 WebUI 人格页或 `PUT /api/personas/by-id` 就是热更新**，不用重启。
+  三条交付路线（WebUI 手改 / 给密码脚本化 / 插件命令从文件热加载）留待以后挑。
 
 ### ⚠️ 已 failed 的 attempt 无法复活（设计不变量，试过两次）
 
