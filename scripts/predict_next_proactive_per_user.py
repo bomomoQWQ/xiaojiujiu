@@ -73,11 +73,17 @@ for path in sorted(glob.glob("/data/*/companion.sqlite3")):
     con.close()
     last_sent = parse(sent["timestamp"]) if sent else None
     window_end = last_sent + dt.timedelta(seconds=REPEAT_WINDOW) if last_sent else None
-    depressed, normal, other = [], [], []
+    depressed, normal, other, denied = [], [], [], []
     for row in dec:  # dec 已按时间倒序 => 每个桶的第一条即"最新"
         when = parse(row["decided_at"])
         adv = row["advantage"]
         if when is None:
+            continue
+        # advantage <= 0 也是真实的判决，但此时 eligible 为空、hazard 根本不算
+        # （motivation.py:902 用的是严格 total > silence），所以它不能当 λ 用。
+        # -99 是"连候选都没有"的哨兵（best = -inf），同样不是 λ。
+        if row["reason"] == "no_candidate_beats_silence" and adv is not None and -50.0 < adv:
+            denied.append(adv)
             continue
         if row["reason"] not in ("hazard_triggered", "hazard_not_triggered") or adv is None:
             other.append((row["decided_at"], row["reason"], adv, row["delta_t"]))
@@ -88,7 +94,7 @@ for path in sorted(glob.glob("/data/*/companion.sqlite3")):
             normal.append(adv)
     records.append({
         "name": name, "st": st, "last_sent": last_sent, "window_end": window_end,
-        "depressed": depressed, "normal": normal, "other": other,
+        "depressed": depressed, "normal": normal, "other": other, "denied": denied,
         "in_window": bool(window_end and NOW < window_end),
     })
 
@@ -134,8 +140,12 @@ for item in records:
         "窗口内 %s 关闭" % cst(item["window_end"]) if item["in_window"] else "正常"))
 
     if not allow or count >= DAILY_CAP or adv_normal is None:
-        reason = ("硬边界禁止" if not allow else
-                  "今日额度用完" if count >= DAILY_CAP else "无实测判决")
+        if adv_normal is None and item["denied"]:
+            reason = ("advantage 恒 ≤ 0（最新 %+.4f）→ eligible 为空、不掷骰"
+                      % item["denied"][0])
+        else:
+            reason = ("硬边界禁止" if not allow else
+                      "今日额度用完" if count >= DAILY_CAP else "无实测判决")
         print("  >>> %s" % reason)
         summary.append((tag, None, None, reason, None))
         continue
