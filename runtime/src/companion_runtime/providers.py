@@ -112,7 +112,10 @@ DEEP_REFRESH_SYSTEM_PROMPT = (
     "不得编造 id。格式样例："
     "{\"reinterpretations\": [{\"sources\": [\"evt_x\"], \"content\": \"当时那句话的意思\", "
     "\"confidence\": 0.6}], "
-    "\"psychological_interpretation\": {\"summary\": \"当前心理状态\"}, "
+    "\"psychological_interpretation\": {\"experience\": \"我此刻心里的感受\", "
+    "\"focus\": \"注意力落在哪里\", \"conflict\": \"心里在拉扯什么\", "
+    "\"impulse\": \"我想怎么做\", \"inhibition\": \"什么拦住了我\", "
+    "\"expression\": \"外在会怎么表现\"}, "
     "\"candidate_intent_operations\": [{\"sources\": [\"evt_x\"], \"operation\": \"add\", "
     "\"intent\": \"想做的事\", \"confidence\": 0.5}], "
     "\"memory_suggestions\": [{\"sources\": [\"evt_x\"], \"summary\": \"值得长期记住的事\", "
@@ -126,8 +129,17 @@ DEEP_REFRESH_SYSTEM_PROMPT = (
     # nothing ever turned those events into feeling: the runtime's own rule appraiser is
     # only consulted for events the rule table already settled, so an event could be
     # understood by a refresh and still leave no trace in how she felt.
-    "event_appraisals 是给 unresolved_events 里你**读懂了情绪分量**的那些事件做一次情绪判定："
-    "direction 取 \"+\"（让你更暖、更想靠近）/ \"-\"（让你难受、退开、被刺到）/ \"0\"（没有情绪重量）；"
+    # The example above used to say `{"summary": "当前心理状态"}`, while both
+    # `parse_explanation` and the reducer's cache writer demand exactly
+    # `experience/focus/conflict/impulse/inhibition/expression` and drop the whole
+    # interpretation when none of them is filled. A model following the example could
+    # therefore never populate the explanation cache: measured on the beta, every
+    # instance had `emotion_explanations` = 0 and every refresh skipped the
+    # interpretation as empty.
+    "psychological_interpretation 必须逐个给出 experience / focus / conflict / impulse / "
+    "inhibition / expression 六个键（每个不超过 120 字），不要换成 summary 之类的别的键名："
+    "运行时读的就是这六个，一个都没填整段会被丢掉。"
+    "event_appraisals 是给 unresolved_events 里你**读懂了情绪分量**的那些事件做一次情绪判定："    "direction 取 \"+\"（让你更暖、更想靠近）/ \"-\"（让你难受、退开、被刺到）/ \"0\"（没有情绪重量）；"
     "impact 是 0 到 1 的强度，0.06 以下等于没有，别浪费在无关紧要的话上；"
     "relation_signal 从 closeness / distance / sorrow / guilt / loss / worry / "
     "appreciation / good_news / bad_news / amusement / uncertain / neutral 里选；"

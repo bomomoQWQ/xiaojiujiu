@@ -616,6 +616,23 @@ class TestRemoteAPIProvider:
         assert example.count('"sources"') == 6
         assert "不得编造 id" in DEEP_REFRESH_SYSTEM_PROMPT
 
+    def test_the_prompt_asks_for_the_explanation_fields_the_runtime_reads(self) -> None:
+        """The interpretation example must use the six keys, not ``summary``.
+
+        Both ``parse_explanation`` and the reducer's cache writer read exactly
+        ``experience/focus/conflict/impulse/inhibition/expression`` and drop the whole
+        interpretation when none of them is filled. The example used to show
+        ``{"summary": "当前心理状态"}``, so a model following it could never populate the
+        explanation cache - measured on the beta: ``emotion_explanations`` was 0 on every
+        instance and every refresh skipped the interpretation as empty.
+        """
+        from companion_runtime.providers import DEEP_REFRESH_SYSTEM_PROMPT, EXPLANATION_FIELDS
+
+        example = DEEP_REFRESH_SYSTEM_PROMPT.split("格式样例：", 1)[1]
+        for field_name in EXPLANATION_FIELDS:
+            assert f'"{field_name}"' in example, field_name
+        assert "不要换成 summary" in DEEP_REFRESH_SYSTEM_PROMPT
+
     def test_bearer_token_is_sent_but_never_stored_in_headers_dict(self) -> None:
         transport = FakeTransport(lambda *_: _reply(GOOD_SUGGESTIONS))
         provider = RemoteAPIProvider(
