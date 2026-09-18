@@ -427,6 +427,13 @@ class OneBotFrontend:
             self.connected_at = time.time()
         self._record("control", "connected", {"url": self.ws_url, "self_id": self.self_id})
         LOGGER.info("onebot connected to %s as %s", self.ws_url, self.self_id)
+        # Announce the lifecycle the moment the socket is up, exactly as a real client
+        # does. Measured against AstrBot 4.28.1's reverse-WS server: a client that stays
+        # silent after the upgrade completes the handshake and then gets dropped again,
+        # and the host never logs "适配器已连接" - so the platform is never registered and
+        # nothing is ever delivered. `send_meta_event` existed but was only reachable
+        # from the CLI and the service HTTP endpoint, i.e. never on the reconnect path.
+        self.send_meta_event("connect")
 
     def _read_loop(self) -> None:
         """Read frames until the peer goes away."""

@@ -199,6 +199,38 @@ class FakeAstrBot:
             time.sleep(0.02)
         raise AssertionError("the API call was never answered")
 
+    def wait_for_message_event(self, *, timeout: float = 5.0) -> dict[str, Any]:
+        """Return the first *message* event, skipping the connect handshake.
+
+        A real OneBot client announces itself with a lifecycle meta event the moment
+        the socket is up (see ``OneBotFrontend._connect_once``), so the first frame the
+        host receives is not the user's message.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                for event in self.events:
+                    if event.get("post_type") == "message":
+                        return event
+            time.sleep(0.02)
+        raise AssertionError("no message event reached the fake AstrBot")
+
+    def wait_for_meta_event(self, *, timeout: float = 5.0) -> dict[str, Any]:
+        """Return the first lifecycle meta event, i.e. the connect handshake."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                for event in self.events:
+                    if event.get("post_type") == "meta_event":
+                        return event
+            time.sleep(0.02)
+        raise AssertionError("the frontend never announced its lifecycle")
+
+    def meta_event_count(self) -> int:
+        """Return how many lifecycle frames have arrived so far."""
+        with self._lock:
+            return sum(1 for event in self.events if event.get("post_type") == "meta_event")
+
 
 def _parse_frame(buffer: bytes) -> tuple[tuple[int, bytes] | None, bytes]:
     """Parse one frame from ``buffer``; returns ``(frame, rest)`` or ``(None, buffer)``."""
@@ -265,6 +297,23 @@ class TestHandshake:
         assert server.headers.get("x-client-role") == "Universal"
         assert server.headers.get("authorization") == "Bearer test-token"
 
+    def test_the_client_announces_its_lifecycle_on_connect(self, fake: Any) -> None:
+        """A reverse-WS client that stays silent after the upgrade is dropped again.
+
+        Measured against AstrBot 4.28.1's aiocqhttp server: the handshake completes
+        (101) and the host then closes the connection without ever logging
+        "适配器已连接", so the platform is never registered and nothing is delivered.
+        Sending the lifecycle frame is what makes the host accept it. The frontend could
+        already build this frame, but only the CLI and the service HTTP endpoint called
+        it - the connect path never did.
+        """
+        server, _frontend = fake
+        event = server.wait_for_meta_event()
+        assert event["meta_event_type"] == "lifecycle"
+        assert event["sub_type"] == "connect"
+        assert event["self_id"] == 10001
+        assert isinstance(event["time"], int)
+
     def test_an_empty_token_sends_no_authorization_header(self) -> None:
         """No token configured means no Authorization header - not an empty one."""
         server = FakeAstrBot()
@@ -290,7 +339,7 @@ class TestEvents:
         """The event carries the fields the adapter and the plugin read."""
         server, frontend = fake
         frontend.send_user_message("你好呀")
-        event = server.wait_for_event()
+        event = server.wait_for_message_event()
         assert event["post_type"] == "message"
         assert event["message_type"] == "private"
         assert event["raw_message"] == "你好呀"
@@ -305,7 +354,7 @@ class TestEvents:
         """Group traffic needs group_id; private traffic must not pretend to have one."""
         server, frontend = fake
         frontend.send_user_message("群里好", group=True)
-        event = server.wait_for_event()
+        event = server.wait_for_message_event()
         assert event["message_type"] == "group"
         assert event["group_id"] == 30001
         assert event["sender"]["role"] == "member"
@@ -379,6 +428,7 @@ class TestReconnect:
         """Dropping the connection leads to a new one, and events flow again."""
         server, frontend = fake
         first = server.connections
+        announced = server.meta_event_count()
         server.drop()
         deadline = time.time() + 8
         while time.time() < deadline and server.connections <= first:
@@ -387,8 +437,14 @@ class TestReconnect:
         deadline = time.time() + 5
         while time.time() < deadline and not frontend.connected:
             time.sleep(0.02)
+        # The handshake has to be repeated on every connection, not just the first:
+        # the host drops a client that reconnects silently.
+        deadline = time.time() + 5
+        while time.time() < deadline and server.meta_event_count() <= announced:
+            time.sleep(0.02)
+        assert server.meta_event_count() > announced, "the reconnect did not re-announce"
         frontend.send_user_message("重连之后还在")
-        assert server.wait_for_event()["raw_message"] in {"你好呀", "重连之后还在"}
+        assert server.wait_for_message_event()["raw_message"] in {"你好呀", "重连之后还在"}
 
     def test_sending_while_disconnected_is_an_error_not_a_crash(self) -> None:
         """A send with no link raises the typed error the callers catch."""
@@ -417,7 +473,7 @@ class TestControlSurface:
         assert status == 200
         assert json.loads(payload)["ok"] is True
         server, _frontend = fake
-        assert server.wait_for_event()["raw_message"] == "从 HTTP 发来的"
+        assert server.wait_for_message_event()["raw_message"] == "从 HTTP 发来的"
 
     def test_state_route_reports_connection_and_counts(self, fake: Any) -> None:
         """GET /state is how a test waits for something to have happened."""
