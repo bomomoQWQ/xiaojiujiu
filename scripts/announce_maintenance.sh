@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # 通过 AstrBot 的 Open API（POST /api/v1/im/messages）以 bot 身份给所有用户发维护公告。
 #
+# ⚠️ 已被 `announce_to_testers.sh` 取代（正文可传参、收件人只取 /fleet-data/people.json 在册的人、
+#    排除 bot 自己与假前端、支持 DRY_RUN）。这个文件留作 9-18 那轮"断网维护"公告的记录。
+#
 # 为什么走这条路：NapCat 没开 HTTP 接口（httpServers 为空），只有一条到 AstrBot 的反向 WS；
 # AstrBot 的 Open API 正是"以 bot 身份发消息"的官方口子，走的就是它连到 NapCat 的那条链路。
 # 鉴权用 JWT（HS256，claim 里要有非空 username），jwt_secret 从 cmd_config.json 读。

@@ -2831,6 +2831,46 @@ bash scripts/boundaries_carryover.sh check  <快照目录>/boundaries   # 复核
 `scheduler.night_penalty 0.30`（深夜开口的额外代价）、`scheduler.max_interval_seconds 900`
 （最长 15 分钟一次内源轮）。想让"掌控欲"更外显，动这几个比再调 values 有效 —— values 已经到顶了。
 
+### 🚀 上线：NapCat 接回 + 公告已发 + 模拟前端保持停止（2026-09-18 21:57 CST）
+
+用户指示："准备上线，启动 napcat，然后发布给所有人一条通知…然后把 astrbot 切换到 napcat，
+然后关闭模拟前端"。全程与实测：
+
+| 时刻（CST） | 事情 | 证据 |
+|---|---|---|
+| 21:55:53 | NapCat 起来并**快速登录成功**（不用扫码） | `正在快速登录 3640344731` / `自动快速登录成功: 3640344731`；`qrcode.png` 是 9-17 的旧文件，说明真有二维码时它才会刷新 |
+| 21:55:54 | AstrBot 适配器连上 | `aiocqhttp(OneBot v11) 适配器已连接` |
+| 21:56:53–57 | 公告发出，**8 个人收到** | NapCat 侧 9 条 `发送 -> 私聊`（含未预期的 bot 自己一条，见下） |
+| 21:57:27 | 728260403 发来「馍馍牛逼」 | 他的库：`user_message` → `foreground_pause` → `context_rendered` ×2 |
+| 21:57:34 | **她回了「馍馍是谁 我认识吗」** | `Prepare to send` + 库里 `assistant_message`；候选 `pending/episodic`，判决 `hazard_not_triggered adv=0.164` |
+
+公告正文（用户给的原文，逐字）：
+`「系统通知」在博馍馍加班加点的维护开发下，苏清徽断网更新维护已经完成，将会在22.10分重新启动服务`
+
+**新工具 `scripts/announce_to_testers.sh "正文" [额外QQ]`**（`announce_maintenance.sh` 已被它取代）：
+走 AstrBot Open API + JWT —— NapCat 没开 `httpServers`，只有一条到 AstrBot 的反向 WS，
+这是"以 bot 身份发消息"的唯一口子。**踩的坑**：第一版还从 AstrBot 库里枚举所有私聊会话兜底，
+收件人变成 22 个：一批早已不存在的压测会话（`HTTP 400 无法获取用户信息`）**外加 bot 自己的 QQ
+（给自己发了一条公告）** ✗。现在只发给 `/fleet-data/people.json` 里在册的人 + 命令行显式追加，
+排除 bot 自己（从 NapCat 配置文件名 `onebot11_<qq>.json` 读出）与假前端 20001，并支持
+`DRY_RUN=1` 只列名单（复核结果：**7 人** ✓）。
+
+**「把 astrbot 切换到 napcat」的真相**：平台配置一直是 `aiocqhttp:6199`
+（`ws_reverse_port: 6199`、token `test-frontend-token`），NapCat 与模拟前端接的是**同一个端点**——
+所以"切换"不是改配置，而是**保证同一时刻只有一个客户端**：NapCat 连上、`xxj-onebot` 保持停止 ✓
+（compose 里那个 `legacy-frontend` profile 就是为此存在的）。
+
+**上线后第一分钟的三条实测**：
+- 994959351 的 `[自动回复] 。` 被 `astrbot_plugin_word_filter` 拦下
+  （`消息被屏蔽词过滤: 匹配到 '[自动回复]'`）**且没有进 Runtime**（他的库 用户消息=0）✓ 防线还在；
+- 2259606745 发了戳一戳（`[ComponentType.Poke]`）+ 两条空消息，没有产生回复 ✓；
+- 插件与舰队的链路活着：每个实例日志里 `outbox/lease` **191 次** ✓（主动消息那条路）。
+
+**⚠️ 新朋友 `3309892640`（自称"小钟"）不在册**：他收到了上一轮和这一轮公告，也回过
+「我是小钟」「你好」「[图片]」，但 `people.json` 里没有他 → **没有实例、没人回他**。
+要收他进测试就得把 `default:FriendMessage:3309892640` 加进 `fleet-data/people.json` 并重建舰队
+（等用户定）。顺带：`people.json` 就是"谁在被服务"的唯一真相，公告/巡检脚本都该以它为准。
+
 
 
 
