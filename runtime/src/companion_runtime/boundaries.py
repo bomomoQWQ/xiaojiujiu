@@ -35,7 +35,7 @@ from .typing import (
     UnfinishedMatter,
     new_id,
 )
-from .utility import clamp, summarize_text, topic_tokens, utcnow
+from .utility import clamp, parse_datetime, summarize_text, topic_tokens, utcnow
 
 LOGGER = logging.getLogger("companion_runtime.boundaries")
 
@@ -553,5 +553,174 @@ def decay_and_persist(
         and (now - b.expires_at).total_seconds() >= expiring_tolerance_seconds
     ]
     return {"active": len(active), "expired": len(expired), "total": len(every)}
+
+
+# --------------------------------------------------------------------------------------
+# carryover: boundaries must survive a data wipe
+# --------------------------------------------------------------------------------------
+
+#: Envelope written by ``companion-runtime boundaries export``.
+BOUNDARY_EXPORT_FORMAT = "companion_runtime.boundaries"
+
+#: Envelope version. Bumped when the payload stops being readable as it is.
+BOUNDARY_EXPORT_VERSION = 1
+
+
+class BoundaryImportError(ValueError):
+    """Raised when a boundary export cannot be trusted to be installed as it is.
+
+    Refusing is the safe direction: the file carries *hard constraints*, and a row that
+    fails to install is not a missing memory, it is a limit the user set that the
+    character then walks through. So an unreadable payload raises instead of importing
+    the part that happened to parse.
+    """
+
+
+def export_boundaries(
+    projection: BoundaryProjection, *, now: datetime | None = None
+) -> dict[str, object]:
+    """Return every declared boundary as a JSON-serialisable envelope.
+
+    Revoked and expired rows are included on purpose: the file is a copy of the table,
+    not a view of it. An export that kept only what is in force today would drop the
+    history of what the user asked for, and a later import could not tell "never
+    declared" from "declared and withdrawn".
+
+    Args:
+        projection: The boundary projection to read.
+        now: Reference time for the active count (default: the wall clock).
+
+    Returns:
+        The envelope: ``format``, ``version``, ``exported_at``, counts and the rows.
+    """
+    moment = now or utcnow()
+    every = projection.list_all(include_revoked=True)
+    return {
+        "format": BOUNDARY_EXPORT_FORMAT,
+        "version": BOUNDARY_EXPORT_VERSION,
+        "exported_at": moment.isoformat(),
+        "count": len(every),
+        "active": sum(1 for boundary in every if boundary.is_active(moment)),
+        "boundaries": [boundary.to_dict() for boundary in every],
+    }
+
+
+def parse_boundary_export(payload: object) -> list[Boundary]:
+    """Validate an export envelope and return the boundaries it carries.
+
+    Args:
+        payload: The decoded JSON document.
+
+    Returns:
+        The boundaries, in the order the file lists them.
+
+    Raises:
+        BoundaryImportError: If the document is not an export this version can install,
+            or if a row is missing a field or carries an unknown boundary type.
+    """
+    if not isinstance(payload, dict):
+        raise BoundaryImportError("the file is not a boundary export (expected a JSON object)")
+    fmt = payload.get("format")
+    if fmt != BOUNDARY_EXPORT_FORMAT:
+        raise BoundaryImportError(
+            f"not a boundary export: format={fmt!r}, expected {BOUNDARY_EXPORT_FORMAT!r}"
+        )
+    version = payload.get("version")
+    if not isinstance(version, int) or version > BOUNDARY_EXPORT_VERSION:
+        raise BoundaryImportError(
+            f"export version {version!r} is newer than this Runtime knows "
+            f"({BOUNDARY_EXPORT_VERSION}); upgrade the Runtime instead of importing part of it"
+        )
+    rows = payload.get("boundaries")
+    if not isinstance(rows, list):
+        raise BoundaryImportError("the export carries no 'boundaries' list")
+    known = {member.value for member in BoundaryType}
+    boundaries: list[Boundary] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise BoundaryImportError(f"boundaries[{index}] is not an object")
+        boundary_id = row.get("boundary_id")
+        if not isinstance(boundary_id, str) or not boundary_id:
+            raise BoundaryImportError(f"boundaries[{index}] has no boundary_id")
+        boundary_type = row.get("type")
+        if boundary_type not in known:
+            raise BoundaryImportError(
+                f"boundaries[{index}] ({boundary_id}) has type {boundary_type!r}, "
+                f"which is not one of {sorted(known)}"
+            )
+        flags: dict[str, bool] = {}
+        for field_name in ("allow_reply", "allow_proactive"):
+            value = row.get(field_name)
+            if not isinstance(value, (bool, int)):
+                raise BoundaryImportError(
+                    f"boundaries[{index}] ({boundary_id}) has a non-boolean {field_name}: {value!r}"
+                )
+            flags[field_name] = bool(value)
+        boundaries.append(
+            Boundary(
+                boundary_id=boundary_id,
+                type=boundary_type,
+                scope=str(row.get("scope") or "all_topics"),
+                allow_reply=flags["allow_reply"],
+                allow_proactive=flags["allow_proactive"],
+                starts_at=parse_datetime(row.get("starts_at")),
+                expires_at=parse_datetime(row.get("expires_at")),
+                revocable_by=str(row.get("revocable_by") or "explicit_user_revoke"),
+                source_event_id=row.get("source_event_id"),
+                revoked_at=parse_datetime(row.get("revoked_at")),
+                note=row.get("note"),
+                subject=row.get("subject"),
+            )
+        )
+    return boundaries
+
+
+def import_boundaries(
+    projection: BoundaryProjection,
+    connection: sqlite3.Connection,
+    payload: object,
+    *,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Install the boundaries of an export into this data directory.
+
+    Written for the wipe workflow: the data directory is archived and rebuilt empty, and
+    everything the character had learned is meant to go with it - except what the user
+    explicitly forbade. Forgetting a limit is not forgetting a memory: the character goes
+    on acting under a rule the user set and no longer remembers setting, which is the one
+    failure a user cannot correct by repeating himself, because the record that he said it
+    is gone.
+
+    Rows are upserted by ``boundary_id``, so an import is idempotent and may be re-run.
+    ``created_at`` records when the row entered *this* data directory; the boundary's own
+    timeline (``starts_at``/``expires_at``/``revoked_at``) is preserved exactly, which is
+    what decides whether it is still in force.
+
+    Args:
+        projection: The boundary projection of the target database.
+        connection: An open write connection (the caller owns the transaction).
+        payload: The decoded JSON document produced by :func:`export_boundaries`.
+        now: Reference time for the active count (default: the wall clock).
+
+    Returns:
+        A summary: how many were installed, how many are in force, and their identifiers.
+
+    Raises:
+        BoundaryImportError: If the payload does not validate. Nothing is installed.
+    """
+    moment = now or utcnow()
+    boundaries = parse_boundary_export(payload)
+    for boundary in boundaries:
+        projection.upsert(connection, boundary)
+    active = [boundary for boundary in boundaries if boundary.is_active(moment)]
+    return {
+        "format": BOUNDARY_EXPORT_FORMAT,
+        "version": BOUNDARY_EXPORT_VERSION,
+        "installed": len(boundaries),
+        "active": len(active),
+        "blocking_proactive": sum(1 for boundary in active if not boundary.allow_proactive),
+        "ids": [boundary.boundary_id for boundary in boundaries],
+    }
+
 
 

@@ -2,6 +2,9 @@
 # 清理 v2：修掉 v1 的两个 bug
 #   - docker run 少了 -i，heredoc 没进容器 -> 归档没执行
 #   - 快照目录是 root 建的，bomomo 写不进去 -> 补快照也要在容器里以 root 身份写
+# 再加一件 v1/v2 都漏掉的事：**用户亲口立的 boundaries 必须先导出、清完再装回去**
+# （步骤 2 与步骤 6）。清库丢的是"学错的记忆"，而 boundaries 是硬约束：丢了它不是少一句话，
+# 是让她继续违反一条用户已经没法再纠正的规矩。
 set -u
 STACK=/home/bomomo/astrbot_test
 BETA=/mnt/xz/xiaojiujiu-beta
@@ -13,7 +16,15 @@ docker stop xxj-onebot >/dev/null 2>&1 || true
 docker stop xxj-runtime-fleet >/dev/null && echo "  舰队已停"
 
 echo
-echo "=== 2) 归档每个人的认知库（docker run -i 这次带上）==="
+echo "=== 2) 导出每个人的 boundaries（清库唯一必须留下的东西）==="
+# 用同镜像单起容器跑 CLI，所以舰队是停的也没关系；导出在归档之前，归档会把实例目录搬走。
+bash "$STACK/src/xiaojiujiu/scripts/boundaries_carryover.sh" export "$SNAP/boundaries" || {
+  echo "  导出失败：不许继续清库（约束会丢）" >&2
+  exit 1
+}
+
+echo
+echo "=== 3) 归档每个人的认知库（docker run -i 这次带上）==="
 docker run --rm -i -v astrbot_test_runtime-fleet-data:/data python:3.12-slim \
   python - "$STAMP" <<'PY'
 import os
@@ -38,7 +49,7 @@ print("  归档后 /data 下剩余: %s" % sorted(os.listdir(root)))
 PY
 
 echo
-echo "=== 3) 补齐快照（以 root 写进 root 拥有的快照目录）==="
+echo "=== 4) 补齐快照（以 root 写进 root 拥有的快照目录）==="
 docker run --rm -i \
   -v astrbot_test_data:/astrbot-data:ro \
   -v "$BETA":/export \
@@ -65,7 +76,7 @@ print("  快照目录内容: %s" % sorted(p.name for p in snap.iterdir()))
 PY
 
 echo
-echo "=== 4) 启动舰队（应新建空库，并按 env 用 yandere 画像）==="
+echo "=== 5) 启动舰队（应新建空库，并按 env 用 yandere 画像）==="
 docker start xxj-runtime-fleet >/dev/null && echo "  舰队已起"
 for i in $(seq 1 40); do
   sleep 5
@@ -85,7 +96,13 @@ for p in d.get('people', []):
 "
 
 echo
-echo "=== 5) 验收：库是空的、画像是 yandere ==="
+echo "=== 6) 把 boundaries 装回新库 ==="
+# 舰队已经在跑也没关系：实例每次判断边界都从库里读（不缓存在内存），装完立刻生效。
+bash "$STACK/src/xiaojiujiu/scripts/boundaries_carryover.sh" import "$SNAP/boundaries"
+bash "$STACK/src/xiaojiujiu/scripts/boundaries_carryover.sh" check "$SNAP/boundaries"
+
+echo
+echo "=== 7) 验收：库是空的、画像是 yandere ==="
 docker exec -i xxj-runtime-fleet python3 - <<'PY'
 import glob
 import json

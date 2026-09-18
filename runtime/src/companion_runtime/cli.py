@@ -14,6 +14,7 @@ Subcommands::
     recover      print (and optionally run) the recovery plan for a data directory
     config       print the effective configuration (redacted)
     health       open the database and print a health summary
+    boundaries   export/import the user's declared boundaries (they must outlive a wipe)
 
 Every command accepts ``--config`` and honours the ``CR_`` environment overrides.
 No command reads, prints or stores an API key: secrets belong to the host
@@ -33,6 +34,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import __version__
+from . import boundaries as boundary_module
 from . import memory as memory_module
 from .config import configure_logging, load_config, resolve_paths
 from .db import Database
@@ -200,6 +202,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("config", help="print the effective configuration (redacted)")
     subparsers.add_parser("health", help="open the database and print a health summary")
+
+    boundaries_cmd = subparsers.add_parser(
+        "boundaries",
+        help="carry the user's declared boundaries across a data wipe",
+    )
+    boundary_actions = boundaries_cmd.add_subparsers(dest="boundaries_command", required=True)
+    boundary_export = boundary_actions.add_parser(
+        "export", help="write every boundary to a JSON file (or to stdout)"
+    )
+    boundary_export.add_argument(
+        "destination", help="target file, or - for stdout"
+    )
+    boundary_import = boundary_actions.add_parser(
+        "import", help="install the boundaries of an export into this data directory"
+    )
+    boundary_import.add_argument(
+        "source", help="a file written by 'boundaries export', or - for stdin"
+    )
+    boundary_import.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate the file and report what it carries, without writing",
+    )
     return parser
 
 
@@ -566,6 +591,89 @@ def cmd_health(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_boundaries(args: argparse.Namespace) -> int:
+    """Export or import the boundaries that have to outlive a data wipe.
+
+    One command rather than two because the two directions are one workflow: the wipe
+    archives a data directory and rebuilds it empty, and what the user explicitly forbade
+    is the one part of it that must come back. Kept next to ``backup``/``restore`` for the
+    same reason - both are durability tools, and both are meant to be run by a script.
+    """
+    if args.boundaries_command == "export":
+        return _export_boundaries(args)
+    return _import_boundaries(args)
+
+
+def _export_boundaries(args: argparse.Namespace) -> int:
+    """Write every boundary of this data directory to a JSON file (or to stdout)."""
+    config = _resolve_config(args)
+    configure_logging(config.server.log_level)
+    runtime = Runtime(config)
+    try:
+        payload = boundary_module.export_boundaries(runtime.projections.boundaries)
+    finally:
+        runtime.close()
+    if args.destination == "-":
+        _emit(payload)
+        return EXIT_OK
+    path = Path(args.destination)
+    if str(path.parent) not in ("", "."):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    # The counts, not the rows: an operator runs this once per person, and the line he
+    # needs is "did this one have anything to carry over".
+    _emit({"written": str(path), "count": payload["count"], "active": payload["active"]})
+    return EXIT_OK
+
+
+def _import_boundaries(args: argparse.Namespace) -> int:
+    """Install the boundaries of an export into this data directory."""
+    config = _resolve_config(args)
+    configure_logging(config.server.log_level)
+    try:
+        # ``-`` reads stdin because that is how the wipe script reaches these instances:
+        # the file lives on the host and the command runs in a container built from the
+        # same image (``docker cp`` into a running fleet has been unreliable), so the
+        # payload is piped rather than mounted.
+        text = sys.stdin.read() if args.source == "-" else Path(args.source).read_text(encoding="utf-8")
+        payload = json.loads(text)
+    except (OSError, ValueError) as exc:
+        print(f"import failed: cannot read {args.source}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if args.dry_run:
+        try:
+            declared = boundary_module.parse_boundary_export(payload)
+        except boundary_module.BoundaryImportError as exc:
+            print(f"import refused: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        _emit(
+            {
+                "source": args.source,
+                "dry_run": True,
+                "would_install": len(declared),
+                "ids": [boundary.boundary_id for boundary in declared],
+            }
+        )
+        return EXIT_OK
+    runtime = Runtime(config)
+    try:
+        with runtime.db.transaction() as conn:
+            result = boundary_module.import_boundaries(
+                runtime.projections.boundaries, conn, payload
+            )
+    except boundary_module.BoundaryImportError as exc:
+        # Refusing is the safe direction, and an operator has to see why: a boundary that
+        # did not install is a limit the character would walk through.
+        print(f"import refused: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    finally:
+        runtime.close()
+    _emit({**result, "source": args.source})
+    return EXIT_OK
+
+
 COMMANDS = {
     "serve": cmd_serve,
     "tick": cmd_tick,
@@ -581,6 +689,7 @@ COMMANDS = {
     "recover": cmd_recover,
     "config": cmd_config,
     "health": cmd_health,
+    "boundaries": cmd_boundaries,
 }
 
 
