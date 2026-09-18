@@ -2631,13 +2631,33 @@ doro/gptimg/weather_amap/zvv 等 8 个）→ 它不是这个角色，所以只�
 （"我告诉你我喜欢喝茶"）一律退回 `episodic` ✓。漏记一句只损失一次回忆；记错一句是把她的话
 当成用户说过的话再复述回去 —— 正是这次要治的病。
 
-**验证**：① 37 行实测/变体人工重放（`.scratch_blackbox/check_subject_rule.py`）**37/37 符合设计** ✓；
-② `tests/test_memory_kind_markers.py` 新增两组参数化（10 行"不是用户"必须退回 episodic +
-8 行真实自述必须保持原 kind；**值门槛归零**，断言的是分类而不是"没存下来" ✓ ——
-否则一个永远答"否"的规则也能全绿）；③ 一条 ingest 端到端用例（证明规则接在生产路径上，
-不只是函数在单元里正确）✓；④ runtime 全量测试通过 ✓；⑤ 部署后在容器里实测：
-`durable_subject_ok("我一哥们很喜欢玩柚子社…","喜欢")` = **False**、
-`("我喜欢打夜羊社的","喜欢")` = **True** ✓。
+**一个已知的语言边界**：`always/prefer/never/hate/love` 这几个英文 marker 现在也要求分句以**中文**
+第一人称开头，所以纯英文自述（"I always drink coke"）会退回 `episodic` ✗，中英混写
+（"我 always 迟到"）照常 ✓。产品的用户是中文，这个损失是主动接受的：要补就得同时给英文代词表
+（I/my/we 与 he/she/they 的区分），而英文子串匹配在中文语料里没有任何验证数据，宁可不做。
+
+**验证**：① 45 行实测/变体人工重放（`.scratch_blackbox/check_subject_rule.py`）**45/45 符合设计** ✓
+（含指示词框"记住我是猫"✓、"我记住了你喜欢喝咖啡"✓、引文"他说「我喜欢打游戏」"✓、
+混写"我 always 迟到"✓）；② `tests/test_memory_kind_markers.py` 新增两组参数化
+（10 行"不是用户"必须退回 episodic + 8 行真实自述必须保持原 kind；**值门槛归零**，
+断言的是分类而不是"没存下来" ✓ —— 否则一个永远答"否"的规则也能全绿）；
+③ 一条 ingest 端到端用例（证明规则接在生产路径上，不只是函数在单元里正确）✓；
+④ runtime 全量 **1214 passed / 17 skipped** ✓（插件仍 **172 passed / 13 subtests** ✓）；
+⑤ 部署后在容器里实测：`durable_subject_ok("我一哥们很喜欢玩柚子社…","喜欢")` = **False**、
+`("我喜欢打夜羊社的","喜欢")` = **True** ✓；
+⑥ **生产端到端**（往假用户实例 `20001` 直接 `POST /v1/events` 灌 5 条，再读回落库的 kind）：
+
+| 灌进去的话 | 落库 kind | 期望 |
+|---|---|---|
+| 我一哥们很喜欢玩柚子社，天天在那喊柚子社天下第一 | `episodic` | ✓ |
+| 因为我 QQ 一直在响！ | `episodic` | ✓ |
+| 我平时喜欢喝手冲咖啡，不加糖 | `user_preference` | ✓ |
+| 我是做后端的，平时在北京上班 | `stable_knowledge` | ✓ |
+| 面试过了，谢谢你那天惦记我 | `relationship` | ✓ |
+
+（这 5 条探针留在 `20001` 假实例的库里 —— 它背后没有真人、随时可清；**8 个真人的库一条没碰** ✓。
+探针脚本 `.scratch_blackbox/probe_production_kinds.sh` 走实例自己的 HTTP API，
+**没有起 `xxj-onebot`** ✓。）
 
 ### 🧷 boundaries 跨清库搬运（同一次，commit `de34192` + `scripts/boundaries_carryover.sh`）
 
@@ -2680,6 +2700,8 @@ bash scripts/boundaries_carryover.sh check  <快照目录>/boundaries   # 复核
 **本次部署记录**：`git pull` → `docker build -q -t xiaojiujiu-runtime:test .` →
 `docker compose -p astrbot_test -f astrbot.yml -f fleet.yml up -d --force-recreate runtime-fleet`
 （重建前先查在飞主动消息：**0** 条 ✓），重建后舰队 **8/8 健康（5 秒）** ✓。
+部署后体检：8 个人画像仍是 `br=0.05 care=1.0` ✓、`boundaries=0` ✓、
+**日志里没有一条 traceback/error** ✓、事件数 1~2 条（清库后测试者真实发的那几条）✓。
 
 
 
