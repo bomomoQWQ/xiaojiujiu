@@ -2122,7 +2122,38 @@ pressure 增长全错位。它现在只差一点点，随时可能过线，但**
 很大（最早比中位早 3.5 小时，最晚晚 6 小时）—— 几何分布本该如此，那张表不能当时刻表用。
 句号修复也确认成功：09-17 有 67% 气泡结尾带句号，**09-18 的 1114 条里只有 4 条（0%）**。
 
-### ✅ 人格反例/正例重写（2026-09-18 18:30 CST）
+### 🧱 存储后端：PG 是选定后端，但**用户决定延后迁移**（2026-09-18 18:45 CST）
+
+用户问"选型上我们用的是 postgresql 吧"，查清后**用户决定：确实要切，但现在太屎山，先算了**。
+把事实与迁移清单记在这里，将来要动时不用重新查。
+
+**事实**：
+- **PG 后端是完整实现且有专门测试**：`runtime/tests/test_db_postgres.py`（~940 行）断言
+  schema/列类型与 SQLite 逐一对齐、往返、锁超时、咨询锁、真实 event-log/prune 语句、
+  约束冲突翻译、DSN 脱敏，以及 `supports_durability_commands is False`。
+  `StorageConfig` 文档：两后端"shape 上刻意等价"，可互迁而不改数据形状。
+- **当前所有 Runtime 都跑 SQLite（每人一个文件）**：容器层
+  `CR_STORAGE__DATABASE_PATH=/data/companion.sqlite3`，舰队在 `runtime_fleet.py:93` 按人覆盖成
+  `/data/<person>/companion.sqlite3` —— 注释写着不这样做所有子进程会写进同一个文件 ✗
+  （= 舰队存在的意义就是防止这种混合）。
+- 宿主上已有 `postgres-ai`（`pgvector/pgvector:0.8.1-pg18-trixie`，跑了两个月），
+  但那是别的项目的，是否共用未定。compose 里没有任何 PG/dsn；镜像里没有 `psycopg`
+  （PG 是延迟导入，SQLite 部署不需要它）。
+
+**将来要切的清单**（按顺序）：
+1. 起**专用** PG 实例（不共用 `postgres-ai`，或明确共用并隔离）；
+2. **每人一个 database 或 schema** —— Runtime 是单会话设计，不能塞同一张表；
+3. 镜像装 `psycopg`；
+4. `storage.dsn` 指向它 + `storage.durability_gap_acknowledged=true`（只是静音那条启动警告，
+   四个命令仍然拒绝 —— PG 的持久化交给服务器工具 WAL 归档 / pg_basebackup / pg_dump）；
+5. **运维脚本要重写**：`snapshot_beta.py` 以及一批按文件写的 dedup / audit / 预测脚本
+   （全部 `sqlite3.connect("file:/data/...")`）要改成 pg_dump 或 SQL；
+6. 用 shape 等价做一次性导入。
+
+**记录下来的权衡（用户已知）**：延后是合理的（现在动要同时碰舰队、镜像、运维脚本）；
+但**越晚切，基于文件写的脚本越多** ✗ —— 所以如果真要切，最省事的顺序是**先把新脚本收敛到
+`open_database(StorageConfig)` 这个后端中立入口**，而不是事后重写。这条只记着，没动代码。
+
 
 用户指出两点：① 人格里的"反例/正例"**自己就用 Markdown**（`**`、`>`、反引号），与它上面第 2 条
 "不用 Markdown" 直接冲突，而模型最容易模仿示例的排版；② 例子**不够符合人格设定**（语气是中性
