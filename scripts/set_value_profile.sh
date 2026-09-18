@@ -5,21 +5,38 @@
 # 之后以库里那份为准（runtime.py -> ensure_defaults）。所以改 env 对已存在的实例无效，
 # 必须直接改 runtime_state.values_json；本脚本两个都改（现有实例 + fleet.yml/env）。
 #
-# 8 个轴里有两个目前是**死代码**：emotional_expression 与 autonomy 只出现在
-# emotion.appraise_event，而该函数没有生产调用方（入口走 semantic.settlement_to_evaluation，
-# 不带价值观）。它们仍然设置，一是记录意图，二是将来接线即生效。
+# ============================ 画像从哪来（2026-09-18 重新推导）============================
+# 依据：人格设定.md（苏清徽 / 病娇·偏执·掌控欲强·凶狠直白·短）。逐轴对应关系：
 #
-# 生效的轴与位置（当前代码）：
-#   boundary_respect          motivation:469 越界成本 / :666 压力抑制 / :673 沉默效用 +0.75x
-#   user_care                 motivation:657 未了之事的驱力 +0.90x
-#   relationship_maintenance  motivation:664 缺席拉力 / memory:414 关系记忆显著度
-#   stability_commitment      emotion:326 情绪衰减更慢 / memory:404 长期记忆
-#   conflict_directness       motivation:675 沉默效用 -0.25x
-#   curiosity                 motivation:665 接近驱力 +0.20x
+#   轴                        人格里的证据                     机制位置（当前代码）
+#   conflict_directness   「凶狠、威胁…富有攻击力…直来直去」   restraint -0.25v；沉默效用 -0.25v
+#   relationship_maintenance「掌控欲过于强」「病娇」「偏执」     缺席拉力 (1.55+0.30v)；关系收益 0.5v；
+#                                                            情绪敏感 ×(0.6+0.8v)；记忆显著 ×(0.6+0.6v)
+#   stability_commitment  「偏执狂」= 放不下                   情绪衰减 ×(1-0.35v)；记忆稳定 0.30+0.30v；
+#                                                            restraint +0.35v；关系收益 0.2v；敏感 ×(0.7+0.6v)
+#   user_care             「我不想生气」「明天几点体检，报给我」 impulse +0.90v·unfinished；敏感 ×(0.6+0.8v)；
+#                                                            关系收益 +0.3v
+#   emotional_expression  「病娇」= 对方一句话就起波澜          敏感 ×(0.7+0.5v)   ★今天起才真正生效
+#   autonomy              「冷静的」= 表面冷，不是不敏感        敏感 ×(1-0.25v)    ★今天起才真正生效
+#                         低值=不被自我容纳削弱；她的机制含义
+#                         与字面"自主"相反，别按字面调
+#   boundary_respect      「掌控欲过于强」= 不顾忌（但明确声明的 越界成本 ∝v；restraint +0.75v；
+#                         边界仍由 authorize 硬拦，与 values 无关）边界压力抑制 -0.35v
+#   curiosity             人格未提及 —— 唯一机制是 impulse +0.20v（"没什么事也想开口"），
+#                         而"没理由也想打个招呼"正是掌控型人格的开口方式，故保持满值
 #
-# 安全边界（与 values 无关，压低 br 不会突破）：
-#   用户明确声明的边界 = authorize.py:112 硬拦（boundary_blocks_proactive / reply_not_permitted）
+# ★ 2026-09-18 更正一处过期注释：`emotional_expression` 与 `autonomy` **不再是死代码**。
+#   当天把 ingest 的情绪判定接到 `emotion.appraise_event`（runtime.py 内
+#   "appraisal_source = rule/coarse_rule" 那段），而它正是唯一读这两个轴的函数。
+#   于是这两个轴从"只是记录意图"变成真的在算：线上画像的情绪敏感度乘子
+#   = 1.4×1.3×0.9875×1.4×1.2 ≈ 3.02×（设计文档示例画像只有 1.43×）。
+#
+# 安全边界（与 values 无关，压低 br 突破不了）：
+#   用户明确声明的边界 = authorize.py 硬拦（boundary_blocks_proactive / reply_not_permitted）
 #   频率硬上限 = drive.cooldown_seconds 2400s、drive.max_contacts_per_day 12
+#   声明窗口长度本身：boundaries.detect_boundaries 只允许**延长**不允许缩短
+#   （2026-09-18 修：br=0.05 曾把"今天不要主动联系我"的 24h 缩成 20.76h）
+# ======================================================================================
 set -u
 BETA=/mnt/xz/xiaojiujiu-beta
 FLEET=/home/bomomo/astrbot_test/fleet.yml
@@ -39,14 +56,33 @@ PROFILE_JSON='{
 
 echo "=== 0) 目标画像与预测 ==="
 python3 - "$PROFILE_JSON" <<'PY'
-import json, sys
+import json
+import sys
 
 target = json.loads(sys.argv[1])
 print("  " + json.dumps(target, ensure_ascii=False))
-silence = lambda p: 0.75 * p["boundary_respect"] + 0.35 * p["stability_commitment"] - 0.25 * p["conflict_directness"]
-print(f"  沉默效用 0.75*br+0.35*sc-0.25*cd = {silence(target):.4f}  （改版前是 0.8500）")
-print(f"  情绪衰减 1-0.35*sc = {1 - 0.35 * target['stability_commitment']:.4f}  （越小越放不下）")
-print(f"  记忆稳定 0.30+0.30*sc = {0.30 + 0.30 * target['stability_commitment']:.4f}")
+sensitivity = (
+    (0.6 + 0.8 * target["relationship_maintenance"])
+    * (0.7 + 0.6 * target["stability_commitment"])
+    * (1.0 - 0.25 * target["autonomy"])
+    * (0.6 + 0.8 * target["user_care"])
+    * (0.7 + 0.5 * target["emotional_expression"])
+)
+restraint_logit = (
+    -0.40
+    + 0.75 * target["boundary_respect"]
+    + 0.35 * target["stability_commitment"]
+    - 0.25 * target["conflict_directness"]
+)
+print(f"  情绪敏感度乘子 = {sensitivity:.2f}x（设计文档示例画像 = 1.43x）")
+print(f"  restraint logit（无边界压力/不忙）= {restraint_logit:+.4f}"
+      f"  => sigmoid {1 / (1 + pow(2.718281828, -restraint_logit)):.4f}"
+      f"（示例画像 0.4410 => 0.6085）")
+print(f"  记忆稳定 0.30+0.30*sc = {0.30 + 0.30 * target['stability_commitment']:.4f}"
+      f"   情绪衰减 1-0.35*sc = {1 - 0.35 * target['stability_commitment']:.4f}")
+print("  实测参照（.scratch_blackbox/compare_value_profiles.py，同一段历史）：")
+print("    示例画像 48h 内不开口（no_candidate_beats_silence，boundary_cost 0.1359）")
+print("    该画像   8.5h 开口（hazard_triggered，boundary_cost 0.0077、relation 0.1975）")
 PY
 
 echo
@@ -74,7 +110,8 @@ for path in sorted(glob.glob("/data/*/companion.sqlite3")):
     got = json.loads(con.execute("select values_json from runtime_state").fetchone()[0])
     ok = all(abs(got.get(k, -1) - v) < 1e-9 for k, v in target.items())
     print(f"  {person}: {'OK' if ok else 'MISMATCH'}  br={got.get('boundary_respect')} "
-          f"uc={got.get('user_care')} cd={got.get('conflict_directness')} sc={got.get('stability_commitment')}")
+          f"uc={got.get('user_care')} cd={got.get('conflict_directness')} sc={got.get('stability_commitment')} "
+          f"ee={got.get('emotional_expression')} au={got.get('autonomy')}")
     con.close()
 PY
 

@@ -214,9 +214,17 @@ def detect_boundaries(
             continue
         hours = rule.hours
         if hours is not None:
-            # A character with strong boundary respect honours the window a
-            # little longer rather than shorter.
-            hours *= 0.85 + 0.3 * state.values.boundary_respect
+            # A character with strong boundary respect honours the window a little
+            # *longer* rather than shorter - and never shorter. The window is the
+            # user's ("今天不要主动联系我" means the day they asked for); the value axis
+            # is only about how much longer a respectful character waits. Measured on
+            # the shipped yandere profile (``boundary_respect = 0.05``) the plain
+            # scaling turned that day into 20.8 hours, i.e. she was free to contact
+            # the user again three hours before the day they asked for. That is the
+            # one thing the safety rule already promises the values cannot touch
+            # (``authorize`` ignores them for a declared boundary), so the scaling is
+            # one-sided here too.
+            hours *= max(1.0, 0.85 + 0.3 * state.values.boundary_respect)
         expires = reference + timedelta(hours=hours) if hours is not None else None
         candidate = Boundary(
             boundary_id=new_id("boundary"),

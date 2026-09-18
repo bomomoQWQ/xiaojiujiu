@@ -418,6 +418,39 @@ def test_open_ended_phrasings_are_never_time_boxed(text: str) -> None:
     assert boundaries[0].is_active(BASE_TIME + timedelta(days=365))
 
 
+def test_a_personality_can_never_shorten_a_declared_window() -> None:
+    """The window a user asked for is the user's, not the character's.
+
+    ``detect_boundaries`` scales the rule's window by ``boundary_respect``
+    (``0.85 + 0.3 * br``), so the shipped yandere profile - ``br = 0.05`` - turned
+    "今天不要主动联系我" into a 20.8-hour limit: she would be free to contact the user
+    again three hours before the day they asked for, and the user would experience
+    that as their request being ignored. A declared boundary is the one thing the
+    safety rule already promises the value axes cannot touch (``authorize`` never
+    reads them), so the scaling may only ever *extend* a window.
+    """
+    for br, at_least in ((0.0, 24.0), (0.05, 24.0), (0.5, 24.0), (1.0, 27.0)):
+        state = RuntimeState()
+        state.values.boundary_respect = br
+        boundaries = boundary_module.detect_boundaries(
+            make_event("今天不要主动联系我。"),
+            state=state,
+            config=RuntimeConfig(),
+            now=BASE_TIME,
+        )
+        assert len(boundaries) == 1, br
+        expires = boundaries[0].expires_at
+        assert expires is not None
+        window = (expires - BASE_TIME).total_seconds() / 3600.0
+        assert window >= at_least, f"br={br} shortened the declared window to {window:.2f}h"
+        assert window <= 28.0, f"br={br} stretched the declared window to {window:.2f}h"
+        assert boundaries[0].allow_proactive is False
+        assert boundaries[0].allow_reply is True
+        # The boundary is in force for the whole window and lapses after it.
+        assert boundaries[0].is_active(expires - timedelta(minutes=1))
+        assert not boundaries[0].is_active(expires)
+
+
 def test_boundary_lifecycle_and_expiry() -> None:
     """Boundaries apply inside their window and lapse afterwards."""
     boundary = Boundary(
