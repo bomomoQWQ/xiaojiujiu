@@ -207,7 +207,58 @@ tools = ['web_search_tavily', 'tavily_extract_web_page', 'future_task', 'send_me
 
 ---
 
-## 5. 审阅结论（按我建议的处理顺序）
+## 5. 代码层面的注入点清单（谁、在哪一行、注入什么）
+
+### 5.1 AstrBot（上游代码，我们不碰）
+
+| 注入内容 | 位置 | 落到请求的哪一部分 | 模板 / 文本 | 本机是否生效 |
+|---|---|---|---|---|
+| 人格 | `astr_main_agent.py:960`（`_ensure_persona_and_skills`） | `system_prompt` 头部 | `# Persona Instructions` + 人格全文 | ✅ 732 字 |
+| Skills 清单 | 同上 | `system_prompt` | 4 个技能描述 + 7 条 rules + "User has not enabled the Computer Use feature…" | ✅ 约 2400 字 |
+| 工具使用提醒 | 同上（末尾） | `system_prompt` 末尾 | `When using tools: never return an empty response; …` | ✅ |
+| 子代理路由 | `:678-679` | `system_prompt` 末尾 | `router_system_prompt`（配置项） | ❌ 未配置 |
+| **定时唤醒**（她自建 cron 触发） | `cron/manager.py:488` | `system_prompt +=` | `PROACTIVE_AGENT_CRON_WOKE_SYSTEM_PROMPT`：`You are an autonomous proactive agent… Use \`send_message_to_user\` tool…` + `{cron_job}` | ⚠️ `cron_jobs` 表 0 行（当前没有）；但她手里有 `future_task` 工具，**用一次就会产生** |
+| **后台任务完成唤醒** | `astr_agent_tool_exec.py:597` | `system_prompt +=` | `BACKGROUND_TASK_RESULT_WOKE_SYSTEM_PROMPT`（同上风格）+ `{background_task_result}` | ⚠️ 同上 |
+| Live 实时对话 / ChatUI GenUI | `astr_main_agent_resources.py:78` / `:61` | `system_prompt` | TTS 实时对话说明 / `<html-genui>` 说明 | ❌ 不适用 |
+| 系统提醒 | `:899-939` | **内容片段** | `<system_reminder>` + `User ID: …, Nickname: …` + `Current datetime: 2026-09-18 16:15 (CST), Weekday: Friday` | ✅ |
+| 知识库 | `:299-309` | 内容片段 | `[Related Knowledge Base Results]:\n{…}` | ❌ `knowledgebase = null` |
+| 知识库（工具模式） | `:316-320` | 工具 | `KnowledgeBaseQueryTool` | ❌ 同上 |
+| 引用消息 | `:894-896` | 内容片段 | `<Quoted Message>\n{…}\n</Quoted Message>` | 视消息而定 |
+| 引用图说明 | `:881-884` → `:733` | `text_chat(prompt=…)` + 内容片段 | 发送的 prompt 是 `Please describe the image content.`；结果包成 `<image_caption>…</image_caption>` | ✅ 配了 `default_image_caption_provider_id`（`博馍馍的ChatGPT-Plus/gpt-5.6`）→ 引用图会走这条 |
+| 图片说明失败占位 | `:739` | 内容片段 | `[Image Captioning Failed]` | 视情况 |
+| 附件路径 | `:745` `:751` `:757` `:778/:799` `:1384` `:1402` `:1412` `:1417` | 内容片段 | `[Image Attachment: path …]`、`[Audio Attachment: path …]`、`[Video Attachment: name …, path …]`、`[File Attachment: name …, path …]`、`[Image unavailable]`，以及各自的"quoted message"版本 | 视消息而定 |
+| 侧栏摘录 | `:1587-1595` | 内容片段 | `The user is asking in a side thread…<selected_excerpt>…</selected_excerpt>` | ❌ WebUI 专用 |
+| 文件摘要兜底 | `:341-342` | **用户 prompt** | 没有 prompt 时设成 `总结一下文件里面讲了什么？` | 视情况 |
+| 附件占位 prompt | `:1609` | **用户 prompt** | `<attachment>` | 视情况 |
+| prompt 前缀 | `:953`（`_apply_prompt_prefix`） | 用户 prompt | `prompt_prefix = "{{prompt}}"` → 实际原样 | ✅ 无实质影响 |
+
+关键机制：**内容片段（`extra_user_content_parts`）会被拼到最后一条 user 消息后面**
+（`provider/entities.py:213`、`openai_source.py:1381-1387`），所以"系统提醒"和"我们注入的块"都不是
+system prompt 的一部分，而是紧贴用户原话的一坨文本 —— 这决定了模型怎么看待它们的权威性。
+
+### 5.2 我们自己的代码
+
+| 注入内容 | 位置 | 落到哪 | 文本 | 生效条件 |
+|---|---|---|---|---|
+| Runtime 上下文块 | 插件 `main.py:756-798`（`_inject_context`，由 `on_llm_request` 调） | `req.extra_user_content_parts`，用 `TextPart(text=…).mark_as_temp()` 追加 | Runtime `POST /context/render-block` 的整段（617 字，逐字见 §1.4） | ✅ `inject_enabled=True`；Runtime 不可达或缺 `TextPart`/`mark_as_temp` 时**放弃注入**（fail-open） |
+| 主动消息的 prompt | Runtime `api_v1.py:597-649`（`_render_payload`）→ 插件 `astrbot_executor.py:52-94`（`render`）→ `context.llm_generate(prompt=…)` | **一次性生成调用**（不走 agent 流水线） | 块（去掉 `- 想做的事：` 行）+【现在要写的话】+ 意图/目的/约束 + 输出要求 | ✅；`system_prompt=""` ✗（见 §2） |
+
+### 5.3 第三方与其他
+
+- **`zz_kb_probe`（测试栈里唯一的第三方插件）不注入任何提示词**：它只挂了
+  `@filter.on_astrbot_loaded()`（`main.py:67`），是启动期探针。
+- **工具 schema 本身也是注入**：`web_search_tavily`、`tavily_extract_web_page`
+  （来自 `provider_settings.web_search = True`）、`future_task`（`core/tools/cron_tools.py:55`）、
+  `send_message_to_user`（`core/tools/message_tools.py:81`）。`get_llm_tool_manager()` 还会带上
+  **所有插件注册的工具**（我们没注册）。
+
+> ⚠️ **由此暴露一个架构层面的口子**：`send_message_to_user` 让**她在任何一轮对话里直接给用户发消息**，
+> 完全绕过 Runtime 的 `authorize`/冷却/每日上限；`future_task` 则会在未来唤醒一个**带独立
+> "autonomous proactive agent" 系统提示词**的 agent 去发消息。也就是说"什么时候开口"目前有
+> **三条并行通道**：①我们 Runtime 的 outbox（无人格 ✗）②`future_task`→cron 唤醒 ③
+> `send_message_to_user` 当场发。按你原本的架构（Runtime 独占"何时说话"），②③ 应该关掉或至少收口。
+
+## 6. 审阅结论（按我建议的处理顺序）
 
 1. **【高】路径 B 没有 system_prompt** —— 她"主动开口"时没有身份、没有文风约束，与对话轮是两个人。
    两条路可选：(a) 在 `_render_payload` 里加一段我们自己的文风约束（不依赖宿主，改动小）；
