@@ -2344,6 +2344,45 @@ user_preference: 8}` —— **16 条 durable vs 31 条 episodic** ✓（修复�
   **情绪状态**缓存 ✓，而未决事件不动情绪 ✓ → 积压时块会滞后 ✓（自洽但要知道 ✓）。
 - 小瑕疵：`boundaries` 里 `user wants space for now` **重复两行** ✗（且是英文 ✓，边界抽取器写的 ✓）。
 
+### 🚀 上线准备：已清理 + runbook 就位（2026-09-18 20:55 CST）
+
+用户指示"清理一下历史和聊天记录，做上线准备"。做了（**先快照、再清理，全程可回滚** ✓）：
+
+**快照**：`/mnt/xz/xiaojiujiu-beta/snapshots/2026-09-18_124843/`
+—— 8 个人的 `companion.sqlite3` + 运行日志、`astrbot_data_v4.db`、`cmd_config.json`、
+两个插件配置、`astrbot.yml` / `fleet.yml`、人格文件、`fleet_routes.json` / `fleet_status.json` /
+`manifest.json` ✓ **全在一个目录** ✓。
+
+**清理**：
+- 8 个人的认知库整体归档到卷内 `/data/_wiped-20260918-205109/`（**可回滚，不是删除** ✓）；
+- AstrBot 聊天记录：**20 个会话 / 2149 条消息 → 0** ✓（`personas` 1 行、全部配置保留 ✓）；
+- 模拟前端 `xxj-onebot` **停掉**并保持停止 ✓。
+
+**重启后验收（实测）**：8 个实例 `raw_events=0 / memories=0` ✓ —— **全是空库** ✓，
+且画像**自动就是 yandere**（`br=0.05 care=1.0 cd=1.0` ✓✓）—— 因为画像来自 fleet 容器的 env ✓，
+所以 `2259606745` 那个"中性画像"的坑**被永久修掉了** ✓（新库一律按 env 播种 ✓）。
+顺带：`1670681411` 里我跳钟留下的未来时间戳也随库清掉了 ✓。
+
+**上线 runbook**：`scripts/relaunch.sh`（已放到服务器 `/home/bomomo/astrbot_test/relaunch.sh` ✓）
+```
+bash relaunch.sh          # 舰队 -> 检查前端必须停 -> NapCat(自动取二维码到 $STACK/qrcode.png) -> AstrBot -> 自检
+bash relaunch.sh check    # 只看当前状态
+```
+它把三条**踩过的坑**写进了注释与行为 ✓：① **绝不要同时起 `xxj-onebot`**（两个 OneBot 客户端会让
+主动发送全部失败 ✗，历史上整整一天没送出一条 ✓）；② NapCat 重启掉登录态要扫码 ✓；
+③ AstrBot 起来后必须等「适配器已连接」才让人发消息 ✓，那之前消息会**静默丢失** ✓。
+
+**上线时的已知取舍/遗留**（都不阻塞）：
+- `rate_limit` 仍是 `{60s, 30条, stall}` ✓（没改成 discard —— 有了 word_filter 挡住自动回复，
+  这一层兜底可以不动 ✓；要改就是一个配置项 ✓）；
+- 存储仍是 SQLite 每人一个文件 ✓（PG 迁移按用户决定延后 ✓，清单已记在本文档）；
+- 自动开通的假用户实例 `20001`（port 8794）在舰队里**仍有一个空库** ✓ —— 因为它的路由在
+  `fleet_routes.json` 里 ✓，`deprovision` 不认非配置人员 ✓；没人连它就永远不会有数据 ✓，
+  要彻底去掉得在舰队停止时删掉那条路由 ✓（非必须 ✓）；
+- `zz_kb_probe`（测试者装的探针插件）保留 ✓；情绪层**未做**的两件（`EMOTION_EXPLAIN` 无触发者 ✓、
+  规则词表缺"工具/自作多情"这类词 ✓）仍待做 ✓。
+
+
 
 `new_string` 里写回去，于是正文"裸"在别的小节下面 ✗（已补回 a+c 标题 ✓）。以后用标题做锚点时，
 `new_string` 必须把它一起写回来 ✓；另外本文件**不要用 grep 工具搜中文** ✗（匹配不到，用 `read`
