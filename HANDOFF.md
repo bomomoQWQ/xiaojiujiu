@@ -2136,4 +2136,29 @@ doro/gptimg/weather_amap/zvv 等 8 个）→ 它不是这个角色，所以只�
 文风约束，不依赖宿主）；② 修那个标错的时间（并把时间来源统一：块里只留相对量，绝对时间在主动渲染
 那条路上单独补一行正确的本地时间）；③ 顺手把 `personas.skills` 设成 `[]` 去掉 Skills 噪声。
 
+#### ✅ ①②③④ 已做完并实证（2026-09-18 17:40 CST，commit `a2bba67` + 部署）
+
+用户的指示是："skill块设置一下，改下2修一下，关于主动人格，考虑到系统上文一般都是开始是注入的，
+我们默认系统上下文是注入好的，但是关于提问问题，文风限制还是要有的" —— 即 ③ 做、② 修、
+①只补文风（不重复注入人格）、并且**提问也要受文风约束**。另外用户两次更新了 `人格设定.md`（变得更凶、
+更病娇自述），要求同步。
+
+| 项 | 做法 | 实证 |
+|---|---|---|
+| ③ Skills 块 | `UPDATE personas SET skills='[]'`（`astr_main_agent.py:580-585`：空列表=该角色不要任何技能） | trace 的 `system_prompt` **4210 → 1051 字**；`## Skills` False、`Computer Use` False ✓ |
+| 人格同步 | `人格设定.md`（779 字）经 `docker cp` 送进容器后写入 `personas.system_prompt`，旧版 732 字备份到 `/home/bomomo/astrbot_test/data/persona_backup_*.txt`（另有 `data_v4.db.bak-persona-*`） | trace 里含新版特征词"富有攻击力" True ✓ |
+| ② 时间 | `build_time_context` 的本地 ISO 改用**原生** `datetime.isoformat()`（保留 +08:00），新增 `local_display`；`render_block` 用它 | 注入块现在打印 `- 当前本地时间：2026-09-18 17:39 周五（CST）` ✓ |
+| ① 文风 | `api_v1.RENDER_STYLE_LINES` 四行，在 `_render_payload` 里 `lines.extend(...)`（放在约束之后、输出要求之前） | 单测 `test_v1_render_prompt_carries_the_style_contract`（走真实 `/v1` lease 路径）✓ |
+
+①的实证方式说明：主动渲染走一次性 `llm_generate`，prompt **不落任何日志**（trace 只记
+`req.system_prompt`，而那是空的），所以只能靠单测 + 下次真实主动消息的**行为**（≤30 字、
+无 Markdown）来确认 —— 别指望在日志里找到它。
+
+④（人格里 Markdown 反例与"不用 Markdown"自相矛盾）**用户没改，保持原样**，不再提。
+
+部署脚本 `scripts/apply_persona_and_prompt_fixes.sh`（含踩过的两个坑：容器里没有宿主
+`/home/bomomo` 路径所以备份要写 `/AstrBot/data/`；舰队重建后首次 tick 会跑刷新，
+`/context/render-block` 要给 60 秒超时并重试）。
+
+
 
