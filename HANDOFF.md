@@ -2122,7 +2122,54 @@ pressure 增长全错位。它现在只差一点点，随时可能过线，但**
 很大（最早比中位早 3.5 小时，最晚晚 6 小时）—— 几何分布本该如此，那张表不能当时刻表用。
 句号修复也确认成功：09-17 有 67% 气泡结尾带句号，**09-18 的 1114 条里只有 4 条（0%）**。
 
-### 🧱 存储后端：PG 是选定后端，但**用户决定延后迁移**（2026-09-18 18:45 CST）
+### ✅ 情绪层 a+c 修复并实测（2026-09-18 19:35 CST，commit `3fe5f94`）
+
+**修复前的事实**：8 个实例、约 2000 个事件，`active_emotion_events` 一共 **2 条**，
+所有实例 `mood_valence`/`mood_arousal` **恒为 0.0** ✗ —— 注入块里那六行"平静无波 / 没有拉扯"
+不是描述她，是**零情绪时的固定文案** ✗。根因两条：
+① 情绪被绑在语义结算上（`settlement_to_evaluation`），而设计里的规则评估器
+`emotion.appraise_event` **没有任何调用方** ✗ → values 里 `emotional_expression` 与
+`autonomy` 两轴永远不生效 ✗；
+② 未决事件被深层刷新结清时**没有任何情绪后效** ✗（`applied` 里只有 reinterpretation/memory/…）。
+
+**(a) 评估器接管已结算事件的情绪**：`runtime.py` 的 ingest 路径改用
+`appraise_event`（价值观敏感度：`user_care` / `relationship_maintenance` /
+`stability_commitment` / `emotional_expression` / `autonomy`；外加"用户忙"时对负面信号的
+**归因衰减** —— `settlement_to_evaluation` 这些一个都没有），粗结算作为**兜底**
+（词表没覆盖的冲突说法仍拿到结算所支持的强度）。**"未决不制造情绪"的契约保留** ✓ ——
+两处老测试（`test_ambiguous_events_are_deferred_not_guessed`、
+`test_unresolved_events_do_not_leak_into_the_block_as_facts`）仍然通过 ✓。
+
+**(c) 语义层给未决事件做情绪判定**：深刷新契约新增 `event_appraisals`
+（`direction` / `impact` / `relation_signal` / `confidence`，必须带 `sources` → 走 grounding ✓），
+新增操作种类 `event_appraisal`，`reducer._apply_appraisal` 折进情绪事件与 mood
+（`source="semantic"`；低于 `emotion.min_event_impact` 则无后效 ✓）。被引用的事件照旧由
+`settle_from_deep_refresh` 结清 —— 这正是 `appraise_event` 文档写的
+"A semantic provider may replace it later; the output contract is identical" 的落地 ✓。
+
+**实测（假用户实例 8794，`scripts/verify_emotion_ac.sh`）**：
+
+| 步骤 | 结果 |
+|---|---|
+| 发"我今晚想自己待着"（已结算的负面） | 出现情绪事件 **`('-', 0.465)`** ✓（词表 × 价值观，不是固定带位 ✓）；mood 0.0000 → **-0.0291** |
+| 发两条含糊话（"嗯，算了" / "随便吧，你忙你的"） | 未决 2 → **4** ✓，且**没有**产生情绪 ✓（契约守住 ✓） |
+| 强制一次深层刷新 | `applied={'reinterpretation': 2, 'memory': 1, **'event_appraisal': 2**}` ✓、`settled_events=4` ✓、未决 **4 → 0** ✓、新增两个情绪事件 `('-',0.45)` `('-',0.3)` ✓；mood → **-0.1643** |
+| 注入块情绪段 | 不再是模板：**"我同时感到对你的亲近与疏远，两种情绪交织在一起"** / "内心亲近的渴望与疏离的警惕相互拉扯" ✓ |
+
+即：模型**真的按新字段输出了情绪判定**（prompt + schema + grounding + reducer 全链路通 ✓）。
+
+**仍未解的两件**（都没动）：
+- `emotion_explanations` 还是 0 条 ✗ —— 心理解释缓存（`TaskKind.EMOTION_EXPLAIN` +
+  `EmotionExplainer`）没有内容；本轮刷新里 `applied` 也没有 `psychological_interpretation`
+  （模型没返回那一段 ✓ 还是别的原因，未查）。
+- 大量 `event_semantics` 行是 `resolved` 但 `settlement_source`/`intensity_band` **为 NULL** ✗
+  （例如 994959351 的 748 行）—— 那不是 `record_settlement` 写的（它必写全）。可能是更早的
+  列迁移留下的 NULL，也可能另有一条路径；**未定论**。
+
+测试：runtime 全量 exit=0；新增 4 条（语义评估给未决事件情绪 / 低于门槛无后效 / grounding 两条），
+更新 2 处（示例字段数 5→6；`test_candidate_shapes` 里写死的情绪强度改为断言方向与范围，
+因为它现在随价值观画像变化 ✓）。
+
 
 用户问"选型上我们用的是 postgresql 吧"，查清后**用户决定：确实要切，但现在太屎山，先算了**。
 把事实与迁移清单记在这里，将来要动时不用重新查。
