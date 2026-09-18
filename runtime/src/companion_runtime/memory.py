@@ -1898,3 +1898,267 @@ def needs_consolidation(
     return due is not None and due <= now
 
 
+# --------------------------------------------------------------------------------------
+# carryover: a hand-picked memory an operator wants a wiped directory to start with
+# --------------------------------------------------------------------------------------
+
+#: Provenance recorded when an operator carried a memory over from another data
+#: directory. It must never read as something the user said *here*: the whole point of
+#: the wipe is that this directory has no history, and a carried fact has to be
+#: distinguishable from one the Runtime heard and classified itself.
+PROVENANCE_OPERATOR_CARRYOVER = "operator_carryover"
+
+#: Structured key holding the carryover record: the key the file gave the item, the note
+#: the operator wrote, and where in the archive it came from.
+CARRYOVER_KEY = "carryover"
+
+#: Envelope of a carryover file. A *carryover*, not an export: it is written by hand,
+#: from a person's own words, and it deliberately has no producer in this package.
+MEMORY_CARRYOVER_FORMAT = "companion_runtime.memory_carryover"
+
+#: Envelope version. Bumped when the payload stops being readable as it is.
+MEMORY_CARRYOVER_VERSION = 1
+
+#: Kinds a carried memory may declare. All four are allowed: an operator may carry over a
+#: lasting fact, a taste, a relational act - or a single episode worth keeping ("她养过一只
+#: 叫豆豆的猫"), which is still a fact the character should not have to relearn.
+CARRYOVER_KINDS = tuple(kind.value for kind in MemoryKind)
+
+
+class MemoryCarryoverError(ValueError):
+    """Raised when a carryover file cannot be installed as written.
+
+    Refusing is the safe direction for the same reason it is for boundaries, with one
+    difference in kind: a boundary that fails to install is a limit the character walks
+    through, while a memory that installs *wrongly* is something she will assert about the
+    user's life. So a bad item refuses the whole file, and the file has to say explicitly
+    what each memory is.
+    """
+
+
+@dataclass(slots=True)
+class CarryoverMemory:
+    """One hand-written memory an operator wants a data directory to start with."""
+
+    summary: str
+    kind: str
+    key: str | None = None
+    topics: list[str] = field(default_factory=list)
+    importance: float | None = None
+    confidence: float = 0.55
+    activation: float | None = None
+    note: str | None = None
+    source_event_ids: list[str] = field(default_factory=list)
+
+
+def _carryover_memory_id(key: str) -> str:
+    """Return the deterministic memory identifier for a carryover key.
+
+    Deterministic so the same file may be installed twice: without it a second run would
+    duplicate every memory, and the operator has no way to tell the two copies apart.
+    """
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return f"mem_carry_{digest[:12]}"
+
+
+def _carryover_number(value: Any, field_name: str, index: int, *, nullable: bool = False) -> float | None:
+    """Validate one numeric field of a carryover item."""
+    if value is None and nullable:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MemoryCarryoverError(
+            f"memories[{index}] has a non-numeric {field_name}: {value!r}"
+        )
+    number = float(value)
+    if not 0.0 <= number <= 1.0:
+        raise MemoryCarryoverError(
+            f"memories[{index}] has {field_name}={number}, outside [0, 1]"
+        )
+    return number
+
+
+def _carryover_strings(value: Any, field_name: str, index: int) -> list[str]:
+    """Validate one string-list field of a carryover item."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise MemoryCarryoverError(
+            f"memories[{index}] has a non-list-of-strings {field_name}: {value!r}"
+        )
+    return [item for item in value if item.strip()]
+
+
+def parse_memory_carryover(payload: object) -> list[CarryoverMemory]:
+    """Validate a carryover envelope and return the memories it carries.
+
+    Args:
+        payload: The decoded JSON document.
+
+    Returns:
+        The items, in file order.
+
+    Raises:
+        MemoryCarryoverError: If the document is not a carryover this version can install,
+            or if an item is missing its summary/kind or carries an out-of-range number.
+    """
+    if not isinstance(payload, dict):
+        raise MemoryCarryoverError("the file is not a memory carryover (expected a JSON object)")
+    fmt = payload.get("format")
+    if fmt != MEMORY_CARRYOVER_FORMAT:
+        raise MemoryCarryoverError(
+            f"not a memory carryover: format={fmt!r}, expected {MEMORY_CARRYOVER_FORMAT!r}"
+        )
+    version = payload.get("version")
+    if not isinstance(version, int) or version > MEMORY_CARRYOVER_VERSION:
+        raise MemoryCarryoverError(
+            f"carryover version {version!r} is newer than this Runtime knows "
+            f"({MEMORY_CARRYOVER_VERSION}); upgrade the Runtime instead of installing part of it"
+        )
+    rows = payload.get("memories")
+    if not isinstance(rows, list):
+        raise MemoryCarryoverError("the carryover carries no 'memories' list")
+    items: list[CarryoverMemory] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise MemoryCarryoverError(f"memories[{index}] is not an object")
+        summary = row.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise MemoryCarryoverError(f"memories[{index}] has no summary")
+        kind = row.get("kind")
+        if kind not in CARRYOVER_KINDS:
+            raise MemoryCarryoverError(
+                f"memories[{index}] has kind {kind!r}, which is not one of {list(CARRYOVER_KINDS)}"
+            )
+        key = row.get("key")
+        if key is not None and (not isinstance(key, str) or not key.strip()):
+            raise MemoryCarryoverError(f"memories[{index}] has an empty key")
+        note = row.get("note")
+        if note is not None and not isinstance(note, str):
+            raise MemoryCarryoverError(f"memories[{index}] has a non-string note: {note!r}")
+        items.append(
+            CarryoverMemory(
+                summary=summary.strip(),
+                kind=kind,
+                key=key.strip() if isinstance(key, str) else None,
+                topics=_carryover_strings(row.get("topics"), "topics", index),
+                importance=_carryover_number(row.get("importance"), "importance", index, nullable=True),
+                confidence=_carryover_number(row.get("confidence", 0.55), "confidence", index),
+                activation=_carryover_number(row.get("activation"), "activation", index, nullable=True),
+                note=note,
+                source_event_ids=_carryover_strings(
+                    row.get("source_event_ids"), "source_event_ids", index
+                ),
+            )
+        )
+    return items
+
+
+def import_memories(
+    projection: MemoryProjection,
+    connection: sqlite3.Connection,
+    payload: object,
+    *,
+    config: RuntimeConfig,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Install a hand-picked set of memories into this data directory.
+
+    Written for the wipe workflow, and deliberately *not* a memory export/restore: what is
+    worth keeping across a wipe is a handful of things the user said about himself, chosen
+    by a person who read them. Two and a half months of misclassified rows are exactly what
+    the wipe is for, so "restore the memories" would restore the problem.
+
+    What the import does *not* do is pretend the directory has a history:
+
+    * ``source_event_ids`` stays empty - the events live in the archived directory, and
+      their identifiers are recorded under ``structured["carryover"]`` instead. A memory
+      that claimed to come from an event this directory never received would be a lie the
+      consistency checks cannot see.
+    * ``structured["proposed_by"]`` says ``operator_carryover``, so the row is never read
+      as something the Runtime heard and classified here.
+    * ``created_at`` is *now*, the moment the fact entered this directory. The fact itself
+      is older; the row's own timeline is not.
+
+    Each item lands in the working set (``activated_memories``) as well, because a carried
+    memory that cannot reach a prompt has not been carried at all. Give an item a ``key``
+    to make the import idempotent: the identifier is derived from it, so re-running the
+    same file replaces rather than duplicates.
+
+    Args:
+        projection: The memory projection of the target database.
+        connection: An open write connection (the caller owns the transaction).
+        payload: The decoded JSON document.
+        config: Runtime configuration, used for the per-kind importance default.
+        now: Reference time (default: the wall clock).
+
+    Returns:
+        A summary: how many were written or replaced, how many are in the working set, and
+        the identifiers.
+
+    Raises:
+        MemoryCarryoverError: If the payload does not validate. Nothing is installed.
+    """
+    stamp = ensure_aware(now) or utcnow()
+    items = parse_memory_carryover(payload)
+    installed: list[str] = []
+    replaced: list[str] = []
+    activated: list[str] = []
+    for item in items:
+        memory_id = _carryover_memory_id(item.key) if item.key else new_id("memory")
+        if projection.get_memory(memory_id) is not None:
+            replaced.append(memory_id)
+        importance = item.importance if item.importance is not None else kind_importance(item.kind, config)
+        memory = Memory(
+            memory_id=memory_id,
+            kind=item.kind,
+            summary=item.summary,
+            structured={
+                "confidence": item.confidence,
+                "proposed_by": PROVENANCE_OPERATOR_CARRYOVER,
+                "topics": list(item.topics),
+                CARRYOVER_KEY: {
+                    "key": item.key,
+                    "note": item.note,
+                    "source_event_ids": list(item.source_event_ids),
+                },
+            },
+            topics=list(item.topics),
+            importance=clamp(importance),
+            confidence=clamp(item.confidence),
+            status=MemoryStatus.ACTIVE.value,
+            source_event_ids=[],
+            created_at=stamp,
+            updated_at=stamp,
+        )
+        projection.upsert_memory(connection, memory)
+        installed.append(memory_id)
+        activation = item.activation
+        if activation is None:
+            # The same seed consolidation uses, so a carried fact is exactly as present in
+            # the working set as one the Runtime formed itself.
+            activation = clamp(0.35 + 0.5 * memory.importance)
+        projection.upsert_activation(
+            connection,
+            ActivatedMemory(
+                memory_id=memory_id,
+                activation=activation,
+                last_recalled_at=stamp,
+                recall_count=0,
+                reason=PROVENANCE_OPERATOR_CARRYOVER,
+            ),
+        )
+        activated.append(memory_id)
+    kinds: dict[str, int] = {}
+    for item in items:
+        kinds[item.kind] = kinds.get(item.kind, 0) + 1
+    return {
+        "format": MEMORY_CARRYOVER_FORMAT,
+        "version": MEMORY_CARRYOVER_VERSION,
+        "installed": len(installed),
+        "replaced": len(replaced),
+        "activated": len(activated),
+        "kinds": kinds,
+        "ids": installed,
+    }
+
+

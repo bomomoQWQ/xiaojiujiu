@@ -138,6 +138,7 @@ python -m companion_runtime.cli --base-dir ./data serve --host 127.0.0.1 --port 
 | `recover [--backup-dir DIR] [--run]` | 打印恢复方案；`--run` 顺带执行一次维护 |
 | `boundaries export <文件\|->` | 把该数据目录的 boundaries **整张表**写成 JSON（含已撤销/已过期；`-` = stdout） |
 | `boundaries import <文件\|-> [--dry-run]` | 把导出装回该数据目录（按 `boundary_id` upsert，可重复跑；`-` = stdin） |
+| `memories import <文件\|-> [--dry-run]` | 装一份**人工挑选**的记忆搬运清单（不是导出、不是全量恢复；按 `key` 幂等；`-` = stdin） |
 | `config` | 打印脱敏后的有效配置 |
 | `health` | 打开数据库并打印健康摘要 |
 
@@ -151,6 +152,13 @@ python -m companion_runtime.cli --base-dir ./data serve --host 127.0.0.1 --port 
 > 时间线 —— 用户收回过的限制不会因为搬了一次家就复活。整份文件先校验再写：类型不认识、字段缺失
 > 一律**整份拒绝**（退出码 4），不跳过坏行，因为一条没装上的边界就是一条会被走穿的约束。
 > 清库时用 `scripts/boundaries_carryover.sh export|import|check`（详见 HANDOFF.md 的 runbook）。
+
+> `memories import` 是同一件事的另一半，但**刻意不是导出/恢复**：整库恢复等于把当初清库的理由
+> 一起搬回来（两个半月里攒下的错分类行）。搬的是**人读过后挑出来的几条**：用户自己说过、值得她
+> 不必重新说一遍的事。它也不假装这个目录有历史 —— `source_event_ids` 留空（事件在归档里，
+> id 记在 `structured["carryover"]`），`structured["proposed_by"] = "operator_carryover"`，
+> 每次导入在事件流里留一条 `system` 事件。每条都会进工作集（`activated_memories`），
+> 否则"搬过来了"只是躺在表里；给每条一个 `key` 就能重复跑（id 由 key 派生，替换而不重复）。
 
 ---
 

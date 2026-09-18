@@ -15,6 +15,7 @@ Subcommands::
     config       print the effective configuration (redacted)
     health       open the database and print a health summary
     boundaries   export/import the user's declared boundaries (they must outlive a wipe)
+    memories     import a hand-picked memory carryover (a few facts, never the archive)
 
 Every command accepts ``--config`` and honours the ``CR_`` environment overrides.
 No command reads, prints or stores an API key: secrets belong to the host
@@ -50,7 +51,7 @@ from .maintenance import (
     verify,
 )
 from .runtime import Runtime
-from .typing import MemoryStatus
+from .typing import Actor, EventType, MemoryStatus
 from .utility import parse_datetime, utcnow
 
 LOGGER = logging.getLogger("companion_runtime.cli")
@@ -225,6 +226,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="validate the file and report what it carries, without writing",
     )
+
+    memories_cmd = subparsers.add_parser(
+        "memories",
+        help="install a hand-picked memory carryover (the other half of the wipe workflow)",
+    )
+    memory_actions = memories_cmd.add_subparsers(dest="memories_command", required=True)
+    memory_import = memory_actions.add_parser(
+        "import", help="install the memories of a carryover file into this data directory"
+    )
+    memory_import.add_argument("source", help="a carryover file, or - for stdin")
+    memory_import.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate the file and report what it carries, without writing",
+    )
     return parser
 
 
@@ -259,6 +275,18 @@ def _emit(payload: Any, *, as_json: bool = False) -> None:
 def _parse_now(value: str | None) -> datetime | None:
     """Parse an optional ``--now`` argument."""
     return parse_datetime(value) if value else None
+
+
+def _read_json_source(source: str) -> Any:
+    """Read a JSON document from a file, or from stdin when ``source`` is ``-``.
+
+    ``-`` exists because these commands run inside a container while the file lives on the
+    host: the wipe workflow pipes the archive in rather than mounting it (``docker cp``
+    into a running fleet has been unreliable), and piping is the only form that works when
+    the fleet is stopped and the CLI runs from a one-off container.
+    """
+    text = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
+    return json.loads(text)
 
 
 # --------------------------------------------------------------------------------------
@@ -633,12 +661,7 @@ def _import_boundaries(args: argparse.Namespace) -> int:
     config = _resolve_config(args)
     configure_logging(config.server.log_level)
     try:
-        # ``-`` reads stdin because that is how the wipe script reaches these instances:
-        # the file lives on the host and the command runs in a container built from the
-        # same image (``docker cp`` into a running fleet has been unreliable), so the
-        # payload is piped rather than mounted.
-        text = sys.stdin.read() if args.source == "-" else Path(args.source).read_text(encoding="utf-8")
-        payload = json.loads(text)
+        payload = _read_json_source(args.source)
     except (OSError, ValueError) as exc:
         print(f"import failed: cannot read {args.source}: {exc}", file=sys.stderr)
         return EXIT_ERROR
@@ -674,6 +697,83 @@ def _import_boundaries(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_memories(args: argparse.Namespace) -> int:
+    """Install a hand-picked set of memories into this data directory.
+
+    The other half of ``boundaries``, and the same workflow: the wipe archives a data
+    directory and rebuilds it empty. Boundaries must come back because forgetting a limit
+    makes the character break it; a *few* memories may come back because a person said
+    something about himself that is worth not relearning - but only a few, chosen by
+    someone who read them. Restoring the memories wholesale would restore exactly what the
+    wipe was for.
+
+    This is the one place a memory enters a data directory without the user having said it
+    *there*, so the row says so: ``structured["proposed_by"] = "operator_carryover"``,
+    ``source_event_ids`` empty, and one ``system`` event in the log per import. Nothing
+    here fabricates history - it records a fact the person stated, in a directory that no
+    longer has the message.
+    """
+    if args.memories_command != "import":
+        print(f"unknown memories action: {args.memories_command}", file=sys.stderr)
+        return EXIT_USAGE
+    config = _resolve_config(args)
+    configure_logging(config.server.log_level)
+    try:
+        payload = _read_json_source(args.source)
+    except (OSError, ValueError) as exc:
+        print(f"import failed: cannot read {args.source}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if args.dry_run:
+        try:
+            carried = memory_module.parse_memory_carryover(payload)
+        except memory_module.MemoryCarryoverError as exc:
+            print(f"import refused: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        _emit(
+            {
+                "source": args.source,
+                "dry_run": True,
+                "would_install": len(carried),
+                "kinds": {item.kind: sum(1 for row in carried if row.kind == item.kind) for item in carried},
+                "summaries": [item.summary for item in carried],
+            }
+        )
+        return EXIT_OK
+    runtime = Runtime(config)
+    try:
+        state = runtime.state()
+        with runtime.db.transaction() as conn:
+            result = memory_module.import_memories(
+                runtime.projections.memory, conn, payload, config=runtime.config
+            )
+            # The audit trail: a memory that arrived from outside the conversation is a
+            # fact about this data directory, and the append-only log is where such facts
+            # live. It is a ``system`` event, never a fake user message.
+            runtime.events.append(
+                EventType.SYSTEM,
+                actor=Actor.RUNTIME,
+                content=f"operator_carryover:{result['installed']}",
+                metadata={
+                    "command": "memories import",
+                    "source": args.source,
+                    "kinds": result["kinds"],
+                    "memory_ids": result["ids"],
+                },
+                timestamp=utcnow(),
+                runtime_version=state.version,
+                connection=conn,
+            )
+    except memory_module.MemoryCarryoverError as exc:
+        # A memory that installs wrongly is something she will assert about the user's
+        # life, so a bad file installs nothing and says why.
+        print(f"import refused: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    finally:
+        runtime.close()
+    _emit({**result, "source": args.source})
+    return EXIT_OK
+
+
 COMMANDS = {
     "serve": cmd_serve,
     "tick": cmd_tick,
@@ -690,6 +790,7 @@ COMMANDS = {
     "config": cmd_config,
     "health": cmd_health,
     "boundaries": cmd_boundaries,
+    "memories": cmd_memories,
 }
 
 
