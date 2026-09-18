@@ -5,6 +5,11 @@ set -u
 REPO=/home/bomomo/astrbot_test/src/xiaojiujiu
 STAMP=$(date +%Y%m%d-%H%M%S)
 
+echo "=== 0) 先拉取（人格文件在仓库里）==="
+cd "$REPO" && git pull --ff-only 2>&1 | tail -1
+grep -c "这是客服，不是我" "$REPO/人格设定.md"
+
+echo
 echo "=== 1) 同步人格 ==="
 docker cp "$REPO/人格设定.md" astrbot-test:/tmp/persona_new.md
 docker exec -u 0 -i astrbot-test python3 - "$STAMP" <<'PY'
