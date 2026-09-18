@@ -358,6 +358,15 @@ class SchedulerConfig:
     max_interval_seconds: float = 5400.0
     quiet_hours_start: int | None = None
     quiet_hours_end: int | None = None
+    #: Silence-utility bonus while the *local* clock sits inside
+    #: ``night_start_hour``..``night_end_hour``. Night is deliberately not silent - a
+    #: real reason can still outbid it - but the bar is much higher: measured on the
+    #: first beta, 6 of 14 proactive messages went out between 00:17 and 06:30 local,
+    #: including a 04:01 "晚上好". With the shipped 0.30 against a typical daytime
+    #: candidate margin of ~0.39, only a genuinely strong drive still clears it.
+    night_penalty: float = 0.30
+    night_start_hour: int = 0
+    night_end_hour: int = 6
     busy_poll_seconds: float = 30.0
     foreground_pause_seconds: float = 60.0
 

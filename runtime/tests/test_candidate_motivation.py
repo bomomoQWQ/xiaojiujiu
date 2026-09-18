@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -435,6 +435,48 @@ def test_silence_becomes_more_painful_as_pressure_rises() -> None:
         state=state, config=config, boundary_risk=0.0, cooldown_active=False, hours_since_contact=24.0
     )
     assert tense < calm
+
+
+def test_late_night_makes_silence_cheaper_by_the_configured_penalty() -> None:
+    """Inside 00:00-06:00 local, silence gains ``scheduler.night_penalty``.
+
+    Night is a penalty rather than a silence window on purpose: the character may still
+    speak if something is genuinely strong, she just has to clear a much higher bar.
+    Measured on the first beta, 6 of 14 proactive messages went out between 00:17 and
+    06:30 local. Datetimes are built in the machine's own timezone so the test holds on
+    a UTC box too.
+    """
+    config = RuntimeConfig()
+    state = RuntimeState()
+    state.approach_impulse = 0.6
+    state.restraint = 0.5
+    local_tz = datetime.now().astimezone().tzinfo
+
+    def utility_at(hour: int) -> float:
+        moment = datetime(2026, 3, 1, hour, 30, tzinfo=local_tz)
+        return motivation.silence_utility(
+            state=state,
+            config=config,
+            boundary_risk=0.0,
+            cooldown_active=False,
+            hours_since_contact=6.0,
+            now=moment,
+        )
+
+    daytime = utility_at(15)
+    assert utility_at(3) == pytest.approx(daytime + config.scheduler.night_penalty)
+    assert utility_at(0) == pytest.approx(daytime + config.scheduler.night_penalty)
+    assert utility_at(6) == pytest.approx(daytime)
+    assert utility_at(23) == pytest.approx(daytime)
+    # Without a reference time the term cannot apply, so callers that do not care about
+    # the clock keep the old value.
+    assert motivation.silence_utility(
+        state=state, config=config, boundary_risk=0.0, cooldown_active=False,
+        hours_since_contact=6.0,
+    ) == pytest.approx(daytime)
+    # The knob is honoured, including switching it off.
+    config.scheduler.night_penalty = 0.0
+    assert utility_at(3) == pytest.approx(daytime)
 
 
 def test_utility_components_follow_the_documented_formula() -> None:

@@ -55,6 +55,7 @@ from .user_model import Prediction
 from .utility import (
     clamp,
     local_day_key,
+    local_now,
     logit,
     max_datetime,
     sigmoid,
@@ -186,6 +187,7 @@ def silence_utility(
     boundary_risk: float,
     cooldown_active: bool,
     hours_since_contact: float,
+    now: datetime | None = None,
 ) -> float:
     """Return the utility of staying silent, a *formal* available action.
 
@@ -205,6 +207,8 @@ def silence_utility(
         boundary_risk: Current boundary risk level.
         cooldown_active: Whether a post-contact cooldown is in effect.
         hours_since_contact: Hours since the last contact.
+        now: Reference time; when given, the local night window adds
+            ``scheduler.night_penalty`` to the silence utility.
 
     Returns:
         The silence utility (unbounded, typically around ``[-1, 1.5]``).
@@ -219,6 +223,17 @@ def silence_utility(
         + settings.impulse_gain * state.approach_impulse
         - settings.pressure_penalty * (state.pressure ** 2)
     )
+    # Late night makes silence cheaper, not mandatory: the same window logic as
+    # ``scheduler._in_quiet_hours`` (including a window that crosses midnight), but as a
+    # utility term rather than a hard gate, so a strong enough reason still speaks.
+    night = config.scheduler
+    if now is not None and night.night_penalty > 0.0:
+        start, end = night.night_start_hour, night.night_end_hour
+        if start != end:
+            hour = local_now(now).hour
+            in_night = start <= hour < end if start < end else (hour >= start or hour < end)
+            if in_night:
+                value += night.night_penalty
     return value
 
 
@@ -835,6 +850,7 @@ def decide(
         boundary_risk=inputs.boundary_risk_baseline,
         cooldown_active=cooldown_active,
         hours_since_contact=inputs.hours_since_contact,
+        now=now,
     )
 
     assessments: list[CandidateAssessment] = []

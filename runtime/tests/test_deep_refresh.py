@@ -156,6 +156,46 @@ class TestGrounding:
             {"kind": "memory", "reason": "ungrounded_sources", "sources": ["evt_ghost"]}
         ]
 
+    def test_a_matter_grounded_only_in_other_matters_is_a_restatement(self) -> None:
+        """Echoing the open matters back as "new" ones is refused.
+
+        A refresh is handed the open matters as input, so a model can re-emit them and
+        cite their ids as sources; both sources resolve, so plain grounding lets it
+        through and the list grows. Measured on a real beta: one person's open matters
+        went from 7 to 13 in a night, every addition a rewrite of an existing one that
+        ``_same_subject`` could not catch. A matter must cite at least one non-matter
+        source.
+        """
+        operations, violations = dr.ground_suggestions(
+            self._suggestions(
+                unfinished_matter_suggestions=[
+                    {"title": "复述旧事", "sources": ["unf_1"]},
+                    {"title": "复述旧事，换个说法", "sources": ["unf_1", "unf_2"]},
+                    {"title": "有事件支撑", "sources": ["unf_1", "evt_9"]},
+                ]
+            ),
+            resolvable=lambda identifier: True,
+            is_matter=lambda identifier: identifier in {"unf_1", "unf_2"},
+        )
+        assert [item.payload.get("title") for item in operations] == ["有事件支撑"]
+        assert violations == [
+            {"kind": "unfinished_matter", "reason": "matter_restatement", "sources": ["unf_1"]},
+            {
+                "kind": "unfinished_matter",
+                "reason": "matter_restatement",
+                "sources": ["unf_1", "unf_2"],
+            },
+        ]
+
+    def test_the_restatement_guard_only_applies_when_a_matter_resolver_is_given(self) -> None:
+        """Callers without the resolver keep the old behaviour (grounding only)."""
+        operations, violations = dr.ground_suggestions(
+            self._suggestions(unfinished_matter_suggestions=[{"title": "复述", "sources": ["unf_1"]}]),
+            resolvable=lambda identifier: True,
+        )
+        assert violations == []
+        assert [item.kind for item in operations] == ["unfinished_matter"]
+
     def test_missing_sources_are_rejected_for_kinds_that_require_them(self) -> None:
         operations, violations = dr.ground_suggestions(
             self._suggestions(unfinished_matter_suggestions=[{"title": "等他回消息"}]),

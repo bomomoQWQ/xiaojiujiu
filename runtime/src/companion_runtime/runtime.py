@@ -2228,6 +2228,7 @@ class Runtime:
         operations, violations = ground_suggestions(
             suggestions,
             resolvable=self._is_resolvable,
+            is_matter=self._is_unfinished_matter,
             max_candidate_operations=config.max_operations_per_refresh,
         )
         outcome.violations = list(violations)
@@ -2432,13 +2433,41 @@ class Runtime:
         # Unfinished matters and emotion events use generated ids that the
         # projections expose through list calls rather than point lookups.
         try:
-            if any(item.unfinished_id == identifier for item in self.projections.unfinished.list_all()):
+            if self._is_unfinished_matter(identifier):
                 return True
             return any(
                 event.emotion_event_id == identifier
                 for event in self.projections.emotion.list_active()
             )
         except Exception:  # noqa: BLE001
+            return False
+
+    def _is_unfinished_matter(self, identifier: str) -> bool:
+        """Return whether an identifier names an unfinished matter.
+
+        Both spellings are accepted on purpose: the rule generators cite matters as
+        ``unfinished:<id>`` (``candidate.UNFINISHED_SOURCE_PREFIX``) while a deep
+        refresh quotes the bare id it was shown. The restatement guard needs to see
+        through either form, otherwise it would let a matter-only suggestion through
+        just because the model prefixed its source.
+
+        Args:
+            identifier: A candidate grounding identifier.
+
+        Returns:
+            ``True`` when the identifier names a stored unfinished matter.
+        """
+        if not identifier or not isinstance(identifier, str):
+            return False
+        bare = identifier
+        if bare.startswith(candidate_module.UNFINISHED_SOURCE_PREFIX):
+            bare = bare[len(candidate_module.UNFINISHED_SOURCE_PREFIX):]
+        try:
+            return any(
+                item.unfinished_id == bare
+                for item in self.projections.unfinished.list_all()
+            )
+        except Exception:  # noqa: BLE001 - a lookup failure is simply "not a matter"
             return False
 
     # ------------------------------------------------------------ feedback path

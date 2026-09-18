@@ -280,6 +280,7 @@ def ground_suggestions(
     suggestions: Any,
     *,
     resolvable: Callable[[str], bool],
+    is_matter: Callable[[str], bool] | None = None,
     max_candidate_operations: int = 8,
 ) -> tuple[list[GroundedOperation], list[dict[str, Any]]]:
     """Convert a provider's suggestions into operations that are safe to apply.
@@ -293,6 +294,9 @@ def ground_suggestions(
         suggestions: A ``DeepRefreshSuggestions``-shaped object, or a mapping with
             the same six fields.
         resolvable: Callback returning whether an identifier exists.
+        is_matter: Callback returning whether an identifier names an unfinished
+            matter. When given, a new matter may not be grounded *only* in other
+            matters (see the restatement guard below).
         max_candidate_operations: Upper bound on returned operations, so one
             verbose response cannot rewrite the whole state at once.
 
@@ -340,6 +344,25 @@ def ground_suggestions(
                             "kind": kind,
                             "reason": "ungrounded_sources",
                             "sources": unresolved,
+                        }
+                    )
+                    continue
+
+            # A matter grounded *only* in other matters restates what the Runtime
+            # already holds rather than discovering anything: a refresh that is handed
+            # the open matters as input will happily echo them back as "new" ones and
+            # cite their ids as sources. Measured on a real beta, one person's open
+            # matters grew from 7 to 13 overnight, all six additions restatements of
+            # existing ones, and `_same_subject` could not catch the rewrites. A matter
+            # has to cite at least one non-matter source (an event, a memory).
+            if kind == "unfinished_matter" and is_matter is not None:
+                matter_sources = [source for source in sources if is_matter(source)]
+                if len(matter_sources) == len(sources):
+                    violations.append(
+                        {
+                            "kind": kind,
+                            "reason": "matter_restatement",
+                            "sources": sources,
                         }
                     )
                     continue
