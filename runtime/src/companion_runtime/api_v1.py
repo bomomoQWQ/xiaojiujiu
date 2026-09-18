@@ -594,6 +594,27 @@ def _capability_kinds(capabilities: Sequence[str]) -> list[str]:
     return kinds
 
 
+#: The style contract a render prompt must carry itself.
+#:
+#: A render is a one-shot ``llm_generate`` call: AstrBot never decorates it with the
+#: persona, the tools or the datetime reminder (measured - ``astr_agent_prepare`` shows
+#: the persona for a chat turn, while the render call goes out with
+#: ``system_prompt=""``, and ``Context.llm_generate`` has no persona fallback). The
+#: *system* context is already in the transcript by the time she speaks proactively, so
+#: only the style has to be restated here. Without it, proactive messages came out at
+#: 60-100 characters with lists and closing summaries - nothing like her 30-character,
+#: no-Markdown voice. Questions get their own line because that is where the habit is
+#: worst: one question, then stop.
+RENDER_STYLE_LINES = (
+    "- 文风（必须遵守）：一次只说一两句，通常 30 字以内。话没说完就再发一条，不要堆成一大段，"
+    "也不要来一句总结陈词。",
+    "- 不用 Markdown：不加粗、不写标题、不列条目、不引用、不做表格。不写“首先/其次/另外/总之”"
+    "这种书面腔。",
+    "- 不复述对方刚说过的话来凑长度。表情和标点可以用，但别堆。",
+    "- 如果这句要问对方什么：只问一个问题，问完就停。不要连问、不要罗列、不要替对方总结。",
+)
+
+
 def _render_payload(
     runtime: Any,
     settings: RuntimeConfig,
@@ -634,6 +655,7 @@ def _render_payload(
         lines.append(f"- 目的：{goal}")
     for constraint in constraints:
         lines.append(f"- 约束：{constraint}")
+    lines.extend(RENDER_STYLE_LINES)
     lines.append("- 只输出要发送的消息正文本身：不要解释、不要复述上面的背景、不要提及这些说明。")
     return {
         "prompt": "\n".join(lines),

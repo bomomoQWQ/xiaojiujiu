@@ -430,6 +430,36 @@ def test_time_context_reports_elapsed_hours(runtime: Runtime) -> None:
     assert bundle.time_context["hours_since_last_user_message"] == pytest.approx(8.0, abs=0.01)
 
 
+def test_time_context_reports_the_local_clock_not_utc(runtime: Runtime) -> None:
+    """The clock line has to be the local wall time, and it has to say so readably.
+
+    Regression: ``build_time_context`` ran the local datetime through ``isoformat()``,
+    which normalises to UTC, so the block printed a UTC stamp on a line labelled
+    当前本地时间. Chat turns survived it (the host appends its own correct reminder) but a
+    proactive render carries no host reminder, so her proactive messages were written
+    eight hours off - measured, a 04:01 CST render came out as 晚上好.
+    """
+    bundle = context_module.build(runtime=runtime, now=BASE_TIME)
+    local = context_module.local_now(BASE_TIME)
+    time_context = bundle.time_context
+
+    # The ISO value must keep the machine's offset, not be re-normalised to UTC.
+    assert time_context["local_now"] == local.isoformat()
+    assert local.strftime("%z") in time_context["local_now"].replace(":", "")
+    assert time_context["local_hour"] == local.hour
+
+    # And the line the model reads must be a clock, not a machine string.
+    display = time_context["local_display"]
+    assert display.startswith(local.strftime("%Y-%m-%d %H:%M"))
+    assert any(day in display for day in ("周一", "周二", "周三", "周四", "周五", "周六", "周日"))
+    block = context_module.render_block(bundle)
+    assert f"当前本地时间：{display}" in block
+    # The old defect in one assertion: an ISO stamp ("…T…+00:00") on the local line.
+    line = block.split("当前本地时间：", 1)[1].splitlines()[0]
+    assert line == display
+    assert "T" not in line
+
+
 def test_intent_description_includes_the_lead_time(runtime: Runtime) -> None:
     """The "I was about to say something" cue is available without being forced."""
     from companion_runtime.typing import CandidateIntent, new_id

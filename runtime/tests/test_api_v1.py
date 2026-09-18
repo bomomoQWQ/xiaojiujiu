@@ -729,3 +729,31 @@ def test_v1_lease_respects_capabilities(client: TestClient, runtime: Runtime) ->
     granted = lease(client, capabilities=["render"], max_actions=1)
     assert granted["count"] == 1
     assert granted["items"][0]["action_type"] == "render"
+
+
+# --------------------------------------------------------------------------------------
+# render prompt styling
+# --------------------------------------------------------------------------------------
+
+
+def test_v1_render_prompt_carries_the_style_contract(client: TestClient, runtime: Runtime) -> None:
+    """A render prompt restates her style itself, because no persona reaches that path.
+
+    A render is a one-shot ``llm_generate`` call: AstrBot adds no persona, no tools and
+    no datetime reminder to it, and ``Context.llm_generate`` has no persona fallback.
+    The system context is already in the transcript by then, so only the style contract
+    has to live in the prompt. Measured before the fix: proactive messages ran 60-100
+    characters, with list formatting and closing summaries, i.e. nothing like her.
+    """
+    commit_attempt(runtime)
+    payload = lease(client)["items"][0]["payload"]
+    prompt = payload["prompt"]
+
+    assert "文风（必须遵守）" in prompt
+    assert "30 字以内" in prompt
+    assert "不用 Markdown" in prompt
+    # The question habit gets its own rule: that is where the failure was worst.
+    assert "只问一个问题" in prompt
+    # The style contract must not swallow the render instruction itself.
+    assert "只输出要发送的消息正文本身" in prompt
+    assert payload["intent"] == "询问面试结果"

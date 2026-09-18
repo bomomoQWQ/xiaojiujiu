@@ -62,6 +62,11 @@ SECTION_MEMORY = "【必要记忆】"
 SECTION_BOUNDARY = "【表达边界】"
 SECTION_TIME = "【时间连续性】"
 
+#: Weekday names for the local clock line. The host's own reminder spells them in
+#: English ("Weekday: Friday") and only exists on chat turns; a proactive render has no
+#: host reminder at all, so this line is the only clock she gets there.
+_WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
 #: Memory kinds that describe who the user *is* rather than what happened once. They
 #: are injected from importance when nothing recalled them, so the character does not
 #: lose the basics between two mentions.
@@ -219,10 +224,22 @@ def build_time_context(state: RuntimeState, *, now: datetime) -> dict[str, Any]:
             return None
         return round(max(0.0, (now - value).total_seconds()) / 3600.0, 2)
 
+    # ``isoformat()`` normalises to UTC on purpose (it is the storage format), so the
+    # local clock must not go through it: the block used to print a UTC stamp on a line
+    # labelled 当前本地时间, which put every prompt of ours eight hours off. Measured: a
+    # proactive message sent at 04:01 CST came out as 晚上好, i.e. it had read 20:01 UTC.
+    # Native ``datetime.isoformat()`` keeps the offset, and the display line is what the
+    # model actually reads.
+    local = local_now(now)
     return {
         "now": isoformat(now),
-        "local_now": isoformat(local_now(now)),
-        "local_hour": local_now(now).hour,
+        "local_now": local.isoformat(),
+        "local_display": "%s %s（%s）" % (
+            local.strftime("%Y-%m-%d %H:%M"),
+            _WEEKDAY_CN[local.weekday()],
+            local.strftime("%Z") or "本地",
+        ),
+        "local_hour": local.hour,
         "hours_since_last_user_message": hours_since(state.last_user_message_at),
         "hours_since_last_contact": hours_since(state.last_contact_at),
         "last_tick_at": isoformat(state.last_tick_at),
@@ -713,7 +730,7 @@ def render_block(bundle: ContextBundle) -> str:
         lines.append(f"- 距离上次用户消息：{time_context['hours_since_last_user_message']} 小时")
     if time_context.get("hours_since_last_contact") is not None:
         lines.append(f"- 距离上次主动联系：{time_context['hours_since_last_contact']} 小时")
-    lines.append(f"- 当前本地时间：{time_context.get('local_now')}")
+    lines.append(f"- 当前本地时间：{time_context.get('local_display') or time_context.get('local_now')}")
     lines.append("")
     lines.append(
         "以上是仅本轮注入的临时背景，不要直接复述，也不要写进长期对话历史；"
