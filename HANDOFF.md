@@ -2095,3 +2095,45 @@ pressure 增长全错位。它现在只差一点点，随时可能过线，但**
 很大（最早比中位早 3.5 小时，最晚晚 6 小时）—— 几何分布本该如此，那张表不能当时刻表用。
 句号修复也确认成功：09-17 有 67% 气泡结尾带句号，**09-18 的 1114 条里只有 4 条（0%）**。
 
+### 提示词审阅（2026-09-18 晚）—— 结论、已做的改动、待办
+
+完整清单在 `docs/PROMPT_REVIEW.md`（逐字样本 `docs/prompt_samples/system_prompt_A.txt`）。
+抓取方式：打开 AstrBot 的 trace（`astr_agent_prepare` 记完整 system_prompt/tools/provider），
+配 `/context/render-block` 逐字取我们注入的块。**trace 目前保持开着**，方便继续审。
+
+**已经确认的四个问题**：
+
+1. **路径 B（主动消息渲染）没有 `system_prompt`** ✗ —— `api_v1.py:_render_payload` 返回
+   `"system_prompt": ""`，`Context.llm_generate`（`star/context.py:204-212`）原样透传、
+   **没有回退成人格的逻辑**，executor 空值时不传该参数 → 她"主动开口"时没有人格、没有文风规矩
+   （人格要求"30 字以内"，实测主动消息普遍 60–100 字）。
+2. **我们块里的"当前本地时间"是 UTC 却标着本地** ✗ —— `context.py:224` 用
+   `isoformat(local_now(now))`，而 `utility.isoformat -> ensure_aware -> astimezone(utc)`
+   （`utility.py:250,281`）把本地时间又归一化回 UTC。路径 A 有宿主那路正确 CST 兜着（所以她能答对
+   "9月17号周四"），**路径 B 只有我们这一个错的时间 → 差 8 小时**，正是"凌晨 4 点说晚上好"。
+3. **system_prompt 里约 2400 字的 `## Skills` 块**（documents/pdf/skill-creator/spreadsheets
+   + "Computer Use 未启用" 提示）对 QQ 陪伴角色基本是噪声。
+   **有开关（不用改代码）**：`personas.skills` 现在是 `null`（= 全部注入），
+   设成 `[]` 即可整段去掉（`astr_main_agent.py:580-585`）。
+4. **人格自己在"反例/正例"里用了 `**`、`>`、反引号**，与它上面"不用 Markdown"的规矩冲突，
+   容易被模仿 —— 建议改纯文本。
+
+**已经做完的改动**：**关掉了联网搜索** ✗→✓（`provider_settings.web_search=false`、
+`web_search_link=false`，**保留 tavily key** 以便随时开回）。实证：驱动一轮后 trace 的
+`tools` 从 `["web_search_tavily","tavily_extract_web_page","future_task","send_message_to_user"]`
+变成 `["future_task","send_message_to_user"]` ✓。备份 `cmd_config.json.bak-websearch-20260918-*`。
+顺带更正一个我先前的错误：线上实例的 tavily key **不是空的**（我用错了键名 `web_search_tavily_key`
+↔ 正确是 `websearch_tavily_key`）。**线上实例（`astrbot`）根本没装我们的插件**（装的是
+doro/gptimg/weather_amap/zvv 等 8 个）→ 它不是这个角色，所以只动了测试栈。
+
+**用户已决定：不摘 `send_message_to_user` / `future_task`。** 用户判断这是 AstrBot 自带的
+主动/定时能力，"和 runtime 不冲突"，不用在意 ✓。所以**不做** `deny_tools`。
+（备忘，不是反对：这两条路径不受 Runtime 的冷却/授权约束，将来统计"她主动说了多少次"时要把它们
+算进去，否则账对不上。`send_message_to_user` 也是目前唯一能发图片/语音/视频/文件的通道 ——
+我们 Runtime 的 `send` 只发纯文本。）
+
+**待办（等用户点头）**：① 修路径 B 的 `system_prompt`（我倾向在 `_render_payload` 里加我们自己的
+文风约束，不依赖宿主）；② 修那个标错的时间（并把时间来源统一：块里只留相对量，绝对时间在主动渲染
+那条路上单独补一行正确的本地时间）；③ 顺手把 `personas.skills` 设成 `[]` 去掉 Skills 噪声。
+
+
