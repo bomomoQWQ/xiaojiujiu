@@ -2122,7 +2122,45 @@ pressure 增长全错位。它现在只差一点点，随时可能过线，但**
 很大（最早比中位早 3.5 小时，最晚晚 6 小时）—— 几何分布本该如此，那张表不能当时刻表用。
 句号修复也确认成功：09-17 有 67% 气泡结尾带句号，**09-18 的 1114 条里只有 4 条（0%）**。
 
-### 🛑 自动回复死环：真正的原因、修法与验收（2026-09-18 18:05 CST）
+### ✅ 三项修复（2026-09-18 18:25 CST，均已部署到测试栈并实测）
+
+用户点名要做前两项，凌晨那条改成了"不静默、吃更重的惩罚"：
+
+**① 凌晨 00:00–06:00 加更重的开口惩罚（不静默）** —— `config.py::SchedulerConfig` 新增
+`night_penalty: float = 0.30` / `night_start_hour: int = 0` / `night_end_hour: int = 6`；
+`motivation.silence_utility(..., now=...)` 在本地时钟落入该窗口时给沉默效用加这一项
+（窗口逻辑与 `scheduler._in_quiet_hours` 一致，含跨午夜），`assess()` 把 `now` 传下去。
+**为什么是"罚"不是"禁"**：用户要保留"她真有事可以说"的能力。
+数量级：yandere 画像下 15:30 的沉默效用 0.8508 → 03:30 变 1.1507（+0.3000 实测），
+而一件真事的候选效用约 1.16 —— 所以夜里只有真正强的理由才过得去，问候式开口过不去。
+可用 `CR_SCHEDULER__NIGHT_PENALTY` / `CR_SCHEDULER__NIGHT_START_HOUR` / `NIGHT_END_HOUR` 调。
+测试：`test_late_night_makes_silence_cheaper_by_the_configured_penalty`（用机器本地时区构造时间，
+UTC 机器上也不误报）。**注意**：`quiet_hours_start/end` 那套硬静默仍在，只是本机没配。
+
+**② 事项复述守卫（止住"事项长回来"）** —— `deep_refresh.ground_suggestions` 新增可选
+`is_matter` 回调：`kind == "unfinished_matter"` 时，**来源里至少要有一个不是事项**，
+否则记 `reason="matter_restatement"` 并整条丢弃。`runtime._is_unfinished_matter` 认
+`unf_x` 与 `unfinished:unf_x` 两种写法（规则生成器写带前缀、深层刷新引裸 id，两种都要看穿）。
+实测（容器内直跑）：只有事项来源的复述被拒 ✓，带 `evt_` 的照常通过 ✓。
+测试：`test_a_matter_grounded_only_in_other_matters_is_a_restatement` +
+`test_the_restatement_guard_only_applies_when_a_matter_resolver_is_given`。
+**顺带记一个已归档但未修的缺陷 D13**（`runtime/docs/audit/block-b-motivation-and-action.md`）：
+grounding 闸门只认裸 id，而规则路径写 `memory:mem_x` 这种带前缀的形式 → 整条被判
+`ungrounded_sources` 丢掉。本次守卫按两种写法都认，但 D13 本身没动。
+
+**③ 输入防抖搬到锁前（老 bug 真修好了）** —— 从 `@filter.on_llm_request(priority=100)` 改成
+`@filter.on_waiting_llm_request(priority=100)`，合并目标从 `req.prompt` 改成
+`event.message_str`（AstrBot 在 `collect_initial_request` 里用它拼 `req.prompt`）。
+**为什么原来必然失效**：AstrBot 在 `internal.py:220` 用会话锁包住整个 agent run，
+而 `on_llm_request`（:352）在锁**里面**；第一条等待期间第二条根本到不了自己的处理器 ✗。
+`on_waiting_llm_request` 的文档字符串自己写着"在获取锁之前"，且 `call_event_hook` 返回 True
+时 `internal.py:217` 直接 return（提前终止该轮）。
+**实测对比**：修前 2 秒内两条 → **两轮 LLM** ✗；修后 1 秒内两条 → **一轮 LLM** ✓
+（trace 的 `astr_agent_prepare` 只 +1），她的回复是"两条都到了，顺序也没乱" ✓。
+测试桩补了 `on_waiting_llm_request`，4 条防抖测试改用 `event.message_str`，另加
+`test_the_debounce_is_registered_before_the_session_lock`（把"必须在锁前钩子上"钉住）。
+插件测试 **172 passed / 13 subtests**；runtime 全量 exit=0。
+
 
 **用户追问"9949 那个号到底是什么情况"查出来的事实**：那个测试者是**真人** ✓。他 750 条来信里
 有 **16 条是真人打的字**，包括"一定得加句号吗，看着好难受"、"句号摘了，然后变成了换行说是"
