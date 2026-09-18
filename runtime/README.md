@@ -136,12 +136,21 @@ python -m companion_runtime.cli --base-dir ./data serve --host 127.0.0.1 --port 
 | `backup [目标] [--keep N]` | 写一份一致快照（`VACUUM INTO`） |
 | `restore <快照>` | 用快照覆盖数据库（先校验，拒绝覆盖运行中的库） |
 | `recover [--backup-dir DIR] [--run]` | 打印恢复方案；`--run` 顺带执行一次维护 |
+| `boundaries export <文件\|->` | 把该数据目录的 boundaries **整张表**写成 JSON（含已撤销/已过期；`-` = stdout） |
+| `boundaries import <文件\|-> [--dry-run]` | 把导出装回该数据目录（按 `boundary_id` upsert，可重复跑；`-` = stdin） |
 | `config` | 打印脱敏后的有效配置 |
 | `health` | 打开数据库并打印健康摘要 |
 
 全局参数：`--config <file.toml|file.json>`、`--base-dir DIR`、`--log-level LEVEL`。
 
 > v0.2 新增两个命令：`refresh`（跑一次深层认知刷新）与 `backlog`（列出未解释的事件）。两者都不需要模型：没有配 provider 时 `refresh` 会以 `provider_unavailable` 正常退出。
+
+> `boundaries export/import` 存在的唯一理由是**清库**：清库丢的是"学错的记忆"，而 boundaries 是
+> 用户亲口立的硬约束（"永远别联系我"）。丢掉它不是少一句记忆，是让她继续违反一条用户已经没法
+> 再纠正的规矩。导入按 `boundary_id` 幂等，并保留 `starts_at`/`expires_at`/`revoked_at` 这条
+> 时间线 —— 用户收回过的限制不会因为搬了一次家就复活。整份文件先校验再写：类型不认识、字段缺失
+> 一律**整份拒绝**（退出码 4），不跳过坏行，因为一条没装上的边界就是一条会被走穿的约束。
+> 清库时用 `scripts/boundaries_carryover.sh export|import|check`（详见 HANDOFF.md 的 runbook）。
 
 ---
 

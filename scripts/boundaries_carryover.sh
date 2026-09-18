@@ -125,6 +125,7 @@ case "$ACTION" in
         echo "  $person  已装回 $count 条；库里现在 活跃/总数 = $(db_summary "$person")"
       else
         echo "  $person  导入失败（继续跑完其他人，最后请用 check 复核）" >&2
+        echo "           常见原因：这个人的数据目录还不存在（全新卷要先让舰队起一次）" >&2
         failed=1
       fi
     done

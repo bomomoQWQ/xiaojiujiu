@@ -2381,6 +2381,8 @@ bash relaunch.sh check    # 只看当前状态
   要彻底去掉得在舰队停止时删掉那条路由 ✓（非必须 ✓）；
 - `zz_kb_probe`（测试者装的探针插件）保留 ✓；情绪层**未做**的两件（`EMOTION_EXPLAIN` 无触发者 ✓、
   规则词表缺"工具/自作多情"这类词 ✓）仍待做 ✓。
+- **本次清库没有 boundaries 可搬**（8 个人都是 0 条 ✓）。搬运能力是清库之后才补上的，
+  见文末「boundaries 跨清库搬运」一节；**下一次清库按那一节的固定顺序跑** ✓。
 
 
 
@@ -2593,6 +2595,92 @@ doro/gptimg/weather_amap/zvv 等 8 个）→ 它不是这个角色，所以只�
 部署脚本 `scripts/apply_persona_and_prompt_fixes.sh`（含踩过的两个坑：容器里没有宿主
 `/home/bomomo` 路径所以备份要写 `/AstrBot/data/`；舰队重建后首次 tick 会跑刷新，
 `/context/render-block` 要给 60 秒超时并重试）。
+
+
+
+### 🧠 durable 记忆分类：先问「这句话在说谁」（2026-09-18 21:40 CST，commit `674095d`）
+
+用户指示"1和2修一下"。① 是上一轮审计认定的记忆质量根因之一：规则路径**只看句子里有没有那个词**，
+从不问这句话在说谁。
+
+**实测错行（第一版 beta 自己的库，逐行重放过）**：
+
+| 用户实际说的 | 被记成 | 为什么错 |
+|---|---|---|
+| 我一哥们很喜欢玩柚子社，天天在那喊柚子社天下第一 | `user_preference` | 朋友的爱好变成用户的口味 |
+| 因为我 QQ 一直在响！ | `user_preference` | "我"属于"因为"，不是这句话的主语 |
+| 那你就试试呗，就当陪我 | `relationship` | 一句请求变成关系事实 |
+| 安能辨我是雌雄 | `stable_knowledge` | 引文里恰好含"我是" |
+| 那你喜欢喝啥饮料啊 / 为啥不喜欢喝魔爪 / 喜欢喝茶是为何 | `user_preference` | 问句变成长久偏好 |
+
+**做法**：`memory.durable_subject_ok(text, marker)` + `durable_marker(text, markers)`（表序=优先级，
+同一句话永远落在同一个 kind）。marker 结束位置往前 `SUBJECT_WINDOW_CHARS=8` 内、剔除
+`DIRECTIVE_MARKERS`（记住/别忘/牢记）之后的**最后一个分句**，必须以第一人称主语开头，
+且不得出现他人指称（你/他/她/哥们/朋友/同学/同事/别人/大家/人家）。
+两个例外都是"主语长在 marker 自己身上"：marker 自身以「我/咱」开头且开启一个分句（我是/我生日）；
+或属于 `SPEAKER_ACT_MARKERS`（谢谢你/对不起/抱歉 —— 说话人自己的行为，汉语里没有代词位；
+不给这个例外，关系分支里所有道谢和道歉会被一起杀掉 ✗）。
+同一个 marker 的每次出现都判一遍，任一次通过即通过（"我哥们喜欢X，我喜欢Y" 取后一次 ✓）。
+
+顺带两处表修正（理由都写进注释）：`PREFERENCE_MARKERS` **删掉「记住」**（和已经删掉的「别再/不要」
+是同一类错误：它是对角色的指令 ——"记住，你不许熬夜"；durable 声明由后面那句自己带 marker。
+它作为强调词的分值不受影响，仍在 `EMPHASIS_MARKERS` 里），**补上「平时/通常」**（真正的习惯词，
+"我平时只喝手冲咖啡"，补住删掉「记住」之后的这一类）。
+
+**取舍（单边保守，写进 docstring）**：无主语的属性句（"老家在山东"、"生日是三月三号"）和跨句主语
+（"我告诉你我喜欢喝茶"）一律退回 `episodic` ✓。漏记一句只损失一次回忆；记错一句是把她的话
+当成用户说过的话再复述回去 —— 正是这次要治的病。
+
+**验证**：① 37 行实测/变体人工重放（`.scratch_blackbox/check_subject_rule.py`）**37/37 符合设计** ✓；
+② `tests/test_memory_kind_markers.py` 新增两组参数化（10 行"不是用户"必须退回 episodic +
+8 行真实自述必须保持原 kind；**值门槛归零**，断言的是分类而不是"没存下来" ✓ ——
+否则一个永远答"否"的规则也能全绿）；③ 一条 ingest 端到端用例（证明规则接在生产路径上，
+不只是函数在单元里正确）✓；④ runtime 全量测试通过 ✓；⑤ 部署后在容器里实测：
+`durable_subject_ok("我一哥们很喜欢玩柚子社…","喜欢")` = **False**、
+`("我喜欢打夜羊社的","喜欢")` = **True** ✓。
+
+### 🧷 boundaries 跨清库搬运（同一次，commit `de34192` + `scripts/boundaries_carryover.sh`）
+
+② 清库会丢掉用户亲口立的 boundaries。清库丢的是"学错的记忆"；boundaries 不是学来的，
+是**硬约束**（"永远别联系我"、"别再提这件事"）。丢掉它不是少一句记忆，是让她继续违反一条
+用户**已经没法再纠正**的规矩 —— 纠正的前提是第一次的记录还在，而那份记录正是被清掉的东西。
+
+- **Runtime**：`boundaries.export_boundaries()` / `parse_boundary_export()` / `import_boundaries()`。
+  导出**整张表**（含已撤销/已过期）：文件是表的拷贝而不是视图 ——"从没立过"和"立过又收回"必须分得开 ✓；
+  校验在写第一行之前完成，坏文件**整份拒绝**（`BoundaryImportError`，CLI 退出码 4），不跳过坏行 ✓
+  （一条没装上的边界就是一条会被走穿的约束）；导入按 `boundary_id` upsert（幂等，可重复跑），
+  并保留 `starts_at/expires_at/revoked_at` 这条时间线 ✓（`created_at` 记的是"进入这个数据目录"的时间）。
+- **CLI**：`companion-runtime boundaries export <文件|->` / `import <文件|-> [--dry-run]`，
+  两端都支持 `-`（stdout / stdin）：清库时文件在宿主机、命令在容器里跑，`docker cp` 进运行中的舰队
+  一直不可靠，管道是唯一稳的形式 ✓。
+- **清库脚本**：`scripts/boundaries_carryover.sh export|import|check [目录]`，**不依赖舰队在跑**
+  （用同一个镜像单起容器跑 CLI —— 清库时舰队是停的，`docker exec` 必然失败 ✗）；
+  导出失败**必须中断**："导出失败"和"这个人没有边界"是两件事，混在一起就是丢约束 ✗。
+  `launch_prep_cleanup2.sh` 补了两步：**归档之前**导出（步骤 2，归档会把实例目录搬走）、
+  舰队起来后装回 + 复核（步骤 6）。**import 之后不需要重启实例**：判断边界一律走
+  `self.projections.boundaries.active(now)`，不缓存在内存 ✓。
+- **测试** `tests/test_boundary_carryover.py`（20 条）：声明 → 导出 → 删库 → 导入 →
+  `authorize` 仍然拒绝主动联系（产品级断言，不是"表里有行"）✓；反向也测（已撤销的不复活、
+  窗口过期的不再有效）✓；10 种坏文件整份拒绝且一行不写 ✓；CLI 往返（走 `cli.main`，
+  顺带证明 `--base-dir` 解析到的是被清掉的那个数据目录）/ stdin 导入 / `--dry-run` 不落库 /
+  空目录导出是合法文件（清库按人跑，不能在这里停下）✓。
+- **服务器实测**（真舰队 + 一次性卷）：8/8 人 `export` / `check` / `import` 全部正常
+  —— 本次 8 人都是 `count=0`（清库后新库，没有 boundaries ✓，所以这一步对当前上线是空操作 ✓）；
+  一次性卷完整往返：从 stdin 装 1 条永久禁联 → 再导出**原样**（时间线/撤销状态都在）✓；
+  坏文件退出码 4 ✓。
+
+**给下一次清库的固定顺序**（两个脚本头部也写了）：
+```bash
+bash scripts/boundaries_carryover.sh export <快照目录>/boundaries   # 必须在归档实例目录之前
+… 清库 …
+bash scripts/boundaries_carryover.sh import <快照目录>/boundaries   # 舰队起来之后
+bash scripts/boundaries_carryover.sh check  <快照目录>/boundaries   # 复核
+```
+
+**本次部署记录**：`git pull` → `docker build -q -t xiaojiujiu-runtime:test .` →
+`docker compose -p astrbot_test -f astrbot.yml -f fleet.yml up -d --force-recreate runtime-fleet`
+（重建前先查在飞主动消息：**0** 条 ✓），重建后舰队 **8/8 健康（5 秒）** ✓。
+
 
 
 
