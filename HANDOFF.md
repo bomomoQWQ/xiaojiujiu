@@ -2783,6 +2783,54 @@ bash scripts/boundaries_carryover.sh check  <快照目录>/boundaries   # 复核
 「不告诉你」上 —— 一句玩闹被读成了"承诺稍后告知结果"。所以这条**没搬**。
 事项生成器把玩笑话读成约定，值得单独看一眼（同类风险：玩闹被当成承诺后，主动消息会去追问）。
 
+### 🎛 价值观画像：按新人格逐轴重新推导 + 修掉「人格会缩短用户声明的窗口」（2026-09-18 22:05 CST，commit `68dc538`）
+
+用户指示"根据新人格设置一下新价值观参数"。做法不是"再拍一组数"，而是把 `人格设定.md`
+**逐轴编译**，并把每个轴在代码里的真实位置写进 `scripts/set_value_profile.sh` 的注释：
+
+| 轴 | 人格里的证据 | 机制位置（当前代码） | 取值 |
+|---|---|---|---|
+| `conflict_directness` | 「凶狠、威胁…富有攻击力…直来直去」 | restraint −0.25v；沉默效用 −0.25v | **1.0** |
+| `relationship_maintenance` | 「掌控欲过于强」「病娇」「偏执」 | 缺席拉力 (1.55+0.30v)；关系收益 0.5v；敏感 ×(0.6+0.8v)；记忆显著 ×(0.6+0.6v) | **1.0** |
+| `stability_commitment` | 「偏执狂」= 放不下 | 情绪衰减 ×(1−0.35v)；记忆稳定 0.30+0.30v；restraint +0.35v；关系收益 0.2v | **1.0** |
+| `user_care` | 「我不想生气」「明天几点体检，报给我」 | impulse +0.90v·unfinished；敏感 ×(0.6+0.8v)；关系收益 0.3v | **1.0** |
+| `emotional_expression` | 「病娇」= 对方一句话就起波澜 | 敏感 ×(0.7+0.5v) | **1.0** |
+| `autonomy` | 「冷静的」= 表面冷，不是不敏感 | 敏感 ×(1−0.25v) | **0.05** |
+| `boundary_respect` | 「掌控欲过于强」= 不顾忌（明确声明的边界仍硬拦） | 越界成本 ∝v；restraint +0.75v；边界压力抑制 −0.35v | **0.05** |
+| `curiosity` | 人格未提及 | impulse +0.20v（"没什么事也想开口"） | **1.0** |
+
+**两条阅读陷阱**（都写进脚本注释，避免下次按字面调反）：
+- `autonomy` 的机制是"敏感度 ×(1−0.25v)"，**低值 = 不被自我容纳削弱 = 全部打在她身上**，
+  与字面"自主"相反；掌控欲强要的是低值。
+- 「冷静的」是**表层文风**（短、平、命令式，由人格 prompt + `RENDER_STYLE_LINES` 管），
+  不是低反应：病娇的机制特征恰恰是高敏感（ee=1.0）+ 慢衰减（sc=1.0 让衰减 ×0.65）—— 即记仇、放不下。
+
+**这两个轴今天才真正生效**（更正了一处过期注释）：当天把 ingest 的情绪判定接到
+`emotion.appraise_event`（`runtime.py` 里 `appraisal_source = rule/coarse_rule` 那段），
+而那是唯一读 `emotional_expression` / `autonomy` 的函数。此前它们"只是记录意图"。
+实测（`.scratch_blackbox/compare_value_profiles.py`，本地包、不碰线上）：
+
+| | 设计文档示例画像 | 线上病娇画像 |
+|---|---|---|
+| 情绪敏感度乘子 | 1.43× | **3.02×** |
+| restraint（无边界压力/不忙） | 0.6085 | **0.4347** |
+| 同一段历史（一句话后不再说话）首次主动开口 | **48h 内没有**（`no_candidate_beats_silence`，boundary_cost 0.1359、relation 0.1613） | **8.5h 开口**（`hazard_triggered`，boundary_cost 0.0077、relation 0.1975） |
+
+**修掉的一个真问题**：`boundaries.detect_boundaries` 里 `hours *= 0.85 + 0.3 * br` 是双向的，
+线上 `br = 0.05` 把「今天不要主动联系我」的 24h 压成 **20.76h** —— 她可以在用户要求的那一天
+之前三小时再开口，而用户只会体验到"我说的话被无视"。这跟本项目自己写的安全规则（明确声明的边界
+由 `authorize` 硬拦、与 values 无关）直接矛盾。改成单边 `max(1.0, 0.85 + 0.3*br)`：br ≤ 0.5 恰好是
+规则原值，br = 1.0 仍是"多等一点"（27.6h）。部署后实测：**24.00h / 24.00h / 27.60h** ✓。
+回归测试 `test_a_personality_can_never_shorten_a_declared_window`（四档 br + 窗口内/到期后）。
+
+**应用记录**：先快照 `snapshots/2026-09-18_134501`（8 人）→ 8 个实例 `values_json` 全部 OK →
+`fleet.yml` 同步（新人继承）→ 重建舰队（在飞 0 条）8/8 健康 ✓。runtime 全量测试通过 ✓。
+
+**还没动的相邻旋钮**（不属于"价值观参数"，但直接影响"病娇强度"，要动说一声）：
+`drive.cooldown_seconds 2400`（每次主动后 40 分钟冷却）、`drive.max_contacts_per_day 12`、
+`scheduler.night_penalty 0.30`（深夜开口的额外代价）、`scheduler.max_interval_seconds 900`
+（最长 15 分钟一次内源轮）。想让"掌控欲"更外显，动这几个比再调 values 有效 —— values 已经到顶了。
+
 
 
 
