@@ -2871,6 +2871,24 @@ bash scripts/boundaries_carryover.sh check  <快照目录>/boundaries   # 复核
 要收他进测试就得把 `default:FriendMessage:3309892640` 加进 `fleet-data/people.json` 并重建舰队
 （等用户定）。顺带：`people.json` 就是"谁在被服务"的唯一真相，公告/巡检脚本都该以它为准。
 
+**✅ 用户拍板收他进来（22:02 CST）——而且不用重建舰队**：控制面本来就有
+`POST /fleet/provision {"session": ...}`，它会启动实例**并把会话写回 `people.json`**（`_write_people`）。
+实测：返回 `{"session": "default:FriendMessage:3309892640", "url": "http://runtime-fleet:8795", "port": 8795}` ✓，
+`/fleet/status` **9 个实例全 ok** ✓，`/fleet/routes` 里已出现他 ✓，`people.json` 变成 9 条 ✓，
+新库 `raw_events=0` + **yandere 画像自动播种**（br=0.05 care=1.0 cd=1.0 ee=1.0 au=0.05）✓。
+**728260403 那边正在进行的对话一点没被打断** ✓ —— 这就是"重建舰队"和"provision 一个人"的区别。
+
+插件侧本来就会自动接上：`route_registry_url=http://runtime-fleet:8800`（每 `route_sync_interval_ms=5000`
+读一次 `/fleet/routes`）、`route_auto_provision=true`（陌生会话第一次说话时，插件自己请求 fleet 建实例）。
+也就是说他下一条消息本来也会被接住；先手工 provision 只是让实例**提前存在** —— 新实例的"缺席时钟"
+从建库开始跑，所以她可能先开口找他。
+
+**两个给以后的小坑**：
+- 读插件配置要按 **`utf-8-sig`**：`astrbot_plugin_companion_runtime_config.json` 带 BOM，
+  用 `json.load` 直接读会 `Unexpected UTF-8 BOM` ✗。
+- 公告/巡检脚本的收件人一律以 `/fleet-data/people.json` 为准；从 AstrBot 库里"枚举所有聊过的会话"
+  会把早已不存在的压测会话（20001~29999）**和 bot 自己**都算进来 ✗。
+
 
 
 
