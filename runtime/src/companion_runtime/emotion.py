@@ -429,6 +429,17 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     return number
 
 
+#: How many cache-key segments may differ before a cached explanation is thrown away.
+#:
+#: The key carries nine segments and five of them are continuously moving numbers, so an
+#: exact-key lookup discards an entry over a 0.1 crossing (``v0.1`` -> ``v0.2``) whose six
+#: sentences would be identical - and re-rendering means a model call once a provider is
+#: configured. A real emotional move changes several segments at once (the sign, the top
+#: intensity and the dominant direction), so it still re-explains, and the TTL stays the
+#: backstop for a state that drifts forever without crossing anything.
+EXPLAIN_KEY_CHANGE_TOLERANCE = 2
+
+
 def _rounded(value: Any) -> float:
     """Return one decimal of a persisted number, tolerating corrupt values."""
     return round(_safe_float(value), 1)
@@ -543,6 +554,18 @@ class EmotionExplainer:
             )
             if cached is not None:
                 return dict(cached) | {"cache_hit": True, "cache_key": key}
+            # Fuzzy hit: see EXPLAIN_KEY_CHANGE_TOLERANCE. Serving the last entry while
+            # less than that many segments differ keeps the cost proportional to how much
+            # actually moved instead of to how finely the key is quantised.
+            latest = self._projection.latest_explanation(now, self._explanation_ttl_seconds())
+            if latest is not None and not self.should_re_explain(
+                latest.get("cache_key"),
+                key,
+                threshold_changes=EXPLAIN_KEY_CHANGE_TOLERANCE,
+            ):
+                payload = latest.get("payload_json") or {}
+                if payload:
+                    return dict(payload) | {"cache_hit": True, "cache_key": key}
 
         payload = self._build_input(state, active)
         result = self._render(payload, rng or random.Random(0), cache_key=key)

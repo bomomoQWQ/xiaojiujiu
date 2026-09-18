@@ -1019,6 +1019,49 @@ class TestTheProviderSeesTheSameCacheKey:
         finally:
             db.close()
 
+    def test_a_drift_within_tolerance_is_served_without_a_model_call(self) -> None:
+        """One segment crossing a rounding boundary must not cost a re-render.
+
+        The key carries nine segments and five of them are continuously moving numbers,
+        so an exact-key lookup re-renders - and calls the model - for prose that would not
+        change. A real move changes several segments at once and still re-explains.
+        """
+        db = Database(":memory:")
+        db.migrate()
+        try:
+            provider = self._FakeProvider()
+            projection = EmotionProjection(db)
+            explainer = EmotionExplainer(projection, RuntimeConfig(), provider=provider)
+            active = [_active_emotion("e1", intensity=0.6, direction="-", label="委屈")]
+
+            base = RuntimeState()
+            base.mood_valence = 0.02
+            with db.transaction() as conn:
+                projection.store_explanation(
+                    conn,
+                    cache_key=EmotionExplainer.cache_key(base, active),
+                    payload={"experience": "缓存的解释"},
+                    source="deep_refresh",
+                    now=BASE_TIME,
+                )
+
+            drifted = RuntimeState()
+            drifted.mood_valence = 0.06  # v0.0 -> v0.1: exactly one segment
+            result = explainer.explain(state=drifted, active=active, now=BASE_TIME)
+            assert result["cache_hit"] is True
+            assert result["experience"] == "缓存的解释"
+            assert provider.keys == [], "a tolerated drift must not call the provider"
+
+            moved = RuntimeState()
+            moved.mood_valence = 0.06
+            moved.mood_arousal = 0.12
+            moved.restraint = 0.83
+            result = explainer.explain(state=moved, active=active, now=BASE_TIME)
+            assert result["cache_hit"] is False
+            assert provider.keys, "a real move must re-render"
+        finally:
+            db.close()
+
     def test_a_future_stamped_entry_is_never_served(self) -> None:
         """A negative age is below every TTL, so it must be rejected explicitly."""
         db = Database(":memory:")

@@ -431,6 +431,30 @@ class EmotionProjection:
             return None
         return data.get("payload_json") or None
 
+    def latest_explanation(self, now: datetime, ttl_seconds: float) -> dict[str, Any] | None:
+        """Return the most recently used explanation of *any* key, when still fresh.
+
+        The explanation key carries nine segments and five of them are continuously
+        moving numbers, so an exact-key lookup throws away an entry whose prose would be
+        identical. The caller compares this entry's key with the current one and decides
+        whether the difference is worth a re-render; the TTL check mirrors
+        :meth:`cached_explanation` (the caller's ``now``, future timestamps rejected).
+        """
+        row = self._db.query_one(
+            "SELECT * FROM emotion_explanations ORDER BY last_used_at DESC LIMIT 1"
+        )
+        data = row_to_dict(row, "emotion_explanations")
+        if data is None:
+            return None
+        last_used = parse_datetime(data.get("last_used_at"))
+        reference = ensure_aware(now)
+        if last_used is None or reference is None:
+            return None
+        age = (reference - last_used).total_seconds()
+        if age < 0.0 or age > max(0.0, float(ttl_seconds)):
+            return None
+        return data
+
     def store_explanation(
         self,
         connection: sqlite3.Connection,
