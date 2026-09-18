@@ -198,7 +198,7 @@ def render(image: str, env: list[str], compose: Path, checkout: Path, *, publish
                 "      # 只开一个端口，下次重建后那个端口就是别人了。",
                 "      # ⚠️ 这些 API **没有自己的鉴权**（runtime_token 为空），只适合家和内网，",
                 "      # 不要把这一段映射到公网；不需要时删掉这几行并重建即可。",
-                "      - \"8787-8799:8787-8799\"",
+                "      - \"8787-8829:8787-8829\"",
             ]
             if publish_people
             else ["      # per-person ports stay in the network (see --publish-people)"]
@@ -241,7 +241,7 @@ def main() -> int:
     parser.add_argument(
         "--publish-people",
         action="store_true",
-        help="publish the per-person port range (8787-8799) to the LAN; unauthenticated APIs",
+        help="publish the per-person port range (8787-8829) to the LAN; unauthenticated APIs",
     )
     parser.add_argument("--no-start", action="store_true")
     args = parser.parse_args()
