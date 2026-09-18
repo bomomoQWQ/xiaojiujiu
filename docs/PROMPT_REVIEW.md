@@ -224,7 +224,8 @@ tools = ['web_search_tavily', 'tavily_extract_web_page', 'future_task', 'send_me
 | 知识库 | `:299-309` | 内容片段 | `[Related Knowledge Base Results]:\n{…}` | ❌ `knowledgebase = null` |
 | 知识库（工具模式） | `:316-320` | 工具 | `KnowledgeBaseQueryTool` | ❌ 同上 |
 | 引用消息 | `:894-896` | 内容片段 | `<Quoted Message>\n{…}\n</Quoted Message>` | 视消息而定 |
-| 引用图说明 | `:881-884` → `:733` | `text_chat(prompt=…)` + 内容片段 | 发送的 prompt 是 `Please describe the image content.`；结果包成 `<image_caption>…</image_caption>` | ✅ 配了 `default_image_caption_provider_id`（`博馍馍的ChatGPT-Plus/gpt-5.6`）→ 引用图会走这条 |
+| 引用图说明 | `:881-884`（引用消息里的图，走硬编码 prompt）→ `:733` | `text_chat(prompt=…)` + 内容片段 | 硬编码 `Please describe the image content.`；结果包成 `<image_caption>…</image_caption>` | ✅（本机配了 caption provider `博馍馍的ChatGPT-Plus/gpt-5.6`） |
+| 普通图片说明 | `_ensure_img_caption`（`:720-741`） | 内容片段 | 用配置项 `image_caption_prompt`，**本机实际值：`Please describe the image using Chinese.`** | ✅ 视消息而定 |
 | 图片说明失败占位 | `:739` | 内容片段 | `[Image Captioning Failed]` | 视情况 |
 | 附件路径 | `:745` `:751` `:757` `:778/:799` `:1384` `:1402` `:1412` `:1417` | 内容片段 | `[Image Attachment: path …]`、`[Audio Attachment: path …]`、`[Video Attachment: name …, path …]`、`[File Attachment: name …, path …]`、`[Image unavailable]`，以及各自的"quoted message"版本 | 视消息而定 |
 | 侧栏摘录 | `:1587-1595` | 内容片段 | `The user is asking in a side thread…<selected_excerpt>…</selected_excerpt>` | ❌ WebUI 专用 |
@@ -243,7 +244,30 @@ system prompt 的一部分，而是紧贴用户原话的一坨文本 —— 这�
 | Runtime 上下文块 | 插件 `main.py:756-798`（`_inject_context`，由 `on_llm_request` 调） | `req.extra_user_content_parts`，用 `TextPart(text=…).mark_as_temp()` 追加 | Runtime `POST /context/render-block` 的整段（617 字，逐字见 §1.4） | ✅ `inject_enabled=True`；Runtime 不可达或缺 `TextPart`/`mark_as_temp` 时**放弃注入**（fail-open） |
 | 主动消息的 prompt | Runtime `api_v1.py:597-649`（`_render_payload`）→ 插件 `astrbot_executor.py:52-94`（`render`）→ `context.llm_generate(prompt=…)` | **一次性生成调用**（不走 agent 流水线） | 块（去掉 `- 想做的事：` 行）+【现在要写的话】+ 意图/目的/约束 + 输出要求 | ✅；`system_prompt=""` ✗（见 §2） |
 
-### 5.3 第三方与其他
+### 5.4 工具是怎么被注册的（门槛 + 默认值 + 两个实例的实际值）
+
+每个内置工具由 `@builtin_tool(config={...})` 声明一串**配置条件**（`core/tools/registry.py:109-118`
+把 config map 编成等值/包含条件）。实测四件工具的门槛与状态：
+
+| 工具 | 注册条件（源码） | AstrBot 默认 | 测试栈 | 线上 |
+|---|---|---|---|---|
+| `web_search_tavily`、`tavily_extract_web_page` | `provider_settings.web_search == True` 且 `provider_settings.websearch_provider == "tavily"`（`web_search_tools.py:28-31`） | `web_search: False` ✗默认关 | `web_search=True` `link=True` `provider=tavily` `key=有值(58 字, tvly…)` → **已注册并交给模型** | 同上，**完全一致** |
+| `future_task` | `provider_settings.proactive_capability.add_cron_tools == True`（`cron_tools.py:16-18`） | `add_cron_tools: True` ⚠️**默认就是开** | True → 已注册 | True → 已注册 |
+| `send_message_to_user` | 自定义判定（`registry.py:121-165`）：存在**启用的、且支持主动发消息**的平台即可（排除 wecom/公众号；wecom_ai_bot 需 webhook） | 无独立开关 | aiocqhttp 启用 → **已注册** | 同上 |
+| `KnowledgeBaseQueryTool` | 知识库开启时（`astr_main_agent.py:316-320`） | — | `knowledgebase=null` → 未注册 | — |
+
+**结论**：那 4 个工具是当前配置的必然结果，不是 bug —— 但值得你确认是否有意为之：
+`web_search` 的**默认是 False**，两个实例都是 `True` 且都填了真实 Tavily key（最旧的备份
+`cmd_config.json.bak-embedding`（09-15 18:00）里就已有 key，说明是早期配置阶段设的）；
+而 `future_task` 属于 **AstrBot 默认开启**，不是谁配出来的。
+
+**收口方式**：
+- 关搜索：`provider_settings.web_search = false` → 两个搜索工具立即不再注册（一个配置项）；
+- 关定时：`proactive_capability.add_cron_tools = false` → `future_task` 不再注册；
+- `send_message_to_user` **没有配置开关** ✗ —— 要收口只能：① 我们插件在 `on_llm_request` 里
+  从 `req.func_tool` 摘掉它（插件就是集成层，且这正好落实"何时开口由 Runtime 决定"）；
+  ② 或改上游（不采纳）。
+
 
 - **`zz_kb_probe`（测试栈里唯一的第三方插件）不注入任何提示词**：它只挂了
   `@filter.on_astrbot_loaded()`（`main.py:67`），是启动期探针。
