@@ -107,7 +107,8 @@ PREFERENCE_MARKERS = (
     "从来",
     "一直",
     "以后",
-    "记住",
+    "平时",
+    "通常",
     "对我来说",
     "prefer",
     "always",
@@ -125,6 +126,11 @@ PREFERENCE_MARKERS = (
 #:   ("不要一直追问我在干嘛" is a boundary declaration), not statements about what the
 #:   user likes. Storing the user's instructions as their preferences is how a
 #:   boundary came to be filed as a durable fact about the user.
+#: * ``记住`` - the same mistake in a politer form, and it was caught the same way:
+#:   "记住，你不许熬夜" is an instruction about the *character*, and the durable claim it
+#:   introduces carries its own marker ("我平时只喝手冲咖啡"). Its weight as an emphasis
+#:   is untouched - ``EMPHASIS_MARKERS`` scores the candidate, and scoring is a different
+#:   question from what kind of fact it is.
 #:
 #: The rule this leaves behind: a marker has to be a word about the user, at least two
 #: characters, and the preference branch is guarded against questions exactly like its
@@ -243,7 +249,172 @@ RELATIONSHIP_MARKERS = (
 #: something that happened (episodic at most): "我生日是什么时候来着" must not be
 #: filed as stable knowledge about the user, which is exactly what the marker "我生日"
 #: alone did.
-QUESTION_MARKERS = ("?", "？", "吗", "呢", "什么时候", "多少", "为什么", "怎么", "哪", "记不记得", "还记")
+QUESTION_MARKERS = (
+    "?",
+    "？",
+    "吗",
+    "呢",
+    "什么时候",
+    "多少",
+    "为什么",
+    "怎么",
+    "哪",
+    "记不记得",
+    "还记",
+    # Measured misses. The first beta's own bad rows spelled the question differently:
+    # "那你喜欢喝啥饮料啊", "为啥不喜欢喝魔爪" and "喜欢喝茶是为何" were all filed as
+    # durable `user_preference`. The guard below is the last line of defence for
+    # questions, so it has to carry the spellings people actually type.
+    "啥",
+    "为啥",
+    "为何",
+    "如何",
+    "是不是",
+    "有没有",
+    "多久",
+    "几点",
+    "谁",
+)
+
+#: Tokens that make a durable statement *about the user*.
+FIRST_PERSON_SUBJECTS = ("我", "咱")
+
+#: Tokens that make it about somebody else - a friend, a colleague, or the character
+#: ("我一哥们很喜欢玩柚子社…" was stored as the user's own preference).
+OTHER_SUBJECTS = (
+    "你",
+    "您",
+    "他",
+    "她",
+    "它",
+    "哥们",
+    "朋友",
+    "同学",
+    "同事",
+    "别人",
+    "大家",
+    "人家",
+)
+
+#: How far before a durable marker its subject may sit.
+SUBJECT_WINDOW_CHARS = 8
+
+#: Characters a subject may follow: the start of the text or of a new clause.
+CLAUSE_BOUNDARIES = "，。！？；、,.!?; \t\n"
+
+#: Markers that are *instructions to the character* rather than statements about the
+#: user. They can open a message ("记住，我平时只喝手冲咖啡"), and then they are the frame
+#: rather than the claim: the subject test looks through them instead of reading them as
+#: the clause the durable marker belongs to.
+DIRECTIVE_MARKERS = ("记住", "别忘", "牢记", "remember")
+
+#: Relational markers that express an act of the speaker's own and therefore carry their
+#: subject implicitly: "谢谢你那天惦记我" *is* the user thanking the character, and there
+#: is no pronoun that could stand in front of it. Without this table the relationship
+#: branch would only fire on "我很想你" and lose every thanks and apology.
+SPEAKER_ACT_MARKERS = ("谢谢你", "谢谢", "对不起", "抱歉", "thank you", "sorry")
+
+
+def _strip_directives(region: str) -> str:
+    """Drop directive markers from a subject window (see :data:`DIRECTIVE_MARKERS`)."""
+    for marker in DIRECTIVE_MARKERS:
+        region = region.replace(marker, "")
+    return region
+
+
+def _last_clause(region: str) -> str:
+    """Return the last non-empty clause of a subject window, trimmed."""
+    clause = ""
+    for segment in re.split("[" + re.escape(CLAUSE_BOUNDARIES) + "]", region):
+        if segment.strip():
+            clause = segment.strip()
+    return clause
+
+
+def _clause_is_about_user(clause: str) -> bool:
+    """Return whether a clause predicates something of the user.
+
+    The clause has to *open* with a first-person subject ("我喜欢…", "我平时…") and it
+    must name nobody else ("我一哥们很喜欢…"). Opening with the subject is what separates
+    a statement from a reason clause: in "因为我 QQ 一直在响" the `我` belongs to `因为`,
+    and the sentence says nothing about what the user is like.
+    """
+    if any(token in clause for token in OTHER_SUBJECTS):
+        return False
+    return any(clause.startswith(token) for token in FIRST_PERSON_SUBJECTS)
+
+
+def _marker_predicated_of_user(text: str, start: int, end: int, marker: str) -> bool:
+    """Judge one occurrence of a durable marker (``text[start:end]``)."""
+    region = _strip_directives(text[max(0, end - SUBJECT_WINDOW_CHARS) : start])
+    if _clause_is_about_user(_last_clause(region)):
+        return True
+    # Otherwise the marker has to carry the subject of its own clause, which is only true
+    # when it opens that clause: ``我是``/``我生日`` do, the ``我是`` inside
+    # "安能辨我是雌雄" does not.
+    if region and region[-1] not in CLAUSE_BOUNDARIES:
+        return False
+    if any(marker.startswith(token) for token in FIRST_PERSON_SUBJECTS):
+        return True
+    return marker.lower() in SPEAKER_ACT_MARKERS
+
+
+def durable_subject_ok(text: str, marker: str) -> bool:
+    """Return whether a durable marker is predicated of the *user*.
+
+    The marker tables are substring tests, so a sentence that merely *contains* one is
+    not evidence about the user. Measured on the first beta's own archive, four bad rows
+    came through this hole: ``我一哥们很喜欢玩柚子社…`` (a friend's taste),
+    ``因为我 QQ 一直在响！`` (a reason clause, not a statement), ``那你就试试呗，就当陪我``
+    (a request) and ``安能辨我是雌雄`` (a quotation that merely contains ``我是``).
+
+    A marker counts only when the clause it ends is about the user: that clause - the text
+    up to :data:`SUBJECT_WINDOW_CHARS` before the marker, with
+    :data:`DIRECTIVE_MARKERS` looked through - has to open with a first-person subject and
+    name nobody else. The two exemptions are both the subject sitting inside the marker:
+    a marker that opens its clause with a first-person token (``我是``, ``我生日``), and an
+    act of the speaker's own (:data:`SPEAKER_ACT_MARKERS`).
+
+    The test is deliberately one-sided. A subjectless attribution ("老家在山东",
+    "生日是三月三号") falls back to episodic, and so does a statement whose subject is
+    implied by the previous clause. A lasting fact about the user that was never filed
+    costs one recall; a lasting fact that was never true is repeated back as if the user
+    had said it, which is the failure this whole function exists to stop.
+
+    Args:
+        text: The user's message.
+        marker: The durable marker that matched.
+
+    Returns:
+        ``True`` when the statement is about the user himself.
+    """
+    lowered = text.lower()
+    needle = marker.lower()
+    start = lowered.find(needle)
+    while start >= 0:
+        if _marker_predicated_of_user(text, start, start + len(needle), marker):
+            return True
+        start = lowered.find(needle, start + 1)
+    return False
+
+
+def durable_marker(text: str, markers: Sequence[str]) -> str | None:
+    """Return the first marker of ``markers`` that is predicated of the user, if any.
+
+    Table order is the priority order of the kinds in :func:`propose_from_event`, so the
+    same sentence always lands in the same kind.
+
+    Args:
+        text: The user's message.
+        markers: One marker table (preference, stable knowledge or relationship).
+
+    Returns:
+        The matching marker, or ``None`` when the sentence contains none about the user.
+    """
+    for marker in markers:
+        if durable_subject_ok(text, marker):
+            return marker
+    return None
 
 #: Phrases that ask the character to *demonstrate* memory rather than to learn
 #: something - "你还记得…吗？". The owner's decision (see
@@ -479,20 +650,27 @@ def propose_from_event(
         return None
 
     kind = MemoryKind.EPISODIC.value
-    lowered = text.lower()
     is_question = any(marker in text for marker in QUESTION_MARKERS)
     # Every branch guards against questions, the preference one included: a question is
     # not a durable fact about the user, and the missing guard here is what filed
     # "我喜欢你这件事情，你还记得我说过吗？" as a lasting `user_preference`.
-    if not is_question and any(marker in lowered for marker in PREFERENCE_MARKERS):
-        kind = MemoryKind.USER_PREFERENCE.value
-    elif not is_question and any(marker in lowered for marker in STABLE_MARKERS):
-        kind = MemoryKind.STABLE_KNOWLEDGE.value
-    elif not is_question and any(marker in lowered for marker in RELATIONSHIP_MARKERS):
-        # A relational act is not a preference and not an episode: it is the material
-        # the relationship model is built from (design §16's fourth kind, which had no
-        # producer at all - the kind existed only in the enum and the importance table).
-        kind = MemoryKind.RELATIONSHIP.value
+    #
+    # Every branch also has to ask *who the sentence is about*, which is what
+    # ``durable_marker`` adds to the substring test. Measured on the first beta's archive:
+    # "我一哥们很喜欢玩柚子社…" was filed as the user's taste, "因为我 QQ 一直在响！" as a
+    # habit, "那你就试试呗，就当陪我" as a relational fact. Every durable row of that run
+    # was replayed through this rule by hand before it was written.
+    if not is_question:
+        if durable_marker(text, PREFERENCE_MARKERS) is not None:
+            kind = MemoryKind.USER_PREFERENCE.value
+        elif durable_marker(text, STABLE_MARKERS) is not None:
+            kind = MemoryKind.STABLE_KNOWLEDGE.value
+        elif durable_marker(text, RELATIONSHIP_MARKERS) is not None:
+            # A relational act is not a preference and not an episode: it is the material
+            # the relationship model is built from (design §16's fourth kind, which had no
+            # producer at all - the kind existed only in the enum and the importance
+            # table).
+            kind = MemoryKind.RELATIONSHIP.value
 
     proposition, frame = proposition_of(text)
     structured: dict[str, Any] = {}
