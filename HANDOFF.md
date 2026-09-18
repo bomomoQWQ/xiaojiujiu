@@ -1910,3 +1910,127 @@ priority 全是 0.50 时**价格完全相同**。所以"她挑哪件旧事说"�
 这是**优先级不分新旧**的设计属性，不是重复 bug。要改就得让 `priority` 反映时效/紧迫度
 （现在全靠模型/规则给的 0.5，`waiting_until`/`expire_at` 没有反向影响 priority）。
 
+### 🛑 测试栈已暂停 + 已发维护公告（2026-09-18 11:55 CST）
+
+用户决定：做一轮大更新，暂停服务并在恢复时**清除聊天记忆**。执行结果：
+
+**公告已送达 7 个真人测试者**（`scripts/announce_maintenance.sh`）。发送通道值得记下来，因为
+**NapCat 没有可用的发送接口**：`onebot11_3640344731.json` 里 `httpServers: []`，只有一条到
+AstrBot 的反向 WS；WebUI（6098）的 `/api/*` 拿 `webui.json` 里的 token 也是 Unauthorized。
+最后走的是 **AstrBot 的 Open API**：`POST /api/v1/im/messages`，body `{"umo": ..., "message": "..."}`
+（`message` 直接给字符串即可），鉴权用 **JWT（HS256，claim 里要有非空 `username`）**，
+`jwt_secret` 从 `cmd_config.json` 的 `dashboard.jwt_secret` 读 —— JWT 拿到 `scopes=["*"]`，
+所以任何 scope 都过。这条路走的就是 AstrBot→NapCat 那条链路，**不用改 NapCat、不用重启**。
+
+公告原文（逐字发送，未加工）：
+> 「系统消息」很抱歉打扰您的雅兴，我们需要暂时对苏清徽进行断网维护和更新，在此期间我们会暂停服务，预计再次上线时间为9月19日23.59前。上线后之前的聊天记忆会被清除。感谢您的耐心等待
+
+两个非预期收件人（我枚举了 AstrBot 库里的全部会话，共 22 个）：
+- `3640344731` —— **bot 自己的 QQ**，成功发出（无害，但在群里会显得蠢）；
+- `3309892640` —— 只有一条 `umo_aliases` 记录、**没有任何聊天记录**，QQ 侧报
+  `EventChecker Failed: NTEvent serviceAndMethod`（大概率没送到，也不像真人）；
+- 另外 13 个 `20001-20012 / 20099 / 29999` 是 **`xxj-onebot` 测试前端的模拟 id**，
+  QQ 返回"无法获取用户信息"（预期，它们不是真人）。
+
+**暂停的容器**（`scripts/pause_service.sh` + `scripts/pause_napcat.sh`）：
+
+```
+astrbot-test        Exited    ← 不再回复
+xxj-runtime-fleet   Exited    ← 不再主动联系
+xxj-napcat-test     Exited    ← QQ 通道断开（按用户要求停）
+xxj-onebot          Exited    ← 18 小时前就停了（profile 门控）
+xxj-runtime-test    Up        ← 闲置兜底实例，无平台链路，发不出任何东西（未停）
+napcat（线上）       Up        ← 没碰
+```
+
+**重新上线步骤**（重要：上次**重启 NapCat 会掉 QQ 登录态、必须重新扫码**）：
+
+```bash
+# 1) 先起 Runtime 舰队（插件的路由注册表要能连上它）
+cd /home/bomomo/astrbot_test
+docker compose -p astrbot_test -f astrbot.yml -f fleet.yml up -d runtime-fleet
+curl -s http://127.0.0.1:8800/fleet/status | head -c 200
+
+# 2) 起 NapCat，等二维码，扫（这一步会掉登录态）
+docker start xxj-napcat-test
+sleep 20
+docker cp xxj-napcat-test:/app/napcat/cache/qrcode.png .   # 复制出来扫码
+docker logs --tail 30 xxj-napcat-test                       # 看是否登录成功
+
+# 3) 起 AstrBot（务必等「适配器已连接」再让人发消息：那之前的消息会静默丢失）
+docker start astrbot-test
+docker logs -f astrbot-test | grep --line-buffered "适配器已连接"
+```
+
+`NapCat 的日志是本地时间（CST）`，AstrBot 的是 CST，Runtime 的 raw_events 是 **UTC** ——
+对时间时别搞混（`11:54 CST = 03:54 UTC`）。
+
+### ⚠️ 封测暴露的产品问题（2026-09-18 早晨，全量聊天记录分析）
+
+拉下 NapCat 的 2512 条收发（09-16 22:39 起，7 个人）分析，`scripts/analyze_qq_transcript.py`：
+
+**① `994959351` 是一个 100% 的 QQ 自动回复死环**（用户口中的"自动回复一直触发bot"）：
+收 670 / 发 **1212**（第二名才 146），**672 条来信全部带 `[自动回复]`**，内容字面就是
+`[自动回复] 。`（653 次），从"请求添加你为好友"那一条就开始了。也就是说：**那个人把 QQ
+自动回复设成了「。」** → 她发一条 → 对方 QQ 自动回「。」→ 我们当成用户消息 → 她再回 →
+无限。她的语气已经把环写出来了（"灯都灭了，还按"、"手松开吧，我不吵了"、"算了，不跟你耗了"、
+"一天亮着，就等你一个字"）。
+
+**没有任何一处把"自动回复"当作不是人在说话。** 排查过的现成方案：
+- 市场里**没有**专门过滤自动回复的插件（"自动回复过滤" 0 条；10 条"自动回复"命中全是
+  关键词自动回复插件，方向相反）；
+- `astrbot_plugin_prompt_injection`（用户最初点的那个）**做不到**：它的文档与代码反复写明
+  "违禁词检查**仅群聊生效**、私聊只做提示词注入"（`main.py:301`），而我们这个环是**私聊** ✗；
+- `astrbot_plugin_self_msg_guard` 是同一类问题的现成实现（全拦/去重/限频），但它拦的是
+  **机器人自己账号被回灌**的消息，QQ 自动回复来自**对方账号**，触发点不同 ✗；
+- 最接近可用的是关键词阻断类（`word_filter` / `prompt_injection` 的群聊部分）与按人限频类
+  （`rate_limiter`）。
+
+**AstrBot 内置限频本身就是一条纯配置解**（`rate_limit_check/stage.py:74-89`）：
+`stall` 只是等待（环继续），**`discard` 直接 `event.stop_event()`**；而阶段顺序
+（`bootstrap.py:7-17`）是 `rate_limit_check` 在 **process_stage 之前** → discard 掉的事件
+**插件的消息钩子根本不会跑** → 既不会被回复，**也不会被上报给 Runtime**（两端同时断）✓。
+现在配的是 `{60s, 30条, stall}` = 太宽 + 不拦。
+
+**② "时间问题"不是时钟问题，是"她挑的钟点"和"她说的钟点"**：
+- 时钟全部正确（host / fleet / astrbot-test / napcat-test 一致；fleet 有 `TZ=Asia/Shanghai`
+  + `/etc/localtime`；`local_now()` 返回 CST ✓；AstrBot `timezone=Asia/Shanghai` ✓）；
+- **14 条主动消息里 6 条落在本地 00:00–06:30**（00:17 / 04:01 / 04:08 / 04:50 / 06:17 / 06:22）
+  —— 因为 **`scheduler.quiet_hours_start/end` 是 `null`**，调度器支持静默时段但没配；
+- "凌晨 4 点说晚上好"：主动消息走插件的一次性 `llm_generate`（**不经流水线**），所以
+  AstrBot 的 `datetime_system_prompt` 那条**不附加**；她的时间感只来自我们注入的背景块，
+  而块里是 `当前本地时间：2026-09-18T04:01:25+08:00` 这种**机器串、没有"现在是凌晨"这层话**
+  → 模型自己编了个问候。
+- 另外 `1670681411` 还留着我跳钟实验的**未来时间戳**（`last_contact_at` +0.8h、2 条 raw_events、
+  1 条判决、1 个 attempt），04:24 UTC 之后自愈。
+
+**③ 输入防抖确认失败**（见上文"输入防抖"一节末尾的更正）：根因是 AstrBot 在
+`internal.py:220` 用**会话锁**包住整个 agent run，而 `on_llm_request`（:352）在锁**里面**
+→ 第一条等待期间第二条根本到不了自己的钩子 → "等更新的请求出现"这个设计**原理上不可能生效**。
+正确位置是锁**之前**的 `on_waiting_llm_request`（:217，`message_merger` 用的就是它，
+且其返回值能直接终止该轮）。
+
+**④ `(b)` 提示词边界没起作用**：`1670681411` 一夜从 7 件长回 **13 件**，6 件新事全是旧事的改写，
+而且它们的 `sources` 是 **`unf_*`（其他事项的 id）而不是事件 id** —— 即**模型把输入里的现有
+未完之事当成"新发现"重新输出了一遍**，并引用事项 id 当来源。现有的 source 去重只比事件 id
+（比不到），标题又被改写到我设的 0.77/0.26 之外（漏过）。**建议的修法**：一条**新建**事项的
+`sources` 必须包含至少一个**事件 id**；如果全是 `unf_*` 就是复述 → 直接拒收并记
+`skipped:unfinished_matter:matter_restatement`。这比调提示词可靠。
+
+**⑤ 第 7 个人（自动开通的 `2259606745`）拿到的是默认人格** —— 我的疏忽，已补：
+`ensure_defaults` 只在**建库那一次**从 env 播种（`ON CONFLICT DO NOTHING`），而**容器 env 只在
+建容器时生效**；她 11:11 开通时那个 fleet 容器是 03:30 建的（早于档案进 fleet.yml）→ 中性默认
+（`br=0.92`）→ 克制 0.70、沉默效用 0.891（别人 0.77）→ **有 4 件真实未完之事却一件都赢不过沉默**。
+已跑 `set_value_profile.sh`（快照 `2026-09-18_032411`）补齐 7 个实例。`set_value_profile.sh`
+的注释里其实写着这个陷阱，只是漏了"脚本跑完之后新开通的人"。
+
+**⑥ 我那个"过线推演"错了**：`2206929446` 实测仍 −0.0225（我预测早该过线）。原因是我的推演
+基线假设"用户不再说话"，但那人 **13:28 又说过一句** → `last_exchange_at` 被重置 → impulse/
+pressure 增长全错位。它现在只差一点点，随时可能过线，但**时间预测不成立**。
+
+**⑦ 过夜的好消息**：主动投递**14 条真人送达**（14.5 小时内，5 个实例各 2–4 条），
+内容对得上上下文（含一条直接回应测试者"只收到自动回复"抱怨的："我在，这条不是自动回复，
+你先忙你的，不急"）。**λ 模型对均值预测准**（预期 ~2.5 条/人，实测 2–4 条），但个体中位噪声
+很大（最早比中位早 3.5 小时，最晚晚 6 小时）—— 几何分布本该如此，那张表不能当时刻表用。
+句号修复也确认成功：09-17 有 67% 气泡结尾带句号，**09-18 的 1114 条里只有 4 条（0%）**。
+
