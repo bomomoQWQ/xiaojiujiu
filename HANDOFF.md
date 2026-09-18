@@ -2948,6 +2948,56 @@ provider_called=true latency=2108ms operations=5`），所以候选集还会随�
 预测不是死的。想核对时重跑同一条命令即可：
 `docker cp scripts/predict_next_contact.py xxj-runtime-fleet:/tmp/predict.py && docker exec xxj-runtime-fleet python3 /tmp/predict.py`。
 
+### 📈 扩容准备：容量实测 + 端口槽位 + 日志轮转 + 两个工具（2026-09-18 22:40 CST）
+
+用户说"我要扩大测试规模"。先把**能扩到多少、会先卡在哪**量出来，再把明显该做的做了。
+
+**实测容量**（`scripts/fleet_capacity.sh`）：
+
+| 项 | 实测 | 外推 |
+|---|---|---|
+| 每个 Runtime 进程 RSS | **57.6 MB**（9 个实例，合计 518 MB） | +50 人 ≈ +2.9 GB；按两倍余量 ≈ +5.6 GB |
+| 每人磁盘 | 库 ~5 MB + 日志 ~1 MB/天 | 50 人 ≈ 300 MB，可忽略 |
+| LLM 调用 | 全部实例累计 **4 次** provider 调用，单次 3.6 s | 由活动量决定，每人每天个位数，50 人约几十次/天 |
+| 宿主机 | **4 核 / 15.5 GB**，已被别的服务占 5.8 GB，**swap 用了 2.9 GB**，负载 1.6–3.9 | 这台机器上百人不现实，50 人要把余量盯住 |
+| `/` 磁盘 | 曾 77% 满（可用 26 GB） | 清构建缓存后 **35 GB 可用** |
+
+**这一轮实际做的四件事**：
+
+1. **腾磁盘**：`docker builder prune -f` 回收 **8.95 GB**（`/` 从 26 GB → 35 GB 可用）。
+   没动镜像（未使用的只有 curlimages/curl、alpine、hello-world 三个小的）。
+2. **日志轮转**（此前一直是待办）：写 `/etc/logrotate.d/xxj-fleet`，
+   `weekly / maxsize 20M / rotate 3 / copytruncate / compress` —— `copytruncate` 是必须的，
+   Runtime 一直持着文件句柄、不等信号重开。宿主已有 logrotate daily timer（00:00），不需要另加 cron。
+   **⚠️ 第一次写错了**：heredoc 里的 `$VOL` 是在**容器里**求值的（未定义），配置里变成 `/logs/*.log`
+   —— 一个宿主上不存在的路径，`missingok` 会让它在 00:00 静默跳过、日志照样涨。已改成宿主先展开，
+   并用真 logrotate `-d` 复核到完整路径 ✓（以后写这类配置都要拿 `logrotate -d` 过一遍）。
+3. **端口槽位 13 → 43**：`fleet.yml` 的发布范围 `8787-8799` → `8787-8829`，
+   生成器同步改（不改生成器的话下次重渲染会缩回去）。重建在静默窗口做（最近一条用户消息 15 分钟前），
+   重建后 9/9 健康、局域网 `8795/health` 仍 200 ✓。
+4. **两个工具 + 一份文案**：
+   - `scripts/scale_out_testers.sh`：给一批 QQ 开实例（幂等、支持 `--dry-run`/`--file`）。
+     走控制面 `POST /fleet/provision`，**不重建舰队**，聊天中的人不会被打断。
+     其实不跑也会开（插件 `route_auto_provision=true`，陌生人第一条消息自动建实例）；
+     先建的意义是**让她的缺席时钟先跑**，于是她会先开口。
+   - `scripts/fleet_capacity.sh`：一次打印实例/端口槽位、容器与宿主资源、每实例 RSS 外推、
+     LLM 调用、日志体积与轮转状态，最后给建议。
+   - `docs/ONBOARDING_new_tester.md`：给新测试者的说明模板（我是谁 / 我会记得你 / 我会主动找你、
+     怎么让我停 / 测试期会出错），以及"发之前先自己确认的两条硬事实"。
+
+**扩容真正的瓶颈不是算力，是「一个 QQ 账号 + 每人每天 12 条的上限」**：
+所有测试者共用一个 bot 账号，主动上限是**每人**每天 12 条、冷却 40 分钟
+（`drive.max_contacts_per_day` / `drive.cooldown_seconds`）—— 50 人时理论上是 **600 条/天**，
+再叠上**不受这两条限制的回复**（994959351 那次风暴一天 1365 条回复）。这是会被 QQ 盯上的量级。
+建议（**等用户点头再动**，因为会改变她的活跃度）：
+
+```
+CR_DRIVE__MAX_CONTACTS_PER_DAY: 4
+CR_DRIVE__COOLDOWN_SECONDS: 5400
+```
+并在插件侧加一个**全局发送预算**（跨会话按小时封顶，reply 风暴也一起挡）——
+这是目前唯一缺的安全阀，AstrBot 的 `rate_limit {60s,30,stall}` 只是排队不是丢弃。
+
 
 
 
