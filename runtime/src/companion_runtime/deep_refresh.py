@@ -94,6 +94,10 @@ FIELD_TO_KIND: Mapping[str, str] = {
     "event_appraisals": "event_appraisal",
 }
 
+#: The values ``kind`` may hold when an inline item uses it to *route* itself rather than
+#: to carry data. See :func:`_payload_of` for why the distinction matters.
+_ROUTING_KIND_VALUES = frozenset(FIELD_TO_KIND.values()) | frozenset(SINGLE_FIELDS.values())
+
 
 @dataclass(slots=True)
 class RefreshTrigger:
@@ -269,12 +273,20 @@ def _payload_of(item: Mapping[str, Any]) -> dict[str, Any]:
     nested = item.get("payload")
     if isinstance(nested, Mapping):
         return {str(key): value for key, value in nested.items()}
-    # Providers may return the body inline; drop the routing keys so the reducer
-    # sees only the fields it documents.
+    # Providers may return the body inline; drop the routing keys so the reducer sees
+    # only the fields it documents. ``kind`` is special-cased: it is a routing key when
+    # it names an *operation* (an item may carry ``"kind": "memory"``), and it is payload
+    # data when it does not - a memory suggestion's own kind (``user_preference`` and
+    # friends). Dropping it unconditionally silently rewrote every model-proposed memory
+    # as the default ``episodic``: measured on the beta, durable memories (preference /
+    # stable knowledge / relationship) were 0-9 out of 37-139 per person (~3%) and the
+    # durable source in ``context.select_memories`` had nothing to offer, no matter what
+    # the prompt asked for.
     return {
         str(key): value
         for key, value in item.items()
-        if key not in {"kind", "sources", "source_ids", "source_event_ids"}
+        if key not in {"sources", "source_ids", "source_event_ids"}
+        and not (str(key) == "kind" and str(value) in _ROUTING_KIND_VALUES)
     }
 
 

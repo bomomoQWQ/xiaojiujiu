@@ -118,8 +118,8 @@ DEEP_REFRESH_SYSTEM_PROMPT = (
     "\"expression\": \"外在会怎么表现\"}, "
     "\"candidate_intent_operations\": [{\"sources\": [\"evt_x\"], \"operation\": \"add\", "
     "\"intent\": \"想做的事\", \"confidence\": 0.5}], "
-    "\"memory_suggestions\": [{\"sources\": [\"evt_x\"], \"summary\": \"值得长期记住的事\", "
-    "\"kind\": \"episodic\", \"importance\": 0.6}], "
+    "\"memory_suggestions\": [{\"sources\": [\"evt_x\"], \"summary\": \"他喜欢下雨天\", "
+    "\"kind\": \"user_preference\", \"importance\": 0.6}], "
     "\"unfinished_matter_suggestions\": [{\"sources\": [\"evt_x\"], \"title\": \"还没了结的事\"}], "
     "\"user_model_evidence_suggestions\": [{\"sources\": [\"evt_x\"], \"trait\": \"推断出的特征\", "
     "\"weight\": 0.3}], "
@@ -155,6 +155,16 @@ DEEP_REFRESH_SYSTEM_PROMPT = (
     "unfinished_matter_suggestions 只放必须等用户回答才能了结的具体问题"
     "（他答应过要告诉你结果、他问了你什么你还没答、有件事悬着没有下文）；"
     "他的偏好、身份、习惯、已经说过的事实属于 memory_suggestions，不要写成未完之事；"
+    # The kind is what decides whether a memory survives as "who the user is". The example
+    # used to say `"kind": "episodic"`, and `MemoryKind`'s dataclass default is episodic
+    # too, so the model copied it: measured on the beta, durable memories (preference /
+    # stable knowledge / relationship) were 0-9 out of 37-139 per person (~3%), the
+    # durable source in `context.select_memories` had nothing to offer, and the
+    # 【必要记忆】 section degenerated into "what happened recently" instead of "who he is".
+    "记忆的 kind 只能从这四种里选，选错等于没记住："
+    "user_preference（他的偏好、习惯、喜好）、stable_knowledge（他的身份、经历、明确说过的事实）、"
+    "relationship（你们之间发生过、会影响关系的事）、episodic（一次性的具体经过，最不重要）；"
+    "优先选前三种，只有确实只是一次性经过时才用 episodic。"
     "你自己打算做的事属于 candidate_intent_operations。"
     "输入 unfinished 列出的是这个人当前还没了结的事："
     "同一件事不要重复输出，换个说法也不行；"

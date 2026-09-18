@@ -58,6 +58,25 @@ from .utility import clamp, delta_seconds, ensure_aware, isoformat, max_datetime
 
 LOGGER = logging.getLogger("companion_runtime.reducer")
 
+#: The memory kinds the Runtime recognises (see ``MemoryKind``). A suggestion whose kind
+#: is outside this set is stored as ``episodic`` rather than as a phantom kind that no
+#: reader treats as durable.
+MEMORY_KIND_VALUES: frozenset[str] = frozenset(item.value for item in MemoryKind)
+
+#: Spellings a model reaches for when it means one of the four kinds.
+MEMORY_KIND_ALIASES: Mapping[str, str] = {
+    "preference": MemoryKind.USER_PREFERENCE.value,
+    "preferences": MemoryKind.USER_PREFERENCE.value,
+    "fact": MemoryKind.STABLE_KNOWLEDGE.value,
+    "facts": MemoryKind.STABLE_KNOWLEDGE.value,
+    "knowledge": MemoryKind.STABLE_KNOWLEDGE.value,
+    "identity": MemoryKind.STABLE_KNOWLEDGE.value,
+    "relation": MemoryKind.RELATIONSHIP.value,
+    "relational": MemoryKind.RELATIONSHIP.value,
+    "episode": MemoryKind.EPISODIC.value,
+    "event": MemoryKind.EPISODIC.value,
+}
+
 
 
 #: Outbox statuses in which a row can still be worked on. A row in one of these
@@ -863,12 +882,20 @@ class Reducer:
             raise ValueError("memory suggestion requires summary")
         if not sources:
             raise ValueError("memory suggestion requires at least one source")
+        # The kind decides whether this ever counts as "who the user is":
+        # `context.select_memories` recognises the durable kinds by exact value, so a
+        # synonym ("preference", "fact") or a missing field silently demotes a durable
+        # memory to an episode and it stops reaching the prompt's durable source.
+        kind = str(body.get("kind") or body.get("type") or "").strip().lower()
+        kind = MEMORY_KIND_ALIASES.get(kind, kind)
+        if kind not in MEMORY_KIND_VALUES:
+            kind = MemoryKind.EPISODIC.value
         self._p.memory.upsert_candidate(
             conn,
             MemoryCandidate(
                 candidate_id=str(body.get("candidate_id") or new_id("memory")),
                 summary=summary,
-                kind=str(body.get("kind") or body.get("type") or MemoryKind.EPISODIC.value),
+                kind=kind,
                 source_event_ids=list(sources),
                 value=clamp(float(body.get("importance", 0.6))),
                 confidence=clamp(float(body.get("confidence", 0.6))),

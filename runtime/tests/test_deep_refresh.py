@@ -187,6 +187,26 @@ class TestGrounding:
             },
         ]
 
+    def test_a_memory_kind_survives_the_routing_key_strip(self) -> None:
+        """A memory suggestion's own ``kind`` is payload, not routing.
+
+        ``_payload_of`` drops ``kind`` so the reducer sees only documented fields, but a
+        memory suggestion's kind (``user_preference`` and friends) shares that key name.
+        Dropping it unconditionally rewrote every model-proposed memory as the default
+        ``episodic``: measured on the beta, durable memories were ~3% of the archive and
+        the durable source in ``select_memories`` had nothing to offer.
+        """
+        operations, _violations = dr.ground_suggestions(
+            self._suggestions(
+                memory_suggestions=[
+                    {"summary": "他喜欢下雨天", "sources": ["evt_1"], "kind": "user_preference"},
+                    {"summary": "路由形态", "sources": ["evt_1"], "kind": "memory"},
+                ]
+            ),
+            resolvable=lambda identifier: identifier == "evt_1",
+        )
+        assert [item.payload.get("kind") for item in operations] == ["user_preference", None]
+
     def test_an_appraisal_must_cite_a_real_event(self) -> None:
         """Emotional readings are grounded like everything else."""
         operations, violations = dr.ground_suggestions(
@@ -487,6 +507,40 @@ class TestRefreshOrchestration:
             assert runtime.state().mood_valence == 0.0
         finally:
             runtime.close()
+
+    def test_a_memory_suggestion_lands_on_a_real_kind(self) -> None:
+        """The kind decides whether a memory ever counts as "who the user is".
+
+        ``context.select_memories`` recognises the durable kinds by exact value, so a
+        synonym ("preference", "fact") or a missing field used to be stored verbatim as a
+        kind no reader treats as durable - the durable source then had nothing to offer.
+        """
+        for given, expected in (
+            ("user_preference", "user_preference"),
+            ("preference", "user_preference"),
+            ("fact", "stable_knowledge"),
+            ("relation", "relationship"),
+            ("nonsense", "episodic"),
+            ("", "episodic"),
+        ):
+            runtime = _runtime()
+            try:
+                first = runtime.process_user_message(content="算了，也没什么。", timestamp=BASE_TIME)
+                body = {"summary": "他喜欢下雨天", "sources": [first.event.event_id]}
+                if given:
+                    body["kind"] = given
+                runtime.semantic_provider = _StubProvider(
+                    DeepRefreshSuggestions(degraded=False, memory_suggestions=[body])
+                )
+                runtime.deep_refresh(now=BASE_TIME + timedelta(minutes=5), force=True)
+                stored = [
+                    item
+                    for item in runtime.projections.memory.pending_candidates()
+                    if item.summary == "他喜欢下雨天"
+                ]
+                assert [item.kind for item in stored] == [expected], given
+            finally:
+                runtime.close()
 
     def test_history_is_not_rewritten_by_a_reinterpretation(self) -> None:
         """Invariant 7 still holds on the refresh path."""

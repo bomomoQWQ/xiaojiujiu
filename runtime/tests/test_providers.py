@@ -616,6 +616,24 @@ class TestRemoteAPIProvider:
         assert example.count('"sources"') == 6
         assert "不得编造 id" in DEEP_REFRESH_SYSTEM_PROMPT
 
+    def test_the_prompt_asks_for_a_durable_memory_kind(self) -> None:
+        """The example must not teach ``episodic`` as the kind to reach for.
+
+        ``MemoryKind``'s dataclass default is episodic, and the example used to show
+        episodic too, so the model learned that everything is an episode. Measured on the
+        beta: durable memories (preference / stable knowledge / relationship) were 0-9 out
+        of 37-139 per person (~3%), the durable source in ``select_memories`` had nothing
+        to offer, and 【必要记忆】 degenerated into "what happened recently".
+        """
+        from companion_runtime.providers import DEEP_REFRESH_SYSTEM_PROMPT
+        from companion_runtime.typing import MemoryKind
+
+        example = DEEP_REFRESH_SYSTEM_PROMPT.split("格式样例：", 1)[1]
+        assert f'"kind": "{MemoryKind.EPISODIC.value}"' not in example
+        assert f'"kind": "{MemoryKind.USER_PREFERENCE.value}"' in example
+        for kind in MemoryKind:
+            assert kind.value in DEEP_REFRESH_SYSTEM_PROMPT, kind.value
+
     def test_the_prompt_asks_for_the_explanation_fields_the_runtime_reads(self) -> None:
         """The interpretation example must use the six keys, not ``summary``.
 
