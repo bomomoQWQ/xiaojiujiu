@@ -489,6 +489,51 @@ class Reducer:
         for emotion_event in created:
             self._p.emotion.upsert(conn, emotion_event)
 
+    def _apply_appraisal(
+        self,
+        conn: sqlite3.Connection,
+        body: Mapping[str, Any],
+        event_ids: Sequence[str],
+        *,
+        state: RuntimeState,
+    ) -> None:
+        """Fold a deep refresh's emotional reading of an event into emotion and mood.
+
+        This is the second half of the deferral contract. The rule appraiser only runs
+        for events the rule table already settled, so before this existed an event could
+        be read by a refresh, settle, and still leave no trace in how she felt - which is
+        why every instance sat at ``mood_valence`` 0.0 while thousands of events went
+        through. ``appraise_event``'s docstring states the intent: a semantic provider may
+        replace it, with an identical output contract. ``apply_new_emotion_events`` keeps
+        its own floor (``emotion.min_event_impact``), so a small reading changes nothing.
+        """
+        from .emotion import EmotionEvaluation, apply_new_emotion_events
+
+        sources = self._events.get_many(list(event_ids))
+        if not sources:
+            return
+        impact = clamp(float(body.get("impact", 0.0)))
+        confidence = clamp(float(body.get("confidence", 0.5)))
+        evaluation = EmotionEvaluation(
+            direction=str(body.get("direction") or "0"),
+            impact=impact,
+            activation=clamp(float(body.get("activation", impact * 0.8))),
+            uncertainty=clamp(float(body.get("uncertainty", 1.0 - confidence))),
+            relation_signal=str(body.get("relation_signal") or "neutral"),
+            responsibility=str(body.get("responsibility") or "unclear"),
+            confidence=confidence,
+            source="semantic",
+        )
+        active = self._p.emotion.list_active()
+        _, created = apply_new_emotion_events(
+            evaluations=[(sources[0], evaluation)],
+            active=active,
+            state=state,
+            config=self._config.emotion,
+        )
+        for emotion_event in created:
+            self._p.emotion.upsert(conn, emotion_event)
+
     def _apply_candidate_operations(
         self,
         conn: sqlite3.Connection,
@@ -666,6 +711,8 @@ class Reducer:
                         continue
                 elif kind == "user_model_evidence":
                     self._apply_user_model_evidence(conn, body, sources)
+                elif kind == "event_appraisal":
+                    self._apply_appraisal(conn, body, sources, state=state)
                 else:
                     skipped.append(f"unknown_kind:{kind}")
                     continue

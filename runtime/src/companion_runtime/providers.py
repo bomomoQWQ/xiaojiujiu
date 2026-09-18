@@ -90,6 +90,7 @@ DEEP_REFRESH_FIELDS: Mapping[str, type] = {
     "memory_suggestions": list,
     "unfinished_matter_suggestions": list,
     "user_model_evidence_suggestions": list,
+    "event_appraisals": list,
 }
 
 #: Optional key a model may wrap the six collections under.
@@ -99,8 +100,8 @@ DEEP_REFRESH_SYSTEM_PROMPT = (
     "你是长期陪伴角色的深层认知整理器，只在低频的后台刷新中被调用。"
     "只输出一个 JSON 对象，字段固定为 reinterpretations, psychological_interpretation, "
     "candidate_intent_operations, memory_suggestions, unfinished_matter_suggestions, "
-    "user_model_evidence_suggestions。"
-    "前五个中除 psychological_interpretation 是对象外，其余都是数组。"
+    "user_model_evidence_suggestions, event_appraisals。"
+    "前六个中除 psychological_interpretation 是对象外，其余都是数组。"
     # The shape has to be spelled out, item keys included. Naming only the six
     # top-level fields is not enough: measured against a real backlog the model
     # answered with `event_id` where the grounding step requires `sources`, and every
@@ -118,7 +119,19 @@ DEEP_REFRESH_SYSTEM_PROMPT = (
     "\"kind\": \"episodic\", \"importance\": 0.6}], "
     "\"unfinished_matter_suggestions\": [{\"sources\": [\"evt_x\"], \"title\": \"还没了结的事\"}], "
     "\"user_model_evidence_suggestions\": [{\"sources\": [\"evt_x\"], \"trait\": \"推断出的特征\", "
-    "\"weight\": 0.3}]}"
+    "\"weight\": 0.3}], "
+    "\"event_appraisals\": [{\"sources\": [\"evt_x\"], \"direction\": \"-\", "
+    "\"impact\": 0.45, \"relation_signal\": \"distance\", \"confidence\": 0.6}]}"
+    # The unresolved backlog is where the rules gave up, and until this field existed
+    # nothing ever turned those events into feeling: the runtime's own rule appraiser is
+    # only consulted for events the rule table already settled, so an event could be
+    # understood by a refresh and still leave no trace in how she felt.
+    "event_appraisals 是给 unresolved_events 里你**读懂了情绪分量**的那些事件做一次情绪判定："
+    "direction 取 \"+\"（让你更暖、更想靠近）/ \"-\"（让你难受、退开、被刺到）/ \"0\"（没有情绪重量）；"
+    "impact 是 0 到 1 的强度，0.06 以下等于没有，别浪费在无关紧要的话上；"
+    "relation_signal 从 closeness / distance / sorrow / guilt / loss / worry / "
+    "appreciation / good_news / bad_news / amusement / uncertain / neutral 里选；"
+    "读不出情绪就别写这一条——不要为了凑数给每句话打分。"
     "你只提供建议，不决定任何状态变更，不生成台词，不创造输入中不存在的事件；"
     # The three suggestion kinds used to be named and nothing more, so the model
     # had to guess where a statement belonged. Measured on the test deployment:
@@ -231,6 +244,7 @@ class DeepRefreshSuggestions:
         memory_suggestions: Suggested memory writes or edits.
         unfinished_matter_suggestions: Suggested unfinished-matter changes.
         user_model_evidence_suggestions: Suggested user-model evidence.
+        event_appraisals: Suggested emotional readings of previously-unresolved events.
         provider: Name of the provider that produced (or failed to produce) this.
         degraded: ``True`` whenever the caller must not rely on the content.
         reason: Machine-readable degradation reason, empty on full success.
@@ -243,6 +257,7 @@ class DeepRefreshSuggestions:
     memory_suggestions: list[dict[str, Any]] = field(default_factory=list)
     unfinished_matter_suggestions: list[dict[str, Any]] = field(default_factory=list)
     user_model_evidence_suggestions: list[dict[str, Any]] = field(default_factory=list)
+    event_appraisals: list[dict[str, Any]] = field(default_factory=list)
     provider: str = ""
     degraded: bool = True
     reason: str = ""
@@ -263,6 +278,7 @@ class DeepRefreshSuggestions:
             "user_model_evidence_suggestions": [
                 dict(item) for item in self.user_model_evidence_suggestions
             ],
+            "event_appraisals": [dict(item) for item in self.event_appraisals],
             "provider": self.provider,
             "degraded": self.degraded,
             "reason": self.reason,
@@ -279,6 +295,7 @@ class DeepRefreshSuggestions:
                 self.memory_suggestions,
                 self.unfinished_matter_suggestions,
                 self.user_model_evidence_suggestions,
+                self.event_appraisals,
             )
         )
 

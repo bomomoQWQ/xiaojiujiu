@@ -609,10 +609,11 @@ class TestRemoteAPIProvider:
             "memory_suggestions",
             "unfinished_matter_suggestions",
             "user_model_evidence_suggestions",
+            "event_appraisals",
         ):
             assert field in example, field
         # One `sources` per kind in the example, plus the instruction itself.
-        assert example.count('"sources"') == 5
+        assert example.count('"sources"') == 6
         assert "不得编造 id" in DEEP_REFRESH_SYSTEM_PROMPT
 
     def test_bearer_token_is_sent_but_never_stored_in_headers_dict(self) -> None:

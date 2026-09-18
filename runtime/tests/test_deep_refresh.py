@@ -187,6 +187,34 @@ class TestGrounding:
             },
         ]
 
+    def test_an_appraisal_must_cite_a_real_event(self) -> None:
+        """Emotional readings are grounded like everything else."""
+        operations, violations = dr.ground_suggestions(
+            self._suggestions(
+                event_appraisals=[
+                    {"sources": ["evt_ghost"], "direction": "-", "impact": 0.5},
+                ]
+            ),
+            resolvable=lambda identifier: False,
+        )
+        assert operations == []
+        assert violations == [
+            {"kind": "event_appraisal", "reason": "ungrounded_sources", "sources": ["evt_ghost"]}
+        ]
+
+    def test_a_grounded_appraisal_survives(self) -> None:
+        operations, violations = dr.ground_suggestions(
+            self._suggestions(
+                event_appraisals=[
+                    {"sources": ["evt_1"], "direction": "-", "impact": 0.5},
+                ]
+            ),
+            resolvable=lambda identifier: identifier == "evt_1",
+        )
+        assert violations == []
+        assert [item.kind for item in operations] == ["event_appraisal"]
+        assert operations[0].sources == ["evt_1"]
+
     def test_the_restatement_guard_only_applies_when_a_matter_resolver_is_given(self) -> None:
         """Callers without the resolver keep the old behaviour (grounding only)."""
         operations, violations = dr.ground_suggestions(
@@ -390,6 +418,73 @@ class TestRefreshOrchestration:
             assert outcome.settled_events == 1
             assert runtime.projections.semantics.unresolved_count() == 0
             assert runtime.projections.interpretations.list_reappraisals(limit=5)
+        finally:
+            runtime.close()
+
+    def test_a_semantic_appraisal_gives_a_deferred_event_its_feeling(self) -> None:
+        """The refresh can close the emotional half of a deferral, not just the semantic one.
+
+        The rule appraiser only runs for events the rule table already settled, so a
+        deferred event used to settle with no trace in mood at all: an event could be
+        understood by a refresh and still leave nothing behind. Measured before this:
+        eight people, ~2000 events, ``mood_valence`` 0.0 on every instance and exactly one
+        emotion event in total.
+        """
+        runtime = _runtime()
+        try:
+            first = runtime.process_user_message(content="算了，也没什么。", timestamp=BASE_TIME)
+            assert runtime.projections.emotion.list_active() == [], (
+                "a deferred event must not manufacture a feeling on its own"
+            )
+            runtime.semantic_provider = _StubProvider(
+                DeepRefreshSuggestions(
+                    degraded=False,
+                    event_appraisals=[
+                        {
+                            "sources": [first.event.event_id],
+                            "direction": "-",
+                            "impact": 0.55,
+                            "relation_signal": "uncertain",
+                            "confidence": 0.7,
+                        }
+                    ],
+                )
+            )
+            outcome = runtime.deep_refresh(now=BASE_TIME + timedelta(minutes=5), force=True)
+            assert outcome.ran is True
+            assert outcome.applied.get("event_appraisal") == 1
+            assert outcome.settled_events == 1
+            assert runtime.projections.semantics.unresolved_count() == 0
+
+            emotions = runtime.projections.emotion.list_active()
+            assert len(emotions) == 1
+            assert emotions[0].direction == "-"
+            assert emotions[0].source_event_id == first.event.event_id
+            assert runtime.state().mood_valence < 0.0
+        finally:
+            runtime.close()
+
+    def test_an_appraisal_below_the_impact_floor_changes_nothing(self) -> None:
+        """A reading smaller than ``emotion.min_event_impact`` is not an after-effect."""
+        runtime = _runtime()
+        try:
+            first = runtime.process_user_message(content="算了，也没什么。", timestamp=BASE_TIME)
+            runtime.semantic_provider = _StubProvider(
+                DeepRefreshSuggestions(
+                    degraded=False,
+                    event_appraisals=[
+                        {
+                            "sources": [first.event.event_id],
+                            "direction": "-",
+                            "impact": 0.01,
+                            "confidence": 0.9,
+                        }
+                    ],
+                )
+            )
+            runtime.deep_refresh(now=BASE_TIME + timedelta(minutes=5), force=True)
+            assert runtime.projections.emotion.list_active() == []
+            assert runtime.state().mood_valence == 0.0
         finally:
             runtime.close()
 

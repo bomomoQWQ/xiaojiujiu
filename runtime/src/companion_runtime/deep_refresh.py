@@ -75,6 +75,7 @@ KINDS_REQUIRING_SOURCES = frozenset(
         "memory",
         "unfinished_matter",
         "user_model_evidence",
+        "event_appraisal",
     }
 )
 
@@ -90,6 +91,7 @@ FIELD_TO_KIND: Mapping[str, str] = {
     "memory_suggestions": "memory",
     "unfinished_matter_suggestions": "unfinished_matter",
     "user_model_evidence_suggestions": "user_model_evidence",
+    "event_appraisals": "event_appraisal",
 }
 
 

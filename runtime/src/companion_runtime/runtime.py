@@ -1138,7 +1138,7 @@ class Runtime:
                     replied_recently=False,
                     context={"stated_busy": any(marker in content for marker in BUSY_MARKERS)},
                 )
-                from .emotion import apply_new_emotion_events
+                from .emotion import appraise_event, apply_new_emotion_events
                 from .semantic import (
                     SemanticStatus,
                     classify_event,
@@ -1155,7 +1155,33 @@ class Runtime:
                 evaluation = None
                 created: list[Any] = []
                 if settlement is not None:
-                    evaluation = settlement_to_evaluation(settlement)
+                    # The emotional reading comes from the appraiser rather than from the
+                    # coarse settlement. `appraise_event` is the appraiser the design
+                    # intends to be replaceable by a semantic one ("the output contract is
+                    # identical"), it is the only reader of the value axes
+                    # `emotional_expression` and `autonomy`, it scales sensitivity by
+                    # `user_care` / `relationship_maintenance` / `stability_commitment`,
+                    # and it damps negative attributions when the user is believed to be
+                    # busy. `settlement_to_evaluation` does none of that, which is why the
+                    # value profile had no effect on how anything felt. The coarse reading
+                    # stays as a floor: a settlement whose phrasing the lexicon does not
+                    # carry (a conflict worded some other way) still gets the
+                    # after-effect the settlement justified.
+                    coarse = settlement_to_evaluation(settlement)
+                    evaluation = appraise_event(
+                        event,
+                        state=state,
+                        config=self.config.emotion,
+                        user_busy_probability=busy,
+                    )
+                    if (
+                        evaluation.impact <= self.config.emotion.min_event_impact
+                        and coarse.impact > evaluation.impact
+                    ):
+                        evaluation = coarse
+                        outcome.appraisal_source = "coarse_rule"
+                    else:
+                        outcome.appraisal_source = "rule"
                     self.projections.semantics.record_settlement(
                         conn,
                         event_id=event.event_id,
@@ -1187,9 +1213,13 @@ class Runtime:
                     outcome.appraisal_source = "deferred"
                     outcome.semantic_status = SemanticStatus.UNRESOLVED.value
                     outcome.potential_relevance = relevance
-                    # An unresolved event yields no emotional after-effect yet.
-                    # The raw event is preserved, so a later deep refresh can
-                    # reinterpret it - that is the "追夫火葬场" path in patch v0.2.
+                    # An unresolved event yields no emotional after-effect yet: the
+                    # semantic layer declined to settle what it means, and manufacturing
+                    # a feeling from a message the Runtime did not understand is exactly
+                    # the guessing that deferral exists to avoid (``算了，也没什么。`` is
+                    # the canonical case). The raw event is preserved, so a later deep
+                    # refresh can reinterpret it - that is the "追夫火葬场" path in
+                    # patch v0.2, and its appraisal arrives through the refresh.
 
                 if evaluation is not None:
                     existing_emotions = self.projections.emotion.list_active()
