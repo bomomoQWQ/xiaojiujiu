@@ -2150,6 +2150,7 @@ pressure 增长全错位。它现在只差一点点，随时可能过线，但**
 - 线上复核：连续调用命中 ✓；情绪变化后也命中，但那是因为刷新刚为**那个新状态**写过一条精确
   匹配的缓存（返回键与当前键一致 ✓，不是过期文案 ✓）—— 即容忍度没有被用来掩盖真变化 ✓。
 
+### ✅ 情绪层 a+c 修复并实测（2026-09-18 19:35 CST，commit `3fe5f94`）
 
 **修复前的事实**：8 个实例、约 2000 个事件，`active_emotion_events` 一共 **2 条**，
 所有实例 `mood_valence`/`mood_arousal` **恒为 0.0** ✗ —— 注入块里那六行"平静无波 / 没有拉扯"
@@ -2196,6 +2197,52 @@ pressure 增长全错位。它现在只差一点点，随时可能过线，但**
 测试：runtime 全量 exit=0；新增 4 条（语义评估给未决事件情绪 / 低于门槛无后效 / grounding 两条），
 更新 2 处（示例字段数 5→6；`test_candidate_shapes` 里写死的情绪强度改为断言方向与范围，
 因为它现在随价值观画像变化 ✓）。
+
+### ✅ 长期记忆 durable 稀缺的真正根因（2026-09-18 20:35 CST，commit `3e77c90`）
+
+查"durable 记忆只占 0–9/37–139（约 3%）、【必要记忆】退化成最近发生的事"时，发现**两层**原因，
+**第二层才是根因**：
+
+**第一层（提示词）**：示例写的是 `"kind": "episodic"` ✗（`MemoryKind` 的 dataclass 默认也是
+episodic ✓），等于教模型"什么都是插曲"。已把示例换成 `user_preference`，并写明四种 kind 的取舍：
+`user_preference`（偏好/习惯/喜好）、`stable_knowledge`（身份/经历/明确说过的事实）、
+`relationship`（你们之间发生过、会影响关系的事）、`episodic`（一次性经过，最不重要），
+"**优先选前三种**"。
+
+**第二层（真正的根因，纯代码）** ✗✗：`deep_refresh._payload_of` 会把内联条目的 `kind` 当作
+**路由键**剥掉，而**记忆建议的 kind（记忆种类）用的正是同一个键名** ✗ → 模型给
+`user_preference` 也会在 grounding 阶段被丢掉 → reducer 只看到空 → 一律落成默认 `episodic`，
+**无论提示词怎么写都改不动** ✓。修法：只有当 `kind` 的值是"操作种类"（`memory` /
+`reinterpretation` / `event_appraisal` …，即 `_ROUTING_KIND_VALUES`）时才当路由键剥掉，
+否则保留为载荷数据。调试实证：同一条建议，修前 `kind=episodic`，修后 `kind=user_preference` ✓。
+
+**配套加固**：`reducer._apply_memory_suggestion` 现在把 kind 规范化到四种合法值
+（近义词 `preference→user_preference`、`fact/knowledge/identity→stable_knowledge`、
+`relation→relationship`、`episode/event→episodic`；未知或缺失→`episodic`）—— 因为
+`context.select_memories` 是**按精确值**识别 durable 的 ✗，拼错一个字母就等于放弃 durable 身份。
+
+**验收 A（立即，实测）** —— 发两条"值得长期记住"的话后强刷一次：
+
+```
+候选 kind 分布: {'episodic': 23, 'user_preference': 3, 'stable_knowledge': 2, 'relationship': 2}
+  stable_knowledge  用户是做后端的，平时在北京上班
+  user_preference   用户特别喜欢下雨天，一到雨天心情就特别好
+  relationship      谢谢你，今天真的很开心
+  episodic          用户会在表达亲近之后用「算了」把话收回去，像是自我克制
+```
+
+四种 kind 全部出现且**分类正确** ✓（修前只有 episodic ✗）。**验收 B**（固化后 `memories` 的
+kind 分布 + 注入块【必要记忆】是否变成"他是谁"）由 `scripts/verify_durable_memory.sh` 在后台跑
+（`CR_MEMORY__CONSOLIDATION_INTERVAL_SECONDS=600`，需等约 11 分钟）。
+
+测试：新增 `test_the_prompt_asks_for_a_durable_memory_kind`、
+`test_a_memory_suggestion_lands_on_a_real_kind`（6 组输入）、
+`test_a_memory_kind_survives_the_routing_key_strip`；runtime 全量 exit=0。
+
+**⚠️ 文档纪律教训（我自己的）**：这一天里有两次 `edit` 把原有小节标题当成锚点替换掉、却没在
+`new_string` 里写回去，于是正文"裸"在别的小节下面 ✗（已补回 a+c 标题 ✓）。以后用标题做锚点时，
+`new_string` 必须把它一起写回来 ✓；另外本文件**不要用 grep 工具搜中文** ✗（匹配不到，用 `read`
+逐段看 ✓）。
 
 
 用户问"选型上我们用的是 postgresql 吧"，查清后**用户决定：确实要切，但现在太屎山，先算了**。
