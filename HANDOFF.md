@@ -1965,6 +1965,67 @@ docker logs -f astrbot-test | grep --line-buffered "适配器已连接"
 `NapCat 的日志是本地时间（CST）`，AstrBot 的是 CST，Runtime 的 raw_events 是 **UTC** ——
 对时间时别搞混（`11:54 CST = 03:54 UTC`）。
 
+#### ✅ 调试环境已恢复（只断真实 QQ 那条线），前端有个必须修的 bug（已修）
+
+用户的要求是"astrbot-test 和 runtime 应该开着，还有模拟 onebot 前端，不然怎么调试验证" ——
+对，我一开始把三样都停了是错的。恢复后现状：
+
+```
+xxj-runtime-fleet   Up (healthy)   7 个真人实例 health=ok
+astrbot-test        Up            插件已加载（debounce=2500ms、7 个 Runtime target）
+xxj-onebot          Up            模拟 OneBot 前端，链路已通
+xxj-napcat-test     Exited        真实 QQ 保持断开（公告已说暂停服务）
+napcat（线上）       Up            没碰
+```
+
+**恢复过程中发现并修掉一个真 bug**（`3f24eb6`）：前端连上 AstrBot 后**从不"报到"**，
+所以 AstrBot 不认这条连接（从不打印"适配器已连接"），一条消息都送不进去 ✗。
+排查链（记下来免得重走）：
+
+1. 先怀疑网络/DNS → **不是**：同网 `astrbot_test_test_net`，`astrbot` 解析正确，TCP 通；
+2. 怀疑 token/握手 → **不是**：对 `astrbot:6199` 做原始握手，带
+   `X-Self-ID`/`X-Client-Role`/`Bearer token` 得到 **101**（不带 X-Self-ID 是 400、
+   错 token 403、无 token 401），连接稳定保持 20 秒，AstrBot 也照常打印"适配器已连接"；
+3. 在前端容器里跑**它自己的** `_WebSocket` 连接代码 → 同样成功并保持 ✓；
+4. 差别只剩一个：我的探测在 101 之后补发了 **lifecycle meta 事件**，前端不发 ✗。
+
+**根因**：`OneBotFrontend.send_meta_event("connect")` 早就存在（docstring 写着"真实客户端
+连上时发的"），但它**只被 CLI 的一个手动命令**（`cf/cli.py`）**和 service 的 HTTP 端点**
+（`cf/onebot_service.py`）调用 —— **WS 连接路径 `_connect_once` 从来没调过** ✗。
+于是每次连上都不报到，AstrBot 的 aiocqhttp 反向 WS 服务端把它踢掉；TCP 层看到的就是
+"连上又被关"，重试期间还会撞上服务端尚未重新监听的窗口，于是 `ConnectionRefused` 与
+`connection closed` 交替刷屏。
+
+**修法**：`_connect_once` 在 socket 建立后立刻发一次 lifecycle（与真实客户端一致），
+重连路径同样受益。测试 `framework/tests/test_onebot.py` **16 → 17 passed**：
+新增 `test_the_client_announces_its_lifecycle_on_connect`，另加三个 helper
+（`wait_for_message_event` / `wait_for_meta_event` / `meta_event_count`）—— 真实客户端连上会先发
+meta，所以"第一条事件"不再是用户消息，旧的 `wait_for_event()` 会拿到 meta（这正是那 4 个测试
+变红的原因，它们编码的是"连上后什么都不发"的旧行为）。`framework/tests/test_host.py::TestLiveHost`
+的一批 ERROR（需要活环境）改动前后完全一致，是既有状态。
+
+**调试验收（端到端跑通）**：
+
+```bash
+# 往前端的控制面注入一条"模拟用户"消息（http-port 6300）
+docker exec -i xxj-onebot python3 - <<'PY'
+import json, urllib.request
+body = json.dumps({"text": "调试用的第一句：你在吗"}).encode()
+req = urllib.request.Request("http://127.0.0.1:6300/send", data=body,
+                             headers={"Content-Type": "application/json"}, method="POST")
+print(urllib.request.urlopen(req, timeout=10).status)
+PY
+```
+
+实测结果：`/send` → 200 ✓ → 插件按 `route_auto_provision` **自动为假用户 `20001` 开了实例**
+（`runtime-fleet:8794`，health=ok ✓）→ 她回复三段气泡「在」/「不过隔了两天，上回还是周三夜里」/
+「昨天体检怎么样？」，**没有尾句号**（句号修复同样在生效 ✓）。
+
+注意两点：① 前端控制面 6300 **没发布到 LAN**，要从容器内或用 `docker exec` 调；
+② 假用户实例会一直留在舰队里（调试完 `docker exec xxj-runtime-fleet` 里 POST
+`/fleet/deprovision/8794` 或留着当调试靶子都行）。调试期间我把 astrbot 的
+`log_level` 临时开到 DEBUG，事后已恢复 INFO ✓。
+
 ### ⚠️ 封测暴露的产品问题（2026-09-18 早晨，全量聊天记录分析）
 
 拉下 NapCat 的 2512 条收发（09-16 22:39 起，7 个人）分析，`scripts/analyze_qq_transcript.py`：
