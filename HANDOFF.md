@@ -3028,6 +3028,73 @@ bash scripts/add_tester.sh --dry-run 1234567       # 只看会做什么
 > 我就当没加过这个好友」——**被无视会进她的记忆并改变她对那个人的判断**，
 > 所以"挡住自动回复"这件事的价值远不止省 token。
 
+### ⏸ 朋友自部署的一次事故复盘：**已知，先不修**（2026-09-19 21:05 CST）
+
+背景：朋友在自己的机器上部署了本仓库（runtime + 插件）。09-19 12:33 她第一次主动开口，
+死在"渲染"那一步，主人一个字没收到。下面是逐条结论与**决定（用户明确"记一下先不修"）**。
+
+**① `render` 失败在运行期里是终态 —— 那条主动消息永久丢失（不是"还剩两次重试"）**
+
+```
+reducer.fail_render()                          runtime/src/companion_runtime/reducer.py:1701
+  → outbox.nack(..., terminal=True)            # 这一行被标终态，永远不会再被租出去
+  → _terminate_undeliverable_attempt(...)      # attempt 直接终止（failed）
+  → outbox.cancel_for_attempt(reason="render_failed")
+  → 事件 PROACTIVE_ABORTED（metadata.stage = "render"）
+```
+
+`attempts=1/3` 只是那一行的计数，别读成"还会重试两次"。**对照出来的不对称**：
+**发送**失败走的是可重试路径（我们这边 20001 那条就是 `ready_to_send -> failed: ActionFailed`，
+outbox `send failed attempts=1/3`），**渲染**失败一次都不重试。
+
+→ **建议的修复（未做）**：`fail_render` 改成非终态 nack，按 `max_attempts` +
+`outbox.retry_backoff_seconds` 重排队（attempt 停在 `rendering`，下次租约重新渲染即可），
+补一条回归测试。**触发条件**是"provider 抽风"，正常时段撞不上；**用户决定先不修**，
+等它真影响主人体验再动。
+
+**② 60 秒渲染预算被 provider 的重试吃掉（根因不在我们的超时）**
+
+- 现场：AstrBot 在 12:30 之后有 **44 条 `openai.InternalServerError: Error code: 521`**，
+  重试冲到 attempt #5、sleep 15s，插件侧 `render_timeout_ms = 60000` 到点 →
+  `render timed out after 60s`。
+- **提超时是安全的**：`render_timeout_ms` 允许 `1000..600000`（默认 60000），且**不会双发** ——
+  插件从拿到租约起按 ≤1s 间隔续租（`outbox.py: MIN_HEARTBEAT_INTERVAL_S = 1.0`，注释明确写了
+  "包括在并发信号量后面排队等的时候"），`test_render_heartbeat_extends_a_long_lease` 与
+  `test_lease_is_heartbeated_while_waiting_behind_the_semaphore` 钉住了这个行为。
+- **但只提超时是治标**：180s 同样会被 6~8 次重试填满。根因修复在 provider 侧
+  （调短单次请求超时 / 换线路 / 加备用 provider）。
+- 我们这边对照：**渲染从未失败过**；唯一那条 failed 是**发送**失败（"两个 OneBot 客户端"那天的老问题）。
+
+**③ 12:33 的外部探针与两次重启：不是插件，但"被催出来"的怀疑方向是对的**
+
+- 插件只碰这 6 条路径：`/v1/events`、`/v1/context`、`/v1/outbox/lease|{id}/heartbeat|{id}/result`、
+  `/v1/actions/{id}/authorize`、`/fleet/routes`、`/fleet/provision`。**从不调 `/config`
+  `/schedule` `/state` `/endogenous`**（插件仓库 grep 零命中）→ 那串 404/200 来自插件之外。
+- `GET /v1/config`(404) → `/v1/schedule`(404) → `/api/v1/schedule`(404) → `/schedule`(200) →
+  `/state`(200) 是**"在摸这个部署有哪些接口"**的指纹；我们仓库的 `force_endogenous_once.sh`
+  就是 `GET /health` → `POST /endogenous {"force": true, "create_attempt": true}`，
+  `hazard_jump_13h.sh` / `deliver_after_jump.sh` 同样会打 `/endogenous`。
+- **`POST /endogenous` 会真的跑一轮**（`force: true` 时无视前台暂停，只受硬边界约束）
+  → 12:33:18 那次 `hazard_triggered` 很可能是被这次外部调用催出来的。
+- **坐实办法**：access log 里那几行的 **User-Agent + 来源 IP**（`python-urllib/3.x` = 仓库脚本/agent；
+  `curl/8.x` = 手敲；浏览器 = 有人在点）+ `journalctl -u <unit>` + **服务账号**的 `~/.bash_history`。
+- ⚠️ **别用 `decisions.delta_t` 判"是不是被催的"**：拿我们自己的库实测，`delta_t < 60s` 命中几百条
+  **正常**轮次（那列是"本轮积分的区间"，cooldown / 前台暂停 / 无候选的轮次本来就是 0.0）；
+  `trigger` 也只有 `endogenous_round` 一个值，没有 forced 标记。
+  → **可选修复（未做）**：给强制轮次写一个显式的 `trigger`（例如 `forced_endogenous`），
+  以后一眼能看出"这轮是谁催的"。同样是"先不修"。
+- 两次重启（12:33:35 / 12:33:45，相隔 10s）：查
+  `journalctl -u <unit> --since "12:33:25" --until "12:34"` 看**退出码/信号**
+  （0 = 有人 restart；非 0 / 137 / 9 = 崩溃或被 kill）、`systemctl show <unit> -p Restart`、
+  `dmesg -T | grep -iE "oom|killed process"`。
+
+**④ 给朋友的运维动作（"先不修代码"，但这几条仍值得做）**
+1. `render_timeout_ms` → 120000~180000（安全，见 ②），确认 `outbox_lease_ttl_ms` 仍为 30000；
+2. 治 provider（521 的根因）：单次超时 / 换线路 / 备用 provider；
+3. 那条 failed 行用 `scripts/revive_send_row.sh`（或 `revive_attempt_and_send.sh`）救回来；
+4. 查清 12:33 探针来源 —— 如果真有人在催轮次，那台机器上**主动消息的时间分布不可信**
+   （账本与观测都被污染）。
+
 
 
 
