@@ -3095,6 +3095,40 @@ outbox `send failed attempts=1/3`），**渲染**失败一次都不重试。
 4. 查清 12:33 探针来源 —— 如果真有人在催轮次，那台机器上**主动消息的时间分布不可信**
    （账本与观测都被污染）。
 
+### 🔓 密钥与暴露面自查（2026-09-19 21:20 CST）—— **用户决定：不处理，「无伤大雅」**
+
+事实与证据留在这里，将来想收的时候照做即可。
+
+**干净的部分（有实测数据）**：
+- 两个公开仓库的**已跟踪文件**（442 + 37 个）与**全部历史对象**（1744 + 179 个）里，
+  真密钥形状命中 **0** —— 只有测试占位串（`sk-should-not-appear-here`、`sk-canary-…7890`）；
+- `fleet.yml`（DeepSeek key）与 `AstrBot/data/cmd_config.json`（5 个 key：deepseek /
+  ChatGPT-Plus 中转 / siliconflow 嵌入 / Ollama / tavily）**都不在任何 git 仓库里**
+  （`/home/bomomo/astrbot_test` 不是仓库，只有 `src/xiaojiujiu` 是）；
+- 日志干净：AstrBot trace 与 9 个实例日志 `sk-` 命中 **0**；
+- 宿主没有 `.git-credentials` / `.netrc` / docker registry 凭据；`~/.ssh/id_rsa` 权限 600 ✓；
+- AstrBot 控制台密码**不是**默认值（试 `astrbot` 被拒；`123456` / `password` 401）。
+
+**已知暴露（用户接受，本轮不处理）** —— 从另一台局域网机器实测这些端口都开放：
+
+| 端口 | 拿到它能做什么 | 现状 |
+|---|---|---|
+| 6098 | NapCat WebUI → **控制那个 QQ 账号** | `accessControlMode: none`、token 12 位（小写+数字）、无 2FA、无 IP 白名单 |
+| 6299 | OneBot v11 反向 WS → **收全部私聊 + 冒充她发消息** | token `test-frontend-token`，且**这个串写在公开仓库的 HANDOFF 里** |
+| 8787-8829 | Runtime API（零鉴权，`api_v1.py:44` 自己写着"只绑 loopback"） | 上一轮为"局域网访问"发布的 |
+| 8800 | 舰队控制面：`provision` / `deprovision` / `restart` | 零鉴权 |
+| 6186 | AstrBot 控制台 + Open API | 密码非默认，但暴露在 0.0.0.0 且 MD5 存储 |
+
+**将来要收的顺序**（改错顺序会让她掉线）：
+1. NapCat 的 OneBot token 与 AstrBot `platform.ws_reverse_token` **同时**换成随机串 → 重建 `astrbot-test`；
+2. 删掉 `astrbot.yml` 里 `6299:6199` 这条宿主映射（模拟前端在 docker 网络内，本不需要发布）；
+3. NapCat WebUI：token 换 32 位随机 + 加 `ipWhitelist`（或只绑 `127.0.0.1`，改走 SSH 隧道）；
+4. Runtime / 控制面：删掉 `--publish-people` → 重渲染 `fleet.yml` → 重建舰队（恢复 loopback-only）。
+
+**已做的一件事**：本地 `.scratch_blackbox/remote_cmd_config.json`（我早期抓的服务器配置副本，
+含 6 个真值）**已删除** ✓（确认过没有脚本引用它）。另外本次会话里出现过 DeepSeek key 的明文 ——
+真要轮换的话就是它。
+
 
 
 
