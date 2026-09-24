@@ -1,0 +1,95 @@
+# =============================================================================
+# QLoRA fallback 配置（仅当 BF16 放不下时使用）
+# =============================================================================
+#
+# 何时用这个文件：
+#   * 显存 < 8GB，或者要和别的进程共享显卡；
+#   * 想把 max_seq_length 拉大（4bit 基座省下的显存可以换更长序列）。
+#
+# 代价：
+#   * 4bit 基座 + LoRA 的收敛通常比 bf16 略慢，最终质量略低；
+#   * 必须配 paged optimizer，否则反而更容易 OOM（优化器状态峰值）。
+#
+# 注意：QLoRA 下"冻结 embedding/lm_head"更关键 —— 解冻它们
+# 会让量化省下来的显存白费，因此 apply_qlora_fallback() 会强制冻结。
+# =============================================================================
+
+training:
+  model:
+    name_or_path: Qwen/Qwen3.5-2B
+    # 4bit 基座下 torch_dtype 由 quantization 节决定，这里保留声明便于记录
+    torch_dtype: bfloat16
+    device: auto
+    load_vision: false
+    trust_remote_code: false
+    attn_implementation: sdpa
+    local_files_only: false
+
+  lora:
+    # QLoRA 常用更大 r 来补偿量化损失
+    r: 32
+    lora_alpha: 64
+    lora_dropout: 0.05
+    bias: none
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+    # 4bit 下把 MLP 纳入 LoRA 收益相对更明显，可按显存开启
+    include_mlp: false
+    mlp_target_modules: [gate_proj, up_proj, down_proj]
+    use_rslora: false
+    use_dora: false
+    init_lora_weights: gaussian
+
+  freeze:
+    freeze_vision: true
+    freeze_embeddings: true
+    freeze_lm_head: true
+    freeze_norms: true
+    freeze_patterns: []
+    unfreeze_patterns: []
+
+  quantization:
+    enabled: true
+    load_in_4bit: true
+    bnb_4bit_quant_type: nf4
+    bnb_4bit_compute_dtype: bfloat16
+    bnb_4bit_use_double_quant: true
+    # 关键：分页优化器避免显存峰值 OOM
+    optim: paged_adamw_8bit
+
+  train_file: data/sft/train.jsonl
+  eval_file: data/sft/val.jsonl
+  output_dir: outputs/qlora-event-eval
+
+  # 4bit 省下来的显存可以用来加长序列
+  max_seq_length: 1536
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+
+  learning_rate: 0.0001
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  num_train_epochs: 2.0
+  max_steps: -1
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  optim: paged_adamw_8bit
+
+  bf16: true
+  fp16: false
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+
+  logging_steps: 10
+  save_steps: 200
+  eval_steps: 200
+  save_total_limit: 3
+  seed: 42
+  data_seed: 42
+  report_to: []
+
+  enable_thinking: false
+  pretty_json: true
+  packing: false
+  verify_freeze: true

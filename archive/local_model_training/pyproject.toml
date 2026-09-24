@@ -1,0 +1,125 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qboss-training"
+version = "0.1.0"
+description = "小九九 Runtime 的 2B 模型训练工程：纯文本事件评价与情绪解释"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Runtime Training" }]
+keywords = ["llm", "lora", "qwen", "sft", "structured-output", "emotion"]
+
+# 核心依赖：只覆盖"数据生成 / 校验 / 切分 / 评测 / 基准"的离线能力。
+# 训练与量化相关依赖在 [project.optional-dependencies] 里，按需安装。
+dependencies = [
+    "PyYAML>=6.0",
+    "jsonschema>=4.18",
+    "httpx>=0.24",
+]
+
+[project.optional-dependencies]
+# 训练（torch 请按 CUDA 版本自行安装，不在此固定）
+train = [
+    "torch>=2.1",
+    "transformers>=4.40",
+    "peft>=0.10",
+    "trl>=0.9",
+    "datasets>=2.18",
+    "accelerate>=0.29",
+]
+# QLoRA fallback
+qlora = [
+    "bitsandbytes>=0.43",
+]
+# llama.cpp GGUF 转换与检查（转换脚本本身来自 llama.cpp 仓库）
+gguf = [
+    "gguf>=0.10",
+    "sentencepiece>=0.2",
+    "protobuf>=4.25",
+]
+# llama.cpp CPU 推理后端（用于 eval/bench 的 llama_cpp backend）
+llamacpp = [
+    "llama-cpp-python>=0.2.70",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[project.scripts]
+qboss = "qboss_training.cli:main"
+
+[project.urls]
+Documentation = "https://github.com/example/qboss-training"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+qboss_training = ["py.typed"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+# tests/_bootstrap.py 会再次确保这两个路径在 sys.path 上，
+# 这里配置是为了让 pytest 自己也能正确解析 src 布局。
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config"
+filterwarnings = [
+    # 把本工程自己触发的告警升级为错误，防止"悄悄出错"。
+    # 注意：这里不能用 `error::FutureWarning:qboss_training.*` ——
+    # 该字段匹配的是**产生告警的模块**，第三方库内部触发时匹配不到。
+    "error::FutureWarning",
+    "error::DeprecationWarning:qboss_training.*",
+    # 第三方依赖的告警只提示，不阻断（升级依赖是另一件事）
+    "default::DeprecationWarning",
+    "default::UserWarning",
+]
+markers = [
+    "slow: 需要较长时间或较大内存的测试",
+    "gpu: 需要 CUDA 的测试（默认不跑）",
+    "model: 需要下载/加载真实模型的测试（默认不跑）",
+]
+
+[tool.coverage.run]
+source = ["qboss_training"]
+branch = true
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = [
+    "E501",   # 行长由 formatter 处理
+    "B008",   # dataclass field(default_factory=...) 是合法用法
+    "SIM108", # 三元表达式并非总是更清晰
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "SIM117"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+ignore_missing_imports = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+files = ["src/qboss_training"]

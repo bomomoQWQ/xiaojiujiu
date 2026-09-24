@@ -1,0 +1,110 @@
+# =============================================================================
+# BF16 LoRA 训练配置（首选方案）
+# =============================================================================
+#
+# 目标：Qwen/Qwen3.5-2B 纯文本 · 事件评价 + 情绪解释
+#
+# 为什么是 BF16 LoRA 而不是全参 / QLoRA：
+#   * 2B 参数在 bf16 下约 4GB 权重，加上 LoRA 优化器状态与激活，
+#     单卡 8GB（RTX 4060 Laptop）即可训练；
+#   * 任务本身是"严格结构化输出"，LoRA 容量足够，全参微调没有收益
+#     且更容易破坏基座的中文能力；
+#   * QLoRA 只在显存不足时作为 fallback（见 configs/qlora_fallback.yaml）。
+#
+# 硬性策略：冻结视觉塔 + embedding + lm_head（见 training/config.py 的说明）。
+# =============================================================================
+
+training:
+  model:
+    name_or_path: Qwen/Qwen3.5-2B
+    torch_dtype: bfloat16
+    device: auto
+    # 纯文本任务：不加载视觉模块。置为 true 会浪费显存，配置校验会告警。
+    load_vision: false
+    trust_remote_code: false
+    attn_implementation: sdpa
+    local_files_only: false
+
+  lora:
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    bias: none
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+    # MLP 也纳入 LoRA：2B 上收益有限但更贵，默认关闭
+    include_mlp: false
+    mlp_target_modules: [gate_proj, up_proj, down_proj]
+    use_rslora: false
+    use_dora: false
+    init_lora_weights: gaussian
+
+  freeze:
+    # 以下四项默认全开，除非有明确理由否则不要改
+    freeze_vision: true
+    freeze_embeddings: true
+    freeze_lm_head: true
+    freeze_norms: true
+    freeze_patterns: []
+    unfreeze_patterns: []
+
+  quantization:
+    # BF16 路径：不做量化
+    enabled: false
+    load_in_4bit: false
+    bnb_4bit_quant_type: nf4
+    bnb_4bit_compute_dtype: bfloat16
+    bnb_4bit_use_double_quant: true
+    optim: paged_adamw_8bit
+
+  # ---- 数据 ----
+  train_file: data/sft/train.jsonl
+  eval_file: data/sft/val.jsonl
+
+  # ---- 输出 ----
+  output_dir: outputs/lora-event-eval
+
+  # ---- 序列与批次 ----
+  # 事件评价上下文几百 token，情绪解释 512~1024（架构文档 §74.2）。
+  # 1024 足够覆盖两者，不必开 8K。
+  max_seq_length: 1024
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+  dataloader_num_workers: 0
+
+  # ---- 优化 ----
+  learning_rate: 0.00008
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  num_train_epochs: 2.0
+  max_steps: -1
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  optim: adamw_torch
+
+  # ---- 精度与显存 ----
+  bf16: true
+  fp16: false
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+
+  # ---- 日志与保存 ----
+  logging_steps: 10
+  save_steps: 200
+  eval_steps: 200
+  save_total_limit: 3
+  seed: 42
+  data_seed: 42
+  report_to: []
+
+  # ---- SFT 相关 ----
+  # 关闭思维链：本任务要确定性 JSON，不需要推理段
+  enable_thinking: false
+  # 与推理端保持一致的 JSON 缩进（必须一致，否则训练/推理分布不匹配）
+  pretty_json: true
+  # packing 会跨样本拼接并破坏 completion-only 掩码边界，必须关闭
+  packing: false
+
+  # 训练前打印冻结命中情况，并在 LoRA 注入后二次校验
+  verify_freeze: true

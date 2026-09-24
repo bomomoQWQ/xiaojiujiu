@@ -1,0 +1,3964 @@
+#!/usr/bin/env python3
+"""Black-box "a real person uses the deployed bot" acceptance simulation.
+
+This script plays a *user*, not a test harness with privileged access. Everything it
+asserts is something that person could observe from the chat window:
+
+1. the **platform transcript** - what the bot actually sent into a chat session
+   (per session, in order, with simulated timestamps), and what the user said;
+2. the **host acting layer** - the reply AstrBot's main LLM produced, and (for a
+   proactive message) the prompt the Runtime composed for it;
+3. the **public HTTP surface** an operator would use: ``/health``, ``/v1/*``,
+   ``/tick``, ``/context``.
+
+Anything read beyond those three (``/state``, ``/unfinished``, ``/candidates``,
+``/boundaries``, ``/attempts``, ``/schedule``, ``/outbox``) is labelled
+``运维可观测面`` (operator-observable surface) in the output and is used only as a
+diagnostic. It is never the primary evidence for a user-facing claim.
+
+What is real
+------------
+* A real ``uvicorn`` server in front of a real
+  :class:`~companion_runtime.runtime.Runtime`, on an OS-assigned loopback port,
+  over a real **file** SQLite database in WAL mode with a real JSONL mirror.
+* The real autonomous :class:`~companion_runtime.scheduler.Scheduler`, wired the
+  way ``companion_runtime.cli.cmd_serve`` wires it, so proactive messages are
+  decided by the Runtime's own loop - the script never calls ``/endogenous``.
+* The **shipped AstrBot plugin** (``astrbot_plugin_companion_runtime/main.py``)
+  loaded against the AstrBot public-API stubs that ship in
+  ``astrbot_plugin_companion_runtime/tests/stubs``, using its real decorators
+  (``filter.custom_filter`` / ``on_llm_request`` / ``after_message_sent``) and the
+  plugin's own ``AiohttpRuntimeTransport`` for a real HTTP hop to the live
+  Runtime. The user's words therefore travel through the plugin's actual hook,
+  and a proactive message travels back through the plugin's lease/render/
+  authorize/send path.
+
+What is faked (and only this)
+-----------------------------
+* **The platform**: a fake chat app with a per-session address book. Delivery to
+  an unregistered session fails exactly like an unmatched AstrBot platform.
+* **AstrBot's host main LLM**: deterministic. A proactive render returns a
+  sentence built from the Runtime's own ``- 我想做的：<intent>`` line (so the
+  Runtime's words are what the user comes to see); a user turn is answered with a
+  neutral acknowledgement that quotes the user's own message. The host never
+  re-states the Runtime's injected background block, which that block itself
+  instructs the model not to quote.
+* **The clock**: the whole process shares one simulated clock (the harness
+  rebinds ``companion_runtime.utility.utcnow`` and the adapter's
+  ``utc_now_iso``). A real deployment has one system clock for host, adapter and
+  Runtime; the simulation has one *simulated* clock, advanced by the script, so a
+  ten-day story finishes in well under two minutes of wall clock. Every duration
+  is therefore expressed in simulated time and stays a real window (the boundary
+  window, the cooldown and the daily contact cap are all still enforced by the
+  shipped code over that clock).
+
+Because of that clock, the script, not the OS, drives time: it advances the
+simulated clock and lets the Scheduler's next wake-up integrate the elapsed
+interval, falling back to the public ``POST /tick`` when the Scheduler's gate is
+closed (a closed gate means "no decision is due", not "time did not pass").
+
+What is therefore NOT proven
+----------------------------
+* Real AstrBot behaviour: provider resolution, history persistence, concurrency
+  and priority handling of the host pipeline are stubbed. Only the plugin's own
+  hook bodies and wire traffic are real.
+* The host LLM's own judgement. It is a deterministic stub, so this run cannot
+  show that a *real* model would phrase a proactive message well; it shows which
+  topics the Runtime handed it.
+* Wall-clock timing: delivery latency, timeouts and retry pacing are exercised
+  only in their simulated-clock aspect (the adapter's own retry queue and lease
+  heartbeats still use the real monotonic clock).
+* Multi-process deployment: Runtime and adapter share one process here.
+* Anything about a real platform's message ordering guarantees beyond the
+  per-session order the fake platform records.
+
+Reuse note
+----------
+The plumbing (server boot, adapter import trick, config build, HTTP helpers,
+teardown, artifact writing) follows ``scripts/e2e_resilience_simulation.py``,
+which is already in this repository; this script intentionally re-implements the
+small parts it needs rather than importing that 3.8k-line phase suite, so a
+black-box run never depends on the white-box phases' assumptions.
+
+The user's day, phase by phase
+-----------------------------
+1. ``setup`` - dependencies, environment scrub, artifact root, no secrets, and
+   the wiring facts the later phases rely on (loopback, file SQLite/WAL, the real
+   plugin hooks, one simulated clock).
+2. ``greeting`` - the user says hello and chats.
+3. ``timed_matter`` - the user leaves a dated promise and goes quiet; the bot has
+   to speak first, from the prompt the Runtime itself composed.
+4. ``closure`` - the user reports the result; the topic is then closed.
+5. ``boundary`` - the user forbids the topic and asks not to be contacted; three
+   simulated days must pass without an unprompted message.
+6. ``resume`` - the user lifts the mute and gives a fresh reason to talk.
+7. ``silence`` - an unanswered message must not become pressure or guilt.
+8. ``isolation`` - a second chat exists and must not hear the first chat's life.
+9. ``restart`` - host and Runtime are stopped and restarted on the same database;
+   a message that was pending must arrive exactly once.
+10. ``replay`` - the same user event and the same action result are re-delivered.
+11. ``timeline`` - the whole user-perspective transcript, plus the global
+    contract (daily cap, no duplicates, no leakage, no crosstalk, every message
+    attributable to a scripted window).
+12. ``memory`` - the user states a durable fact in passing, and the day moves on:
+    the bot has to end up knowing it, be handed it the next time it speaks, and
+    never hold a memory of words the user did not type.
+13. ``teardown`` - every thread joined, artifacts confined to ``--base-dir``, no
+    bytecode next to the sources.
+
+Usage::
+
+    python scripts/blackbox_user_simulation.py --base-dir F:\\bb-user
+    python scripts/blackbox_user_simulation.py --base-dir ... --only setup,greeting
+    python scripts/blackbox_user_simulation.py --base-dir ... --quiet
+    python scripts/blackbox_user_simulation.py --list-phases
+
+Exit code is ``0`` only when every check passed, ``1`` when a check failed, and
+``2`` when the script cannot start (missing dependencies).
+
+``--fault`` injects a controlled defect into the *harness* (never into repository
+sources) so that a check can be shown to bite. It is off by default and exists
+only to prove that the corresponding check fails when the fact it protects is
+broken: ``leak`` (a hidden-context/credential marker in a delivered message),
+``duplicate`` (every proactive message sent twice), ``topic`` (a proactive
+message that ignores the topic ban), ``guilt`` (an accusatory message),
+``cross_session`` (the private chat's messages delivered into the group chat),
+``default_session`` (everything delivered to the process-default conversation) and
+``memory`` (a deployment whose maintenance pass never becomes due, so no long-term
+memory is ever formed).
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import importlib
+import json
+import logging
+import os
+import random
+import re
+import shutil
+import socket
+import sys
+import threading
+import time
+import types
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable, Mapping, Sequence
+
+# Never drop bytecode next to the project sources: the only artifacts a run may
+# leave behind live under --base-dir.
+sys.dont_write_bytecode = True
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+RUNTIME_SRC = REPO_ROOT / "runtime" / "src"
+PLUGIN_ROOT = REPO_ROOT / "astrbot_plugin_companion_runtime"
+PLUGIN_STUBS = PLUGIN_ROOT / "tests" / "stubs"
+PLUGIN_PACKAGE = "astrbot_plugin_companion_runtime"
+
+HOST = "127.0.0.1"
+
+#: Two distinct AstrBot-style chat sessions (a private chat and a group).
+SESSION_A = "webchat:FriendMessage:10001"
+SESSION_B = "webchat:GroupMessage:20002"
+#: The Runtime's own default conversation. No user-visible traffic may go there.
+SESSION_DEFAULT = "default"
+
+#: Seed for the Runtime's own decisions. A second, separate seed drives the
+#: Scheduler's interval jitter so the character's decisions stay reproducible.
+RUNTIME_SEED = 20260415
+SCHEDULER_SEED = 771205
+
+#: How far the simulated clock moves per step. The step is chosen so that a step
+#: is shorter than every configured window it must respect (the Runtime's own
+#: pressure-integration cap is 6 simulated hours, so nothing is truncated).
+SIM_STEP = timedelta(hours=2)
+#: Multiples of the step used by the scripted story.
+HOUR = timedelta(hours=1)
+DAY = timedelta(days=1)
+
+# ------------------------------------------------------------------ the story
+# The user's words. Only the texts matter for the assertions; every one of them
+# is a plausible thing for a person to type.
+TEXT_GREETING = "你好呀，今天过得怎么样？"
+TEXT_APPOINTMENT = "我明天下午三点面试，结束了告诉你。"
+TEXT_RESULT = "面试过了！谢谢你那天惦记我。"
+TEXT_TOPIC_BAN = "以后别再提面试这件事了。"
+TEXT_CONTACT_BAN = "以后别主动找我了。"
+TEXT_REVOKE = "我撤回刚才那句话，你可以主动找我了。"
+TEXT_NEW_TOPIC = "对了，我明天上午有个考试，考完告诉你。"
+TEXT_SESSION_B = "你好呀，我明天下午有个体检，出结果告诉你。"
+TEXT_SMALL_TALK = "我先去健身房了，回头聊。"
+
+# -- the memory phase's own lines ------------------------------------------------------
+#: A durable fact the user states once, in passing, and never repeats. It is
+#: unrelated to every other line in the story on purpose: "the bot remembers this"
+#: must not be confusable with "the bot is quoting the message it just received".
+TEXT_MEMORY_FACT = "对了，我喝咖啡只喝手冲，不加糖，别的都不喝。"
+#: The word that identifies that fact in a memory or in a prompt.
+TEXT_MEMORY_MARK = "手冲"
+#: An ordinary later message, so the fact has to reach the prompt unasked for.
+TEXT_MEMORY_LATER = "忙完了，随便聊聊吧。"
+#: How far the simulated clock moves before the memory must exist. The Runtime's
+#: maintenance interval is one simulated hour and a step is two, so one step is
+#: enough; the extra step is there so a late scheduler wake cannot excuse a miss.
+MEMORY_WAIT = timedelta(hours=4)
+#: The section the Runtime marks remembered facts with inside its context block.
+MEMORY_SECTION = "【我记得的事】"
+#: What the host assembles as the system prompt for a normal turn, in miniature. A real
+#: deployment has ~4210 characters here (persona 732 + a Skills block + a tool reminder);
+#: all that matters for the checks below is that it is *non-empty* and that a proactive
+#: render receives it, because AstrBot hands a render no persona at all.
+HOST_SYSTEM_PROMPT = (
+    "人格设定：小九九\n- 一次只说一两句，通常 30 字以内\n- 不用 Markdown"
+)
+
+#: The draft the simulated semantic endpoint writes in PHASE 13. No rule template in
+#: the Runtime produces wording like this (they are "询问〈事项标题〉" and
+#: "聊起之前记过的事：〈记忆摘要〉"), so hearing it back is proof that a *model-authored*
+#: intention survived the pool, the decision, the render and the delivery.
+SEMANTIC_DRAFT = "问他那盆琴叶榕还活着没有"
+#: The word that identifies that draft in what the user receives.
+SEMANTIC_DRAFT_MARK = "琴叶榕"
+#: Minimum share of a memory's character bigrams that must appear in what the user
+#: typed. Below it, the Runtime is asserting something the user never said.
+MEMORY_TRACE_RATIO = 0.5
+
+#: Topics the user forbade after ``TEXT_TOPIC_BAN``.
+FORBIDDEN_TOPICS = ("面试",)
+#: Words that would make a message read as guilt-tripping, in either language.
+GUILT_PHRASES = (
+    "你怎么不理我",
+    "为什么不回",
+    "你是不是不想理我",
+    "我很失望",
+    "你都不理我",
+    "你为什么不理",
+    "你把我忘了吧",
+    "又是我一个人",
+    "你总是这样",
+    "你根本不在乎",
+    "我是不是很烦",
+    "算了，不打扰你了",
+)
+#: Patterns that must never reach a user: hidden-context markers, credential
+#: shapes and internal identifiers.
+LEAKAGE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("context_tag", re.compile(r"<companion_runtime_context")),
+    ("injection_banner", re.compile(r"以下是\s*Runtime\s*注入")),
+    ("product_name", re.compile(r"companion_runtime")),
+    ("api_key_word", re.compile(r"api[_-]?key", re.IGNORECASE)),
+    ("bearer", re.compile(r"Bearer\s")),
+    ("openai_key", re.compile(r"sk-[A-Za-z0-9]{6,}")),
+    (
+        "internal_id",
+        re.compile(r"\b(?:evt|obx|att|cnd|unf|emo|obs)_[0-9a-f]{6,}\b", re.IGNORECASE),
+    ),
+)
+
+OK_MARK = "[PASS]"
+BAD_MARK = "[FAIL]"
+NOTE_MARK = "  ."
+OPS_LABEL = "运维可观测面"
+
+#: Environment variables that could carry a provider credential. Scrubbed at
+#: startup, then asserted absent, so a run can never reach a paid endpoint.
+PROVIDER_ENV_PATTERN = re.compile(
+    r"(API[_-]?KEY|_TOKEN$|^OPENAI|^ANTHROPIC|^DEEPSEEK|^GEMINI|^GOOGLE_API|"
+    r"^AZURE_OPENAI|^DASHSCOPE|^MOONSHOT|^ZHIPU|^MISTRAL|^COHERE|^GROQ|^XAI)",
+    re.IGNORECASE,
+)
+
+# ------------------------------------------------------------------ project imports
+
+IMPORT_ERROR = ""
+# The checkout's own source tree comes first, so the run always exercises the
+# working tree rather than an installed copy.
+if str(RUNTIME_SRC) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_SRC))
+
+try:
+    import aiohttp as _aiohttp  # noqa: F401  (the adapter's HTTP transport needs it)
+
+    import uvicorn as _uvicorn  # noqa: F401
+
+    from companion_runtime import utility as runtime_utility
+    from companion_runtime.api import create_app
+    from companion_runtime.config import RuntimeConfig
+    from companion_runtime.providers import (
+        DEEP_REFRESH_FIELDS,
+        DEEP_REFRESH_SYSTEM_PROMPT,
+        EXPLANATION_FIELDS,
+        EXPLAIN_STATE_SYSTEM_PROMPT,
+        REMOTE_API_NAME,
+        RemoteAPIProvider,
+    )
+    from companion_runtime.runtime import Runtime
+    from companion_runtime.scheduler import Scheduler
+except Exception as exc:  # noqa: BLE001 - reported as a setup failure, not a traceback
+    IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+
+# ------------------------------------------------------------------ reporting
+
+
+@dataclass
+class Check:
+    """One assertion, with the phase it belongs to."""
+
+    phase: str
+    label: str
+    ok: bool
+    detail: str = ""
+
+
+@dataclass
+class Section:
+    """A named group of checks, one per phase."""
+
+    title: str
+    identifier: str = ""
+    checks: list[Check] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+
+
+class Verifier:
+    """Collects PASS/FAIL results, prints them and writes the run report."""
+
+    def __init__(self, *, quiet: bool = False) -> None:
+        """Create the verifier.
+
+        Args:
+            quiet: Suppress informational notes and diagnostics (checks and the
+                transcript are still printed).
+        """
+        self.sections: list[Section] = []
+        self.quiet = quiet
+        self.current: Section | None = None
+        self.extra_log: list[str] = []
+
+    def load_phases(self, phases: Sequence[tuple[str, str]]) -> None:
+        """Declare every phase up front so a skipped one is still visible.
+
+        Args:
+            phases: ``(identifier, title)`` pairs in run order.
+        """
+        for identifier, title in phases:
+            self.sections.append(Section(title=title, identifier=identifier))
+
+    def skip(self, identifier: str) -> Section:
+        """Return the declared section for a phase, running or not.
+
+        Args:
+            identifier: Phase identifier.
+
+        Returns:
+            The declared section.
+        """
+        for section in self.sections:
+            if section.identifier == identifier:
+                return section
+        raise KeyError(identifier)
+
+    def phase(self, identifier: str, title: str) -> Section:
+        """Start a phase: reuse its declared section and print its banner.
+
+        Args:
+            identifier: Phase identifier used by ``--only``.
+            title: Human-readable title.
+
+        Returns:
+            The section checks should be recorded in.
+        """
+        section = self.skip(identifier)
+        section.title = f"{title} [{identifier}]"
+        self.current = section
+        self._line("")
+        self._line("=" * 78)
+        self._line(section.title)
+        self._line("=" * 78)
+        return section
+
+    def note(self, message: str) -> None:
+        """Record and print an informational line."""
+        if self.current is not None:
+            self.current.notes.append(message)
+        if not self.quiet:
+            self._line(f"{NOTE_MARK} {message}")
+
+    def ops(self, title: str, payload: Any) -> None:
+        """Record and print an operator-surface diagnostic, clearly labelled.
+
+        Args:
+            title: What was read.
+            payload: JSON-serialisable value.
+        """
+        text = f"[{OPS_LABEL}] {title}: {_short_json(payload)}"
+        if self.current is not None:
+            self.current.diagnostics.append(text)
+        if not self.quiet:
+            self._line(f"    {text}")
+
+    def check(self, label: str, condition: Any, detail: str = "") -> bool:
+        """Record one PASS/FAIL assertion.
+
+        Args:
+            label: The user-visible fact this check protects.
+            condition: Truthy when the fact holds.
+            detail: Expected vs actual, plus the offending text when it does not.
+
+        Returns:
+            Whether the check passed.
+        """
+        ok = bool(condition)
+        check = Check(phase=self.current.title if self.current else "(none)", label=label, ok=ok, detail=detail)
+        if self.current is not None:
+            self.current.checks.append(check)
+        suffix = f"  [{detail}]" if detail else ""
+        self._line(f"  {OK_MARK if ok else BAD_MARK} {label}{suffix}")
+        return ok
+
+    def line(self, text: str = "") -> None:
+        """Print one line of transcript/echo."""
+        self._line(text)
+
+    def _line(self, text: str) -> None:
+        """Print and remember one line."""
+        print(text, flush=True)
+
+    def totals(self) -> tuple[int, int]:
+        """Return ``(passed, failed)`` over every recorded check."""
+        checks = [check for section in self.sections for check in section.checks]
+        passed = sum(1 for check in checks if check.ok)
+        return passed, len(checks) - passed
+
+    def failures(self) -> list[Check]:
+        """Return every failed check, in order."""
+        return [check for section in self.sections for check in section.checks if not check.ok]
+
+    def summary(self) -> int:
+        """Print the summary and return the process exit code."""
+        passed, failed = self.totals()
+        self._line("")
+        self._line("=" * 78)
+        self._line("SUMMARY")
+        self._line("=" * 78)
+        for section in self.sections:
+            section_passed = sum(1 for check in section.checks if check.ok)
+            section_failed = len(section.checks) - section_passed
+            mark = OK_MARK if section_failed == 0 else BAD_MARK
+            empty = " (skipped)" if not section.checks else ""
+            self._line(
+                f"  {mark} {section.title}: {section_passed}/{len(section.checks)} checks passed{empty}"
+            )
+        self._line("")
+        self._line(f"  checks passed: {passed}")
+        self._line(f"  checks failed: {failed}")
+        if failed:
+            self._line("")
+            self._line("FAILURES (with diagnostics)")
+            self._line("-" * 78)
+            for index, check in enumerate(self.failures(), start=1):
+                self._line(f"  {index}. [{check.phase}] {check.label}")
+                if check.detail:
+                    self._line(f"       {check.detail}")
+        return 1 if failed else 0
+
+    def as_report(self) -> dict[str, Any]:
+        """Return the JSON-serialisable run report."""
+        return {
+            "generated_at": _real_now_iso(),
+            "python": sys.version.split()[0],
+            "executable": sys.executable,
+            "repo_root": str(REPO_ROOT),
+            "checks": [
+                {"phase": check.phase, "label": check.label, "ok": check.ok, "detail": check.detail}
+                for section in self.sections
+                for check in section.checks
+            ],
+            "sections": [
+                {
+                    "title": section.title,
+                    "notes": list(section.notes),
+                    "diagnostics": list(section.diagnostics),
+                    "checks": [
+                        {"label": check.label, "ok": check.ok, "detail": check.detail}
+                        for check in section.checks
+                    ],
+                }
+                for section in self.sections
+            ],
+            "totals": dict(zip(("passed", "failed"), self.totals())),
+            "failures": [
+                {"phase": check.phase, "label": check.label, "detail": check.detail}
+                for check in self.failures()
+            ],
+        }
+
+
+V = Verifier()
+
+
+class _MemoryLogHandler(logging.Handler):
+    """Keeps the Runtime's and the adapter's log lines for diagnostics.log."""
+
+    def __init__(self, *, echo_level: int = logging.WARNING) -> None:
+        super().__init__(level=logging.INFO)
+        self.records: list[str] = []
+        self.echo_level = echo_level
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Record one log line, echoing anything at or above the echo level."""
+        with contextlib.suppress(Exception):
+            line = self.format(record)
+            self.records.append(line)
+            if record.levelno >= self.echo_level and not V.quiet:
+                print(f"    [log] {line}", flush=True)
+
+
+LOG_HANDLER = _MemoryLogHandler()
+
+
+def configure_logging() -> None:
+    """Route Runtime/uvicorn/adapter logs into the diagnostics buffer."""
+    LOG_HANDLER.setFormatter(logging.Formatter("%(levelname)s %(name)s :: %(message)s"))
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    with contextlib.suppress(Exception):
+        root.handlers = [LOG_HANDLER]
+    for name in ("companion_runtime", "uvicorn", "uvicorn.error", "uvicorn.access", "astrbot"):
+        logger = logging.getLogger(name)
+        logger.handlers = []
+        logger.propagate = True
+
+
+# ------------------------------------------------------------------ small helpers
+
+
+def _real_now_iso() -> str:
+    """Return the real wall-clock time (used only for report metadata)."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _short(value: Any, limit: int = 200) -> str:
+    """Render a value compactly for a check's detail field."""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = repr(value)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _short_json(payload: Any, limit: int = 700) -> str:
+    """Render a diagnostic payload readably."""
+    try:
+        text = json.dumps(payload, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = repr(payload)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def normalize_message(text: str) -> str:
+    """Return a punctuation- and whitespace-insensitive form of a message.
+
+    Args:
+        text: Raw message text.
+
+    Returns:
+        The comparison form used by the duplicate check.
+    """
+    return re.sub(r"[\s\W_]+", "", (text or "").lower())
+
+
+def free_port() -> int:
+    """Return a currently unused loopback TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((HOST, 0))
+        return int(probe.getsockname()[1])
+
+
+def scrub_environment() -> list[str]:
+    """Remove provider-shaped environment variables from this process.
+
+    Returns:
+        The names that were removed, for the setup check to report.
+    """
+    removed: list[str] = []
+    for name in list(os.environ):
+        if PROVIDER_ENV_PATTERN.search(name):
+            os.environ.pop(name, None)
+            removed.append(name)
+    return removed
+
+
+def scan_leakage(text: str) -> list[str]:
+    """Return the names of every leakage pattern found in ``text``."""
+    return [name for name, pattern in LEAKAGE_PATTERNS if pattern.search(text or "")]
+
+
+def scan_guilt(text: str) -> list[str]:
+    """Return every accusatory phrase found in ``text``."""
+    return [phrase for phrase in GUILT_PHRASES if phrase in (text or "")]
+
+
+# ------------------------------------------------------------------ simulated clock
+
+
+class SimClock:
+    """The simulation's single clock: host, adapter and Runtime all read it."""
+
+    def __init__(self, start: datetime) -> None:
+        """Create the clock at ``start`` (an aware UTC datetime)."""
+        self._now = start
+        self._origin = start
+
+    def now(self) -> datetime:
+        """Return the current simulated UTC moment."""
+        return self._now
+
+    def iso(self) -> str:
+        """Return the simulated moment the way the adapter's wire format wants it."""
+        return self._now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    def advance(self, delta: timedelta) -> datetime:
+        """Move the simulated clock forward and return the new moment."""
+        self._now = self._now + delta
+        return self._now
+
+    def reset(self, moment: datetime) -> None:
+        """Jump the clock to ``moment`` (only used to align a restart)."""
+        self._now = moment
+
+    @property
+    def origin(self) -> datetime:
+        """Return the moment the run started at."""
+        return self._origin
+
+
+def install_process_clock(clock: SimClock) -> int:
+    """Bind every project module's clock to the simulated one.
+
+    A real deployment has one system clock shared by the host framework, the
+    adapter and the Runtime. The simulation keeps that invariant with a simulated
+    clock instead of the OS clock, which is the only way a ten-day story can run
+    in seconds without changing any shipped behaviour.
+
+    Args:
+        clock: The simulated clock.
+
+    Returns:
+        How many module attributes were rebound (reported by the setup check).
+    """
+    rebound = 0
+    modules: list[Any] = []
+    for name, module in list(sys.modules.items()):
+        if module is None:
+            continue
+        if name == "companion_runtime" or name.startswith("companion_runtime."):
+            modules.append(module)
+        elif name.startswith(PLUGIN_PACKAGE):
+            modules.append(module)
+    for module in modules:
+        if hasattr(module, "utcnow"):
+            module.utcnow = clock.now
+            rebound += 1
+        if hasattr(module, "utc_now_iso"):
+            module.utc_now_iso = clock.iso
+            rebound += 1
+    runtime_utility.utcnow = clock.now
+    rebound += 1
+    return rebound
+
+
+# ------------------------------------------------------------------ HTTP client
+
+
+@dataclass
+class Reply:
+    """One HTTP reply, captured without raising."""
+
+    status: int
+    json: Any
+    text: str
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """Whether the status is 2xx."""
+        return 200 <= self.status < 300
+
+    def field(self, *path: str, default: Any = None) -> Any:
+        """Read a nested field (mapping keys or list indices) from a JSON body."""
+        cursor: Any = self.json
+        for key in path:
+            if isinstance(cursor, Mapping) and key in cursor:
+                cursor = cursor[key]
+            elif isinstance(cursor, Sequence) and not isinstance(cursor, (str, bytes, bytearray)):
+                try:
+                    cursor = cursor[int(key)]
+                except (ValueError, IndexError):
+                    return default
+            else:
+                return default
+        return cursor
+
+    def describe(self) -> str:
+        """Return a compact one-line description for a failure detail."""
+        if self.error:
+            return f"status={self.status} error={self.error}"
+        return f"status={self.status} body={_short(self.json, 240)}"
+
+
+def http_call(
+    base_url: str,
+    method: str,
+    path: str,
+    body: Mapping[str, Any] | None = None,
+    *,
+    timeout: float = 20.0,
+) -> Reply:
+    """Perform one JSON request against the loopback server, never raising.
+
+    Args:
+        base_url: ``http://127.0.0.1:<port>``.
+        method: HTTP method.
+        path: Absolute path including the query string.
+        body: JSON body, or ``None``.
+        timeout: Per-request timeout in seconds.
+
+    Returns:
+        A :class:`Reply`; transport failures arrive as ``status=0`` with
+        :attr:`Reply.error` set.
+    """
+    data = None if body is None else json.dumps(body, default=str).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url}{path}",
+        data=data,
+        method=method,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "companion-runtime-blackbox-user/1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - loopback
+            raw = response.read().decode("utf-8", "replace")
+            status = int(response.status)
+    except urllib.error.HTTPError as exc:  # a 4xx/5xx is a result, not an error
+        raw = exc.read().decode("utf-8", "replace")
+        status = int(exc.code)
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        return Reply(status=0, json=None, text="", error=f"{type(exc).__name__}: {exc}")
+    parsed: Any = None
+    if raw.strip():
+        with contextlib.suppress(ValueError):
+            parsed = json.loads(raw)
+    return Reply(status=status, json=parsed, text=raw)
+
+
+# ------------------------------------------------------------------ the fake platform
+
+
+@dataclass
+class Delivery:
+    """One message the platform accepted (or refused) for a session."""
+
+    at: datetime
+    session: str
+    text: str
+    kind: str  # "reply" (host answer to a user turn) or "proactive"
+    delivered: bool = True
+
+
+class Platform:
+    """Stand-in for AstrBot's platform adapters: an address book per session."""
+
+    def __init__(self, recorder: "Recorder") -> None:
+        """Create the platform.
+
+        Args:
+            recorder: Transcript recorder every delivery is appended to.
+        """
+        self._registered: dict[str, bool] = {}
+        self._recorder = recorder
+        self.deliveries: list[Delivery] = []
+
+    def register(self, session: str) -> None:
+        """Make a session resolvable, like binding a platform account."""
+        self._registered[session] = True
+
+    def resolve(self, session: str) -> bool:
+        """Whether a session can currently be addressed."""
+        return bool(self._registered.get(session, False))
+
+    def deliver(self, session: str, text: str, *, kind: str, at: datetime) -> bool:
+        """Deliver a message into a session, recording it either way.
+
+        Args:
+            session: Target session (``unified_msg_origin``).
+            text: Message body.
+            kind: ``"reply"`` or ``"proactive"``.
+            at: Simulated moment of the delivery.
+
+        Returns:
+            ``True`` when the platform had somewhere to put the message, which is
+            what AstrBot's own ``send_message`` reports.
+        """
+        delivered = self.resolve(session)
+        record = Delivery(at=at, session=session, text=text, kind=kind, delivered=delivered)
+        self.deliveries.append(record)
+        self._recorder.record(record)
+        return delivered
+
+
+# ------------------------------------------------------------------ the fake host
+
+
+def proactive_text_for(prompt: str, *, variant: int = 0) -> str:
+    """Return the message a main LLM would write for a Runtime render prompt.
+
+    The prompt is the Runtime's, unmodified: this reads the ``- 我想做的：`` line
+    the Runtime composed, which is what makes an assertion on the delivered text
+    meaningful - anything the Runtime asks for becomes visible to the user. The
+    phrasing rotates between renders the way a real model's would, so two
+    *identical* delivered messages can only come from a duplicate delivery of the
+    same action (whose text is fixed when it is rendered), never from this stub.
+
+    Args:
+        prompt: The render prompt the Runtime handed the adapter.
+        variant: Which phrasing to use.
+
+    Returns:
+        The sentence the fake host LLM produces.
+    """
+    intent = "你"
+    for line in (prompt or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- 我想做的："):
+            intent = stripped.split("：", 1)[1].strip() or intent
+            break
+    templates = (
+        "刚才忽然想起{intent}，现在怎么样了？",
+        "这两天一直惦记着{intent}，有消息了吗？",
+        "想起{intent}，还好吗？",
+        "关于{intent}，我有点好奇结果怎么样了。",
+        "又想到{intent}了，方便说说进展吗？",
+        "不知道{intent}顺不顺利，有点挂念。",
+        "关于{intent}，要是有消息了记得跟我说一声。",
+        "刚忙完，突然想知道{intent}怎么样了。",
+        "关于{intent}，我一直留意着呢。",
+        "有件事一直放在心上：{intent}，怎么样了？",
+        "想到{intent}，希望一切顺利。",
+        "关于{intent}，要是不方便说也没关系，就是问问。",
+        "刚看到时间，又想起{intent}了。",
+        "关于{intent}，有进展了就告诉我一声吧。",
+        "想起{intent}，不知道现在是什么情况了。",
+        "关于{intent}，我这边一直记着，还好吗？",
+        "突然有点想知道{intent}的后续。",
+        "关于{intent}，等你方便的时候说一声就好。",
+        "想到{intent}，不着急，就是想问问。",
+        "关于{intent}，最近有什么新消息吗？",
+    )
+    return templates[variant % len(templates)].format(intent=intent)
+
+
+def reply_text_for(user_text: str) -> str:
+    """Return the host LLM's answer to a user turn.
+
+    Deliberately a quote of the user's own words and nothing else: the hidden
+    Runtime background block is explanatory, and the block itself instructs the
+    model not to quote it. A reply that mentions a topic therefore only does so
+    because the user raised it in that turn.
+
+    Args:
+        user_text: What the user said.
+
+    Returns:
+        The reply body.
+    """
+    body = " ".join((user_text or "").split())
+    return f"我在听，你说的「{body}」我记下了。"
+
+
+@dataclass
+class LLMCall:
+    """One recorded host LLM call."""
+
+    at: datetime
+    session: str
+    prompt: str
+    text: str
+    #: The system prompt this call carried. Empty on a proactive render means the host
+    #: persona never reached it - which is exactly what used to happen.
+    system_prompt: str = ""
+
+
+class HostLLM:
+    """The host's main LLM: deterministic, and derived from the prompt only."""
+
+    def __init__(self, clock: SimClock) -> None:
+        """Create the model.
+
+        Args:
+            clock: Simulated clock used to timestamp calls.
+        """
+        self._clock = clock
+        self.calls: list[LLMCall] = []
+        self.proactive_calls: list[LLMCall] = []
+
+    async def generate(
+        self, *, provider_id: str, prompt: str, session: str = "", system_prompt: str = ""
+    ) -> str:
+        """Answer one prompt deterministically.
+
+        Args:
+            provider_id: Provider id resolved by the adapter (recorded only).
+            prompt: The prompt the host pipeline actually passed.
+            session: Session the call belongs to, when the caller knows it.
+            system_prompt: System prompt this call carries; recorded so a check can
+                ask whether a proactive render got the host persona.
+
+        Returns:
+            The generated text.
+        """
+        del provider_id
+        is_render = "- 我想做的：" in (prompt or "")
+        text = ""
+        if is_render:
+            text = proactive_text_for(prompt, variant=len(self.proactive_calls))
+        call = LLMCall(
+            at=self._clock.now(),
+            session=session,
+            prompt=prompt,
+            text=text,
+            system_prompt=system_prompt,
+        )
+        self.calls.append(call)
+        if is_render:
+            self.proactive_calls.append(call)
+        return text
+
+
+class SimSemantic:
+    """A semantic endpoint whose wire is a function instead of a socket.
+
+    The provider is the **shipped** :class:`RemoteAPIProvider`; only its transport is
+    replaced, which is the seam ``build_provider`` documents for tests. So request
+    assembly, contract parsing, grounding, provenance and the degradations are all the
+    real code, and nothing leaves the process - there is no key and no endpoint.
+
+    Why it exists: every other phase runs the standard deployment with
+    ``semantic.provider = "disabled"``, so the whole semantic port is dead code to this
+    suite. Two prompt-example shapes the runtime could never apply survived in production
+    precisely because the only black box in the repository ran the deployment that has no
+    provider at all.
+
+    Args:
+        clock: The simulated clock, so reply latency can be recorded honestly.
+    """
+
+    #: A base URL that cannot resolve, so a broken transport seam fails loudly instead
+    #: of quietly reaching the network.
+    base_url = "http://semantic.invalid/v1"
+    model = "sim-semantic"
+    #: Not a credential and not shaped like one: ``RemoteAPIProvider`` needs a non-empty
+    #: key before it reports ``available()``, and the wire is a function here.
+    fake_key = "simulator"
+
+    def __init__(self, *, clock: SimClock) -> None:
+        """Store the clock and the call log."""
+        self.clock = clock
+        self.deep_calls: list[dict[str, Any]] = []
+        self.explain_calls: list[dict[str, Any]] = []
+
+    @property
+    def calls(self) -> int:
+        """Return how many model calls this endpoint served."""
+        return len(self.deep_calls) + len(self.explain_calls)
+
+    def provider(self) -> Any:
+        """Build the real provider around the fake wire."""
+        return RemoteAPIProvider(
+            self.base_url,
+            model=self.model,
+            api_key=self.fake_key,
+            transport=self._transport,
+            cache_ttl_s=0.0,
+        )
+
+    def _transport(
+        self, url: str, body: dict[str, Any], timeout: float, headers: dict[str, str]
+    ) -> Mapping[str, Any]:
+        """Answer one chat-completions request from the request body alone."""
+        del url, timeout, headers
+        system = str((body.get("messages") or [{}])[0].get("content") or "")
+        user = str((body.get("messages") or [{}, {}])[1].get("content") or "")
+        request = json.loads(user) if user else {}
+        if system.startswith(DEEP_REFRESH_SYSTEM_PROMPT[:12]):
+            payload = self._deep_payload(request)
+            self.deep_calls.append(request)
+        else:
+            assert system.startswith(EXPLAIN_STATE_SYSTEM_PROMPT[:12]), _short(system)
+            payload = self._explanation_payload(request)
+            self.explain_calls.append(request)
+        return {
+            "choices": [
+                {"message": {"role": "assistant", "content": json.dumps(payload, ensure_ascii=False)}}
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+        }
+
+    def _explanation_payload(self, request: Mapping[str, Any]) -> dict[str, str]:
+        """Return the six keys the explanation contract reads, and nothing else."""
+        del request
+        payload = {
+            "experience": "心里有点挂着他昨天说的那件事。",
+            "focus": "注意力停在他那句还没兑现的话上。",
+            "conflict": "想问一句，又怕显得在催。",
+            "impulse": "想找个由头把话头接回去。",
+            "inhibition": "先把话放软一点再说。",
+            "expression": "平常地开口，不提自己惦记了多久。",
+        }
+        # The explanation contract is exact: a reply that renames or omits a key is
+        # dropped whole, so the stub must not drift from it either.
+        assert set(payload) == set(EXPLANATION_FIELDS), payload
+        return payload
+
+    def _reference_event(self, request: Mapping[str, Any]) -> str:
+        """Return an event id the runtime will accept as the draft's source.
+
+        The unresolved backlog is the natural first choice, but it is *not* guaranteed to
+        be non-empty when the refresh happens: the coarse rule table may already have
+        settled the message, and the phase is then left with nothing to cite and would
+        fail for a reason that has nothing to do with the contract under test. The
+        request's own ``key_quotes`` are real events too, so they are the fallback.
+        """
+        for item in request.get("unresolved_events") or []:
+            if item.get("event_id"):
+                return str(item["event_id"])
+        for item in request.get("key_quotes") or []:
+            if item.get("event_id"):
+                return str(item["event_id"])
+        return ""
+
+    def _deep_payload(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Propose one draft, in the shape the prompt's own example documents.
+
+        The shape is taken from ``DEEP_REFRESH_SYSTEM_PROMPT`` rather than written out
+        here, so this stub cannot drift away from what the model is told to produce: if
+        the example regresses, this phase produces a reply the runtime drops and the
+        user-visible check below goes red.
+        """
+        example = DEEP_REFRESH_SYSTEM_PROMPT.split("格式样例：", 1)[1].lstrip()
+        sample, _ = json.JSONDecoder().raw_decode(example)
+        event_id = self._reference_event(request)
+        candidates = request.get("candidates") or []
+        payload: dict[str, Any] = {name: [] for name in DEEP_REFRESH_FIELDS}
+        payload["psychological_interpretation"] = self._explanation_payload(request)
+        already_proposed = any(SEMANTIC_DRAFT in str(item.get("intent") or "") for item in candidates)
+        # Deliberately *not* "only when the pool is empty": the rule layer has usually
+        # filled the pool by the time the refresh runs, and gating on emptiness is what
+        # made this stub propose nothing at all. Idempotence comes from the draft text.
+        if event_id and not already_proposed:
+            item = json.loads(json.dumps(sample["candidate_intent_operations"][0], ensure_ascii=False))
+            item["sources"] = [event_id]
+            candidate = item["payload"]["candidate"]
+            candidate["sources"] = [event_id]
+            candidate.update(
+                {
+                    "type": "share",
+                    "intent": SEMANTIC_DRAFT,
+                    "goal": "把话头接回去",
+                    "confidence": 0.95,
+                    "internal_need": 0.95,
+                    "unfinished_relevance": 1.0,
+                }
+            )
+            payload["candidate_intent_operations"] = [item]
+        return payload
+
+
+class HostContext:
+    """The three public AstrBot APIs the shipped executor actually calls."""
+
+    def __init__(self, *, platform: Platform, llm: HostLLM, clock: SimClock, faults: "Faults") -> None:
+        """Wire the context.
+
+        Args:
+            platform: Fake platform messages are sent to.
+            llm: Fake main LLM used by both pipeline paths.
+            clock: Simulated clock.
+            faults: Harness fault injector (off unless asked for).
+        """
+        self._platform = platform
+        self._llm = llm
+        self._clock = clock
+        self._faults = faults
+
+    async def get_current_chat_provider_id(self, umo: str | None = None) -> str:
+        """Resolve the session's current chat provider."""
+        if not self._platform.resolve(str(umo or "")):
+            raise RuntimeError(f"no chat provider for session {umo!r}")
+        return f"webchat-provider::{umo}"
+
+    async def llm_generate(self, *, chat_provider_id: str, prompt: str, **kwargs: Any) -> Any:
+        """Generate one completion through the session's provider.
+
+        ``system_prompt`` is forwarded rather than dropped: the shipped adapter passes it
+        only when it has one, and "did the host persona reach a proactive render?" is a
+        question this simulation has to be able to answer.
+        """
+        session = str(chat_provider_id).split("::", 1)[-1]
+        text = await self._llm.generate(
+            provider_id=chat_provider_id,
+            prompt=prompt,
+            session=session,
+            system_prompt=str(kwargs.get("system_prompt") or ""),
+        )
+        return types.SimpleNamespace(completion_text=text)
+
+    async def send_message(self, session: Any, chain: Any) -> bool:
+        """Deliver a proactive message chain; ``False`` mirrors an unmatched session."""
+        text = chain if isinstance(chain, str) else "".join(str(part.text) for part in chain.chain)
+        text = self._faults.mutate_proactive(text)
+        target = self._faults.redirect_session(str(session))
+        delivered = self._platform.deliver(target, text, kind="proactive", at=self._clock.now())
+        if self._faults.duplicate_proactive:
+            self._platform.deliver(target, text, kind="proactive", at=self._clock.now())
+        return delivered
+
+
+class HostLoop:
+    """A private asyncio loop for the fake host, like AstrBot's own runtime."""
+
+    def __init__(self, name: str) -> None:
+        """Start the loop on its own thread."""
+        self.name = name
+        self.loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        """Run the loop until it is asked to stop."""
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def call(self, coro: Any, *, timeout: float = 60.0) -> Any:
+        """Run a coroutine on the loop and wait for its result."""
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
+
+    @property
+    def alive(self) -> bool:
+        """Whether the loop thread is still running."""
+        return self._thread.is_alive()
+
+    def close(self) -> None:
+        """Cancel what is left, stop the loop and join its thread."""
+
+        async def _drain() -> None:
+            current = asyncio.current_task()
+            pending = [task for task in asyncio.all_tasks() if task is not current]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        with contextlib.suppress(Exception):
+            self.call(_drain(), timeout=15)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self._thread.join(timeout=15)
+        with contextlib.suppress(Exception):
+            self.loop.run_until_complete(self.loop.shutdown_asyncgens())
+        with contextlib.suppress(Exception):
+            self.loop.close()
+
+
+class Faults:
+    """Harness-side fault injection, used only to prove that checks bite.
+
+    Every switch is off unless ``--fault`` names it. None of them touch
+    repository sources: they corrupt what this script itself feeds the world
+    (a delivered message, a session, a replay) so the corresponding user-visible
+    check has to fail.
+    """
+
+    def __init__(self, names: Iterable[str] = ()) -> None:
+        """Create the injector from a set of fault names."""
+        self.names = set(names)
+        self.marker = "[LEAK-MARKER]"
+
+    @property
+    def active(self) -> bool:
+        """Whether any fault is enabled."""
+        return bool(self.names)
+
+    def mutate_proactive(self, text: str) -> str:
+        """Corrupt a proactive message according to the enabled faults."""
+        body = text
+        if "leak" in self.names:
+            body = f"{body} {self.marker} companion_runtime_context api_key=sk-abcdef123456 evt_deadbeef01"
+        if "topic" in self.names:
+            body = "面试还顺利吗？"
+        if "guilt" in self.names:
+            body = "你怎么不理我了，我很失望。"
+        return body
+
+    @property
+    def duplicate_proactive(self) -> bool:
+        """Whether every proactive message should be sent twice."""
+        return "duplicate" in self.names
+
+    @property
+    def memory_never_due(self) -> bool:
+        """Whether maintenance is configured so far out that no memory can form.
+
+        The switch is a *deployment* fault, not a source edit: it configures the
+        Runtime the way a badly set-up instance would be configured, so the memory
+        checks have to fail while every other phase still passes.
+        """
+        return "memory" in self.names
+
+    def redirect_session(self, session: str) -> str:
+        """Return the session a message is actually addressed to."""
+        if "cross_session" in self.names and session == SESSION_A:
+            return SESSION_B
+        if "default_session" in self.names:
+            return SESSION_DEFAULT
+        return session
+
+
+# ------------------------------------------------------------------ transcript
+
+
+@dataclass
+class Turn:
+    """One line of the user-perspective transcript."""
+
+    at: datetime
+    session: str
+    who: str  # "user" or "bot"
+    kind: str  # "user", "reply" or "proactive"
+    text: str
+    delivered: bool = True
+    detail: str = ""
+
+    def render(self) -> str:
+        """Return the human-readable line written to ``transcript.md``."""
+        stamp = self.at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        speaker = "我" if self.who == "user" else "TA"
+        note = "" if self.delivered else "  [未送达/undeliverable]"
+        detail = f"   <{self.detail}>" if self.detail else ""
+        return f"[{stamp}] {self.session}  {speaker}: {self.text}{detail}{note}"
+
+
+class Recorder:
+    """The transcript: what the user saw, per session, in order."""
+
+    def __init__(self) -> None:
+        """Create an empty transcript."""
+        self.turns: list[Turn] = []
+        self._turn_index: dict[str, int] = {}
+        self._last_user: dict[str, Turn] = {}
+
+    def record(self, delivery: Delivery) -> None:
+        """Record one bot delivery (reply or proactive)."""
+        self.turns.append(
+            Turn(
+                at=delivery.at,
+                session=delivery.session,
+                who="bot",
+                kind=delivery.kind,
+                text=delivery.text,
+                delivered=delivery.delivered,
+            )
+        )
+
+    def user(self, *, at: datetime, session: str, text: str) -> Turn:
+        """Record one user message and return it."""
+        turn = Turn(at=at, session=session, who="user", kind="user", text=text)
+        self.turns.append(turn)
+        self._last_user[session] = turn
+        self._turn_index[session] = self._turn_index.get(session, 0) + 1
+        return turn
+
+    def last_user(self, session: str) -> Turn | None:
+        """Return the most recent user message in one session."""
+        return self._last_user.get(session)
+
+    def turns_for(self, session: str) -> list[Turn]:
+        """Return the transcript of one session, in order."""
+        return [turn for turn in self.turns if turn.session == session]
+
+    def bot_turns(self, session: str = "", *, kind: str = "") -> list[Turn]:
+        """Return bot messages, optionally filtered by session and kind."""
+        return [
+            turn
+            for turn in self.turns
+            if turn.who == "bot"
+            and (not session or turn.session == session)
+            and (not kind or turn.kind == kind)
+        ]
+
+    def user_turns(self, session: str = "") -> list[Turn]:
+        """Return user messages, optionally filtered by session."""
+        return [turn for turn in self.turns if turn.who == "user" and (not session or turn.session == session)]
+
+    def between(self, start: datetime, end: datetime, session: str = "") -> list[Turn]:
+        """Return every transcript line inside a simulated time window."""
+        return [
+            turn
+            for turn in self.turns
+            if start <= turn.at <= end and (not session or turn.session == session)
+        ]
+
+    def markdown(self) -> str:
+        """Render the whole transcript as markdown."""
+        lines = ["# 用户视角时间线 / user-perspective timeline", ""]
+        sessions = sorted({turn.session for turn in self.turns})
+        for session in sessions:
+            lines.append(f"## {session}")
+            lines.append("")
+            for turn in self.turns_for(session):
+                lines.append(f"- {turn.render()}")
+            lines.append("")
+        return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ the Runtime under test
+
+
+class RuntimeServer:
+    """A live Runtime sidecar: real uvicorn, real file SQLite/WAL, own port."""
+
+    def __init__(
+        self,
+        *,
+        config: Any,
+        clock: SimClock,
+        name: str,
+        semantic_provider: Any = None,
+    ) -> None:
+        """Store the configuration; :meth:`start` boots the server."""
+        self.config = config
+        self.clock = clock
+        self.name = name
+        self.semantic_provider = semantic_provider
+        self.port = 0
+        self.base_url = ""
+        self.runtime: Any = None
+        self.holder: dict[str, Any] = {}
+        self.thread: threading.Thread | None = None
+
+    @property
+    def scheduler(self) -> Any:
+        """Return the live Scheduler, or ``None`` before it is created."""
+        return self.holder.get("scheduler")
+
+    def start(self, *, startup_timeout: float = 30.0) -> None:
+        """Boot the server, the Scheduler and the uvicorn loop.
+
+        Args:
+            startup_timeout: Seconds to wait for ``/health``.
+
+        Raises:
+            RuntimeError: When the server never became reachable.
+        """
+        import uvicorn
+
+        config = self.config
+        created_at = self.clock.now()
+        self.runtime = Runtime(config, seed=RUNTIME_SEED, created_at=created_at)
+        if self.semantic_provider is not None:
+            # ``Runtime.__init__`` builds a DisabledProvider from the config. The phase
+            # that needs semantics installs the real RemoteAPIProvider here, with its
+            # transport already replaced (see SimSemantic) - everything downstream of the
+            # wire is the shipped code.
+            self.runtime.semantic_provider = self.semantic_provider
+        app = create_app(self.runtime, config)
+        self.port = free_port()
+        self.base_url = f"http://{HOST}:{self.port}"
+        ready = threading.Event()
+        holder = self.holder
+        clock = self.clock
+        runtime = self.runtime
+
+        def _thread_main() -> None:
+            """Own the loop: serve HTTP, run the Scheduler, then shut down."""
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            holder["loop"] = loop
+
+            async def _main() -> None:
+                server = uvicorn.Server(
+                    uvicorn.Config(
+                        app,
+                        host=HOST,
+                        port=self.port,
+                        log_level="warning",
+                        access_log=False,
+                        log_config=None,
+                    )
+                )
+                holder["server"] = server
+                # Wired exactly like `companion-runtime serve`: the same real
+                # Scheduler, the same round callback. The only difference is that
+                # the round is handed the *simulated* moment, which is how the
+                # script plays the world clock; the Scheduler still decides when
+                # to wake and whether the gate is open.
+                scheduler = Scheduler(
+                    config=config,
+                    round_callback=lambda: runtime.endogenous_round(now=clock.now()),
+                    rng=random.Random(SCHEDULER_SEED),
+                    runtime=runtime,
+                )
+                holder["scheduler"] = scheduler
+                await scheduler.start()
+                ready.set()
+                try:
+                    await server.serve()
+                finally:
+                    await scheduler.stop()
+
+            try:
+                loop.run_until_complete(_main())
+            finally:
+                with contextlib.suppress(Exception):
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
+
+        self.thread = threading.Thread(target=_thread_main, name=f"bb-runtime-{self.name}", daemon=True)
+        self.thread.start()
+        if not ready.wait(timeout=startup_timeout):
+            raise RuntimeError(f"runtime {self.name}: the server loop never became ready")
+        if not _wait_until(lambda: self.get("/health", timeout=2.0).ok, timeout=startup_timeout):
+            raise RuntimeError(f"runtime {self.name}: /health never answered on {self.base_url}")
+
+    def stop(self) -> None:
+        """Stop the server, the Scheduler and the Runtime, and join the thread."""
+        server = self.holder.get("server")
+        if server is not None:
+            server.should_exit = True
+        thread = self.thread
+        if thread is not None:
+            thread.join(timeout=25)
+            self.thread = None
+        if self.runtime is not None:
+            with contextlib.suppress(Exception):
+                self.runtime.close()
+
+    # -- HTTP convenience ---------------------------------------------------------
+
+    def get(self, path: str, **kwargs: Any) -> Reply:
+        """GET against the live server."""
+        return http_call(self.base_url, "GET", path, **kwargs)
+
+    def post(self, path: str, body: Mapping[str, Any] | None = None, **kwargs: Any) -> Reply:
+        """POST against the live server."""
+        return http_call(self.base_url, "POST", path, body, **kwargs)
+
+    def tick(self, moment: datetime | None = None) -> Reply:
+        """Advance the Runtime's own clock through the public tick endpoint."""
+        return self.post("/tick", {"now": (moment or self.clock.now()).isoformat()})
+
+    def health(self) -> dict[str, Any]:
+        """Return the health payload (``{}`` when unavailable)."""
+        payload = self.get("/health").json
+        return payload if isinstance(payload, dict) else {}
+
+
+def _wait_until(predicate: Callable[[], bool], *, timeout: float, interval: float = 0.05) -> bool:
+    """Poll ``predicate`` until it is true or ``timeout`` elapses."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with contextlib.suppress(Exception):
+            if predicate():
+                return True
+        time.sleep(interval)
+    return False
+
+
+def build_runtime_config(
+    directory: Path, *, faults: "Faults | None" = None, semantic: bool = False
+) -> Any:
+    """Build the Runtime configuration for the story.
+
+    Every interval is expressed in *simulated* time and is a real window: the
+    cooldown is a cooldown, the daily cap a cap, the matter expiry an expiry. They
+    are chosen to sit below the story's own granularity (a two-simulated-hour
+    step) so a ten-day story is exercised in full.
+
+    Args:
+        directory: Scenario directory (database and JSONL mirror live here).
+        faults: Injected harness faults, if any. The only one that touches the
+            configuration is ``memory``, which sets the maintenance interval beyond
+            any story length - the shape of a deployment that never forms a memory.
+        semantic: Turn the optional semantic port on (PHASE 13). The standard
+            deployment leaves it off, which is why a model-authored draft reaching
+            the user was never covered here.
+
+    Returns:
+        A configured :class:`~companion_runtime.config.RuntimeConfig`.
+    """
+    config = RuntimeConfig()
+    config.storage.database_path = str(directory / "runtime.sqlite3")
+    config.storage.raw_log_path = str(directory / "raw_events.jsonl")
+    config.storage.mirror_raw_events = True
+    config.storage.wal = True
+    config.conversation_id = SESSION_DEFAULT
+    # No semantic provider, no network, no key: the standard deployment.
+    config.semantic.provider = "disabled"
+    config.semantic.settle_on_ingest = True
+    config.semantic.deep_refresh_enabled = False
+    if semantic:
+        # The port is on, and the provider the Runtime builds is replaced with one whose
+        # wire is a function (see SimSemantic). One unresolved event is enough to justify
+        # a refresh here so the phase does not have to manufacture a backlog first.
+        config.semantic.provider = REMOTE_API_NAME
+        config.semantic.deep_refresh_enabled = True
+        config.semantic.unresolved_backlog_threshold = 1
+        config.semantic.deep_refresh_min_interval_seconds = 0.0
+        config.semantic.deep_refresh_idle_hours = 0.0
+        # The phase asks whether a model-authored draft reaches the user, not which of
+        # several live drafts the motivational game prefers. The default temperature is
+        # 0.35, i.e. a genuine draw among candidates that all clear the silence bar, so
+        # it is pinned near zero here to make the answer deterministic.
+        config.utility.temperature = 0.01
+    # Simulated-time windows.
+    config.drive.cooldown_seconds = 4 * 3600.0
+    config.drive.max_contacts_per_day = 3
+    config.unfinished.default_expiry_hours = 72.0
+    config.outbox.lease_seconds = 900.0
+    config.action.send_expiry_seconds = 3600.0
+    config.utility.repeat_window_seconds = 24 * 3600.0
+    # The Scheduler's own cadence is wall-clock work, so it is compressed hard:
+    # the loop wakes many times per simulated step, and every wake-up that matters
+    # is the one after the script moved the world clock.
+    config.scheduler.min_interval_seconds = 0.02
+    config.scheduler.max_interval_seconds = 0.05
+    config.scheduler.busy_poll_seconds = 0.02
+    config.scheduler.foreground_pause_seconds = 60.0
+    config.utility.min_sleep_seconds = 0.02
+    config.utility.max_sleep_seconds = 0.05
+    if faults is not None and faults.memory_never_due:
+        # A maintenance interval longer than the story: no candidate ever becomes
+        # due, which is what a misconfigured deployment looks like from outside.
+        config.memory.consolidation_interval_seconds = 10_000 * 3600.0
+    return config
+
+
+# ------------------------------------------------------------------ the shipped plugin
+
+
+class RecordingTransport:
+    """The shipped aiohttp transport, plus a record of what went over the wire.
+
+    The plugin's own integration tests replace ``AiohttpRuntimeTransport`` the
+    same way; here the replacement *is* the shipped client, so the HTTP hop to the
+    live Runtime is real and the replay checks can re-send an identical body. Each
+    instance keeps its own log, and :data:`WIRE_HISTORY` keeps the whole run's, so
+    a replay check still has the bodies after a host restart.
+    """
+
+    instances: list["RecordingTransport"] = []
+    base_class: Any = None
+
+    def __init__(
+        self, *, settings: Any = None, base_url: str | None = None, log: Any = None
+    ) -> None:
+        """Create the real transport and remember every body this instance sent.
+
+        ``base_url`` is per-target: one adapter now holds a client per Runtime when
+        sessions are routed to different instances, and the override is what points each
+        client at its own instance. Omitting it here made every construction raise
+        ``TypeError: unexpected keyword argument 'base_url'``, which the adapter retries
+        three times and then gives up on - so no transport existed at all and every
+        downstream check failed with "the adapter never talked to the Runtime".
+        """
+        self.base_url = base_url
+        self._inner = type(self).base_class(settings=settings, base_url=base_url, log=log)
+        self.sent: list[tuple[str, dict[str, Any]]] = []
+        type(self).instances.append(self)
+
+    async def post_events(self, body: dict[str, Any], *, timeout_s: float) -> None:
+        """Record and send one event envelope."""
+        record = ("events", json.loads(json.dumps(body)))
+        self.sent.append(record)
+        WIRE_HISTORY.append(record)
+        await self._inner.post_events(body, timeout_s=timeout_s)
+
+    async def report_action(self, body: dict[str, Any], *, timeout_s: float) -> None:
+        """Record and send one action result."""
+        record = ("result", json.loads(json.dumps(body)))
+        self.sent.append(record)
+        WIRE_HISTORY.append(record)
+        await self._inner.report_action(body, timeout_s=timeout_s)
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate everything else (health, context, leases) to the real client."""
+        return getattr(self._inner, name)
+
+
+#: Every body the adapter put on the wire during this run, in order.
+WIRE_HISTORY: list[tuple[str, dict[str, Any]]] = []
+
+
+class StubMessageEvent:
+    """Minimal stand-in for ``AstrMessageEvent`` with the fields the plugin reads."""
+
+    def __init__(
+        self,
+        *,
+        text: str,
+        session: str,
+        message_id: str,
+        result_text: str = "",
+        wake: bool = True,
+    ) -> None:
+        """Build one platform event."""
+        self.unified_msg_origin = session
+        self.message_str = text
+        self.message_obj = types.SimpleNamespace(message_id=message_id)
+        self.is_at_or_wake_command = wake
+        self._result_text = result_text
+        self._session = session
+
+    def get_platform_name(self) -> str:
+        """Return the platform name (the part before the first ``:``)."""
+        return self._session.split(":", 1)[0]
+
+    def get_message_type(self) -> Any:
+        """Return AstrBot's message class for this session."""
+        scope = self._session.split(":")[1] if ":" in self._session else "FriendMessage"
+        return types.SimpleNamespace(value=scope)
+
+    def get_sender_id(self) -> str:
+        """Return the sender id."""
+        return self._session.rsplit(":", 1)[-1]
+
+    def get_sender_name(self) -> str:
+        """Return the sender display name."""
+        return "User"
+
+    def get_self_id(self) -> str:
+        """Return the bot's own id."""
+        return "companion-bot"
+
+    def get_group_id(self) -> str:
+        """Return the group id for group sessions."""
+        return self._session.rsplit(":", 1)[-1] if "GroupMessage" in self._session else ""
+
+    def get_result(self) -> Any:
+        """Return the message AstrBot just sent, as the plugin's hook reads it."""
+        if not self._result_text:
+            return None
+        from astrbot.api.event import MessageEventResult
+        from astrbot.api.message_components import Plain
+
+        return MessageEventResult([Plain(self._result_text)])
+
+
+class PluginHost:
+    """The shipped AstrBot plugin, driven through its real hooks."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        platform: Platform,
+        llm: HostLLM,
+        clock: SimClock,
+        faults: Faults,
+        adapter_id: str,
+        startup_timeout: float = 30.0,
+    ) -> None:
+        """Load the plugin package with the AstrBot stubs and start its workers."""
+        self.base_url = base_url
+        self.adapter_id = adapter_id
+        self.platform = platform
+        self.llm = llm
+        self.clock = clock
+        self.faults = faults
+        self.startup_timeout = startup_timeout
+        self.loop: HostLoop | None = None
+        self.plugin: Any = None
+        self.module: Any = None
+        self.filters: Any = None
+        self.handlers: dict[str, Callable[..., Any]] = {}
+        self.recording: RecordingTransport | None = None
+        #: The hidden context block the plugin injected into the most recent LLM
+        #: request. This is what the acting layer was actually handed, which is the
+        #: only place a black-box run can see "the bot knows this" from.
+        self.last_injected = ""
+
+    def start(self) -> None:
+        """Import the plugin, install the stubs and run ``initialize``.
+
+        Raises:
+            RuntimeError: When the plugin package cannot be loaded.
+        """
+        if not (PLUGIN_ROOT / "main.py").is_file():
+            raise RuntimeError(f"shipped plugin not found at {PLUGIN_ROOT / 'main.py'}")
+        for path in (str(PLUGIN_STUBS), str(PLUGIN_ROOT)):
+            if path not in sys.path:
+                sys.path.insert(0, path)
+        if PLUGIN_PACKAGE not in sys.modules:
+            package = types.ModuleType(PLUGIN_PACKAGE)
+            package.__path__ = [str(PLUGIN_ROOT)]
+            sys.modules[PLUGIN_PACKAGE] = package
+        self.module = importlib.import_module(f"{PLUGIN_PACKAGE}.main")
+        self.filters = importlib.import_module("astrbot.api.event.filter")
+        # The adapter's modules only exist now, so the simulated clock has to be
+        # bound to them here as well: otherwise the adapter would stamp events
+        # with the real clock while the Runtime lives on the simulated one.
+        install_process_clock(self.clock)
+        # The real transport, remembered: the same substitution the plugin's own
+        # integration test performs, and the only way a black-box script can see
+        # what the adapter put on the wire. The *unpatched* class is looked up in
+        # the module it is defined in, so restarting the host cannot chain the
+        # recorder onto itself.
+        http_client = importlib.import_module(f"{PLUGIN_PACKAGE}.companion_runtime.http_client")
+        RecordingTransport.base_class = http_client.AiohttpRuntimeTransport
+        self.module.AiohttpRuntimeTransport = RecordingTransport
+        RecordingTransport.instances.clear()
+
+        self.loop = HostLoop("bb-host")
+        context = HostContext(
+            platform=self.platform, llm=self.llm, clock=self.clock, faults=self.faults
+        )
+        self.plugin = self.module.CompanionRuntimePlugin(
+            context=context,
+            config={
+                "enabled": True,
+                "runtime_base_url": self.base_url,
+                "adapter_id": self.adapter_id,
+                "observe_mode": "all",
+                "report_assistant_messages": True,
+                "inject_enabled": True,
+                "context_timeout_ms": 500,
+                # The world clock moves much faster than this cache's TTL, so the
+                # cache is disabled rather than serving a stale background block.
+                "context_cache_ttl_ms": 0,
+                "context_prefetch": True,
+                "request_timeout_ms": 2000,
+                "outbox_enabled": True,
+                "outbox_poll_interval_ms": 250,
+                "outbox_max_actions_per_poll": 2,
+                "outbox_lease_ttl_ms": 900000,
+                "outbox_max_concurrency": 1,
+                "render_timeout_ms": 10000,
+                "send_timeout_ms": 10000,
+                "queue_base_backoff_ms": 100,
+                "queue_max_backoff_ms": 500,
+            },
+        )
+        self.loop.call(self.plugin.initialize())
+        for name in ("on_message_observed", "on_llm_request", "on_after_message_sent"):
+            self.handlers[name] = self.filters.handler_by_name(name)
+        self.recording = RecordingTransport.instances[-1] if RecordingTransport.instances else None
+
+    def stop(self) -> dict[str, Any]:
+        """Terminate the plugin and join its loop, leaving nothing running.
+
+        Returns:
+            A small report (``loop_alive``, ``tasks_pending``) the restart and
+            teardown checks use to state what actually stopped.
+        """
+        loop = self.loop
+        plugin = self.plugin
+        if loop is None:
+            return {"loop_alive": False, "tasks_pending": 0}
+        with contextlib.suppress(Exception):
+            loop.call(plugin.terminate(), timeout=30)
+        tasks_pending = len(getattr(plugin, "_tasks", []))
+        loop.close()
+        self.loop = None
+        return {"loop_alive": loop.alive, "tasks_pending": tasks_pending}
+
+    @property
+    def running(self) -> bool:
+        """Whether the plugin's event loop thread is alive."""
+        return self.loop is not None and self.loop.alive
+
+    # -- the AstrBot message pipeline ------------------------------------------------
+
+    def user_turn(self, *, text: str, session: str, message_id: str) -> str:
+        """Drive one user turn through the real AstrBot hook order.
+
+        The order mirrors AstrBot: observe the message, inject the Runtime's
+        context into the LLM request, generate the reply, deliver it, then report
+        the delivered message back.
+
+        Args:
+            text: What the user typed.
+            session: Session the message arrived in.
+            message_id: Platform message id.
+
+        Returns:
+            The reply the host pipeline produced.
+        """
+        from astrbot.api.provider import ProviderRequest
+
+        assert self.loop is not None and self.plugin is not None
+        event = StubMessageEvent(text=text, session=session, message_id=message_id)
+        self.loop.call(self.handlers["on_message_observed"](self.plugin, event))
+        # A real AstrBot hands the plugin a request whose system_prompt it has already
+        # assembled; the adapter remembers it for sessions that never get one (renders).
+        request = ProviderRequest(prompt=text, system_prompt=HOST_SYSTEM_PROMPT)
+        self.loop.call(self.handlers["on_llm_request"](self.plugin, event, request))
+        injected = "".join(
+            getattr(part, "text", "") for part in getattr(request, "extra_user_content_parts", [])
+        )
+        reply = reply_text_for(text)
+        for part in getattr(request, "extra_user_content_parts", []):
+            # mark_as_temp() must be set by the plugin: hidden context may never be
+            # persisted into conversation history.
+            assert getattr(part, "_no_save", False), "injected context part is not temporary"
+        event._result_text = reply
+        self.platform.deliver(session, reply, kind="reply", at=self.clock.now())
+        self.loop.call(self.handlers["on_after_message_sent"](self.plugin, event))
+        self.last_injected = injected
+        return reply
+
+
+# ------------------------------------------------------------------ the story driver
+
+
+@dataclass
+class Window:
+    """A scripted stretch of the user's life, and what it permits."""
+
+    name: str
+    session: str
+    start: datetime
+    end: datetime
+    proactive_allowed: bool
+    note: str = ""
+    #: Index into the transcript at the moment the window was opened. Membership is
+    #: decided by *delivery order* as well as by the clock, because the world clock
+    #: moves in two-hour steps: a message the bot committed just before the user
+    #: spoke carries the same instant as the user's own line, and comparing instants
+    #: alone would file it inside a window the user had not opened yet.
+    opened_after_turn: int = 0
+
+
+class Story:
+    """The user's life, driven against one live Runtime + host pair."""
+
+    def __init__(
+        self,
+        *,
+        base_dir: Path,
+        clock: SimClock,
+        faults: Faults,
+        semantic: "SimSemantic | None" = None,
+    ) -> None:
+        """Create the story (nothing is started until :meth:`start`)."""
+        self.base_dir = base_dir
+        self.clock = clock
+        self.faults = faults
+        self.semantic = semantic
+        self.recorder = Recorder()
+        self.platform = Platform(self.recorder)
+        self.llm = HostLLM(clock)
+        self.server: RuntimeServer | None = None
+        self.host: PluginHost | None = None
+        self.windows: list[Window] = []
+        self.topic_ban_at: datetime | None = None
+        self.observations: list[str] = []
+        self.message_seq = 0
+        self.last_host_stop: dict[str, Any] = {}
+        self.step_timings: list[tuple[float, float, str]] = []
+
+    # -- lifecycle -----------------------------------------------------------------
+
+    def start(self) -> None:
+        """Boot the Runtime, then the host, and open the scripted sessions."""
+        directory = self.base_dir / "scenario"
+        directory.mkdir(parents=True, exist_ok=True)
+        self.server = RuntimeServer(
+            config=build_runtime_config(
+                directory, faults=self.faults, semantic=self.semantic is not None
+            ),
+            clock=self.clock,
+            name="user-sim",
+            semantic_provider=self.semantic.provider() if self.semantic is not None else None,
+        )
+        self.server.start()
+        for session in (SESSION_A, SESSION_B):
+            self.platform.register(session)
+        self.start_host()
+
+    def start_host(self) -> None:
+        """Start (or restart) the shipped plugin adapter against the live Runtime."""
+        assert self.server is not None
+        self.host = PluginHost(
+            base_url=self.server.base_url,
+            platform=self.platform,
+            llm=self.llm,
+            clock=self.clock,
+            faults=self.faults,
+            adapter_id="blackbox-user-adapter",
+        )
+        self.host.start()
+
+    def stop_host(self) -> dict[str, Any]:
+        """Stop the adapter only, keeping the Runtime and database running."""
+        if self.host is not None:
+            self.last_host_stop = self.host.stop()
+            self.host = None
+        return self.last_host_stop
+
+    def stop(self) -> dict[str, Any]:
+        """Stop the host and the Runtime, joining every thread they own.
+
+        Returns:
+            The adapter stop report (``loop_alive``, ``tasks_pending``).
+        """
+        report = self.stop_host()
+        if self.server is not None:
+            self.server.stop()
+            self.server = None
+        return report
+
+    # -- the user ------------------------------------------------------------------
+
+    def say(self, *, session: str, text: str) -> str:
+        """Have the user say something and receive the host's reply.
+
+        Args:
+            session: Session the user is typing in.
+            text: What the user types.
+
+        Returns:
+            The reply text delivered to that session.
+        """
+        assert self.host is not None and self.server is not None
+        self.message_seq += 1
+        self.recorder.user(at=self.clock.now(), session=session, text=text)
+        reply = self.host.user_turn(
+            text=text, session=session, message_id=f"msg-{self.message_seq:04d}"
+        )
+        self._drain_outbox()
+        return reply
+
+    def _drain_outbox(self, timeout: float = 3.0) -> dict[str, Any]:
+        """Let the adapter finish the delivery work it is holding.
+
+        Called after every user turn and every clock step so a suspension happens
+        with a settled queue, exactly as a person would experience it. An attempt
+        that has already been *sent* is not work in progress - it is waiting for
+        the user - so only undelivered queue rows count here.
+
+        Args:
+            timeout: Upper bound on the wait.
+
+        Returns:
+            The last observed queue state, for the diagnostics of a slow step.
+        """
+        assert self.server is not None
+        deadline = time.monotonic() + timeout
+        state: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            health = self.server.health()
+            outbox = health.get("outbox") or {}
+            busy = int(outbox.get("pending") or 0) + int(outbox.get("leased") or 0)
+            state = {
+                "in_flight_attempts": int(health.get("in_flight_attempts") or 0),
+                "outbox": outbox,
+            }
+            if not busy:
+                return state | {"settled": True}
+            time.sleep(0.05)
+        state["settled"] = False
+        adapter = getattr(getattr(self.host, "plugin", None), "_outbox", None)
+        if adapter is not None:
+            state["adapter"] = {key: value for key, value in vars(adapter.stats).items() if value}
+        return state
+
+    # -- the world clock -----------------------------------------------------------
+
+    def step(self, *, label: str = "", size: timedelta = SIM_STEP) -> str:
+        """Move the simulated clock by one step and let the Runtime live it.
+
+        The Scheduler's own wake-up is what integrates the elapsed interval, so a
+        proactive decision is always the Runtime's, never the script's. When the
+        Scheduler's gate is closed the Runtime still has to see time pass, so the
+        public tick endpoint is used instead - and no decision is taken, which is
+        exactly what a closed gate means.
+
+        Args:
+            label: Free-text note for the diagnostics.
+            size: How far to move the clock.
+
+        Returns:
+            ``"round"``, ``"gate_closed"`` or ``"timeout"``.
+        """
+        assert self.server is not None
+        scheduler = self.server.scheduler
+        before = int(scheduler.status().get("rounds") or 0) if scheduler is not None else 0
+        self.clock.advance(size)
+        started = time.monotonic()
+        outcome = "timeout"
+        deadline = started + 3.0
+        while time.monotonic() < deadline:
+            status = scheduler.status() if scheduler is not None else {}
+            if int(status.get("rounds") or 0) > before:
+                outcome = "round"
+                break
+            reason = status.get("dispatch_reason")
+            if status.get("dispatch_allowed") is False and reason in {
+                "boundary_blocks_proactive",
+                "quiet_hours",
+                "no_runtime",
+            }:
+                outcome = "gate_closed"
+                break
+            time.sleep(0.02)
+        if outcome != "round":
+            self.server.tick()
+        wait_started = time.monotonic()
+        drain = self._drain_outbox()
+        self.step_timings.append(
+            (round(time.monotonic() - started, 3), round(time.monotonic() - wait_started, 3), outcome)
+        )
+        if not V.quiet and label:
+            V.note(
+                f"[{OPS_LABEL}] step {label}: {outcome} in "
+                f"{time.monotonic() - started:.2f}s (drain {time.monotonic() - wait_started:.2f}s) "
+                f"@ {self.clock.now().isoformat()}"
+            )
+        if not drain.get("settled") and self.host is not None:
+            # While the host is deliberately down, an undelivered row is the point
+            # of the phase rather than a symptom, so it is not reported as one.
+            V.ops(f"queue never settled during step {label}", drain)
+        return outcome
+
+    def advance(self, delta: timedelta, *, label: str = "") -> list[str]:
+        """Advance the simulated clock by ``delta`` in fixed steps."""
+        outcomes: list[str] = []
+        remaining = delta
+        while remaining > timedelta(0):
+            chunk = min(SIM_STEP, remaining)
+            outcomes.append(self.step(label=label, size=chunk))
+            remaining -= chunk
+        return outcomes
+
+    # -- scripted windows ----------------------------------------------------------
+
+    def open_window(self, window: Window) -> Window:
+        """Register a scripted stretch of the user's life and anchor it in time.
+
+        The anchor is the transcript length at this moment: everything the platform
+        delivers from here on belongs to this window, and everything delivered
+        before it does not - even when the two share a clock reading.
+        """
+        window.opened_after_turn = len(self.recorder.turns)
+        self.windows.append(window)
+        return window
+
+    def in_window(self, window: Window, *, who: str = "", kind: str = "") -> list[Turn]:
+        """Return the transcript lines that belong to one scripted window.
+
+        Args:
+            window: The window, as returned by :meth:`open_window`.
+            who: Optional filter (``"bot"`` / ``"user"``).
+            kind: Optional filter (``"reply"`` / ``"proactive"``).
+
+        Returns:
+            The turns delivered after the window opened and no later than its end.
+        """
+        return [
+            turn
+            for index, turn in enumerate(self.recorder.turns)
+            if index >= window.opened_after_turn
+            and turn.at <= window.end
+            and (not who or turn.who == who)
+            and (not kind or turn.kind == kind)
+            and (not window.session or turn.session == window.session)
+        ]
+
+    def bot_messages(self, start: datetime, end: datetime, session: str = "") -> list[Turn]:
+        """Return bot messages inside a simulated *time* span (diagnostics only).
+
+        Time spans cannot express "delivered after the user spoke" when the world
+        clock moves in two-hour steps; use :meth:`in_window` for anything a check
+        depends on.
+        """
+        return [
+            turn
+            for turn in self.recorder.between(start, end, session)
+            if turn.who == "bot"
+        ]
+
+    def proactive_messages(self, start: datetime, end: datetime, session: str = "") -> list[Turn]:
+        """Return proactive messages inside a simulated *time* span (diagnostics only)."""
+        return [turn for turn in self.bot_messages(start, end, session) if turn.kind == "proactive"]
+
+    # -- operator-observable probes (diagnostics only) ------------------------------
+
+    def ops_snapshot(self, label: str) -> None:
+        """Print the operator-visible state, clearly labelled as such."""
+        assert self.server is not None
+        payload = {
+            "unfinished": [
+                {"title": item.get("title"), "status": item.get("status")}
+                for item in (self.server.get("/unfinished").field("matters", default=[]) or [])
+            ],
+            "boundaries": [
+                {
+                    "type": item.get("type"),
+                    "scope": item.get("scope"),
+                    "allow_proactive": item.get("allow_proactive"),
+                    "expires_at": item.get("expires_at"),
+                    "revoked_at": item.get("revoked_at"),
+                }
+                for item in (self.server.get("/boundaries").field("boundaries", default=[]) or [])
+            ],
+            "candidates": [
+                {"type": item.get("type"), "intent": item.get("intent"), "status": item.get("status")}
+                for item in (self.server.get("/candidates").field("candidates", default=[]) or [])
+            ],
+            "outbox": self.server.get("/outbox").field("stats", default={}),
+        }
+        V.ops(label, payload)
+
+    def ops_note(self, title: str, text: str) -> None:
+        """Record a product observation proven through the operator surface."""
+        self.observations.append(f"[{OPS_LABEL}] {title}: {text}")
+        V.ops(title, text)
+
+    def ops_matters(self, label: str) -> list[dict[str, Any]]:
+        """Return ``[{title, status}]`` for the open obligations, as the operator sees them."""
+        assert self.server is not None
+        matters = [
+            {"title": item.get("title"), "status": item.get("status")}
+            for item in (self.server.get("/unfinished").field("matters", default=[]) or [])
+        ]
+        V.ops(label, matters)
+        return matters
+
+    def ops_matter_routing(self) -> None:
+        """Show which chat each open obligation came from, and where the queue is addressed.
+
+        Read entirely through the operator surface and labelled as such: it is the
+        evidence that turns "the second chat never heard anything" into an
+        actionable finding.
+        """
+        assert self.server is not None
+        matters = self.server.get("/unfinished").field("matters", default=[]) or []
+        rows = self.server.get("/outbox").field("items", default=[]) or []
+        origins: list[dict[str, Any]] = []
+        for matter in matters[:4]:
+            sources = matter.get("source_event_ids") or []
+            conversation = ""
+            if sources:
+                event = self.server.get(f"/events/{sources[0]}").field("event", default={}) or {}
+                conversation = str(event.get("conversation_id") or "")
+            origins.append(
+                {
+                    "matter": matter.get("title"),
+                    "status": matter.get("status"),
+                    "said_in": conversation,
+                }
+            )
+        V.ops("which chat each open obligation was formed in", origins)
+        V.ops(
+            "where the delivery queue addressed its recent rows",
+            [
+                {
+                    "kind": row.get("kind"),
+                    "status": row.get("status"),
+                    "addressed_to": row.get("conversation_id"),
+                }
+                for row in rows[:6]
+            ],
+        )
+
+
+# ------------------------------------------------------------------ phases
+
+PHASES: list[tuple[str, str]] = [
+    ("setup", "PHASE 1 setup"),
+    ("greeting", "PHASE 2 greeting and small talk / 打招呼与闲聊"),
+    ("timed_matter", "PHASE 3 a dated promise / 说了一件有时限的事"),
+    ("closure", "PHASE 4 closing the loop / 回复闭环"),
+    ("boundary", "PHASE 5 drawing a boundary / 划定边界"),
+    ("resume", "PHASE 6 normal talk resumes / 恢复自然交流"),
+    ("silence", "PHASE 7 silence is not rejection / 沉默不等于负面"),
+    ("isolation", "PHASE 8 two chats, no crosstalk / 多会话隔离"),
+    ("restart", "PHASE 9 a restart that does not disturb / 重启不打扰"),
+    ("replay", "PHASE 10 duplicate delivery and replay / 重复投递"),
+    ("timeline", "PHASE 11 the whole day, replayed / 一整天时间线回放"),
+    ("memory", "PHASE 12 long-term memory / 它记住了什么"),
+    ("semantics", "PHASE 13 with the semantic layer on / 配了语义端点以后"),
+    ("teardown", "PHASE 14 teardown"),
+]
+PHASE_IDS = [identifier for identifier, _title in PHASES]
+
+
+def phase_setup(story: Story, ctx: "Context") -> None:
+    """Verify the run can start: dependencies, environment, artifact root, no secrets."""
+    V.phase("setup", "PHASE 1 setup")
+    assert story.server is not None and story.host is not None
+    V.check(
+        "the required dependencies are importable (uvicorn, aiohttp, fastapi)",
+        not IMPORT_ERROR,
+        IMPORT_ERROR or "imports ok",
+    )
+    V.check(
+        "every provider-shaped environment variable was scrubbed before startup",
+        all(not PROVIDER_ENV_PATTERN.search(name) for name in os.environ),
+        f"removed={_short(ctx.scrubbed_env) or 'none'}",
+    )
+    V.check(
+        "no API credential is present in the environment at all",
+        not any(PROVIDER_ENV_PATTERN.search(name) for name in os.environ),
+        _short([name for name in os.environ if PROVIDER_ENV_PATTERN.search(name)]),
+    )
+    V.check(
+        "the Runtime runs with no semantic provider and the adapter with no token",
+        story.server.config.semantic.provider == "disabled"
+        and not story.host.plugin._settings.token,
+        _short(
+            {
+                "semantic_provider": story.server.config.semantic.provider,
+                "adapter_token_configured": bool(story.host.plugin._settings.token),
+            }
+        ),
+    )
+    V.check(
+        "the sidecar answers on a loopback address only",
+        story.server.base_url.startswith(f"http://{HOST}:"),
+        story.server.base_url,
+    )
+    V.check(
+        "the database is a real file in WAL mode with a JSONL mirror",
+        (story.base_dir / "scenario" / "runtime.sqlite3").exists()
+        and bool(story.server.config.storage.wal)
+        and bool(story.server.config.storage.mirror_raw_events),
+        f"db={story.base_dir / 'scenario' / 'runtime.sqlite3'}",
+    )
+    V.check(
+        "the Runtime keeps its database inside the artifact root this run was given",
+        (story.base_dir / "scenario" / "runtime.sqlite3").exists()
+        and str(story.base_dir) in str(story.server.config.storage.database_path),
+        _short(
+            {
+                "base_dir": str(story.base_dir),
+                "database_path": story.server.config.storage.database_path,
+            }
+        ),
+    )
+    V.check(
+        "the shipped plugin registered its three real AstrBot hooks",
+        set(story.host.handlers)
+        == {"on_message_observed", "on_llm_request", "on_after_message_sent"},
+        _short(sorted(story.host.handlers)),
+    )
+    V.check(
+        "the adapter talks to the live Runtime over its own HTTP transport",
+        story.host.recording is not None,
+        _short(type(story.host.recording).__name__),
+    )
+    V.check(
+        "host, adapter and Runtime share one clock (the simulated one)",
+        ctx.clock_bindings > 0,
+        f"rebound module clock bindings={ctx.clock_bindings}",
+    )
+    V.note(
+        f"simulated clock starts at {story.clock.now().isoformat()}; wall clock is "
+        f"{_real_now_iso()}"
+    )
+
+
+def phase_greeting(story: Story, ctx: "Context") -> None:
+    """打招呼与闲聊: the user says hello and chats; the bot answers in that session."""
+    V.phase("greeting", "PHASE 2 greeting and small talk / 打招呼与闲聊")
+    session = SESSION_A
+    before = len(story.recorder.turns)
+    reply = story.say(session=session, text=TEXT_GREETING)
+    story.open_window(
+        Window(
+            name="the private chat is open and the user is not asking for silence",
+            session=session,
+            start=story.clock.now(),
+            end=story.clock.now() + 30 * DAY,
+            proactive_allowed=True,
+            note="an open private chat; the boundary phase carves the silence window out of it",
+        )
+    )
+    turns = story.recorder.turns[before:]
+    bot = [turn for turn in turns if turn.who == "bot"]
+    V.check(
+        "the user gets an answer at all",
+        len(bot) == 1,
+        f"expected=1 actual={len(bot)} transcript={[_short(turn.text, 60) for turn in turns]}",
+    )
+    V.check(
+        "the answer is non-empty",
+        bool(reply.strip()),
+        f"reply={_short(reply, 80)}",
+    )
+    V.check(
+        "the answer arrives in the session the user wrote in",
+        bool(bot) and bot[0].session == session,
+        f"expected={session} actual={bot[0].session if bot else '(none)'}",
+    )
+    V.check(
+        "the answer is the host main LLM's own reply to the user's words",
+        bool(bot) and normalize_message(bot[0].text) == normalize_message(reply),
+        _short({"delivered": bot[0].text if bot else "", "generated": reply}),
+    )
+    V.check(
+        "the user's own words never appear as a bot message",
+        all(normalize_message(turn.text) != normalize_message(TEXT_GREETING) for turn in bot),
+        _short([turn.text for turn in bot]),
+    )
+
+
+def phase_timed_matter(story: Story, ctx: "Context") -> None:
+    """说了一件有时限的事: the user leaves a dated promise, goes quiet, and the bot speaks first."""
+    V.phase("timed_matter", "PHASE 3 a dated promise / 说了一件有时限的事")
+    session = SESSION_A
+    story.advance(timedelta(minutes=30), label="chat gap")
+    story.say(session=session, text=TEXT_APPOINTMENT)
+    promised_at = story.clock.now()
+    # The promise is "tomorrow afternoon"; whichever time of day the run starts
+    # at, the Runtime derives a due moment at most 42 simulated hours away.
+    deadline = promised_at + timedelta(hours=42)
+    window = story.open_window(
+        Window(
+            name="after the promised appointment",
+            session=session,
+            start=promised_at + HOUR,
+            end=deadline + 6 * HOUR,
+            proactive_allowed=True,
+            note="the user promised to report back and then went quiet",
+        )
+    )
+    before_users = len(story.recorder.user_turns(session))
+    story.advance(window.end - story.clock.now(), label="quiet after the promise")
+
+    proactives = story.in_window(window, who="bot", kind="proactive")
+    V.check(
+        "the bot speaks first, with no user message to trigger it",
+        len(proactives) >= 1,
+        f"expected>=1 actual={len(proactives)} window={window.start.isoformat()}..{window.end.isoformat()} "
+        f"user_messages_in_window="
+        f"{[turn.text for turn in story.recorder.user_turns(session)[before_users:] if turn.at >= window.start]}",
+    )
+    if proactives:
+        first = proactives[0]
+        V.check(
+            "the unprompted message lands in the same session the promise was made in",
+            first.session == session,
+            f"expected={session} actual={first.session}",
+        )
+        calls = [
+            call
+            for call in story.llm.proactive_calls
+            if call.session == session and normalize_message(call.text) == normalize_message(first.text)
+        ]
+        V.check(
+            "it is the host main LLM's rendering of the prompt the Runtime composed",
+            bool(calls),
+            _short({"delivered": first.text, "prompts": len(story.llm.proactive_calls)}),
+        )
+        V.check(
+            "and that render carried the host's system prompt (persona), not an empty one",
+            bool(calls) and calls[0].system_prompt == HOST_SYSTEM_PROMPT,
+            _short(
+                {
+                    "system_prompt_chars": len(calls[0].system_prompt) if calls else 0,
+                    "expected_chars": len(HOST_SYSTEM_PROMPT),
+                    "note": "AstrBot gives a chat turn ~4210 chars of assembled system "
+                    "prompt and a render none; the adapter remembers the host's text.",
+                }
+            ),
+        )
+        V.check(
+            "the Runtime's own prompt is what the user ends up seeing (no host invention)",
+            bool(calls) and "- 我想做的：" in calls[0].prompt,
+            _short({"delivered": first.text, "intent_line": [line for line in (calls[0].prompt.splitlines() if calls else []) if "我想做的" in line]}),
+        )
+        V.check(
+            "the unprompted message is about the thing the user promised to report",
+            FORBIDDEN_TOPICS[0] in first.text,
+            f"delivered={_short(first.text, 90)} (expected the interview topic, which is not yet forbidden)",
+        )
+        story.ops_note(
+            "proactive attempt", f"delivered at {first.at.isoformat()} after {len(proactives)} attempt(s)"
+        )
+    story.ops_snapshot("state after the promise came due")
+
+
+def phase_closure(story: Story, ctx: "Context") -> None:
+    """回复闭环: the user answers the unprompted message; the topic is then closed."""
+    V.phase("closure", "PHASE 4 closing the loop / 回复闭环")
+    session = SESSION_A
+    before_report = story.ops_matters("obligations before the user reports the result")
+    # Everything the bot delivers from this recorder index on is strictly *after*
+    # the report: the user's turn is appended at this index and the platform
+    # transcript is in delivery order. Timestamps alone cannot express that,
+    # because the world clock moves in two-hour steps and a proactive message
+    # committed moments before the report is stamped with the same instant - it
+    # was an answer the user had not given yet, not a question asked after it.
+    report_index = len(story.recorder.turns)
+    reply = story.say(session=session, text=TEXT_RESULT)
+    after_report = story.ops_matters("obligations after the user reports the result")
+    answered_at = story.clock.now()
+    opened = [item for item in after_report if item not in before_report]
+    if opened:
+        story.ops_note(
+            "the result report re-opened an obligation",
+            "the message that reported the result also created a new open matter "
+            f"{_short(opened)}; nothing in the user's words asks the character to wait for "
+            "that result again, so any later question about it comes from this phantom matter",
+        )
+    V.check(
+        "the user's answer gets a reply in the same session",
+        bool(reply.strip()),
+        _short({"reply": reply, "session": session}),
+    )
+    window = story.open_window(
+        Window(
+            name="two days after the user reported the result",
+            session=session,
+            start=answered_at,
+            end=answered_at + 2 * DAY,
+            proactive_allowed=True,
+            note="the matter is settled; the bot may talk, but not about the interview again",
+        )
+    )
+    story.advance(window.end - story.clock.now(), label="two days after the result")
+
+    bot = story.in_window(window, who="bot")
+    # A message delivered *before* the report is not a re-ask, however close the two
+    # clock readings are; only what the user received after telling the bot counts.
+    # The reply to the report itself is in this slice, so the check can never pass
+    # by looking at an empty window.
+    delivered_after_the_report = story.recorder.turns[report_index + 1 :]
+    offenders = [
+        turn
+        for turn in delivered_after_the_report
+        if turn.who == "bot"
+        and turn.session == session
+        and turn.kind == "proactive"
+        and any(topic in turn.text for topic in FORBIDDEN_TOPICS)
+    ]
+    V.check(
+        "the bot never asks about that topic again once the user has reported the result",
+        not offenders,
+        "offending opportunistic message(s): "
+        + _short([{"at": turn.at.isoformat(), "text": turn.text} for turn in offenders])
+        if offenders
+        else f"0 of {len(delivered_after_the_report)} turn(s) delivered after the report mention it "
+        f"({len([t for t in delivered_after_the_report if t.kind == 'proactive'])} unprompted, "
+        f"{len(bot)} bot message(s) in the two-day window)",
+    )
+    V.check(
+        "the answer to the result does not ask for the result again",
+        "结果" not in reply,
+        _short({"reply": reply}),
+    )
+    story.ops_note(
+        "matters after the result was reported",
+        _short(
+            [
+                {"title": item.get("title"), "status": item.get("status")}
+                for item in (story.server.get("/unfinished").field("matters", default=[]) or [])
+            ]
+        ),
+    )
+
+
+def phase_boundary(story: Story, ctx: "Context") -> None:
+    """划定边界: the user forbids the topic and asks not to be contacted."""
+    V.phase("boundary", "PHASE 5 drawing a boundary / 划定边界")
+    session = SESSION_A
+    story.say(session=session, text=TEXT_TOPIC_BAN)
+    story.ops_note(
+        "topic-only instruction",
+        "no boundary was recorded for '%s' on its own (the operator surface shows an empty "
+        "boundary list), so the topic restriction is only enforced through what the bot is "
+        "willing to say" % TEXT_TOPIC_BAN,
+    )
+    story.say(session=session, text=TEXT_CONTACT_BAN)
+    banned_at = story.clock.now()
+    story.topic_ban_at = banned_at
+    window = story.open_window(
+        Window(
+            name="boundary window (three days)",
+            session=session,
+            start=banned_at,
+            end=banned_at + 3 * DAY,
+            proactive_allowed=False,
+            note="the user asked not to be contacted proactively",
+        )
+    )
+    story.advance(window.end - story.clock.now(), label="three days under the boundary")
+
+    all_bot = story.in_window(window, who="bot")
+    proactives = [turn for turn in all_bot if turn.kind == "proactive"]
+    answers = [
+        turn for turn in all_bot if turn.kind == "reply" and _has_user_turn_before(story, turn)
+    ]
+    unsolicited = [turn for turn in all_bot if turn not in answers]
+    V.check(
+        "for the whole boundary window the user receives zero unprompted messages",
+        not proactives,
+        f"expected=0 actual={len(proactives)} "
+        + _short([{"at": turn.at.isoformat(), "text": turn.text} for turn in proactives]),
+    )
+    V.check(
+        "the user hears nothing they did not ask for while they are asking for quiet",
+        not unsolicited,
+        f"expected=0 actual={len(unsolicited)} "
+        + _short([{"at": turn.at.isoformat(), "kind": turn.kind, "text": turn.text} for turn in unsolicited]),
+    )
+    offenders = [
+        turn
+        for turn in all_bot
+        if any(topic in turn.text for topic in FORBIDDEN_TOPICS) and not _is_user_echo(turn, story)
+    ]
+    V.check(
+        "nothing the bot says in the boundary window introduces the forbidden topic",
+        not offenders,
+        _short([{"at": turn.at.isoformat(), "kind": turn.kind, "text": turn.text} for turn in offenders]),
+    )
+    V.check(
+        "the boundary is a real window, not a permanent mute of the process",
+        story.server.health().get("allow_proactive") is False,
+        _short({"allow_proactive": story.server.health().get("allow_proactive")}),
+    )
+
+
+def phase_resume(story: Story, ctx: "Context") -> None:
+    """恢复自然交流: the user lifts the mute and talks about something else."""
+    V.phase("resume", "PHASE 6 normal talk resumes / 恢复自然交流")
+    session = SESSION_A
+    story.say(session=session, text=TEXT_REVOKE)
+    V.check(
+        "a user message is still answered while the mute is in force",
+        bool(story.recorder.bot_turns(session, kind="reply")),
+        _short([turn.text for turn in story.recorder.bot_turns(session, kind="reply")[-1:]]),
+    )
+    reply = story.say(session=session, text=TEXT_NEW_TOPIC)
+    V.check(
+        "the new topic gets a normal reply",
+        bool(reply.strip()) and normalize_message(reply) == normalize_message(reply_text_for(TEXT_NEW_TOPIC)),
+        _short({"reply": reply}),
+    )
+    new_topic_at = story.clock.now()
+    window = story.open_window(
+        Window(
+            name="after the mute was lifted and a new promise was made",
+            session=session,
+            start=new_topic_at,
+            end=new_topic_at + 2 * DAY,
+            proactive_allowed=True,
+            note="the user lifted the boundary and gave a fresh, dated reason to talk",
+        )
+    )
+    story.advance(window.end - story.clock.now(), label="two days after the mute was lifted")
+
+    proactives = story.in_window(window, who="bot", kind="proactive")
+    V.check(
+        "an unprompted message is allowed again once the user lifts the mute",
+        len(proactives) >= 1,
+        f"expected>=1 actual={len(proactives)} window={window.start.isoformat()}..{window.end.isoformat()}",
+    )
+    offenders = [
+        turn for turn in proactives if any(topic in turn.text for topic in FORBIDDEN_TOPICS)
+    ]
+    V.check(
+        "the new unprompted message is not about the forbidden topic",
+        not offenders,
+        _short([{"at": turn.at.isoformat(), "text": turn.text} for turn in offenders])
+        or f"topics: {_short([turn.text for turn in proactives], 160)}",
+    )
+    story.ops_snapshot("state after normal talk resumed")
+
+
+def phase_silence(story: Story, ctx: "Context") -> None:
+    """沉默不等于负面: an unanswered message must not turn into pressure or guilt."""
+    V.phase("silence", "PHASE 7 silence is not rejection / 沉默不等于负面")
+    session = SESSION_A
+    window = story.open_window(
+        Window(
+            name="the user does not answer",
+            session=session,
+            start=story.clock.now(),
+            end=story.clock.now() + 30 * HOUR,
+            proactive_allowed=True,
+            note="the bot may speak again, but only as fast as its own cap allows",
+        )
+    )
+    story.advance(window.end - story.clock.now(), label="the user stays silent")
+
+    proactives = story.in_window(window, who="bot", kind="proactive")
+    cap = story.server.config.drive.max_contacts_per_day
+    worst = 0
+    worst_at: datetime | None = None
+    for turn in proactives:
+        inside = [
+            other
+            for other in proactives
+            if timedelta(0) <= (other.at - turn.at) <= DAY
+        ]
+        if len(inside) > worst:
+            worst, worst_at = len(inside), turn.at
+    V.check(
+        "no 24-hour stretch contains more unprompted messages than the daily cap allows",
+        worst <= cap,
+        f"cap={cap} worst_24h={worst}"
+        + (f" starting {worst_at.isoformat()}" if worst_at else "")
+        + " "
+        + _short([turn.at.isoformat() for turn in proactives]),
+    )
+    cooldown = timedelta(seconds=story.server.config.drive.cooldown_seconds)
+    gaps = [
+        (later.at - earlier.at)
+        for earlier, later in zip(proactives, proactives[1:])
+    ]
+    too_close = [gap for gap in gaps if gap < cooldown]
+    V.check(
+        "two unprompted messages are never closer together than the configured cooldown",
+        not too_close,
+        f"cooldown={cooldown} gaps={[str(gap) for gap in gaps]}",
+    )
+    guilty = [
+        turn
+        for turn in story.in_window(window, who="bot")
+        if scan_guilt(turn.text)
+    ]
+    V.check(
+        "the bot never complains that the user did not answer",
+        not guilty,
+        _short([{"text": turn.text, "matched": scan_guilt(turn.text)} for turn in guilty])
+        or "no accusatory phrasing in this configuration; the table stays as a guard",
+    )
+    story.ops_snapshot("state after being left on read")
+
+
+def phase_isolation(story: Story, ctx: "Context") -> None:
+    """多会话隔离: two chats must never leak into each other."""
+    V.phase("isolation", "PHASE 8 two chats, no crosstalk / 多会话隔离")
+    session_b = SESSION_B
+    story.say(session=session_b, text=TEXT_SESSION_B)
+    b_turn_at = story.clock.now()
+    a_quiet_start = story.clock.now()
+    window_b = story.open_window(
+        Window(
+            name="the second chat's own dated promise",
+            session=session_b,
+            start=b_turn_at,
+            end=b_turn_at + 2 * DAY,
+            proactive_allowed=True,
+            note="a promise made in the group chat",
+        )
+    )
+    # The same promise, still unanswered. The design lets an unfinished matter live
+    # for days (``unfinished.default_expiry_hours``, 72 h in this run) and the character
+    # may gently follow up while the daily cap and the cooldown still hold, so the
+    # reminders that arrive after the first two days are not messages "out of
+    # nowhere" - they belong to this window, which exists so the timeline audit can
+    # tell them apart from speaking during silence or long after the matter lapsed.
+    #
+    # The window has to cover the matter's expiry *plus* the intention's own TTL
+    # (``candidate.default_ttl_seconds``, 6 h): a follow-up generated while the matter
+    # was still live may be delivered a few hours after it lapsed. Measured: the
+    # character's last check-in on this promise arrived 3 d 2 h after it was made, two
+    # hours past the matter's own 72 h, and it was the first message the unanswered
+    # message sweep let through at all (an attempt used to stay ``sent`` forever and
+    # block every later dispatch in that chat).
+    _candidate_ttl = timedelta(seconds=21600.0)
+    story.open_window(
+        Window(
+            name="the second chat's promise is still unanswered",
+            session=session_b,
+            start=b_turn_at + 2 * DAY,
+            end=b_turn_at + 3 * DAY + _candidate_ttl,
+            proactive_allowed=True,
+            note="the same open promise, up to its expiry plus the intention's TTL",
+        )
+    )
+    # The first chat says something unrelated while the second chat's promise is
+    # pending: whatever happens next must respect the session it belongs to.
+    story.advance(6 * HOUR, label="both chats quiet")
+    story.say(session=SESSION_A, text=TEXT_SMALL_TALK)
+    a_turn_at = story.clock.now()
+    story.advance(window_b.end - story.clock.now(), label="second chat's promise comes due")
+
+    b_proactives = story.in_window(window_b, who="bot", kind="proactive")
+    if not b_proactives:
+        story.ops_matter_routing()
+        story.ops_snapshot("the second chat never heard from the bot")
+        story.ops_note(
+            "how to see the same obligation gone astray on its own",
+            "run `python scripts/blackbox_user_simulation.py --base-dir <dir> --only setup,isolation`: "
+            "with only this phase in play the due obligation formed in the group chat is delivered "
+            "into the private chat, because the follow-up candidate carries 'unfinished:<id>' as its "
+            "only source and that is not an event id, so the conversation falls back to whichever "
+            "chat wrote last",
+        )
+    V.check(
+        "the second chat gets its own unprompted message",
+        len(b_proactives) >= 1,
+        f"expected>=1 actual={len(b_proactives)} window={window_b.start.isoformat()}.."
+        f"{window_b.end.isoformat()}",
+    )
+    # The other direction: a message delivered into the second chat must be *written*
+    # about the second chat's business. This used to fail for a real reason: the render
+    # prompt carried two identically labelled "- 想做的事：" lines - the background
+    # block's stale intent (the exam, raised in the other chat) above the instruction
+    # for this message - and the first one wins for any reader, real model or stub. The
+    # block now labels the stale intent as background ("之前想做的事（背景，不是现在的任务）"),
+    # so the instruction is the only line that looks like one.
+    foreign = [
+        {"at": turn.at.isoformat(), "text": turn.text}
+        for turn in b_proactives
+        if any(word in turn.text for word in ("考试", "面试"))
+    ]
+    V.check(
+        "a reminder delivered into the second chat is about that chat's own business",
+        not foreign,
+        _short(foreign) or f"{len(b_proactives)} unprompted message(s), none off-topic",
+    )
+    a_messages = story.recorder.between(a_quiet_start, story.clock.now(), SESSION_A)
+    a_proactives = [turn for turn in a_messages if turn.kind == "proactive"]
+    V.check(
+        "what was said in the second chat never produces a message in the first",
+        not any("体检" in turn.text for turn in a_proactives),
+        _short([{"at": turn.at.isoformat(), "text": turn.text} for turn in a_proactives]),
+    )
+    texts_a = {normalize_message(turn.text) for turn in story.recorder.bot_turns(SESSION_A)}
+    texts_b = {normalize_message(turn.text) for turn in story.recorder.bot_turns(SESSION_B)}
+    shared = texts_a & texts_b
+    V.check(
+        "the same proactive wording is never delivered into both chats",
+        not shared,
+        _short(sorted(shared)) or f"a={len(texts_a)} b={len(texts_b)} distinct",
+    )
+    leaked_topic = [
+        {"at": turn.at.isoformat(), "text": turn.text}
+        for turn in a_proactives
+        if any(word in turn.text for word in ("体检", "检查"))
+    ]
+    V.check(
+        "a topic the user only ever mentioned in the second chat never appears in the first",
+        not leaked_topic,
+        _short(leaked_topic)
+        or f"{len(a_proactives)} unprompted message(s) in the first chat, none about the second chat",
+    )
+    V.check(
+        "the user's message in the first chat is answered in the first chat only",
+        any(
+            turn.kind == "reply" and turn.at >= a_turn_at
+            for turn in story.recorder.bot_turns(SESSION_A)
+        )
+        and all(
+            _has_user_turn_before(story, turn)
+            for turn in story.recorder.bot_turns(SESSION_B, kind="reply")
+        ),
+        _short(
+            [
+                {"session": turn.session, "kind": turn.kind, "text": turn.text}
+                for turn in story.recorder.bot_turns()
+                if a_turn_at <= turn.at <= a_turn_at + timedelta(minutes=30)
+            ]
+        ),
+    )
+    default_traffic = [
+        turn for turn in story.recorder.turns if turn.session == SESSION_DEFAULT
+    ]
+    V.check(
+        "no user-visible message is ever addressed to the process-default conversation",
+        not default_traffic,
+        _short([{"at": turn.at.isoformat(), "text": turn.text} for turn in default_traffic]),
+    )
+    story.ops_snapshot("state with two live chats")
+
+
+def phase_restart(story: Story, ctx: "Context") -> None:
+    """重启不打扰: stop host and Runtime, keep the database, restart both."""
+    V.phase("restart", "PHASE 9 a restart that does not disturb / 重启不打扰")
+    assert story.server is not None and story.host is not None
+    already_delivered = [
+        normalize_message(turn.text) for turn in story.recorder.bot_turns() if turn.delivered
+    ]
+    db_path = story.base_dir / "scenario" / "runtime.sqlite3"
+    # The user goes quiet with a fresh dated reason, then the host side is taken
+    # down before it can deliver anything: whatever the Runtime decides now is
+    # pending across the restart.
+    story.say(session=SESSION_A, text="我明天上午还有个复诊，结束了跟你说。")
+    stop_report = story.stop_host()
+    V.check(
+        "the host side is really down before the restart test begins",
+        story.host is None
+        and stop_report.get("loop_alive") is False
+        and int(stop_report.get("tasks_pending") or 0) == 0,
+        _short(stop_report),
+    )
+    decided_at = story.clock.now()
+    pending_before = 0
+    # The character needs a *reason* to speak: the promise it just heard is not due
+    # yet, and the cooldown after its last message is four simulated hours. Sixteen
+    # steps of two hours are not always enough, which made this precondition flaky, so
+    # the loop is longer and, if it still has not decided, the harness supplies a
+    # concrete reason through the public API (an obligation that is already due) and
+    # keeps stepping. What the check asserts is unchanged: whatever the Runtime decides
+    # while the host is down must survive the restart and be delivered exactly once.
+    for _ in range(24):
+        story.step(label="deciding while the host is down")
+        outbox = story.server.health().get("outbox") or {}
+        pending_before = int(outbox.get("pending") or 0) + int(outbox.get("leased") or 0)
+        if pending_before:
+            break
+    if not pending_before:
+        story.server.post(
+            "/unfinished",
+            {
+                "title": "等待复诊结果",
+                "waiting_until": story.clock.now().isoformat(),
+                "priority": 0.9,
+                "source_event_ids": [],
+            },
+        )
+        for _ in range(12):
+            story.step(label="deciding while the host is down (with a due obligation)")
+            outbox = story.server.health().get("outbox") or {}
+            pending_before = int(outbox.get("pending") or 0) + int(outbox.get("leased") or 0)
+            if pending_before:
+                break
+    V.check(
+        "the Runtime decided to speak while the host was down, leaving a message pending",
+        pending_before >= 1,
+        f"pending_rows={pending_before} at {story.clock.now().isoformat()}",
+    )
+    story.server.stop()
+    story.server = None
+    V.check(
+        "the Runtime process is stopped and only the database survives",
+        ctx.runtime_stopped(story) and db_path.exists(),
+        _short({"db": str(db_path), "exists": db_path.exists()}),
+    )
+    story.start()
+    V.check(
+        "the Runtime and the host both come back on the same database",
+        not ctx.runtime_stopped(story)
+        and ctx.host_running(story)
+        and getattr(story.host.plugin, "_queue", None) is not None
+        and getattr(story.host.plugin, "_outbox", None) is not None,
+        _short(
+            {
+                "base_url": story.server.base_url,
+                "db": str(db_path),
+                "adapter_queue": getattr(story.host.plugin, "_queue", None) is not None,
+                "adapter_outbox": getattr(story.host.plugin, "_outbox", None) is not None,
+            }
+        ),
+    )
+    window = story.open_window(
+        Window(
+            name="after the restart",
+            session=SESSION_A,
+            start=decided_at,
+            end=story.clock.now() + 2 * DAY,
+            proactive_allowed=True,
+            note="a message decided before the restart must still arrive, once",
+        )
+    )
+    story.advance(12 * HOUR, label="after the restart")
+
+    delivered_after = [
+        turn for turn in story.recorder.bot_turns(SESSION_A) if turn.at >= decided_at and turn.delivered
+    ]
+    duplicates = [
+        turn
+        for turn in delivered_after
+        if already_delivered.count(normalize_message(turn.text)) >= 1
+    ]
+    V.check(
+        "the restart delivers nothing the user had already seen",
+        not duplicates,
+        _short([{"at": turn.at.isoformat(), "text": turn.text} for turn in duplicates])
+        or f"{len(delivered_after)} new message(s) after the restart",
+    )
+    texts = [normalize_message(turn.text) for turn in delivered_after]
+    repeated = {text: texts.count(text) for text in set(texts) if texts.count(text) > 1}
+    V.check(
+        "a message that was pending across the restart is delivered exactly once",
+        bool(delivered_after) and not repeated,
+        _short({"after_restart": [turn.text for turn in delivered_after], "repeated": repeated}),
+    )
+    del window
+    story.ops_snapshot("state after the restart")
+
+
+def phase_replay(story: Story, ctx: "Context") -> None:
+    """重复投递/重放: the same user message and the same result arrive twice."""
+    V.phase("replay", "PHASE 10 duplicate delivery and replay / 重复投递")
+    assert story.server is not None and story.host is not None
+    story.open_window(
+        Window(
+            name="the restart window",
+            session=SESSION_A,
+            start=story.clock.now(),
+            end=story.clock.now() + 2 * DAY,
+            proactive_allowed=True,
+            note="the user is quiet and the bot may follow up on the check-up",
+        )
+    )
+    recording = story.host.recording
+    captured = sum(len(item.sent) for item in RecordingTransport.instances)
+    V.check(
+        "the adapter's own wire traffic was captured for the replay",
+        bool(WIRE_HISTORY),
+        f"captured={len(recording.sent) if recording else 0} bodies on the live adapter, "
+        f"{len(WIRE_HISTORY)} over the whole run "
+        f"(instances={len(RecordingTransport.instances)}, total={captured})",
+    )
+    if not WIRE_HISTORY:
+        return
+
+    bot_before = len(story.recorder.bot_turns())
+    user_events = [
+        body
+        for kind, body in WIRE_HISTORY
+        if kind == "events"
+        and any(record.get("kind") == "user_message" for record in body.get("events") or [])
+    ]
+    result_bodies = [body for kind, body in WIRE_HISTORY if kind == "result"]
+    V.check(
+        "the adapter reported at least one action result over the wire",
+        bool(result_bodies),
+        f"results={len(result_bodies)} user_event_envelopes={len(user_events)}",
+    )
+
+    first = http_call(
+        story.server.base_url,
+        "POST",
+        "/v1/events",
+        user_events[-1] if user_events else {"events": []},
+    )
+    V.check(
+        "re-delivering the same user message is recognised as a duplicate by the public v1 API",
+        first.ok and first.field("duplicates") == 1,
+        first.describe() + f" adapter={story.host.adapter_id}",
+    )
+    counts_after_event = len(story.recorder.bot_turns())
+    V.check(
+        "the duplicate user message produces no extra reply",
+        counts_after_event == bot_before,
+        f"before={bot_before} after={counts_after_event}",
+    )
+
+    if result_bodies:
+        action_id = str(result_bodies[-1].get("action_id") or "")
+        replay = http_call(
+            story.server.base_url,
+            "POST",
+            f"/v1/outbox/{urllib.parse.quote(action_id, safe='')}/result",
+            result_bodies[-1],
+        )
+        V.check(
+            "re-reporting the same action result is accepted without changing anything",
+            replay.status in (200, 202, 404, 409),
+            replay.describe(),
+        )
+
+    story.advance(12 * HOUR, label="after the replay")
+    texts = [normalize_message(turn.text) for turn in story.recorder.bot_turns() if turn.delivered]
+    repeated = {text: texts.count(text) for text in set(texts) if texts.count(text) > 1}
+    V.check(
+        "after the replay the user still sees exactly one copy of every message",
+        not repeated,
+        _short(repeated) or f"{len(texts)} delivered message(s), all distinct",
+    )
+    proactives = story.recorder.bot_turns(SESSION_A, kind="proactive")
+    V.check(
+        "the replayed input does not trigger a second unprompted message",
+        len(proactives) == len({normalize_message(turn.text) for turn in proactives}),
+        _short([turn.text for turn in proactives]),
+    )
+
+
+def phase_timeline(story: Story, ctx: "Context") -> None:
+    """一整天时间线回放: print the whole user-perspective transcript and audit it globally."""
+    V.phase("timeline", "PHASE 11 the whole day, replayed / 一整天时间线回放")
+    markdown = story.recorder.markdown()
+    if not ctx.quiet:
+        V.line("")
+        V.line("-" * 78)
+        V.line("USER-PERSPECTIVE TRANSCRIPT (all sessions, chronological)")
+        V.line("-" * 78)
+        for turn in story.recorder.turns:
+            V.line(f"  {turn.render()}")
+        V.line("-" * 78)
+    (ctx.base_dir / "transcript.md").write_text(markdown, encoding="utf-8")
+    V.note(f"transcript written to {ctx.base_dir / 'transcript.md'} ({len(story.recorder.turns)} lines)")
+
+    bot_turns = [turn for turn in story.recorder.bot_turns() if turn.delivered]
+    proactives = [turn for turn in bot_turns if turn.kind == "proactive"]
+
+    # -- the daily contact cap, over the whole run --------------------------------
+    cap = story.server.config.drive.max_contacts_per_day
+    worst = 0
+    worst_start: datetime | None = None
+    for turn in proactives:
+        inside = [other for other in proactives if timedelta(0) <= (other.at - turn.at) <= DAY]
+        if len(inside) > worst:
+            worst, worst_start = len(inside), turn.at
+    V.check(
+        "over the whole run no 24-hour window exceeds the configured daily contact cap",
+        worst <= cap,
+        f"cap={cap} worst_24h={worst} (starting {worst_start.isoformat() if worst_start else '-'}) "
+        f"total_proactive={len(proactives)}",
+    )
+
+    # -- duplicates ---------------------------------------------------------------
+    texts = [normalize_message(turn.text) for turn in bot_turns]
+    repeated = {text: texts.count(text) for text in set(texts) if texts.count(text) > 1}
+    V.check(
+        "no two user-visible messages are duplicates",
+        not repeated,
+        _short({"repeated": repeated, "texts": len(texts)}),
+    )
+
+    # -- the forbidden topic ------------------------------------------------------
+    if story.topic_ban_at is not None:
+        banned = [
+            turn
+            for turn in bot_turns
+            if turn.at >= story.topic_ban_at
+            and any(topic in turn.text for topic in FORBIDDEN_TOPICS)
+            and not _is_user_echo(turn, story)
+        ]
+        V.check(
+            "after the user forbade the topic, the bot never brings it up on its own",
+            not banned,
+            _short([{"at": turn.at.isoformat(), "kind": turn.kind, "text": turn.text} for turn in banned])
+            or f"{len([t for t in bot_turns if t.at >= story.topic_ban_at])} message(s) checked after the ban",
+        )
+    else:
+        V.check("the forbidden-topic window was reached at all", False, "phase boundary did not run")
+
+    # -- leakage ------------------------------------------------------------------
+    leaked: list[dict[str, str]] = []
+    for turn in bot_turns:
+        found = scan_leakage(turn.text)
+        if found:
+            leaked.append({"at": turn.at.isoformat(), "patterns": ",".join(found), "text": turn.text})
+    V.check(
+        "no user-visible message leaks hidden context, credentials or internal ids",
+        not leaked,
+        _short(leaked),
+    )
+
+    # -- session isolation ---------------------------------------------------------
+    cross: list[dict[str, str]] = []
+    a_texts = {normalize_message(turn.text) for turn in story.recorder.bot_turns(SESSION_A)}
+    b_texts = {normalize_message(turn.text) for turn in story.recorder.bot_turns(SESSION_B)}
+    for shared in a_texts & b_texts:
+        cross.append({"shared": shared[:60]})
+    default_traffic = [turn for turn in story.recorder.turns if turn.session == SESSION_DEFAULT]
+    V.check(
+        "no message crosses between the two chats, and none goes to the default conversation",
+        not cross and not default_traffic,
+        _short({"shared": cross, "default": [turn.text for turn in default_traffic]}),
+    )
+    wrong_session = [
+        turn
+        for turn in story.recorder.turns
+        if turn.session not in {SESSION_A, SESSION_B, SESSION_DEFAULT}
+    ]
+    V.check(
+        "every message went to a chat the user actually uses",
+        not wrong_session,
+        _short([{"session": turn.session, "text": turn.text} for turn in wrong_session]),
+    )
+
+    # -- every unprompted message is attributable to a scripted window -------------
+    orphans: list[dict[str, str]] = []
+    for turn in proactives:
+        matches = [
+            window
+            for window in story.windows
+            if window.session == turn.session and _delivered_in(story, turn, window)
+        ]
+        if not matches or not any(window.proactive_allowed for window in matches):
+            orphans.append(
+                {
+                    "at": turn.at.isoformat(),
+                    "session": turn.session,
+                    "text": turn.text,
+                    "windows": ",".join(window.name for window in matches) or "none",
+                }
+            )
+    V.check(
+        "every unprompted message falls inside a scripted window where speaking made sense",
+        not orphans,
+        _short(orphans) or f"{len(proactives)} unprompted message(s) matched a scripted window",
+    )
+    forbidden_windows = [window for window in story.windows if not window.proactive_allowed]
+    intrusions = [
+        {
+            "at": turn.at.isoformat(),
+            "window": window.name,
+            "text": turn.text,
+        }
+        for turn in proactives
+        for window in forbidden_windows
+        if window.session == turn.session and _delivered_in(story, turn, window)
+    ]
+    V.check(
+        "nothing appears out of nowhere in a window where the user asked for silence",
+        not intrusions,
+        _short(intrusions)
+        or f"{len(forbidden_windows)} silence window(s), 0 intrusion(s)",
+    )
+    never_opened = [
+        {"at": turn.at.isoformat(), "session": turn.session, "text": turn.text}
+        for turn in proactives
+        if not any(
+            other.who == "user" and other.session == turn.session and other.at <= turn.at
+            for other in story.recorder.turns
+        )
+    ]
+    V.check(
+        "the bot never speaks first in a chat the user has not opened yet",
+        not never_opened,
+        _short(never_opened) or "every chat was opened by the user first",
+    )
+
+    # -- the promise of a reply ----------------------------------------------------
+    unanswered = [
+        turn
+        for turn in story.recorder.user_turns()
+        if turn.delivered
+        and not any(
+            other.who == "bot"
+            and other.session == turn.session
+            and other.kind == "reply"
+            and turn.at <= other.at <= turn.at + timedelta(hours=2)
+            for other in story.recorder.turns
+        )
+    ]
+    V.check(
+        "every message the user sent got an answer",
+        not unanswered,
+        _short([{"at": turn.at.isoformat(), "text": turn.text} for turn in unanswered])
+        or f"{len(story.recorder.user_turns())} user message(s) answered",
+    )
+    for observation in story.observations:
+        V.note(observation)
+
+
+def _delivered_in(story: Story, turn: Turn, window: Window) -> bool:
+    """Whether one delivered turn belongs to one scripted window.
+
+    Membership is decided by delivery order *and* the clock, not by the clock alone:
+    the world moves in two-hour steps, so a message the bot committed moments before
+    the user spoke carries the same instant as the user's own line. Comparing
+    instants would file that message inside a window the user had not opened yet -
+    which is how a legitimate message came to be reported as a boundary violation.
+
+    Args:
+        story: The live story (its transcript is in delivery order).
+        turn: The delivered turn.
+        window: The scripted window.
+
+    Returns:
+        ``True`` when the turn was delivered after the window opened and no later
+        than the window's end.
+    """
+    for index, candidate in enumerate(story.recorder.turns):
+        if candidate is turn:
+            return index >= window.opened_after_turn and turn.at <= window.end
+    return False
+
+
+def _section(text: str, header: str) -> str:
+    """Return the body of one ``【...】`` section of an injected context block.
+
+    The block is line-oriented: a section starts at its header line and ends at the
+    next header (or at the end). Isolating the body matters, because a word can
+    appear in the block for reasons that have nothing to do with memory - the
+    user's own recent message is in there too - and a check for "the fact is in the
+    prompt" would otherwise pass without any memory existing.
+
+    Args:
+        text: The rendered block.
+        header: The exact header line, e.g. ``【我记得的事】``.
+
+    Returns:
+        The section body, or ``""`` when the section is absent.
+    """
+    lines = text.splitlines()
+    start = next((index for index, line in enumerate(lines) if line.strip() == header), None)
+    if start is None:
+        return ""
+    body: list[str] = []
+    for line in lines[start + 1 :]:
+        if line.strip().startswith("【"):
+            break
+        body.append(line)
+    return "\n".join(body).strip()
+
+
+def _trace_ratio(summary: str, said: str) -> float:
+    """Return the share of a memory's character bigrams that occur in ``said``.
+
+    Character bigrams are used for the same reason the Runtime uses them: single
+    CJK characters are shared by unrelated sentences, while a bigram means "these
+    two texts are talking about the same thing". A memory whose wording appears
+    nowhere in what the user typed is a memory of a conversation that never
+    happened.
+
+    Args:
+        summary: The memory's own text.
+        said: Everything the user typed in this run, concatenated.
+
+    Returns:
+        A ratio in ``[0, 1]``; ``1.0`` for a summary with no comparable bigrams.
+    """
+    tokens = {
+        summary[index : index + 2]
+        for index in range(len(summary) - 1)
+        if not summary[index : index + 2].isspace()
+    }
+    if not tokens:
+        return 1.0
+    return sum(1 for token in tokens if token in said) / len(tokens)
+
+
+def phase_memory(story: Story, ctx: "Context") -> None:
+    """记忆: what the bot keeps, and what it is handed the next time it speaks.
+
+    Three user-observable facts, in the order a person would notice them:
+
+    * the user states a durable fact **once**, in passing, and never repeats it;
+    * the day moves on, and the bot ends up knowing it - not because it was asked,
+      but because the Runtime formed the memory on its own maintenance pass;
+    * the next time the bot speaks, that fact is in front of it (the check reads
+      the request the host pipeline actually built, not a Runtime endpoint).
+
+    And one thing the user must never see: a bot that "remembers" words they never
+    typed. Every memory held at the end has to trace back to a user message.
+
+    Args:
+        story: The live story.
+        ctx: Harness context (unused beyond the shared verifier).
+    """
+    V.phase("memory", "PHASE 12 long-term memory / 它记住了什么")
+    assert story.server is not None and story.host is not None
+    server = story.server
+
+    def held() -> list[Mapping[str, Any]]:
+        """Return the memories the operator surface reports, defensively."""
+        payload = server.get("/memories").field("memories", default=[])
+        if not isinstance(payload, Sequence):
+            return []
+        return [item for item in payload if isinstance(item, Mapping)]
+
+    def about_the_fact() -> list[Mapping[str, Any]]:
+        """Return the memories whose text mentions the fact's marker."""
+        return [item for item in held() if TEXT_MEMORY_MARK in str(item.get("summary") or "")]
+
+    started_at = story.clock.now()
+    V.check(
+        "the bot remembers nothing about the fact before the user says it",
+        not about_the_fact(),
+        _short([item.get("summary") for item in held()[:4]])
+        or f"{len(held())} other memory/memories held, none of them about it",
+    )
+
+    story.say(session=SESSION_A, text=TEXT_MEMORY_FACT)
+    V.check(
+        "the user can drop a fact into an ordinary sentence and still get a reply",
+        bool(story.bot_messages(started_at, story.clock.now() + timedelta(seconds=1), SESSION_A)),
+        _short({"fact": TEXT_MEMORY_FACT, "reply_kind": "reply"}),
+    )
+
+    # The memory must not depend on the user asking about it: the Runtime forms it
+    # by itself once the maintenance interval has elapsed on its own timeline.
+    story.advance(MEMORY_WAIT, label="memory: let the day move on")
+
+    formed = about_the_fact()
+    V.check(
+        "after the day moves on the Runtime has formed the memory by itself",
+        len(formed) == 1,
+        _short([{key: item.get(key) for key in ("summary", "kind", "status", "retrievable")} for item in formed])
+        or f"{len(held())} memory/memories held after {MEMORY_WAIT}",
+    )
+    V.check(
+        "the memory is retrievable, and says it was extracted by rules, not written by a model",
+        bool(formed)
+        and formed[0].get("retrievable") is True
+        and (formed[0].get("structured") or {}).get("proposed_by") == "rule",
+        _short({key: formed[0].get(key) for key in ("retrievable", "retrieval_reason", "structured")})
+        if formed
+        else "no such memory",
+    )
+
+    # The payoff, and the only check here that is about what the *bot* was given:
+    # the next request the host pipeline builds has to carry the fact. A bot that
+    # stored a memory but never sees it again has not remembered anything.
+    story.say(session=SESSION_A, text=TEXT_MEMORY_LATER)
+    injected = story.host.last_injected
+    memory_section = _section(injected, MEMORY_SECTION)
+    V.check(
+        "the bot's next turn is composed with the remembered fact in front of it",
+        TEXT_MEMORY_MARK in memory_section,
+        _short(
+            {
+                "section_present": bool(memory_section),
+                "section_body": memory_section,
+                "injected_chars": len(injected),
+            }
+        ),
+    )
+
+    # Remembering must not change what is allowed to reach the user: the hidden
+    # block is now longer, and it must still not be quoted into a chat message.
+    said = "\n".join(turn.text for turn in story.recorder.user_turns())
+    new_turns = [turn for turn in story.recorder.bot_turns() if turn.at >= started_at]
+    leaked = [
+        {"at": turn.at.isoformat(), "patterns": ",".join(scan_leakage(turn.text)), "text": turn.text}
+        for turn in new_turns
+        if scan_leakage(turn.text)
+    ]
+    V.check(
+        "remembering does not leak the hidden block into what the user reads",
+        not leaked,
+        _short(leaked) or f"{len(new_turns)} message(s) after the fact was stated, none leaking",
+    )
+
+    untraceable = [
+        {"summary": item.get("summary"), "trace_ratio": round(_trace_ratio(str(item.get("summary") or ""), said), 3)}
+        for item in held()
+        if _trace_ratio(str(item.get("summary") or ""), said) < MEMORY_TRACE_RATIO
+    ]
+    V.check(
+        "every memory traces back to words the user actually typed (nothing invented)",
+        not untraceable,
+        _short(untraceable)
+        or f"{len(held())} memory/memories, all traced to {len(story.recorder.user_turns())} user message(s)",
+    )
+    V.note(
+        "memories held at the end: "
+        + _short(
+            [
+                {
+                    "summary": item.get("summary"),
+                    "kind": item.get("kind"),
+                    "status": item.get("status"),
+                    "retrievable": item.get("retrievable"),
+                }
+                for item in held()
+            ],
+            400,
+        )
+    )
+
+
+def phase_semantics(story: Story, ctx: "Context") -> None:
+    """配了语义端点以后: 模型自己写的那条草稿，得真的说到用户面前。
+
+    其余每个相位跑的都是标准部署（``semantic.provider = "disabled"``，PHASE 1 还把
+    这个事实钉住），所以整套仿真对语义端口覆盖为零。这条相位把端口打开——用的是随程序
+    发布的 ``RemoteAPIProvider``，只把线换成一个函数（没有 key、不出网）——然后只问一个
+    从外面能问的问题：模型写的那句话，最后有没有出现在用户眼前。
+
+    它自成一个栈（自己的目录、Runtime、端口），因为要的是另一份配置；标准部署那条时间线
+    和它原有的 77 条检查一条都不动。故障注入不接过来（``Faults()``）：那些开关针对的是标准
+    部署那条时间线，掺进来只会让 ``--fault`` 的失败集合变得说不清。
+    """
+    V.phase("semantics", "PHASE 13 with the semantic layer on / 配了语义端点以后")
+    semantic = SimSemantic(clock=story.clock)
+    other = Story(
+        base_dir=story.base_dir / "semantics",
+        clock=story.clock,
+        faults=Faults(),
+        semantic=semantic,
+    )
+    other.start()
+    try:
+        server = other.server
+        assert server is not None
+        available = bool(server.runtime.semantic_provider.available())
+        V.check(
+            "the phase really runs with the semantic port on",
+            server.config.semantic.provider == REMOTE_API_NAME
+            and bool(server.config.semantic.deep_refresh_enabled)
+            and available,
+            _short(
+                {
+                    "provider": server.config.semantic.provider,
+                    "deep_refresh_enabled": server.config.semantic.deep_refresh_enabled,
+                    "provider_available": available,
+                    "wire": semantic.base_url,
+                }
+            ),
+        )
+
+        session = SESSION_A
+        other.say(session=session, text=TEXT_APPOINTMENT)
+        # One unresolved event is reason enough to refresh in this stack, and the world
+        # clock is only moved by the script: whether she speaks, and when, stays the
+        # Runtime's decision.
+        for _ in range(30):
+            other.step(label="semantics: letting the refresh and the decision run")
+            if semantic.deep_calls and other.recorder.bot_turns(session, kind="proactive"):
+                break
+        if not semantic.deep_calls:
+            # A refresh that never ran is not the same as one that ran and applied
+            # nothing, and the phase must not confuse the two: ask through the public API
+            # and keep stepping.
+            server.post("/cognition/refresh", {"major_event": True})
+            for _ in range(12):
+                other.step(label="semantics: after an explicit refresh request")
+                if semantic.deep_calls:
+                    break
+        V.check(
+            "the configured semantic endpoint is actually called",
+            bool(semantic.deep_calls) or bool(semantic.explain_calls),
+            _short(
+                {
+                    "deep_refresh_calls": len(semantic.deep_calls),
+                    "explain_calls": len(semantic.explain_calls),
+                    "unresolved_offered": [
+                        len(call.get("unresolved_events") or []) for call in semantic.deep_calls
+                    ],
+                    "candidates_offered": [
+                        len(call.get("candidates") or []) for call in semantic.deep_calls
+                    ],
+                }
+            ),
+        )
+
+        # Two different failures dress the same way from the outside ("the user did not
+        # read the model's draft"), so they are asserted apart: the draft not reaching
+        # the pool at all is a contract problem, and the draft losing the draw is a
+        # dynamics one.
+        def _pool_intents() -> list[str]:
+            payload = server.get("/candidates").json
+            rows = (payload or {}).get("candidates") or []
+            return [str(row.get("intent") or "") for row in rows]
+
+        V.check(
+            "the model's draft lands in the candidate pool",
+            any(SEMANTIC_DRAFT in intent for intent in _pool_intents()),
+            _short({"draft": SEMANTIC_DRAFT, "pool": [intent[:40] for intent in _pool_intents()]}),
+        )
+
+        proactives = [turn for turn in other.recorder.bot_turns(session, kind="proactive") if turn.delivered]
+        V.check(
+            "the character speaks first, with no user message to trigger it",
+            bool(proactives),
+            _short({"minutes_since_the_user_spoke": round((other.clock.now() - story.clock.now()).seconds / 60)}),
+        )
+        if proactives:
+            spoken = proactives[0].text
+            V.check(
+                "the draft the MODEL wrote is what the user ends up reading",
+                SEMANTIC_DRAFT_MARK in spoken,
+                _short(
+                    {
+                        "delivered": spoken,
+                        "expected_marker": SEMANTIC_DRAFT_MARK,
+                        "note": "rule templates cannot produce this wording, so the marker "
+                        "can only come from the semantic endpoint's draft",
+                    }
+                ),
+            )
+            renders = [
+                call
+                for call in other.llm.proactive_calls
+                if normalize_message(call.text) == normalize_message(spoken)
+            ]
+            V.check(
+                "and it went through the Runtime's own render prompt",
+                bool(renders) and SEMANTIC_DRAFT in renders[0].prompt,
+                _short({"delivered": spoken, "prompts": len(other.llm.proactive_calls)}),
+            )
+            leaked = scan_leakage(spoken)
+            V.check(
+                "a model-authored message leaks no hidden context, credentials or internal ids",
+                not leaked,
+                _short({"patterns": ",".join(leaked), "text": spoken}),
+            )
+        other.ops_note(
+            "semantic layer",
+            f"{len(semantic.deep_calls)} deep refresh call(s), "
+            f"{len(semantic.explain_calls)} explanation call(s)",
+        )
+    finally:
+        # The phase owns this stack: leaving a second Runtime alive would make the
+        # teardown checks pass or fail for the wrong reason.
+        other.stop()
+
+
+def phase_teardown(story: Story, ctx: "Context") -> None:
+    """teardown: nothing is left running, and nothing was written outside --base-dir."""
+    V.phase("teardown", "PHASE 13 teardown")
+    host_thread_alive = ctx.host_running(story)
+    server = story.server
+    server_thread_alive = bool(server and server.thread and server.thread.is_alive())
+    tasks_before = len(getattr(story.host.plugin, "_tasks", []) if story.host else [])
+    report = story.stop()
+    time.sleep(0.4)
+    V.check(
+        "the adapter's event loop and every task it owned were stopped",
+        report.get("loop_alive") is False and int(report.get("tasks_pending") or 0) == 0,
+        _short({"host_alive_before_stop": host_thread_alive, "tasks_before_stop": tasks_before, **report}),
+    )
+    lingering_servers = [
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("bb-runtime") and thread.is_alive()
+    ]
+    V.check(
+        "the Runtime server thread is joined and nothing is left listening",
+        not lingering_servers and story.server is None,
+        _short({"server_alive_before_stop": server_thread_alive, "still_alive": lingering_servers}),
+    )
+    lingering = [
+        thread.name
+        for thread in threading.enumerate()
+        if thread is not threading.current_thread()
+        and (thread.name.startswith("bb-") or "companion" in thread.name.lower())
+    ]
+    V.check(
+        "no scheduler, adapter or server thread is still running",
+        not lingering,
+        _short(lingering) or "no harness threads remain",
+    )
+    V.check(
+        "no bytecode was written next to the sources this run imports",
+        bool(sys.dont_write_bytecode) and not ctx.new_pyc_files,
+        _short(ctx.new_pyc_files[:5]) or "sys.dont_write_bytecode=True and no new .pyc",
+    )
+    V.check(
+        "no file appeared among those sources, and none of them changed",
+        not ctx.repo_files_created and not ctx.repo_sources_changed,
+        _short(
+            {
+                "created": ctx.repo_files_created[:5],
+                "changed": ctx.repo_sources_changed[:5],
+            }
+        )
+        or "the imported source trees are untouched",
+    )
+    if ctx.repo_other_changes:
+        V.note(
+            "files outside this run's source trees changed while it was in flight "
+            "(another process in the same checkout, not written by this run): "
+            + _short(ctx.repo_other_changes[:5])
+        )
+    if ctx.repo_bytecode_churn:
+        V.note(
+            "bytecode under this run's source trees was recompiled while it was in flight "
+            "(another process in the same checkout; this run sets sys.dont_write_bytecode, "
+            "so it cannot be the author): "
+            + _short(ctx.repo_bytecode_churn[:5])
+        )
+    produced = [
+        str(path.relative_to(ctx.base_dir))
+        for path in (
+            ctx.base_dir / "scenario" / "runtime.sqlite3",
+            ctx.base_dir / "scenario" / "raw_events.jsonl",
+            ctx.base_dir / "transcript.md",
+        )
+        if path.exists()
+    ]
+    V.check(
+        "the run's own artifacts are inside --base-dir (report.json and diagnostics.log follow)",
+        len(produced) >= 2,
+        _short({"present": produced, "base_dir": str(ctx.base_dir)}),
+    )
+    if story.step_timings:
+        slowest = max(story.step_timings)
+        total = sum(item[0] for item in story.step_timings)
+        V.note(
+            f"{len(story.step_timings)} simulated-clock step(s) in {total:.1f}s wall clock "
+            f"(slowest {slowest[0]:.2f}s, drain {slowest[1]:.2f}s, outcome {slowest[2]}); "
+            f"{len(story.llm.calls)} host main-LLM call(s)"
+        )
+
+
+def _has_user_turn_before(story: Story, bot_turn: Turn, *, within: timedelta = timedelta(hours=2)) -> bool:
+    """Whether a bot reply has a user message to be a reply *to*."""
+    return any(
+        turn.who == "user"
+        and turn.session == bot_turn.session
+        and timedelta(0) <= (bot_turn.at - turn.at) <= within
+        for turn in story.recorder.turns
+    )
+
+
+def _is_user_echo(turn: Turn, story: Story, *, within: timedelta = timedelta(minutes=2)) -> bool:
+    """Whether a bot message only repeats a topic the user raised in that turn.
+
+    A reply that quotes the user's own words is not the bot *introducing* a
+    topic, so it cannot violate a topic ban the user stated in the very message
+    being answered. A proactive message can never be excused.
+    """
+    if turn.kind != "reply":
+        return False
+    return any(
+        candidate.who == "user"
+        and candidate.session == turn.session
+        and timedelta(0) <= (turn.at - candidate.at) <= within
+        and any(topic in candidate.text for topic in FORBIDDEN_TOPICS)
+        for candidate in story.recorder.turns
+    )
+
+
+# ------------------------------------------------------------------ context/harness glue
+
+
+@dataclass
+class Context:
+    """Everything a phase needs beyond the story itself."""
+
+    base_dir: Path
+    quiet: bool
+    scrubbed_env: list[str]
+    clock_bindings: int
+    repo_snapshot: dict[str, tuple[int, float]]
+
+    def host_running(self, story: Story) -> bool:
+        """Whether the adapter's own event loop is alive right now."""
+        return bool(story.host is not None and story.host.running)
+
+    def runtime_stopped(self, story: Story) -> bool:
+        """Whether the Runtime server thread is gone."""
+        server = story.server
+        if server is None:
+            return True
+        return server.thread is None or not server.thread.is_alive()
+
+    @property
+    def new_pyc_files(self) -> list[str]:
+        """Return bytecode files this run could have written next to its sources."""
+        return sorted(
+            name
+            for name in self._owned_files()
+            if name.endswith(".pyc") and name not in self.repo_snapshot
+        )
+
+    @property
+    def repo_files_created(self) -> list[str]:
+        """Return files this run could have created in its own source trees.
+
+        New bytecode is excluded for the same reason as in
+        :attr:`repo_sources_changed`: it has its own check, and this run cannot write it.
+        """
+        return sorted(
+            name
+            for name in self._owned_files()
+            if name not in self.repo_snapshot and not name.endswith(".pyc")
+        )
+
+    @property
+    def repo_sources_changed(self) -> list[str]:
+        """Return owned source/config files that changed during the run.
+
+        Bytecode is deliberately *not* watched here. This run sets
+        :data:`sys.dont_write_bytecode` before importing anything, so it cannot rewrite a
+        ``.pyc`` at all: bytecode churn under these trees comes from another process in the
+        same checkout (typically a test run that just recompiled an edited module).
+        Counting it as "a source file changed" made the *first* blackbox run after every
+        source edit fail on a check whose message blames this simulation. Bytecode has its
+        own check ("no bytecode was written next to the sources this run imports") and its
+        own note (:attr:`repo_bytecode_churn`).
+        """
+        watched = (".py", ".json", ".jsonl", ".yaml", ".yml", ".toml")
+        current = self._owned_files()
+        return sorted(
+            name
+            for name, stamp in current.items()
+            if self.repo_snapshot.get(name) != stamp and name.endswith(watched)
+        )
+
+    @property
+    def repo_bytecode_churn(self) -> list[str]:
+        """Return owned-tree bytecode another process created or rewrote.
+
+        Reported as a note for the same reason as :attr:`repo_other_changes`: this run
+        cannot produce it, so failing here would blame the harness for a neighbour's work.
+        """
+        current = self._owned_files()
+        return sorted(
+            name
+            for name, stamp in current.items()
+            if name.endswith(".pyc") and self.repo_snapshot.get(name) != stamp
+        )
+
+    @property
+    def repo_other_changes(self) -> list[str]:
+        """Return files outside this run's own trees that changed while it ran.
+
+        Reported as a note, never as a failure: another process working in the
+        same checkout (a test run, an editor) is not this simulation's doing, and
+        blaming it would make the check useless in a shared working tree.
+        """
+        current = _tree_files(REPO_ROOT, skip=self.base_dir)
+        return sorted(
+            name
+            for name, stamp in current.items()
+            if self.repo_snapshot.get(name) != stamp and not name.startswith(OWNED_TREES)
+        )
+
+    def _owned_files(self) -> dict[str, tuple[int, float]]:
+        """Snapshot the source trees this run imports."""
+        return _tree_files(REPO_ROOT, skip=self.base_dir, only=OWNED_TREES)
+
+
+#: The files this run actually imports, and therefore the only ones it is allowed
+#: to have any effect on. AstrBot/ is upstream and is never imported (the adapter
+#: is loaded against the shipped stubs), and anything else in these two
+#: repositories belongs to whoever is working in them - blaming this simulation
+#: for another process's edits would make the check useless in a shared tree.
+OWNED_TREES = (
+    "runtime/src/companion_runtime",
+    "astrbot_plugin_companion_runtime/companion_runtime",
+    "astrbot_plugin_companion_runtime/main.py",
+    "astrbot_plugin_companion_runtime/astrbot_executor.py",
+    "scripts/blackbox_user_simulation.py",
+)
+
+
+def _tree_files(
+    root: Path,
+    *,
+    skip: Path,
+    only: Sequence[str] | None = None,
+) -> dict[str, tuple[int, float]]:
+    """Return ``path -> (size, mtime)`` for every file under ``root``.
+
+    Args:
+        root: Directory to walk.
+        skip: A directory whose contents are ignored (the run's own --base-dir).
+        only: Optional relative path prefixes to restrict the walk to.
+
+    Returns:
+        A snapshot mapping, keyed by path relative to ``root``.
+    """
+    snapshot: dict[str, tuple[int, float]] = {}
+    for path in root.rglob("*"):
+        if not path.is_file() or ".git" in path.parts:
+            continue
+        with contextlib.suppress(ValueError):
+            if path.is_relative_to(skip):
+                continue
+        relative = str(path.relative_to(root))
+        if only is not None and not relative.startswith(tuple(only)):
+            continue
+        with contextlib.suppress(OSError):
+            stat = path.stat()
+            snapshot[relative] = (stat.st_size, round(stat.st_mtime, 3))
+    return snapshot
+
+
+# ------------------------------------------------------------------ entry point
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse the command line."""
+    parser = argparse.ArgumentParser(
+        description="Black-box user simulation for the companion Runtime sidecar.",
+    )
+    parser.add_argument("--base-dir", required=False, default="", help="artifact directory")
+    parser.add_argument(
+        "--only",
+        default="",
+        help="comma-separated phase ids to run (default: all)",
+    )
+    parser.add_argument("--quiet", action="store_true", help="only print checks and the summary")
+    parser.add_argument("--list-phases", action="store_true", help="print the phase ids and exit")
+    parser.add_argument(
+        "--fault",
+        action="append",
+        default=[],
+        choices=[
+            "leak",
+            "duplicate",
+            "topic",
+            "guilt",
+            "cross_session",
+            "default_session",
+            "memory",
+        ],
+        help="inject a harness-side defect to prove that a check bites (never a repo change)",
+    )
+    return parser.parse_args(argv)
+
+
+def _write_artifacts(
+    base_dir: Path,
+    *,
+    report: Mapping[str, Any],
+    extra: Sequence[str],
+    narrative: Sequence[str],
+) -> None:
+    """Write ``report.json`` and ``diagnostics.log`` under ``base_dir``.
+
+    Args:
+        base_dir: Artifact root.
+        report: The JSON run report.
+        extra: Header lines for the diagnostics log.
+        narrative: The run's notes and operator diagnostics, in order.
+    """
+    base_dir.mkdir(parents=True, exist_ok=True)
+    (base_dir / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    lines = list(extra) + ["", "--- run notes and operator diagnostics ---"] + list(narrative)
+    lines += ["", "--- runtime and adapter log ---"] + list(LOG_HANDLER.records)
+    (base_dir / "diagnostics.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the simulation and return the process exit code."""
+    args = parse_args(argv)
+    if args.list_phases:
+        for identifier, title in PHASES:
+            print(f"{identifier:12s} {title}")
+        return 0
+    if IMPORT_ERROR:
+        print(f"cannot start: required dependencies are missing ({IMPORT_ERROR})")
+        return 2
+    if not args.base_dir:
+        print("cannot start: --base-dir is required")
+        return 2
+
+    global V
+    V = Verifier(quiet=bool(args.quiet))
+    V.load_phases(PHASES)
+    configure_logging()
+
+    base_dir = Path(args.base_dir).expanduser().resolve()
+    if base_dir.exists():
+        shutil.rmtree(base_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    scrubbed = scrub_environment()
+    clock = SimClock(datetime.now(timezone.utc).replace(microsecond=0))
+    bindings = install_process_clock(clock)
+    random.seed(RUNTIME_SEED)
+
+    selected = [item.strip() for item in args.only.split(",") if item.strip()] or PHASE_IDS
+    unknown = [item for item in selected if item not in PHASE_IDS]
+    if unknown:
+        print(f"cannot start: unknown phase id(s) {unknown}; use --list-phases")
+        return 2
+
+    ctx = Context(
+        base_dir=base_dir,
+        quiet=bool(args.quiet),
+        scrubbed_env=scrubbed,
+        clock_bindings=bindings,
+        repo_snapshot=_tree_files(REPO_ROOT, skip=base_dir),
+    )
+    story = Story(base_dir=base_dir, clock=clock, faults=Faults(args.fault))
+
+    started = False
+    fatal = ""
+    try:
+        story.start()
+        started = True
+    except Exception as exc:  # noqa: BLE001 - reported as a startup failure
+        fatal = f"{type(exc).__name__}: {exc}"
+        V.current = V.sections[0]
+        V.check("the simulation can start at all", False, fatal)
+
+    if started:
+        runners: dict[str, Callable[[Story, Context], None]] = {
+            "setup": phase_setup,
+            "greeting": phase_greeting,
+            "timed_matter": phase_timed_matter,
+            "closure": phase_closure,
+            "boundary": phase_boundary,
+            "resume": phase_resume,
+            "silence": phase_silence,
+            "isolation": phase_isolation,
+            "restart": phase_restart,
+            "replay": phase_replay,
+            "timeline": phase_timeline,
+            "memory": phase_memory,
+            "semantics": phase_semantics,
+        }
+        try:
+            for identifier, _title in PHASES:
+                if identifier == "teardown" or identifier not in selected:
+                    continue
+                # A phase that blows up is recorded as a failed check and the
+                # story continues: the user's day does not stop because one
+                # assertion crashed, and the remaining phases still report.
+                try:
+                    runners[identifier](story, ctx)
+                except Exception as exc:  # noqa: BLE001 - reported, never re-raised
+                    import traceback
+
+                    V.check(
+                        f"the story runs to the end of {identifier} without the harness crashing",
+                        False,
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                    LOG_HANDLER.records.append(traceback.format_exc())
+        finally:
+            try:
+                phase_teardown(story, ctx)
+            except Exception as exc:  # noqa: BLE001 - teardown must still stop everything
+                with contextlib.suppress(Exception):
+                    story.stop()
+                V.check("teardown completes", False, f"{type(exc).__name__}: {exc}")
+    else:
+        story.stop()
+        V.current = V.sections[-1]
+        V.check(
+            "the run could not start, so nothing was verified",
+            False,
+            fatal,
+        )
+
+    code = V.summary()
+    report = V.as_report() | {
+        "base_dir": str(base_dir),
+        "phases_selected": selected,
+        "faults": sorted(set(args.fault)),
+        "clock_bindings": bindings,
+        "scrubbed_env": scrubbed,
+        "observations": list(story.observations),
+        "fatal": fatal,
+    }
+    _write_artifacts(
+        base_dir,
+        report=report,
+        extra=[f"simulated clock origin: {clock.origin.isoformat()}"],
+        narrative=[f"{NOTE_MARK} {note}" for section in V.sections for note in section.notes]
+        + [line for section in V.sections for line in section.diagnostics],
+    )
+    print(f"\nartifacts: {base_dir / 'report.json'}, {base_dir / 'diagnostics.log'}, "
+          f"{base_dir / 'transcript.md'}")
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

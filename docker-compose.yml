@@ -1,0 +1,71 @@
+# 小九九 (xiaojiujiu) - two containers, one companion.
+#
+#   runtime  the persistent cognition sidecar (this repository's core)
+#   astrbot  the chat host, with the thin plugin mounted from this checkout
+#
+# Both ports are published to 127.0.0.1 on purpose: the sidecar has no
+# public-facing authentication, so it must never be reachable from the internet
+# directly. Put a reverse proxy in front of the AstrBot WebUI if you need remote
+# access, and keep 8787 private.
+#
+# Secrets: the optional remote semantic provider reads its key from
+# CR_SEMANTIC_API_KEY only. Pass it through your shell environment or an
+# untracked .env file - never commit it here.
+
+name: xiaojiujiu
+
+services:
+  runtime:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xiaojiujiu-runtime:local
+    restart: unless-stopped
+    environment:
+      # The conversation this sidecar belongs to. In a multi-session deployment
+      # set it to the AstrBot session origin, e.g. aiocqhttp:FriendMessage:10001,
+      # otherwise proactive messages can only be routed in a single-session setup.
+      CR_CONVERSATION_ID: ${CR_CONVERSATION_ID:-default}
+      # No model is required: `disabled` is the deterministic, fully offline
+      # default. The remote provider needs provider, base URL, model and key.
+      CR_SEMANTIC_PROVIDER: ${CR_SEMANTIC_PROVIDER:-disabled}
+      CR_SEMANTIC_BASE_URL: ${CR_SEMANTIC_BASE_URL:-}
+      CR_SEMANTIC_MODEL: ${CR_SEMANTIC_MODEL:-}
+      CR_SEMANTIC_API_KEY: ${CR_SEMANTIC_API_KEY:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # SQLite WAL database, raw-event mirror and manual snapshots.
+      - runtime-data:/data
+    ports:
+      - "127.0.0.1:8787:8787"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=4).status == 200 else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  astrbot:
+    image: soulter/astrbot:latest
+    restart: unless-stopped
+    depends_on:
+      runtime:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # AstrBot's own configuration, plugins and data.
+      - astrbot-data:/AstrBot/data
+      # The thin plugin: the only host-side change this project makes. Mounted
+      # read-write because AstrBot writes plugin caches and config beside it.
+      - ./astrbot_plugin_companion_runtime:/AstrBot/data/plugins/astrbot_plugin_companion_runtime
+    ports:
+      - "127.0.0.1:6185:6185"
+
+volumes:
+  runtime-data:
+  astrbot-data:

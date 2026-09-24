@@ -1,0 +1,823 @@
+"""Emotion system: event appraisal, background mood and emotional impact events.
+
+Three layers, matching the architecture:
+
+1. **Event appraisal** (:func:`appraise_event`) - a cheap, rule-based
+   classification of *what kind of thing happened to the character*. It must not
+   output final emotion values; it outputs direction, impact, activation,
+   uncertainty, relation signal and responsibility.
+2. **Dynamics** (:func:`tick_emotions`, :func:`apply_new_emotion_events`) - plain
+   code combining values, current mood, the user model and existing emotion
+   events into mood movement and decaying impact events.
+3. **Explanation** (:class:`EmotionExplainer`) - translates structured state into
+   first-person psychological language. Templates by default, with an optional
+   semantic provider; it may never modify state.
+
+``semantic_label = None`` is a legitimate state: the Runtime can know that
+something was a moderately negative, relation-relevant impact before it knows
+whether it was disappointment, anxiety or shame.
+"""
+
+from __future__ import annotations
+
+import logging
+import random
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Mapping, Protocol, Sequence
+
+from .config import EmotionConfig, RuntimeConfig
+from .projections import EmotionProjection
+from .typing import (
+    EmotionDirection,
+    EmotionEvaluation,
+    EmotionEvent,
+    EventType,
+    RawEvent,
+    RuntimeState,
+    new_id,
+)
+from .utility import clamp, exponential_decay
+
+LOGGER = logging.getLogger("companion_runtime.emotion")
+
+
+@dataclass(slots=True)
+class Signal:
+    """A lexicon entry used by the rule-based appraiser."""
+
+    needle: str
+    direction: str
+    impact: float
+    activation: float
+    relation_signal: str = "neutral"
+    responsibility: str = "unclear"
+    label: str | None = None
+
+
+#: Small bilingual lexicon. Order matters: the first match wins, so the more
+#: specific / more intense phrases come first.
+SIGNAL_LEXICON: tuple[Signal, ...] = (
+    # --- explicit boundaries (handled by the boundary machine, but they also sting)
+    Signal("不要主动", EmotionDirection.NEGATIVE.value, 0.55, 0.35, "distance", "other", "被拒绝"),
+    Signal("别主动", EmotionDirection.NEGATIVE.value, 0.55, 0.35, "distance", "other", "被拒绝"),
+    Signal("别一直问", EmotionDirection.NEGATIVE.value, 0.62, 0.45, "distance", "self", "被责备"),
+    Signal("don't message me", EmotionDirection.NEGATIVE.value, 0.55, 0.35, "distance", "other", "rejection"),
+    Signal("stop asking", EmotionDirection.NEGATIVE.value, 0.62, 0.45, "distance", "self", "rebuke"),
+    # --- strong negative life events
+    Signal("家里出事", EmotionDirection.NEGATIVE.value, 0.85, 0.80, "crisis", "third_party", "担忧"),
+    Signal("很难受", EmotionDirection.NEGATIVE.value, 0.70, 0.60, "sorrow", "third_party", "心疼"),
+    Signal("出事了", EmotionDirection.NEGATIVE.value, 0.78, 0.72, "crisis", "third_party", "担忧"),
+    Signal("去世", EmotionDirection.NEGATIVE.value, 0.90, 0.70, "loss", "third_party", "哀伤"),
+    Signal("生病", EmotionDirection.NEGATIVE.value, 0.65, 0.50, "worry", "third_party", "担心"),
+    Signal("难过", EmotionDirection.NEGATIVE.value, 0.62, 0.55, "sorrow", "third_party", "心疼"),
+    Signal("崩溃", EmotionDirection.NEGATIVE.value, 0.80, 0.75, "sorrow", "third_party", "心疼"),
+    Signal("好累", EmotionDirection.NEGATIVE.value, 0.48, 0.38, "fatigue", "third_party", "心疼"),
+    Signal("好烦", EmotionDirection.NEGATIVE.value, 0.45, 0.45, "fatigue", "third_party", "共情"),
+    Signal("工作很多", EmotionDirection.NEGATIVE.value, 0.25, 0.20, "busy", "third_party", None),
+    Signal("很忙", EmotionDirection.NEGATIVE.value, 0.22, 0.18, "busy", "third_party", None),
+    Signal("没时间", EmotionDirection.NEGATIVE.value, 0.35, 0.25, "busy", "third_party", "失落"),
+    Signal("不来了", EmotionDirection.NEGATIVE.value, 0.42, 0.30, "distance", "third_party", "失落"),
+    Signal("自己待着", EmotionDirection.NEGATIVE.value, 0.30, 0.22, "distance", "third_party", "失落"),
+    Signal("没发现", EmotionDirection.NEGATIVE.value, 0.55, 0.45, "guilt", "self", "愧疚"),
+    Signal("对不起", EmotionDirection.NEGATIVE.value, 0.40, 0.45, "apology", "third_party", None),
+    Signal("算了", EmotionDirection.NEGATIVE.value, 0.30, 0.25, "uncertain", "third_party", "不确定"),
+    Signal("随便", EmotionDirection.NEGATIVE.value, 0.22, 0.20, "uncertain", "third_party", "不确定"),
+    Signal("sorry", EmotionDirection.NEGATIVE.value, 0.40, 0.45, "apology", "third_party", None),
+    Signal("太累了", EmotionDirection.NEGATIVE.value, 0.50, 0.40, "fatigue", "third_party", "心疼"),
+    # --- positive signals
+    Signal("面试过啦", EmotionDirection.POSITIVE.value, 0.80, 0.75, "good_news", "third_party", "高兴"),
+    Signal("过了", EmotionDirection.POSITIVE.value, 0.55, 0.50, "good_news", "third_party", "高兴"),
+    Signal("成功了", EmotionDirection.POSITIVE.value, 0.72, 0.70, "good_news", "third_party", "高兴"),
+    Signal("好消息", EmotionDirection.POSITIVE.value, 0.65, 0.60, "good_news", "third_party", "高兴"),
+    Signal("考上", EmotionDirection.POSITIVE.value, 0.72, 0.70, "good_news", "third_party", "高兴"),
+    Signal("谢谢", EmotionDirection.POSITIVE.value, 0.45, 0.40, "appreciation", "third_party", "被感激"),
+    Signal("谢谢你", EmotionDirection.POSITIVE.value, 0.55, 0.50, "appreciation", "third_party", "被感激"),
+    Signal("喜欢你", EmotionDirection.POSITIVE.value, 0.75, 0.70, "closeness", "third_party", "喜悦"),
+    Signal("想你", EmotionDirection.POSITIVE.value, 0.68, 0.65, "closeness", "third_party", "喜悦"),
+    Signal("多主动", EmotionDirection.POSITIVE.value, 0.60, 0.50, "closeness", "third_party", "被接纳"),
+    Signal("在吗", EmotionDirection.POSITIVE.value, 0.30, 0.45, "contact", "third_party", None),
+    Signal("哈哈", EmotionDirection.POSITIVE.value, 0.38, 0.45, "amusement", "third_party", "愉快"),
+    Signal("开心", EmotionDirection.POSITIVE.value, 0.52, 0.50, "good_news", "third_party", "高兴"),
+    Signal("thank you", EmotionDirection.POSITIVE.value, 0.45, 0.40, "appreciation", "third_party", None),
+    Signal("miss you", EmotionDirection.POSITIVE.value, 0.68, 0.65, "closeness", "third_party", None),
+)
+
+
+def _match_signal(text: str) -> Signal | None:
+    """Return the first lexicon entry present in ``text``.
+
+    Args:
+        text: User-visible content to scan.
+
+    Returns:
+        The matching :class:`Signal`, or ``None``.
+    """
+    lowered = (text or "").lower()
+    if not lowered:
+        return None
+    for signal in SIGNAL_LEXICON:
+        if signal.needle.lower() in lowered:
+            return signal
+    return None
+
+
+def appraise_event(
+    event: RawEvent,
+    *,
+    state: RuntimeState,
+    config: EmotionConfig,
+    user_busy_probability: float = 0.0,
+) -> EmotionEvaluation:
+    """Classify what kind of thing an event was for the character.
+
+    This is deliberately rule-based so the Runtime runs with zero models
+    (degradation Level 0). A semantic provider may replace it later; the output
+    contract is identical.
+
+    Args:
+        event: The raw event to appraise.
+        state: Current runtime state (values modulate sensitivity).
+        config: Emotion configuration.
+        user_busy_probability: Current belief that the user is busy, used to
+            dampen negative attributions.
+
+    Returns:
+        An :class:`EmotionEvaluation` with no final emotion values.
+    """
+    values = state.values
+    text = event.content or ""
+    metadata = event.metadata or {}
+
+    if event.event_type == EventType.TOOL_RESULT.value:
+        success = bool(metadata.get("success", True))
+        return EmotionEvaluation(
+            direction=EmotionDirection.POSITIVE.value if success else EmotionDirection.NEGATIVE.value,
+            impact=0.20 if success else 0.35,
+            activation=0.15,
+            uncertainty=0.20,
+            relation_signal="neutral",
+            responsibility="tool",
+            confidence=0.9,
+            source="rule",
+        )
+
+    if event.event_type in {EventType.BOUNDARY_DECLARED.value, EventType.BOUNDARY_REVOKED.value}:
+        negative = event.event_type == EventType.BOUNDARY_DECLARED.value
+        return EmotionEvaluation(
+            direction=EmotionDirection.NEGATIVE.value if negative else EmotionDirection.POSITIVE.value,
+            impact=0.40 if negative else 0.25,
+            activation=0.30,
+            uncertainty=0.15,
+            relation_signal="distance" if negative else "closeness",
+            responsibility="user",
+            confidence=0.85,
+            source="rule",
+        )
+
+    if event.event_type == EventType.ASSISTANT_MESSAGE.value:
+        # The character's own words are not evidence about the world. They only
+        # matter through the user's later reaction, which arrives separately.
+        return EmotionEvaluation(
+            direction=EmotionDirection.NEUTRAL.value,
+            impact=0.0,
+            activation=0.0,
+            uncertainty=0.5,
+            relation_signal="self",
+            responsibility="self",
+            confidence=0.5,
+            source="rule",
+        )
+
+    signal = _match_signal(text)
+    if signal is None:
+        # Unknown content: stay agnostic rather than inventing an interpretation.
+        return EmotionEvaluation(
+            direction=EmotionDirection.NEUTRAL.value,
+            impact=0.05,
+            activation=0.10,
+            uncertainty=0.60,
+            relation_signal="neutral",
+            responsibility="unclear",
+            confidence=0.30,
+            source="rule",
+        )
+
+    impact = signal.impact
+    activation = signal.activation
+    uncertainty = 0.35
+
+    # Values modulate sensitivity, never the facts themselves.
+    sensitivity = 1.0
+    if signal.direction == EmotionDirection.NEGATIVE.value:
+        sensitivity *= 0.6 + 0.8 * values.relationship_maintenance
+        sensitivity *= 0.7 + 0.6 * values.stability_commitment
+        sensitivity *= 1.0 - 0.25 * values.autonomy
+    else:
+        sensitivity *= 0.6 + 0.8 * values.user_care
+        sensitivity *= 0.7 + 0.5 * values.emotional_expression
+
+    # A busy user explains the signal away: the fact stands, the weight drops.
+    attribution_damping = 1.0 - 0.55 * clamp(user_busy_probability) if signal.direction == EmotionDirection.NEGATIVE.value else 1.0
+    impact = clamp(impact * sensitivity * attribution_damping * config.event_reactivity)
+    activation = clamp(activation * sensitivity * config.event_reactivity)
+
+    if signal.relation_signal in {"distance", "uncertain", "busy"}:
+        uncertainty = clamp(uncertainty + 0.25 * user_busy_probability + 0.1)
+
+    return EmotionEvaluation(
+        direction=signal.direction,
+        impact=impact,
+        activation=activation,
+        uncertainty=uncertainty,
+        relation_signal=signal.relation_signal,
+        responsibility=signal.responsibility,
+        confidence=0.75 if text else 0.3,
+        source="rule",
+    )
+
+
+@dataclass(slots=True)
+class EmotionTickResult:
+    """Outcome of decaying the active emotion events."""
+
+    decayed_ids: list[str]
+    mood_excess_valence: float
+    mood_excess_arousal: float
+
+
+def tick_emotions(
+    *,
+    active: Sequence[EmotionEvent],
+    state: RuntimeState,
+    config: EmotionConfig,
+    dt_seconds: float,
+) -> list[EmotionEvent]:
+    """Decay active emotion events in place by ``dt_seconds``.
+
+    Events below the retirement threshold after decay are dropped from the
+    returned list (the caller deactivates them in the database).
+
+    Args:
+        active: Currently active emotion events.
+        state: Runtime state (unused for scaling but kept for future use).
+        config: Emotion configuration.
+        dt_seconds: Elapsed seconds since the last tick.
+
+    Returns:
+        The still-active events with updated intensities.
+    """
+    if dt_seconds <= 0.0:
+        return list(active)
+    survivors: list[EmotionEvent] = []
+    for event in active:
+        factor = exponential_decay(event.decay_rate, dt_seconds)
+        event.intensity = event.intensity * factor
+        event.activation = event.activation * factor
+        if event.intensity >= config.emotion_retire_threshold:
+            survivors.append(event)
+    return survivors
+
+
+def apply_new_emotion_events(
+    *,
+    evaluations: Sequence[tuple[RawEvent, EmotionEvaluation]],
+    active: Sequence[EmotionEvent],
+    state: RuntimeState,
+    config: EmotionConfig,
+) -> tuple[list[EmotionEvent], list[EmotionEvent]]:
+    """Turn appraisals into mood motion and new impact events.
+
+    Mood is pulled toward the sign of each active impact, weighted by its
+    intensity relative to the current mood, and then relaxes back toward a
+    neutral baseline. Arousal moves with activation. Intensity of each event is
+    pulled slightly toward the mood it produced, so repeated events settle
+    instead of diverging.
+
+    Args:
+        evaluations: ``(source event, appraisal)`` pairs to fold in.
+        active: Existing active impact events.
+        state: Runtime state (mutated in place).
+        config: Emotion configuration.
+
+    Returns:
+        ``(mood_changed, new_events)``.
+    """
+    created: list[EmotionEvent] = []
+    mood_changed = False
+    values = state.values
+
+    for source, evaluation in evaluations:
+        if evaluation.impact <= config.min_event_impact:
+            # Too small to be worth an impact event; the appraisal itself is still
+            # available to callers and to the working situation.
+            continue
+        signed = evaluation.impact
+        if evaluation.direction == EmotionDirection.NEGATIVE.value:
+            signed = -signed
+        elif evaluation.direction == EmotionDirection.NEUTRAL.value:
+            signed = 0.0
+
+        # Long-memory residue: relation-relevant events with high stability
+        # orientation decay more slowly.
+        decay_rate = config.emotion_decay_rate
+        if evaluation.relation_signal in {"distance", "uncertain", "guilt", "loss"}:
+            decay_rate *= 1.0 - 0.35 * values.stability_commitment
+        decay_rate = max(0.005, decay_rate)
+
+        event = EmotionEvent(
+            emotion_event_id=new_id("emotion"),
+            source_event_id=source.event_id,
+            direction=evaluation.direction,
+            intensity=evaluation.impact,
+            activation=evaluation.activation,
+            target="user" if source.actor != "runtime" else "self",
+            semantic_label=None,
+            created_at=source.timestamp,
+            decay_rate=decay_rate,
+        )
+        created.append(event)
+
+        delta_v = signed * config.valence_pull_gain * (1.0 - 0.5 * abs(state.mood_valence))
+        delta_a = evaluation.activation * config.arousal_pull_gain
+        state.mood_valence = clamp(state.mood_valence + delta_v, -1.0, 1.0)
+        state.mood_arousal = clamp(state.mood_arousal + delta_a - 0.02, 0.0, 1.0)
+        state.mood_stability = clamp(
+            state.mood_stability - 0.5 * config.stability_pull_gain * evaluation.impact,
+            0.0,
+            1.0,
+        )
+        mood_changed = True
+
+    # Existing events keep shaping mood so that mood reflects the whole stack.
+    if active and not created:
+        for event in active:
+            signed = event.signed_intensity
+            state.mood_valence = clamp(
+                state.mood_valence + signed * config.valence_pull_gain * 0.25, -1.0, 1.0
+            )
+    return (created if mood_changed else []), created
+
+
+def mood_relax(state: RuntimeState, config: EmotionConfig, dt_seconds: float) -> None:
+    """Relax background mood toward baseline and update stability.
+
+    Args:
+        state: Runtime state (mutated in place).
+        config: Emotion configuration.
+        dt_seconds: Elapsed seconds.
+    """
+    if dt_seconds <= 0.0:
+        return
+    pull = config.mood_recovery_rate * min(dt_seconds, 86400.0)
+    recovery = min(0.9, pull)
+    state.mood_valence = clamp(state.mood_valence * (1.0 - recovery), -1.0, 1.0)
+    state.mood_arousal = clamp(state.mood_arousal * (1.0 - recovery * 1.2), 0.0, 1.0)
+    state.mood_stability = clamp(state.mood_stability + (0.70 - state.mood_stability) * recovery * 0.5, 0.0, 1.0)
+
+
+# --------------------------------------------------------------------------------------
+# Explanation layer
+# --------------------------------------------------------------------------------------
+
+
+class EmotionSemanticProvider(Protocol):
+    """Optional port for a semantic provider that renders the psychological cache.
+
+    Two call shapes are accepted so that both the legacy explanation port and the
+    patch-v0.2 :class:`~companion_runtime.providers.SemanticProvider` work here:
+    ``explain(payload)`` or ``explain_state(payload, state_key=...)``.
+    """
+
+    def explain(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Return first-person psychological language for ``payload``."""
+        ...
+
+
+TEMPLATES_POSITIVE = (
+    "我进来之前，整体是偏暖的，情绪往上走。",
+    "这一阵心里比较松，愿意多待一会儿。",
+    "最近的底色是轻快的，不太设防。",
+)
+TEMPLATES_NEGATIVE = (
+    "我进来之前，底色偏负，还有没消化完的东西。",
+    "这段时间情绪偏低，说出来会比平常收着。",
+    "近期一直有一点沉，还没完全过去。",
+)
+TEMPLATES_NEUTRAL = (
+    "我进来之前，整体比较平，没有强烈倾向。",
+    "这段时间基调平稳，我处在观察状态。",
+    "最近没有大起大落，底色是中性的。",
+)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Return ``value`` as a finite float, or ``default``.
+
+    Cache keys are built from persisted numbers, and a key builder that raises
+    because one column holds ``nan`` or a string would take the whole turn down.
+    A non-finite value is not a state the explainer can describe, so it is
+    normalised rather than allowed to poison the key.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number or number in (float("inf"), float("-inf")):
+        return default
+    return number
+
+
+#: How many cache-key segments may differ before a cached explanation is thrown away.
+#:
+#: The key carries nine segments and five of them are continuously moving numbers, so an
+#: exact-key lookup discards an entry over a 0.1 crossing (``v0.1`` -> ``v0.2``) whose six
+#: sentences would be identical - and re-rendering means a model call once a provider is
+#: configured. A real emotional move changes several segments at once (the sign, the top
+#: intensity and the dominant direction), so it still re-explains, and the TTL stays the
+#: backstop for a state that drifts forever without crossing anything.
+EXPLAIN_KEY_CHANGE_TOLERANCE = 2
+
+
+def _rounded(value: Any) -> float:
+    """Return one decimal of a persisted number, tolerating corrupt values."""
+    return round(_safe_float(value), 1)
+
+
+def _direction_token(dominant: EmotionEvent | None) -> str:
+    """Return a stable cache-key token for a dominant event's direction."""
+    if dominant is None:
+        return "none"
+    return str(dominant.direction or "none")
+
+
+def _label_token(dominant: EmotionEvent | None) -> str:
+    """Return a stable cache-key token for a dominant event's semantic label."""
+    if dominant is None:
+        return "none"
+    return str(dominant.semantic_label or "none")
+
+
+class EmotionExplainer:
+    """Translates structured state into first-person psychological context.
+
+    The explainer has no write access to Runtime state. Its output is injected
+    into the main LLM prompt for one turn and then discarded.
+    """
+
+    def __init__(
+        self,
+        projection: EmotionProjection,
+        config: RuntimeConfig,
+        provider: EmotionSemanticProvider | None = None,
+    ) -> None:
+        """Store the projection, configuration and optional semantic provider."""
+        self._projection = projection
+        self._config = config
+        self._provider = provider
+
+    @staticmethod
+    def cache_key(state: RuntimeState, active: Sequence[EmotionEvent]) -> str:
+        """Return a coarse cache key that changes only on meaningful movement.
+
+        The key carries the *identity* of the dominant emotion as well as its
+        intensity: an explanation is about one thing being felt, so replacing a
+        dominant negative event with a dominant positive one of the same magnitude
+        must invalidate the entry. Intensity alone did not - the two states produced
+        the same key and the old prose was served for the new feeling.
+        """
+        dominant = max(active, key=lambda event: event.intensity, default=None)
+        top = dominant.intensity if dominant is not None else 0.0
+        sign = "+" if state.mood_valence >= 0 else "-"
+        return "|".join(
+            [
+                f"v{_rounded(state.mood_valence)}",
+                f"a{_rounded(state.mood_arousal)}",
+                f"i{_rounded(state.approach_impulse)}",
+                f"r{_rounded(state.restraint)}",
+                f"p{_rounded(state.pressure)}",
+                f"m{top:.1f}",
+                sign,
+                f"d{_direction_token(dominant)}",
+                f"l{_label_token(dominant)}",
+            ]
+        )
+
+    @staticmethod
+    def should_re_explain(
+        previous_key: str | None, current_key: str, threshold_changes: int = 1
+    ) -> bool:
+        """Return whether the psychological state moved enough to re-explain.
+
+        Args:
+            previous_key: Cache key of the last explanation.
+            current_key: Cache key for the current state.
+            threshold_changes: How many differing key segments trigger a refresh.
+
+        Returns:
+            ``True`` when a re-explanation is warranted.
+        """
+        if not previous_key:
+            return True
+        previous = previous_key.split("|")
+        current = current_key.split("|")
+        differing = sum(1 for a, b in zip(previous, current) if a != b)
+        return differing >= threshold_changes
+
+    def explain(
+        self,
+        *,
+        state: RuntimeState,
+        active: Sequence[EmotionEvent],
+        now: datetime,
+        force: bool = False,
+        rng: random.Random | None = None,
+    ) -> dict[str, Any]:
+        """Return the current psychological context, using the cache when possible.
+
+        Args:
+            state: Current runtime state.
+            active: Active emotion events.
+            now: Reference time.
+            force: Bypass the cache.
+            rng: Random source used for template variety.
+
+        Returns:
+            A mapping with ``experience``, ``focus``, ``conflict``, ``impulse``,
+            ``inhibition`` and ``expression`` keys, plus ``source`` and ``cache_hit``.
+        """
+        key = self.cache_key(state, active)
+        if not force:
+            cached = self._projection.cached_explanation(
+                key, now, self._explanation_ttl_seconds()
+            )
+            if cached is not None:
+                return dict(cached) | {"cache_hit": True, "cache_key": key}
+            # Fuzzy hit: see EXPLAIN_KEY_CHANGE_TOLERANCE. Serving the last entry while
+            # less than that many segments differ keeps the cost proportional to how much
+            # actually moved instead of to how finely the key is quantised.
+            latest = self._projection.latest_explanation(now, self._explanation_ttl_seconds())
+            if latest is not None and not self.should_re_explain(
+                latest.get("cache_key"),
+                key,
+                threshold_changes=EXPLAIN_KEY_CHANGE_TOLERANCE,
+            ):
+                payload = latest.get("payload_json") or {}
+                if payload:
+                    return dict(payload) | {"cache_hit": True, "cache_key": key}
+
+        payload = self._build_input(state, active)
+        result = self._render(payload, rng or random.Random(0), cache_key=key)
+        result["source"] = "semantic" if self._semantic_available() else "template"
+        result["cache_hit"] = False
+        result["cache_key"] = key
+        return result
+
+    def _explanation_ttl_seconds(self) -> float:
+        """Return how long a cached interpretation stays valid.
+
+        Patch v0.2 section 15 states the real staleness rule as *event driven*
+        (the mood moved, the dominant active event changed, a major reappraisal
+        landed). The cache key already encodes the first two - it is recomputed
+        from the current mood and top intensity on every turn - so the key
+        changing is what invalidates the entry. This TTL is only the backstop for
+        a state that somehow stops moving.
+        """
+        configured = getattr(
+            getattr(self._config, "semantic", None), "interpretation_max_age_seconds", None
+        )
+        if configured:
+            return float(configured)
+        return float(self._config.task.explain_cache_ttl_seconds)
+
+    def _semantic_available(self) -> bool:
+        """Return whether a provider is present and can actually answer.
+
+        ``semantic.template_fallback = false`` is honoured here: with no usable
+        provider and the fallback disabled, the explainer returns nothing and the
+        caller omits the psychological section instead of inventing prose.
+        """
+        if self._provider is None:
+            return False
+        checker = getattr(self._provider, "available", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:  # noqa: BLE001 - an unavailable provider is absent
+                return False
+        return True
+
+    def explain_and_store(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        state: RuntimeState,
+        active: Sequence[EmotionEvent],
+        now: datetime,
+        force: bool = False,
+        rng: random.Random | None = None,
+    ) -> dict[str, Any]:
+        """Like :meth:`explain`, but persists the result in the explanation cache."""
+        result = self.explain(state=state, active=active, now=now, force=force, rng=rng)
+        if not result.get("cache_hit"):
+            stored = dict(result)
+            stored.pop("cache_hit", None)
+            self._projection.store_explanation(
+                connection,
+                cache_key=str(result["cache_key"]),
+                payload=stored,
+                source=str(result.get("source", "template")),
+                now=now,
+            )
+        return result
+
+    def _build_input(self, state: RuntimeState, active: Sequence[EmotionEvent]) -> dict[str, Any]:
+        """Assemble the structured input the explainer works from."""
+        dominant = max(active, key=lambda e: e.intensity, default=None)
+        return {
+            "background_mood": {
+                "valence": round(state.mood_valence, 3),
+                "arousal": round(state.mood_arousal, 3),
+                "stability": round(state.mood_stability, 3),
+            },
+            "active_emotions": [
+                {
+                    "target": e.target,
+                    "direction": e.direction,
+                    "intensity": round(e.intensity, 3),
+                    "semantic_label": e.semantic_label,
+                }
+                for e in sorted(active, key=lambda e: e.intensity, reverse=True)[:4]
+            ],
+            # The peak over *every* active event, not just the four listed above.
+            # :meth:`cache_key_from_payload` derives the same value from it, so the
+            # provider-side key matches the Runtime-side key even when the active set
+            # is longer than the payload's list.
+            "max_intensity": round(dominant.intensity, 3) if dominant is not None else 0.0,
+            "dominant": None
+            if dominant is None
+            else {
+                "direction": dominant.direction,
+                "intensity": round(dominant.intensity, 3),
+                "label": dominant.semantic_label,
+            },
+            "approach_impulse": round(state.approach_impulse, 3),
+            "restraint": round(state.restraint, 3),
+            "pressure": round(state.pressure, 3),
+        }
+
+    def _render(
+        self,
+        payload: dict[str, Any],
+        rng: random.Random,
+        *,
+        cache_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Render the explanation, delegating to the provider when available.
+
+        A provider is a *cache filler*, never a requirement: patch v0.2 keeps the
+        deep interpretation optional and falls back to the deterministic template.
+
+        Args:
+            payload: Structured state handed to the provider.
+            rng: Random source used for template variety.
+            cache_key: The caller's own cache key. It is passed to the provider so
+                that its cache and the Runtime's cache are keyed by exactly the same
+                string; recomputing one from the payload would let the two disagree
+                and serve prose the Runtime considers stale.
+        """
+        if self._provider is not None and self._semantic_available():
+            try:
+                provided = self._call_provider(payload, cache_key=cache_key)
+                required = {"experience", "impulse", "inhibition"}
+                if isinstance(provided, Mapping) and required.issubset(provided.keys()):
+                    return {
+                        "experience": str(provided.get("experience", "")),
+                        "focus": str(provided.get("focus", "")),
+                        "conflict": str(provided.get("conflict", "")),
+                        "impulse": str(provided.get("impulse", "")),
+                        "inhibition": str(provided.get("inhibition", "")),
+                        "expression": str(provided.get("expression", "")),
+                    }
+                LOGGER.info("Semantic provider returned no usable payload; using templates")
+            except Exception:  # pragma: no cover - defensive boundary around a model
+                LOGGER.exception("Semantic provider failed; falling back to templates")
+
+        if not getattr(getattr(self._config, "semantic", None), "template_fallback", True):
+            # The operator turned the deterministic fallback off, which means they
+            # prefer no psychological section over a generic one.
+            return {}
+
+        return self._render_template(payload, rng)
+
+    def _call_provider(self, payload: dict[str, Any], *, cache_key: str | None = None) -> Any:
+        """Call the provider through whichever explanation interface it offers.
+
+        The relevant cache key is passed through rather than recomputed from the
+        payload, so a provider that caches internally cannot collide two states the
+        Runtime treats as distinct.
+        """
+        explain_state = getattr(self._provider, "explain_state", None)
+        if callable(explain_state):
+            key = cache_key or EmotionExplainer.cache_key_from_payload(payload)
+            return explain_state(payload, state_key=key)
+        explain = getattr(self._provider, "explain", None)
+        if callable(explain):
+            return explain(payload)
+        return None
+
+    @staticmethod
+    def cache_key_from_payload(payload: Mapping[str, Any]) -> str:
+        """Return a cache key for a raw explainer payload.
+
+        Used when a provider is invoked with the payload but without a key, and by
+        the reducer when storing a provider-supplied interpretation. The segments
+        match :meth:`cache_key` exactly - including the dominant event's identity -
+        so a key built either way names the same state.
+        """
+        mood = payload.get("background_mood") or {}
+        dominant = payload.get("dominant") or {}
+        peak = payload.get("max_intensity")
+        if peak is None:
+            # A payload stored before ``max_intensity`` existed: the dominant entry is
+            # the best available source, and it is exact whenever the active set was
+            # short enough to be listed in full.
+            peak = dominant.get("intensity")
+        sign = "+" if _safe_float(mood.get("valence")) >= 0 else "-"
+        return "|".join(
+            [
+                f"v{_rounded(mood.get('valence'))}",
+                f"a{_rounded(mood.get('arousal'))}",
+                f"i{_rounded(payload.get('approach_impulse'))}",
+                f"r{_rounded(payload.get('restraint'))}",
+                f"p{_rounded(payload.get('pressure'))}",
+                f"m{_safe_float(peak):.1f}",
+                sign,
+                f"d{dominant.get('direction') or 'none'}",
+                f"l{dominant.get('label') or 'none'}",
+            ]
+        )
+
+    def _render_template(self, payload: dict[str, Any], rng: random.Random) -> dict[str, Any]:
+        """Compose the long-term background from deterministic templates.
+
+        Patch v0.2 redefined this function's job. It must **not** describe how the
+        current message should be received - the main LLM decides that from the
+        user's actual words. It only answers "roughly what state am I carrying
+        into this turn", so every phrase below is about the standing weather
+        rather than the present moment.
+        """
+        mood = payload["background_mood"]
+        valence = float(mood["valence"])
+        impulse = float(payload["approach_impulse"])
+        restraint = float(payload["restraint"])
+        pressure = float(payload["pressure"])
+        dominant = payload.get("dominant")
+
+        if valence > 0.12:
+            experience = rng.choice(TEMPLATES_POSITIVE)
+        elif valence < -0.12:
+            experience = rng.choice(TEMPLATES_NEGATIVE)
+        else:
+            experience = rng.choice(TEMPLATES_NEUTRAL)
+
+        if dominant is not None:
+            label = dominant.get("label")
+            if label:
+                focus = f"近期最占位置的是「{label}」这一类还没散掉的东西。"
+            elif dominant["direction"] == EmotionDirection.NEGATIVE.value:
+                focus = "有一件事还压着，具体叫什么我暂时说不上来。"
+            else:
+                focus = "有一件让人心里偏暖的事，还在余波里。"
+        else:
+            focus = "没有特别占位置的旧事，我的注意力比较散。"
+
+        if impulse > restraint + 0.15:
+            conflict = "长期下来我一直有靠近的倾向，同时又习惯性地收着。"
+            impulse_text = "总体上是想靠近的，只是未必马上行动。"
+        elif pressure > 0.45:
+            conflict = "压着不说的东西攒了一阵子，已经有点沉。"
+            impulse_text = "总体上有确认对方状态的倾向，但不急。"
+        else:
+            conflict = "长期来看我没什么明显的内部拉扯。"
+            impulse_text = "总体没有非做不可的倾向。"
+
+        if restraint > 0.68:
+            inhibition = "我表达上偏克制，不太主动施压。"
+            expression = "底色是收着的，话不多，但留有余地。"
+        elif restraint < 0.35:
+            inhibition = "我表达上顾虑不多，倾向于直说。"
+            expression = "底色是直接的，想到什么说什么。"
+        else:
+            inhibition = "我表达上看情况决定说多少。"
+            expression = "底色是平常的分寸，不高不低。"
+
+        return {
+            "experience": experience,
+            "focus": focus,
+            "conflict": conflict,
+            "impulse": impulse_text,
+            "inhibition": inhibition,
+            "expression": expression,
+        }
