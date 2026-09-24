@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "companion-framework"
+version = "0.1.0"
+description = "外接测试框架：可控虚拟时钟 + OpenAI 兼容 mock 端点 + 变量日志，用于驱动小九九 Runtime，且不修改原程序。"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "bomomoQWQ" }]
+keywords = ["testing", "harness", "virtual-clock", "openai-compatible", "companion"]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Testing",
+]
+
+# The framework itself is standard library only: it must be usable against a
+# program checkout without installing anything. uvicorn/fastapi belong to the
+# program, and the tests borrow the program's virtualenv to get them.
+dependencies = []
+
+[project.optional-dependencies]
+# Runtime dependencies, needed only to run the test suite and to boot a harness.
+run = [
+    "uvicorn>=0.27",
+    "fastapi>=0.110",
+]
+test = [
+    "pytest>=7.4",
+    "uvicorn>=0.27",
+    "fastapi>=0.110",
+]
+
+[project.scripts]
+cf = "cf.cli:main"
+
+[tool.setuptools]
+packages = ["cf"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q --strict-markers"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    # The suite deliberately runs under the program's virtualenv; site.py warns
+    # that sys.prefix and the interpreter path disagree. Harmless, and noisy.
+    "ignore:Unexpected value in sys.prefix:RuntimeWarning",
+    "ignore:Unexpected value in sys.exec_prefix:RuntimeWarning",
+]
+markers = [
+    "slow: boots a harness (needs the program checkout and uvicorn)",
+]
+
+[tool.ruff]
+line-length = 118
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

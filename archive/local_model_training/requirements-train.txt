@@ -1,0 +1,22 @@
+# =============================================================================
+# 训练依赖（BF16 LoRA / QLoRA）
+# =============================================================================
+# 安装：pip install -r requirements-train.txt
+#
+# 注意：torch 请按你的 CUDA 版本单独安装，例如
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# 直接用下面这行会装到 CPU 版 torch，训练会慢到不可用。
+# =============================================================================
+
+torch>=2.1
+transformers>=4.40
+peft>=0.10
+trl>=0.9
+datasets>=2.18
+accelerate>=0.29
+
+# QLoRA fallback（4bit 量化）需要
+bitsandbytes>=0.43
+
+# 训练指标记录（可选）
+# tensorboard>=2.15

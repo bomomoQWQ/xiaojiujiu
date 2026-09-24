@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.runtime/schemas/emotion_explain.input.schema.json",
+  "title": "emotion_explain_input",
+  "description": "2B 情绪解释器输入契约。512~1024 token 量级（架构文档 74.2）。输入即『已经存在的结构化心理状态』。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event",
+    "background_mood",
+    "active_emotions",
+    "approach_drive",
+    "restraint"
+  ],
+  "properties": {
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["char", "user"],
+      "properties": {
+        "char": {"type": "string", "minLength": 1, "maxLength": 200},
+        "user": {"type": "string", "minLength": 1, "maxLength": 200}
+      }
+    },
+    "background_mood": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valence", "arousal"],
+      "properties": {
+        "valence": {"type": "number", "minimum": -1, "maximum": 1},
+        "arousal": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "active_emotions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target", "cause", "direction", "intensity"],
+        "properties": {
+          "target": {"type": "string", "enum": ["user", "self", "situation", "third_party"]},
+          "cause": {"type": "string", "minLength": 1, "maxLength": 200},
+          "direction": {"type": "string", "enum": ["+", "-", "0", "+-"]},
+          "intensity": {"type": "number", "minimum": 0, "maximum": 1},
+          "semantic_label": {
+            "type": ["string", "null"],
+            "description": "深层情绪命名。null 是合法状态（系统可能只知道『中等负向影响』而尚不知具体是失落/委屈/焦虑）。"
+          },
+          "action_tendency": {"type": "string", "maxLength": 120}
+        }
+      }
+    },
+    "approach_drive": {"type": "number", "minimum": 0, "maximum": 1},
+    "restraint": {"type": "number", "minimum": 0, "maximum": 1},
+    "conflict_present": {
+      "type": "boolean",
+      "description": "Runtime 已知是否存在内心冲突结构。为 false 时解释器不得虚构冲突。省略表示未知。"
+    }
+  }
+}

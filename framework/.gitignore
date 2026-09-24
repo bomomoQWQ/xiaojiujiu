@@ -1,0 +1,19 @@
+# 运行产物：每次 cf run 都写一份 trace.jsonl / framework.log / 原程序数据库
+runs/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.jsonl
+
+# 自己的客户端配置：cf config init cf.toml 生成。模板（cf.toml.example）
+# 和它脚手架出来的 personas/*.md 是要提交的范例。
+cf.toml
+cf.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/

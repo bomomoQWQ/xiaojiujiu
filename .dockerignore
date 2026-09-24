@@ -1,0 +1,48 @@
+# Nothing here is needed to build the Runtime image, and some of it must never
+# leave this machine (credentials live in the environment, the upstream checkout
+# lives in its own repository, snapshots and databases are private state).
+
+.git
+.github
+.vscode
+.idea
+
+# Upstream AstrBot checkout
+AstrBot
+
+# Local environments and caches
+.venv
+.venv-dev
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+
+# Private state and backups
+data
+**/data/*.sqlite3
+**/*.sqlite3
+**/*.sqlite3-wal
+**/*.sqlite3-shm
+**/*.db
+**/*.db-wal
+**/*.db-shm
+*.bundle
+backups
+
+# Abandoned local-model route and one-off tooling
+archive
+scripts
+.scratch_*
+
+# Test suites are not shipped in the image
+runtime/tests
+
+# The adapter is a separate repository; compose bind-mounts it at run time, so it
+# has no business being in the build context either.
+astrbot_plugin_companion_runtime
+
+# Environment files must never enter an image layer
+.env
+.env.*

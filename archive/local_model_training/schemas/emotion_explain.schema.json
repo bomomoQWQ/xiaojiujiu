@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.runtime/schemas/emotion_explain.schema.json",
+  "title": "emotion_explain",
+  "description": "2B 情绪解释器输出。把『已经存在的』结构化心理状态翻译成人类可理解的第一人称心理语言。它不是生成情绪，不决定行为，不写台词，不修改 Runtime 状态。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "experience",
+    "focus",
+    "conflict",
+    "impulse",
+    "inhibition",
+    "expression"
+  ],
+  "properties": {
+    "experience": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 80,
+      "description": "第一人称的感受描述。强度必须与输入的 intensity / valence / arousal 相符，不得放大也不得抹平。"
+    },
+    "focus": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 80,
+      "description": "此刻最在意、注意力落在哪里。"
+    },
+    "conflict": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 80,
+      "description": "内心冲突结构。若输入确实没有冲突，用一句话说明当前不构成冲突。"
+    },
+    "impulse": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 80,
+      "description": "冲动/倾向。必须与输入的 approach_drive 方向一致。"
+    },
+    "inhibition": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 80,
+      "description": "节制/抑制。必须与输入的 restraint 水平一致。"
+    },
+    "expression": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 80,
+      "description": "表达的总体风格取向（如克制/外露），不是台词本身。"
+    },
+    "restraint_evidence": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 80,
+      "description": "可选。当节制作用体现在 conflict 而非 inhibition 时，用它显式给出节制依据（架构文档 §11.2 示例把『不想显得太依赖』放在 conflict）。"
+    }
+  }
+}

@@ -1,0 +1,26 @@
+# =============================================================================
+# 推理 / 量化依赖
+# =============================================================================
+# 安装：pip install -r requirements-infer.txt
+#
+# 包含两部分：
+#   1. GGUF 转换（convert_hf_to_gguf.py 需要 gguf/sentencepiece/protobuf）
+#   2. llama.cpp Python 绑定（eval / bench 的 llama_cpp 后端）
+#
+# llama-cpp-python 在 Windows 上建议用预编译 wheel，或先装 Visual Studio
+# Build Tools。源码编译很慢，且需要 CMake。
+# =============================================================================
+
+# --- GGUF 转换依赖（配合 llama.cpp 仓库里的 convert_hf_to_gguf.py） ---
+gguf>=0.10
+sentencepiece>=0.2
+protobuf>=4.25
+numpy>=1.24
+
+# --- llama.cpp CPU 推理后端 ---
+# Windows + CUDA 可用预编译源：
+#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+llama-cpp-python>=0.2.70
+
+# --- 内存观测（benchmark 里估算进程 RSS，可选） ---
+psutil>=5.9
