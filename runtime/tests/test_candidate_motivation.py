@@ -15,6 +15,7 @@ from companion_runtime.db import Database
 from companion_runtime.projections import Projections
 from companion_runtime.runtime import Runtime
 from companion_runtime.typing import (
+    ActivatedMemory,
     CandidateIntent,
     CandidateOp,
     CandidateStatus,
@@ -165,6 +166,72 @@ def test_memory_candidates_require_enough_confidence() -> None:
         now=BASE_TIME,
     )
     assert not [item for item in produced if item.type == "curious_question"]
+
+
+def _activated(memory_id: str, summary: str, kind: str = "episodic") -> tuple:
+    """One (activation, memory) pair, both strong enough to produce a candidate."""
+    return (
+        ActivatedMemory(memory_id=memory_id, activation=0.9),
+        Memory(memory_id=memory_id, kind=kind, summary=summary, importance=0.8),
+    )
+
+
+def _curious(produced: list) -> list:
+    return [item for item in produced if item.type == "curious_question"]
+
+
+def test_two_memories_of_one_kind_both_become_candidates() -> None:
+    """A candidate's subject is the memory, not its kind.
+
+    Imported memories carry no topics, and the old target (``", ".join(topics[:3]) or
+    memory.kind``) then collapsed every memory of a kind onto one string. ``existing_targets``
+    is a plain set, so only the first was ever admitted: measured on the beta (2026-09-25),
+    the person holding 50 live memories had 2 live candidates, which leaves the pool able to
+    offer only the same thing again.
+    """
+    produced = candidate_module.generate(
+        state=RuntimeState(),
+        config=RuntimeConfig(),
+        activated=[
+            _activated("mem_1", "他两点五十下课"),
+            _activated("mem_2", "他四点上课、五点二十下课"),
+        ],
+        existing=[],
+        now=BASE_TIME,
+    )
+    curious = _curious(produced)
+    assert len(curious) == 2, "两条不同的记忆应该各出一个候选"
+    assert curious[0].target != curious[1].target
+
+
+def test_a_memory_without_topics_is_named_by_its_summary() -> None:
+    """The target has to read as the memory: the subject guard matches text against it."""
+    memory = Memory(
+        memory_id="mem_1", kind="preference", summary="他喜欢喝拿铁", importance=0.8
+    )
+    candidate = candidate_module._memory_candidate(
+        ActivatedMemory(memory_id="mem_1", activation=0.9),
+        memory,
+        now=BASE_TIME,
+        config=RuntimeConfig(),
+    )
+    assert "拿铁" in candidate.target
+    assert candidate.target != memory.kind
+
+
+def test_one_memory_is_only_offered_once() -> None:
+    """Two rows about the same thing are still one thought."""
+    produced = candidate_module.generate(
+        state=RuntimeState(),
+        config=RuntimeConfig(),
+        activated=[
+            _activated("mem_1", "他两点五十下课"),
+            _activated("mem_2", "他两点五十下课"),
+        ],
+        existing=[],
+        now=BASE_TIME,
+    )
+    assert len(_curious(produced)) == 1
 
 
 def test_candidate_validation_rejects_groundless_thoughts() -> None:

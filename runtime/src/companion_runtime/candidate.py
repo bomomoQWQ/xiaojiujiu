@@ -153,6 +153,46 @@ MAX_REPLY_PER_ROUND = 1
 #: about something the character did, so it must not produce an apology.
 REPAIR_BOUNDARY_TYPES: frozenset[str] = frozenset({"topic", "permanent", "conditional"})
 
+#: How much of a memory summary names the memory as a candidate's subject, and the label
+#: that keeps that subject distinct from a candidate keyed on the same raw text.
+MEMORY_SUBJECT_LIMIT = 40
+MEMORY_SUBJECT_PREFIX = "记忆："
+
+
+def _memory_subject(memory: Memory) -> str:
+    """Return the subject that identifies *this* memory among candidate subjects.
+
+    Deliberately the summary, not ``", ".join(memory.topics[:3]) or memory.kind``. The
+    stored topics are the first six **characters** of the message that produced the memory
+    (``tokenize`` splits CJK per character), and a memory that arrived through an import
+    carries no topics at all - and that expression was the target of every memory-derived
+    candidate. ``existing_targets`` (in :func:`generate`) and ``plan_operations`` key
+    candidates by that string, so identical targets mean "this thought already exists":
+    every memory of a kind collapsed onto one key and exactly one candidate per kind was
+    ever admitted. Measured on the beta (2026-09-25), the person holding 50 live memories had
+    2 live candidates, which leaves the pool able to offer only the same thing again - the
+    material-level repetition the count-level ``repeat_cost`` cannot see.
+
+    The summary keeps the key per-memory and still reads as text, which the subject guard in
+    ``runtime`` needs: it matches ``target + intent`` against the subjects already spoken
+    for. The 记忆： prefix keeps it distinct from the reply shape, which keys on the
+    *question's* own text - a memory summary is written from that same text, so
+    un-namespaced the two produce the same key and one of them silently loses (measured: the
+    reply shape stopped being produced at all).
+
+    Args:
+        memory: The memory the candidate is about.
+
+    Returns:
+        A prefixed summary excerpt (ellipsised when long), or the memory's kind when it has
+        no summary to quote.
+    """
+    summary = " ".join((memory.summary or "").split())
+    if summary:
+        return MEMORY_SUBJECT_PREFIX + summarize_text(summary, limit=MEMORY_SUBJECT_LIMIT)
+    return memory.kind or "memory"
+
+
 #: What a boundary scope means when it becomes an apology, in the operator's language.
 _BOUNDARY_SCOPE_LABELS: Mapping[str, str] = {
     "topic_avoid": "提到了用户不想聊的话题",
@@ -427,13 +467,12 @@ def _memory_candidate(
     activation: ActivatedMemory, memory: Memory, *, now: datetime, config: RuntimeConfig
 ) -> CandidateIntent:
     """Build a curiosity candidate from an activated memory."""
-    topics = ", ".join(memory.topics[:3])
     return CandidateIntent(
         candidate_id=new_id("candidate"),
         type="curious_question",
         intent=f"聊起之前记过的事：{memory.summary[:40]}",
         goal="延续共同经历，保持联系的连续性",
-        target=topics or memory.kind,
+        target=_memory_subject(memory),
         sources=[f"{MEMORY_SOURCE_PREFIX}{memory.memory_id}"],
         constraints=["不要重复追问同一件事"],
         preconditions=[],
@@ -513,7 +552,6 @@ def _share_candidate(
         The candidate, ready for the pool manager.
     """
     excerpt = (memory.summary or "").strip()[:40]
-    topics = ", ".join(memory.topics[:3])
     sources = [f"{MEMORY_SOURCE_PREFIX}{memory.memory_id}"]
     if emotion is not None:
         sources.append(f"{EMOTION_SOURCE_PREFIX}{emotion.emotion_event_id}")
@@ -522,7 +560,7 @@ def _share_candidate(
         type="share",
         intent=f"主动提起我记得的事：{excerpt}",
         goal="把自己记得的东西拿出来分享，而不是又一次向用户提问",
-        target=topics or memory.kind,
+        target=_memory_subject(memory),
         sources=sources,
         constraints=["不要变成考问用户是否还记得", "一次只说一件事"],
         # No precondition: the premise of a share is "this memory is in the working
