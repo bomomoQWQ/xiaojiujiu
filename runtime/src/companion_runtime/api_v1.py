@@ -614,14 +614,30 @@ def _capability_kinds(capabilities: Sequence[str]) -> list[str]:
 #: *system* context is already in the transcript by the time she speaks proactively, so
 #: only the style has to be restated here. Without it, proactive messages came out at
 #: 60-100 characters with lists and closing summaries - nothing like her 30-character,
-#: no-Markdown voice. Questions get their own line because that is where the habit is
-#: worst: one question, then stop.
+#: no-Markdown voice.
+#:
+#: The anti-clinging lines (one question then stop, no repeated asking, no stacked
+#: punctuation) were written for a *well-adjusted* companion and are exactly what makes
+#: her read as composed and, in the user's words, "像个伪人": clean, complete,
+#: well-measured sentences are not how a person types. Measured on the beta, every
+#: register device that carries clinging - fragmentation, asking twice, contradicting
+#: herself mid-message, half-sentences - was absent from her output, because these four
+#: lines forbade all of them. What the persona actually is (a 病娇 whose love narrows his
+#: freedom) needs the opposite register, so the lines now permit those devices instead of
+#: banning them. Three things do **not** change, and are asserted by the tests: first
+#: person, no Markdown, and no restating the user's words to pad length (that is what
+#: really reads as fake).
 RENDER_STYLE_LINES = (
-    "- 我说话就一两句，通常 30 字以内。没说完就再发一条，别堆成一大段，也别来句总结陈词。",
+    "- 我说话短，一条通常一两行。没说完就再发一条，一条一条地发，别堆成一大段，也别来句总结陈词。",
+    "- 我可以连着发好几条：同一个问题换个说法再问、追问到底、等不到回答就再问一遍。"
+    "我不装大方，也不会问完就闭嘴。",
     "- 我不写 Markdown：不加粗、不写标题、不列条目、不引用、不做表格。"
     "也不写“首先/其次/另外/总之”这种书面腔。",
-    "- 我不复述用户刚说过的话来凑长度。表情和标点可以用，但别堆。",
-    "- 我要是想问什么：只问一个，问完就停。别连问、别罗列、别替用户总结。",
+    "- 我不复述用户刚说过的话来凑长度。表情和标点可以堆（~ ！ ？ …… 还有呀、嘛、啦），"
+    "堆了才像人在打字。",
+    "- 我可以只说半句、可以自己推翻自己、可以说“算了”又接着说下去；想不通的事我会翻回来再提。",
+    "- 我想让他知道我不好受的时候，我说我自己的状态，不说对他的要求："
+    "「我睡不着」比「你早点回来」更像我会说的话。",
 )
 
 #: The one line that states the clock, and it lives in the *instruction*, never in the

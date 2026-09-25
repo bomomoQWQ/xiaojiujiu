@@ -711,6 +711,31 @@ class TestRemoteAPIProvider:
         assert "短句、口语" in DEEP_REFRESH_SYSTEM_PROMPT
         assert "不要书面语" in DEEP_REFRESH_SYSTEM_PROMPT
 
+    def test_the_reappraisal_asks_her_to_justify_herself_not_to_absolve_him(self) -> None:
+        """重评（reinterpretations.content）原先只写了"当时那句话的意思"，没规定写给谁看。
+
+        模型于是稳定地写出**替对方找台阶**的解释 —— 实测样本：「他说『只是网友』，是在划清
+        界限，也是在提醒我别越界」「前面那句大概是气话或者试探」。那是一个已经把情绪消化掉的
+        人说的话，而这段文本会被注入主模型每轮读的块里，于是她拿到的是"已经放下"的状态，
+        只能演成嘴硬心软（用户的原话：现在这个角色像个傲娇）。病娇不能消化，账要留着。
+        """
+        from companion_runtime.providers import DEEP_REFRESH_SYSTEM_PROMPT
+
+        assert "她写给自己的话" in DEEP_REFRESH_SYSTEM_PROMPT
+        assert "给自己编理由" in DEEP_REFRESH_SYSTEM_PROMPT
+        assert "不要替对方找台阶" in DEEP_REFRESH_SYSTEM_PROMPT
+        assert "账可以留着不结" in DEEP_REFRESH_SYSTEM_PROMPT
+
+    def test_the_reappraisal_keeps_the_first_person_voice(self) -> None:
+        """用户 2026-09-25 的硬约束：语气和心理描写可以病娇化，**叙述视角不动**。
+
+        写成第三人称的分析腔（"她其实是在…"）会让这段文本变成一份角色说明，
+        而不是她自己写给自己的话；注入给主模型之后，人味也就没了。
+        """
+        from companion_runtime.providers import DEEP_REFRESH_SYSTEM_PROMPT
+
+        assert "第一人称" in DEEP_REFRESH_SYSTEM_PROMPT
+
     def test_bearer_token_is_sent_but_never_stored_in_headers_dict(self) -> None:
         transport = FakeTransport(lambda *_: _reply(GOOD_SUGGESTIONS))
         provider = RemoteAPIProvider(
@@ -898,3 +923,40 @@ class TestProtocolConformance:
         result = _suggestions_payload()
         assert result.degraded is False
         assert isinstance(result, DeepRefreshSuggestions)
+
+
+class TestRenderStyleLines:
+    """主动消息的渲染风格行：黏人版。
+
+    用户点名（2026-09-25）："语气还是太不病娇了……直白说这语气 tm 像个伪人"。原因很具体 ——
+    旧的四条（"一两句、30 字以内""只问一个，问完就停""表情和标点可以用，但别堆"）本身是
+    **去黏人**的：每条都干净、完整、一次说清、有分寸，而干净就是没人味。黏人的本质是违反
+    这些规则：重复、追问、说不完整、堆标点、自己推翻自己。
+    """
+
+    def test_clinging_devices_are_allowed(self) -> None:
+        from companion_runtime.api_v1 import RENDER_STYLE_LINES
+
+        joined = "\n".join(RENDER_STYLE_LINES)
+        assert "连着发好几条" in joined
+        assert "换个说法再问" in joined
+        assert "堆了才像人在打字" in joined
+        assert "只说半句" in joined
+
+    def test_the_anti_clinging_rules_are_gone(self) -> None:
+        from companion_runtime.api_v1 import RENDER_STYLE_LINES
+
+        joined = "\n".join(RENDER_STYLE_LINES)
+        assert "只问一个，问完就停" not in joined
+        assert "别连问" not in joined
+        assert "但别堆" not in joined
+
+    def test_the_three_invariants_survive(self) -> None:
+        """三条不动：第一人称 / 不写 Markdown / 不复述用户的话（复述才是真的假）。"""
+        from companion_runtime.api_v1 import RENDER_STYLE_LINES
+
+        joined = "\n".join(RENDER_STYLE_LINES)
+        for line in RENDER_STYLE_LINES:
+            assert line.startswith("- 我"), line
+        assert "我不写 Markdown" in joined
+        assert "我不复述用户刚说过的话" in joined
