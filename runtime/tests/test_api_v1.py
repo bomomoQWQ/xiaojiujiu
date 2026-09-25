@@ -745,15 +745,23 @@ def test_v1_render_prompt_carries_the_style_contract(client: TestClient, runtime
     The system context is already in the transcript by then, so only the style contract
     has to live in the prompt. Measured before the fix: proactive messages ran 60-100
     characters, with list formatting and closing summaries, i.e. nothing like her.
+
+    The contract changed on 2026-09-25: the old lines ("30 字以内", "只问一个，问完就停",
+    "标点别堆") were written for a well-adjusted companion and made her read as composed -
+    the user's words: "这语气 tm 像个伪人". Clinging *is* the violation of exactly those
+    rules, so the lines now permit repeating a question, contradicting herself and
+    stacking punctuation. Three things stay pinned: first person, no Markdown, and no
+    restating the user's words to pad length.
     """
     commit_attempt(runtime)
     payload = lease(client)["items"][0]["payload"]
     prompt = payload["prompt"]
 
-    assert "30 字以内" in prompt
+    assert "我说话短" in prompt
     assert "我不写 Markdown" in prompt
-    # The question habit gets its own rule: that is where the failure was worst.
-    assert "只问一个" in prompt
+    # The clinging devices are allowed now: that is where the failure was.
+    assert "换个说法再问" in prompt
+    assert "我不复述用户刚说过的话" in prompt
     # The style contract must not swallow the render instruction itself.
     assert "只回正文本身" in prompt
     assert payload["intent"] == "询问面试结果"
