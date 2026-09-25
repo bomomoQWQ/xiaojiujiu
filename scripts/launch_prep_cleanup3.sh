@@ -138,7 +138,9 @@ IMAGE=$(docker inspect xxj-runtime-fleet --format '{{.Config.Image}}')
 runtime_cli() {
   person="$1"
   shift
-  docker run --rm --entrypoint companion-runtime \
+  # `-i` 不能少：`memories import -` 是从 stdin 读 JSON 的。少了它容器 stdin 不接，
+  # CLI 读到空输入直接 `Expecting value: line 1 column 1`（09-22 那次就是这么发现的 ✗）。
+  docker run --rm -i --entrypoint companion-runtime \
     -e CR_STORAGE__DATABASE_PATH="/data/$person/companion.sqlite3" \
     -v astrbot_test_runtime-fleet-data:/data "$IMAGE" "$@"
 }
