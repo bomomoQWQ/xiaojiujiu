@@ -21,7 +21,11 @@
 set -eu
 STACK=/home/bomomo/astrbot_test
 BETA=/mnt/xz/xiaojiujiu-beta
-SNAP="$BETA/snapshots/2026-09-22_1833"
+# 快照目录必须**跟着这次的 STAMP 走**：v3 的注释说改成了"用今天的时间戳"，实际那行
+# 还是硬编码 `2026-09-22_1833` ✗ —— 再跑一次就会把 09-22 那份快照的 boundaries 覆盖掉。
+# 现在真的按时间戳生成，并且允许用环境变量覆盖（SNAP=... bash launch_prep_cleanup3.sh）。
+SNAP="${SNAP:-$BETA/snapshots/$(date +%Y-%m-%d_%H%M)}"
+export SNAP
 STAMP=$(date +%Y%m%d-%H%M%S)
 
 echo "=== 0) 前置检查：NapCat 必须在停 ==="
