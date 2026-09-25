@@ -3032,6 +3032,60 @@ class Runtime:
             retired.append(candidate.candidate_id)
         return retired
 
+    #: How many of her own recent lines a render prompt is shown.
+    RECENT_OUTGOING_LINES = 6
+
+    def recent_outgoing_lines(self, *, limit: int = 0):
+        """Return her last few outgoing lines, oldest first.
+
+        A proactive render is a one-shot ``llm_generate`` **with no transcript**: the model
+        cannot see what it just said. Measured on the beta (2026-09-25): a render 45 seconds
+        after a reply repeated the same two questions (「几点回」/「外套穿厚的」), and that
+        decision's own sheet showed ``repeat_cost = 0.0``. Neither existing guard covers the
+        case - ``repeat_cost`` counts *contacts* inside a six-hour window, and
+        ``memory_callback_cooldown_hours`` guards the *material* of a memory opener - so the
+        render has to be told outright what it must not say again.
+
+        Both halves of "what she said" are needed: the proactive lines live on the sent
+        attempts (``committed != sent``: only what actually went out counts), and the
+        replies arrive as the ``assistant_message`` events the host reports every turn.
+
+        Args:
+            limit: How many lines to keep (newest win). ``0`` uses
+                :data:`RECENT_OUTGOING_LINES`.
+
+        Returns:
+            Up to ``limit`` lines, oldest first. Empty when she has not spoken yet.
+        """
+        wanted = int(limit or self.RECENT_OUTGOING_LINES)
+        if wanted <= 0:
+            return []
+        found: list[tuple[float, str]] = []
+        for attempt in self.projections.attempts.list_by_state(
+            [AttemptState.SENT.value], limit=ATTRIBUTION_SCAN_LIMIT, newest_first=True
+        ):
+            text = str(getattr(attempt, "rendered_text", "") or "").strip()
+            moment = ensure_aware(attempt.committed_at or attempt.created_at)
+            if text and moment is not None:
+                found.append((moment.timestamp(), text))
+        for event in self.events.read(
+            EventQuery(event_types=[EventType.ASSISTANT_MESSAGE.value], limit=40, newest_first=True)
+        ):
+            text = str(
+                getattr(event, "content", "") or getattr(event, "text", "") or ""
+            ).strip()
+            moment = ensure_aware(
+                getattr(event, "created_at", None) or getattr(event, "occurred_at", None)
+            )
+            if text and moment is not None:
+                found.append((moment.timestamp(), text))
+        found.sort(key=lambda pair: pair[0])
+        lines: list[str] = []
+        for _stamp, text in found:
+            if text not in lines:
+                lines.append(text)
+        return lines[-wanted:]
+
     def _recently_spoken_memory_ids(self, *, now: datetime) -> set[str]:
         """Return memory ids already used as a proactive opener inside the cooldown.
 

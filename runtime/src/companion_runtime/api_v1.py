@@ -605,6 +605,18 @@ def _capability_kinds(capabilities: Sequence[str]) -> list[str]:
     return kinds
 
 
+#: The "don't say the same thing again" block, stated above the style contract.
+#:
+#: A proactive render is a one-shot ``llm_generate`` with **no transcript**, so the model
+#: cannot look up what it just said: measured on the beta (2026-09-25), a render 45 seconds
+#: after a reply repeated the same two questions (「几点回」/「外套穿厚的」), and that
+#: decision's own sheet showed ``repeat_cost = 0.0``. Neither existing guard covers that
+#: case - ``repeat_cost`` counts *contacts* inside a six-hour window, and
+#: ``memory_callback_cooldown_hours`` guards the *material* of a memory opener - so the
+#: Runtime states her own last lines here and says what to do with them.
+RENDER_ALREADY_SAID_HEADER = "- 我刚说过这些（别再说一遍，也别换个说法再说）："
+
+
 #: The style contract a render prompt must carry itself.
 #:
 #: A render is a one-shot ``llm_generate`` call: AstrBot never decorates it with the
@@ -765,6 +777,10 @@ def _render_payload(
         lines.append(f"- 为的是：{goal}")
     for constraint in constraints:
         lines.append(f"- 约束：{constraint}")
+    already_said = runtime.recent_outgoing_lines()
+    if already_said:
+        lines.append(RENDER_ALREADY_SAID_HEADER)
+        lines.extend("  · " + line for line in already_said)
     lines.extend(RENDER_STYLE_LINES)
     lines.append("- 只回正文本身：别解释、别复述上面的背景、别提这些说明。")
     return {
