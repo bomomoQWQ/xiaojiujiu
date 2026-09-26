@@ -752,6 +752,11 @@ def test_v1_render_prompt_carries_the_style_contract(client: TestClient, runtime
     rules, so the lines now permit repeating a question, contradicting herself and
     stacking punctuation. Three things stay pinned: first person, no Markdown, and no
     restating the user's words to pad length.
+
+    It changed again on 2026-09-26: the burst permission overshot (one proactive
+    good-morning came out as 172 characters in 5-8 sentences) and the user's own target for
+    a turn is 2-3 sentences, so the cap is now on the whole turn and the annotations are
+    banned - the same two rules her hand-written persona got.
     """
     commit_attempt(runtime)
     payload = lease(client)["items"][0]["payload"]
@@ -759,8 +764,9 @@ def test_v1_render_prompt_carries_the_style_contract(client: TestClient, runtime
 
     assert "我说话短" in prompt
     assert "我不写 Markdown" in prompt
-    # The clinging devices are allowed now: that is where the failure was.
-    assert "换个说法再问" in prompt
+    # Clinging stays, but as a follow-up rather than a monologue.
+    assert "我这一轮总共就说两三句" in prompt
+    assert "我也不给自己做注脚" in prompt
     assert "我不复述用户刚说过的话" in prompt
     # The style contract must not swallow the render instruction itself.
     assert "只回正文本身" in prompt

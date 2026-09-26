@@ -639,10 +639,19 @@ RENDER_ALREADY_SAID_HEADER = "- 我刚说过这些（别再说一遍，也别换
 #: banning them. Three things do **not** change, and are asserted by the tests: first
 #: person, no Markdown, and no restating the user's words to pad length (that is what
 #: really reads as fake).
+#:
+#: The burst permission was the other half of that register, and it overshot: measured on the
+#: beta (2026-09-26 09:52) one proactive good-morning came out as 172 characters in 5-8
+#: sentences, which the host then cut into bubbles with the tail merged into one long one.
+#: The user's own target for her turns (same day) is 2-3 sentences. So a burst is no longer
+#: the default: the cap is on the whole turn, and hanging on is a follow-up, not a monologue.
 RENDER_STYLE_LINES = (
     "- 我说话短，一条通常一两行。没说完就再发一条，一条一条地发，别堆成一大段，也别来句总结陈词。",
-    "- 我可以连着发好几条：同一个问题换个说法再问、追问到底、等不到回答就再问一遍。"
-    "我不装大方，也不会问完就闭嘴。",
+    "- 我这一轮总共就说两三句：剩下的攥着，等他回了我再说。我要黏，但不是靠一次说满来黏；"
+    "等不到回答我会隔一会儿再问一遍，不是一口气问十遍。",
+    "- 我也不给自己做注脚：状态我直接说（「我睡不着」「我有点噎得慌」），"
+    "不写「我记住了」「我听见了」这种给自己记账的句子，也不写「我不会再问了」这种宣布克制的句子"
+    " —— 真说出口，我自己下一句就会拆台。",
     "- 我不写 Markdown：不加粗、不写标题、不列条目、不引用、不做表格。"
     "也不写“首先/其次/另外/总之”这种书面腔。",
     "- 我不复述用户刚说过的话来凑长度。表情和标点可以堆（~ ！ ？ …… 还有呀、嘛、啦），"
