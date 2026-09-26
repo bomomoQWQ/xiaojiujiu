@@ -934,14 +934,27 @@ class TestRenderStyleLines:
     这些规则：重复、追问、说不完整、堆标点、自己推翻自己。
     """
 
-    def test_clinging_devices_are_allowed(self) -> None:
+    def test_clinging_survives_as_a_follow_up(self) -> None:
+        """黏人还在，但不是"一口气说满"：一轮两三句，剩下的等他回了再说。
+
+        用户实测（2026-09-26 09:52）：一条主动问候渲染成 172 字、5–8 句，而他自己给的
+        音量目标是**一轮 2–3 句**，所以连发从"默认"降级成"追问时的做法"。
+        """
         from companion_runtime.api_v1 import RENDER_STYLE_LINES
 
         joined = "\n".join(RENDER_STYLE_LINES)
-        assert "连着发好几条" in joined
-        assert "换个说法再问" in joined
+        assert "我这一轮总共就说两三句" in joined
+        assert "等不到回答我会隔一会儿再问一遍" in joined
         assert "堆了才像人在打字" in joined
         assert "只说半句" in joined
+
+    def test_she_does_not_annotate_herself(self) -> None:
+        """不给自己的心里活动做注脚，也不宣布克制 —— 和人格 v9 同一条规矩。"""
+        from companion_runtime.api_v1 import RENDER_STYLE_LINES
+
+        joined = "\n".join(RENDER_STYLE_LINES)
+        assert "我也不给自己做注脚" in joined
+        assert "我不会再问了" in joined
 
     def test_the_anti_clinging_rules_are_gone(self) -> None:
         from companion_runtime.api_v1 import RENDER_STYLE_LINES
