@@ -347,9 +347,9 @@ def _fallback_block(bundle: Any) -> str:
     time_context = _mapping(getattr(bundle, "time_context", {}))
     lines = [context_module.PRIORITY_PREAMBLE, "", context_module.SECTION_TIME]
     if time_context.get("hours_since_last_user_message") is not None:
-        lines.append(f"- 距离上次用户消息：{time_context['hours_since_last_user_message']} 小时")
+        lines.append(f"他上次开口是 {time_context['hours_since_last_user_message']} 小时前")
     if time_context.get("hours_since_last_contact") is not None:
-        lines.append(f"- 距离上次主动联系：{time_context['hours_since_last_contact']} 小时")
+        lines.append(f"我上次主动找他是 {time_context['hours_since_last_contact']} 小时前")
     # No clock here either, for the same reason ``context.render_block`` states none:
     # a duration is cognition, a clock is performance, and the performance states it
     # itself (``_context_text`` returns it from the bundle regardless of which block was
@@ -357,7 +357,7 @@ def _fallback_block(bundle: Any) -> str:
     # *ISO* form, on a line labelled 当前本地时间 - which is the very shape that put every
     # prompt eight hours off before it was fixed once already.
     lines.append("")
-    lines.append("以上都只是我进来之前的状态，是一轮的临时背景，别照抄，也别写进长期记录。")
+    lines.append("上面这些是我进这句话之前的样子，是我自己脑子里的事，别照着念，也别写进长期记忆。")
     return "\n".join(lines)
 
 

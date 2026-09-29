@@ -141,7 +141,7 @@ def test_the_block_never_states_a_clock() -> None:
         assert "当前本地时间" not in block
         assert "- 现在是：" not in block
         # 认知性的时长留着：它不是钟。
-        assert "距离上次用户消息" in block
+        assert "他上次开口是" in block
     finally:
         runtime.close()
 

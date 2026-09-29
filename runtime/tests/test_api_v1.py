@@ -802,7 +802,7 @@ def test_v1_render_prompt_states_the_clock_with_the_task(
     # Only the clock moved: the time section survives in the block, so "how long since
     # we last spoke" stays where it was - it is cognition, not a performance parameter.
     assert "【时间上的事】" in prompt
-    assert "以上都只是我进来之前的状态" in prompt
+    assert "上面这些是我进这句话之前的样子" in prompt
 
     # It must be the local wall clock, not an ISO stamp on a line labelled 现在是 - and
     # the draft's own anchor must be stated next to it. "Now" alone cannot tell the render
