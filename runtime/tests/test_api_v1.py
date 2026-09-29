@@ -762,12 +762,12 @@ def test_v1_render_prompt_carries_the_style_contract(client: TestClient, runtime
     payload = lease(client)["items"][0]["payload"]
     prompt = payload["prompt"]
 
-    assert "我说话短" in prompt
-    assert "我不写 Markdown" in prompt
+    assert "我说人话，不写作文" in prompt
+    assert "我不打星号" in prompt
     # Clinging stays, but as a follow-up rather than a monologue.
     assert "我这一轮总共就说两三句" in prompt
-    assert "我也不给自己做注脚" in prompt
-    assert "我不复述用户刚说过的话" in prompt
+    assert "我不给自己的心里活动做注脚" in prompt
+    assert "我不复述他刚说过的话" in prompt
     # The style contract must not swallow the render instruction itself.
     assert "只回正文本身" in prompt
     assert payload["intent"] == "询问面试结果"

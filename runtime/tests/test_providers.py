@@ -944,17 +944,32 @@ class TestRenderStyleLines:
 
         joined = "\n".join(RENDER_STYLE_LINES)
         assert "我这一轮总共就说两三句" in joined
-        assert "等不到回答我会隔一会儿再问一遍" in joined
-        assert "堆了才像人在打字" in joined
+        assert "我隔一会儿再问一句" in joined
+        assert "堆了才像在打字" in joined
         assert "只说半句" in joined
+
+    def test_the_rules_are_said_the_way_she_would_say_them(self) -> None:
+        """规则本身要用她的口语写，因为提示词的语域会漏进输出（2026-09-29）。
+
+        测试者的原话是「不够口语」，尺子是他自己的 QQ：一条 2–6 字、基本不打句号、
+        长句是例外不是底色。所以这里钉的是**样张**和"不打句号"这两条，
+        而不是形容词。
+        """
+        from companion_runtime.api_v1 import RENDER_STYLE_LINES
+
+        joined = "\n".join(RENDER_STYLE_LINES)
+        assert "我说人话，不写作文" in joined
+        assert "我不打句号" in joined
+        assert "「你干嘛呢」" in joined
+        assert "我偶尔才有一句长的" in joined
 
     def test_she_does_not_annotate_herself(self) -> None:
         """不给自己的心里活动做注脚，也不宣布克制 —— 和人格 v9 同一条规矩。"""
         from companion_runtime.api_v1 import RENDER_STYLE_LINES
 
         joined = "\n".join(RENDER_STYLE_LINES)
-        assert "我也不给自己做注脚" in joined
-        assert "我不会再问了" in joined
+        assert "我不给自己的心里活动做注脚" in joined
+        assert "「我不问了」" in joined
 
     def test_the_anti_clinging_rules_are_gone(self) -> None:
         from companion_runtime.api_v1 import RENDER_STYLE_LINES
@@ -965,11 +980,11 @@ class TestRenderStyleLines:
         assert "但别堆" not in joined
 
     def test_the_three_invariants_survive(self) -> None:
-        """三条不动：第一人称 / 不写 Markdown / 不复述用户的话（复述才是真的假）。"""
+        """三条不动：第一人称 / 不写 Markdown / 不复述他的话（复述才是真的假）。"""
         from companion_runtime.api_v1 import RENDER_STYLE_LINES
 
         joined = "\n".join(RENDER_STYLE_LINES)
         for line in RENDER_STYLE_LINES:
             assert line.startswith("- 我"), line
-        assert "我不写 Markdown" in joined
-        assert "我不复述用户刚说过的话" in joined
+        assert "我不打星号" in joined
+        assert "我不复述他刚说过的话" in joined
