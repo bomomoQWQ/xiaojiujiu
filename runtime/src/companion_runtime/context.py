@@ -62,6 +62,17 @@ SECTION_MEMORY = "【我记得的事】"
 SECTION_BOUNDARY = "【用户划过的线】"
 SECTION_TIME = "【时间上的事】"
 
+#: How an unfinished matter reads in her own voice, keyed by its stored status. The status
+#: is a scheduling word ("open"/"waiting"/"due"), and a scheduling word inside a first-person
+#: block is what turns the block into a report: measured 2026-09-29, her replies were reading
+#: as written prose rather than typing, and the injected block was one of the three prompts
+#: feeding that register (the others: the persona, and the render style lines).
+_MATTER_VOICE = {
+    "open": "还没结的是：",
+    "waiting": "还在等的是：",
+    "due": "该问一句了：",
+}
+
 #: Weekday names for the local clock line. The host's own reminder spells them in
 #: English ("Weekday: Friday") and only exists on chat turns; a proactive render has no
 #: host reminder at all, so this line is the only clock she gets there.
@@ -102,24 +113,14 @@ FRESH_WINDOW_HOURS = 24.0
 #: compressed chain will happily collapse "persistent state" and "the current
 #: message" into one priority, which is the exact failure this ordering prevents.
 PRIORITY_PREAMBLE = (
-    "【说明】下面是我进这句话之前的状态，不是这一句该怎么回。分量从大到小是这么排的：\n"
-    "1. 我的人设和安全底线\n"
-    "2. 用户刚说的这句话\n"
-    "3. 眼下确定的事实\n"
-    "4. 用户明确划过的界线\n"
-    "5. 我长期以来的心理状态（就是下面这一段）\n"
-    "6. 我对眼下心情的解释\n"
-    "7. 我自己的临场发挥\n"
-    "第 2 条要是跟第 5、6 条顶上了，听第 2 条：别因为旧状态写着「失落」"
-    "就接着闷着，也别因为写着「靠近」就当没听见用户刚说的拒绝。"
-    "这一句怎么接，我自己看着办。"
-    # The one time fact the acting layer gets, and it is *provenance*, not a clock:
-    # "he said this at …" is what makes a relative phrase legible later ("我明天要去面试"
-    # + 说于 11-14 19:36 -> 明天 = 11-15). The anchor is always written by the code; the
-    # model is never asked to guess one. The clock ("what time is it") is not here at all -
-    # only a proactive render states that, in its own instruction section.
-    "\n凡是引用用户原话的地方，都带着他说那句话的时刻（「用户在 …… 说：」或「（他在 …… 说的）」）："
-    "他话里的「明天」「下周」「三点」，都是按那一刻算的。"
+    "【先说清楚】下面这些是我进这句话之前的样子，不是他现在问我什么，也不是这一句该怎么回。\n"
+    "谁压得过谁是这个顺序：最大的永远是我的人设和安全底线；然后是他刚说的那句话；"
+    "然后是我眼下确定的事；然后是他明确划过的线；再往下才是我自己那些旧情绪、"
+    "我这份心情是怎么来的、还有我这一句的临场发挥。\n"
+    "他刚说的那句，压得过我那些旧情绪：别因为我这儿写着「失落」就接着闷着，"
+    "也别因为我这儿写着「靠近」，就当没听见他刚拒绝我。这一句怎么接，我自己看着办。\n"
+    "凡是我引用他原话的地方，都带着他说那句话是什么时候 —— 他嘴里的「明天」「下周」「三点」，"
+    "都按说那句话的那一刻算。"
 )
 
 #: How long a *closed* attempt stays worth recalling. A committed intention that
@@ -748,58 +749,60 @@ def render_block(bundle: ContextBundle) -> str:
     if any(psych.get(key) for key in prose_keys):
         lines.append(SECTION_PSYCH)
         for label, key in (
-            ("我最近大概是这样", "experience"),
-            ("心里搁着", "focus"),
-            ("卡着的地方", "conflict"),
-            ("想做的", "impulse"),
-            ("忍着的", "inhibition"),
-            ("说出来会是", "expression"),
+            ("我最近大概是这样：", "experience"),
+            ("心里搁着的是：", "focus"),
+            ("卡住的地方是：", "conflict"),
+            ("想做的：", "impulse"),
+            ("忍着的：", "inhibition"),
+            ("真说出口会是：", "expression"),
         ):
             value = psych.get(key)
             if value:
-                lines.append(f"- {label}：{value}")
+                lines.append(f"{label}{value}")
         lines.append("")
 
     situation = bundle.situation
     if situation.get("facts") or situation.get("inferences"):
         lines.append(SECTION_SITUATION)
         for fact in situation.get("facts", [])[:6]:
-            lines.append(f"- {_fact_line(fact)}")
+            lines.append(_fact_line(fact))
         for inference in situation.get("inferences", [])[:4]:
+            confidence = inference.get("confidence")
+            sure = isinstance(confidence, (int, float)) and float(confidence) >= 0.7
             lines.append(
-                f"- 我猜（把握 {inference.get('confidence')}）：{inference.get('content')}"
+                f"{'我挺确定，' if sure else '我拿不太准，我猜：'}{inference.get('content')}"
             )
         for matter in situation.get("unfinished", [])[:4]:
-            lines.append(f"- 还没了结的：{matter.get('title')}（{matter.get('status')}）")
+            lead = _MATTER_VOICE.get(str(matter.get("status") or ""), "还没结的是：")
+            lines.append(f"{lead}{matter.get('title')}")
         lines.append("")
 
     if bundle.intent:
         closed = bool(bundle.intent.get("closed"))
         lines.append(SECTION_INTENT if not closed else SECTION_SITUATION_INTENT)
         # The label differs between the two cases on purpose: a render prompt states
-        # what to write now with the same "- 想做的事：" line, and an identically
+        # what to write now with the same "我想做的：" line, and an identically
         # labelled *background* line above it is read as the instruction by whatever
         # reads first. That happened in practice - a check-up reminder in one chat was
         # written about the interview the character had last wanted to mention - so the
         # stale intent is marked as background rather than repeating the live label.
         lines.append(
-            f"- 我想做的：{bundle.intent.get('intent')}"
+            f"我想做的：{bundle.intent.get('intent')}"
             if not closed
-            else f"- 之前想做的（背景，不是现在的任务）：{bundle.intent.get('intent')}"
+            else f"这是我刚差点说出口的，已经过去了，不是这一轮的活：{bundle.intent.get('intent')}"
         )
         if bundle.intent.get("goal"):
-            lines.append(f"- 为的是：{bundle.intent.get('goal')}")
+            lines.append(f"我为的是：{bundle.intent.get('goal')}")
         lead = bundle.intent.get("lead_seconds_before_user_message")
         if closed:
             seconds = bundle.intent.get("closed_seconds_ago")
             if seconds is not None and seconds >= 0:
                 lines.append(
-                    f"- 用户开口前 {round(seconds, 1)} 秒我就决定要这么做了；"
-                    "这个念头已经过去，不用再执行"
+                    f"他开口前 {round(seconds, 1)} 秒我就打定主意了 —— 这念头已经过去，不用再执行"
                 )
-            lines.append("- 这只是刚发生的一件小事，提不提看眼下，别硬凹")
+            lines.append("这就是刚过去的一件小事，提不提看眼下，别硬凹")
         elif bundle.intent.get("committed_not_yet_sent") and lead is not None and lead >= 0:
-            lines.append(f"- 用户消息到之前 {round(lead, 1)} 秒我就决定要这么做了（还没发出去）")
+            lines.append(f"他这条消息来之前 {round(lead, 1)} 秒我就想好要这么做了，还没发出去")
         lines.append("")
 
     if bundle.memories:
@@ -807,29 +810,29 @@ def render_block(bundle: ContextBundle) -> str:
         for memory in bundle.memories:
             stamp = str(memory.get("said_at") or "")
             attribution = ATTRIBUTION % stamp if stamp else ""
-            lines.append(f"- {memory.get('summary')}{attribution}")
+            lines.append(f"{memory.get('summary')}{attribution}")
         lines.append("")
 
     if bundle.constraints:
         lines.append(SECTION_BOUNDARY)
         for constraint in bundle.constraints:
-            lines.append(f"- {constraint}")
+            lines.append(f"{constraint}")
         if bundle.boundaries:
-            lines.append("- 用户划过的线就是线，什么情绪都不能越")
+            lines.append("他划过线的地方我不越，情绪再大也不越")
         lines.append("")
 
     if bundle.attention_hints:
         lines.append("【我该留神】")
         for hint in bundle.attention_hints:
-            lines.append(f"- {hint}")
+            lines.append(f"{hint}")
         lines.append("")
 
     lines.append(SECTION_TIME)
     time_context = bundle.time_context
     if time_context.get("hours_since_last_user_message") is not None:
-        lines.append(f"- 距离上次用户消息：{time_context['hours_since_last_user_message']} 小时")
+        lines.append(f"他上次开口是 {time_context['hours_since_last_user_message']} 小时前")
     if time_context.get("hours_since_last_contact") is not None:
-        lines.append(f"- 距离上次主动联系：{time_context['hours_since_last_contact']} 小时")
+        lines.append(f"我上次主动找他是 {time_context['hours_since_last_contact']} 小时前")
     # Deliberately *no* clock line here. A duration ("8 hours since") is cognition - it
     # describes the state the character is in. A clock ("it is 17:53") is a parameter of
     # the performance, and there is exactly one place that performs: the proactive render
@@ -841,7 +844,7 @@ def render_block(bundle: ContextBundle) -> str:
     # local rather than UTC, and is what the render states.
     lines.append("")
     lines.append(
-        "以上都只是我进来之前的状态，是一轮的临时背景，别照抄，也别写进长期记录；"
+        "上面这些是我进这句话之前的样子，是我自己脑子里的事，别照着念，也别写进长期记忆 ——"
         "它说的是之前，不是这一句该怎么回。"
     )
     return "\n".join(lines)

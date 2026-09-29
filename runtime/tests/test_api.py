@@ -163,8 +163,8 @@ def test_context_and_render_block(client: TestClient) -> None:
     assert "psychological" in bundle
     block = client.post("/context/render-block", json={}).json()
     assert block["ephemeral"] is True
-    assert "临时背景" in block["block"]
-    assert "用户刚说的这句话" in block["block"]
+    assert "我自己脑子里的事" in block["block"]
+    assert "他刚说的那句话" in block["block"]
 
 
 # --------------------------------------------------------------------------------------

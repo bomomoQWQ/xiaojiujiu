@@ -409,9 +409,9 @@ def test_render_block_contains_the_documented_sections(runtime: Runtime) -> None
     assert context_module.SECTION_SITUATION in block
     assert context_module.SECTION_TIME in block
     assert context_module.PRIORITY_PREAMBLE in block
-    assert "用户刚说的这句话" in block
+    assert "他刚说的那句话" in block
     assert "我进来之前的状态" in block
-    assert "临时背景" in block
+    assert "我自己脑子里的事" in block
 
 
 def test_render_block_never_contains_raw_numbers_for_emotion(runtime: Runtime) -> None:
@@ -495,7 +495,7 @@ def test_the_fallback_block_states_no_clock_either(runtime: Runtime) -> None:
     assert "当前本地时间" not in fallback, fallback
     assert "- 现在是：" not in fallback, fallback
     assert context_module.PRIORITY_PREAMBLE in fallback
-    assert "以上都只是我进来之前的状态" in fallback
+    assert "上面这些是我进这句话之前的样子" in fallback
 
 
 def test_intent_description_includes_the_lead_time(runtime: Runtime) -> None:

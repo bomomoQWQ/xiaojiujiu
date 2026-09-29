@@ -147,19 +147,23 @@ class TestPriorityPreambleIsComplete:
     """Patch section 7 lists seven levels; the prompt must not compress them."""
 
     def test_all_seven_levels_are_named(self) -> None:
+        """Patch section 7 lists seven levels; the prompt must not compress them.
+
+        They are prose now rather than a numbered list (2026-09-29: the block is written
+        in her voice), so this pins the ordering statement plus all seven ideas.
+        """
         preamble = context_module.PRIORITY_PREAMBLE
-        for level in range(1, 8):
-            assert f"{level}." in preamble, f"level {level} missing"
+        assert "谁压得过谁是这个顺序" in preamble
         for token in (
             "我的人设和安全底线",
-            "用户刚说的这句话",
-            "眼下确定的事实",
-            "用户明确划过的界线",
-            "我长期以来的心理状态",
-            "我对眼下心情的解释",
-            "我自己的临场发挥",
+            "他刚说的那句话",
+            "我眼下确定的事",
+            "他明确划过的线",
+            "我自己那些旧情绪",
+            "我这份心情是怎么来的",
+            "我这一句的临场发挥",
         ):
             assert token in preamble, token
 
     def test_the_preamble_states_that_the_current_turn_wins(self) -> None:
-        assert "听第 2 条" in context_module.PRIORITY_PREAMBLE
+        assert "他刚说的那句，压得过我那些旧情绪" in context_module.PRIORITY_PREAMBLE
