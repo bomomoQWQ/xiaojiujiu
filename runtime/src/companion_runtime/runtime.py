@@ -3191,6 +3191,19 @@ class Runtime:
                     used.add(text[len(prefix) :])
         return used
 
+    def refresh_candidates_for_v2(self, *, now: datetime | None = None) -> list[CandidateIntent]:
+        """Refresh the mechanical candidate pool without running legacy motivation.
+
+        Production v2 still reuses rule/semantic candidate generation, memory and
+        unfinished matters.  This explicit capability stops the scheduler from
+        calling ``endogenous_round`` merely to populate the pool.
+        """
+        stamp = ensure_aware(now) or utcnow()
+        with self.write_session():
+            state = self.projections.runtime.ensure()
+            active = self.projections.emotion.list_active()
+            return self._refresh_candidates(now=stamp, state=state, active=active)
+
     def _refresh_candidates(
         self, *, now: datetime, state: RuntimeState, active: Sequence[EmotionEvent]
     ) -> list[CandidateIntent]:
