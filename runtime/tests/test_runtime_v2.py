@@ -278,6 +278,7 @@ def test_fake_e2e_ack_then_prepare_and_user_event_settles_v2() -> None:
         "committed",
         "rendered",
         "send_ack",
+        "reconciled",
     ]
 
 
@@ -314,7 +315,10 @@ def test_failed_send_never_collects_context_or_prepares_exposure() -> None:
     assert context_calls == 0
     assert repository.prepared == {}
     assert order[-1] == "legacy_send_ack"
-    assert repository.audits["decision:failed"]["events"][-1]["stage"] == "send_fail"
+    assert [event["stage"] for event in repository.audits["decision:failed"]["events"][-2:]] == [
+        "send_fail",
+        "reconciled",
+    ]
 
 
 def test_endogenous_path_honours_legacy_boundary_before_commit() -> None:
