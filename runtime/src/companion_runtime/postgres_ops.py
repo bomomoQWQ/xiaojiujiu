@@ -372,6 +372,14 @@ def restore_drill(
     try:
         _run(build_createdb_command(dsn, name))
         created = True
+        # ``pg_dump --schema`` archives objects inside the schema but does not
+        # reliably include CREATE SCHEMA itself. Create the validated destination
+        # namespace explicitly before pg_restore materialises qualified tables.
+        connect_env = dict(conninfo_to_dict(drill_target.conninfo))
+        if source.password is not None:
+            connect_env["password"] = source.password
+        with psycopg.connect(**connect_env) as connection:
+            connection.execute(f'CREATE SCHEMA IF NOT EXISTS "{manifest.schema}"')
         restore_spec = build_pg_restore_command(
             drill_target.conninfo, archive_path, schema=manifest.schema,
             base_env=command_environment(source),
@@ -379,9 +387,6 @@ def restore_drill(
         # Preserve the source password after constructing the password-free drill DSN.
         restore_spec.env.update(command_environment(source))
         _run(restore_spec)
-        connect_env = dict(conninfo_to_dict(drill_target.conninfo))
-        if source.password is not None:
-            connect_env["password"] = source.password
         with psycopg.connect(**connect_env) as connection:
             ledger, counts = _inventory(connection, manifest.schema)
         actual_hash = migration_hash(ledger)
