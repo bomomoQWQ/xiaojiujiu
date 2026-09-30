@@ -327,7 +327,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
         rng=runtime.rng,
     )
     runtime.v2_coordinator = v2_composition.coordinator
-    app = create_app(runtime, config, v2_composition=v2_composition)
 
     last_allowed_at: datetime | None = None
 
@@ -345,6 +344,27 @@ def cmd_serve(args: argparse.Namespace) -> int:
             now=now,
             elapsed_allowed_seconds=elapsed,
         )
+
+    def simulate_v2_decision(_payload: dict[str, Any]) -> dict[str, Any]:
+        """Guarded acceptance-only decision hook exposed while NapCat is stopped."""
+        result = runtime.v2_coordinator.decide_endogenous(
+            decision_id=new_id("decision"),
+            now=utcnow(),
+            # A simulation is an immediate trial over one scheduler minimum interval.
+            elapsed_allowed_seconds=float(config.scheduler.min_interval_seconds),
+        )
+        return {
+            "acted": result.acted,
+            "reason": result.reason,
+            "decision_id": result.decision_id,
+            "chosen_candidate_id": result.chosen_candidate_id,
+        }
+
+    v2_composition.enable_decision_run = bool(config.v2_simulation_enabled)
+    v2_composition.decision_simulation_runner = (
+        simulate_v2_decision if config.v2_simulation_enabled else None
+    )
+    app = create_app(runtime, config, v2_composition=v2_composition)
 
     # The sidecar is autonomous, not request-driven: without this loop a standard
     # deployment would never run an endogenous round, so the character would only
