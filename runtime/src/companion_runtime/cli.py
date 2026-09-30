@@ -38,7 +38,8 @@ from . import __version__
 from . import boundaries as boundary_module
 from . import memory as memory_module
 from .config import configure_logging, load_config, resolve_paths
-from .db import Database
+from .db import open_database
+from .db_base import DatabaseBase
 from .maintenance import (
     backup,
     checkpoint,
@@ -253,13 +254,13 @@ def _resolve_config(args: argparse.Namespace):
     return config
 
 
-def _open_database(config) -> Database:
-    """Open and migrate a database handle from the configuration."""
-    database = Database(
-        config.storage.database_path,
-        busy_timeout_ms=config.storage.busy_timeout_ms,
-        wal=config.storage.wal,
-    )
+def _open_database(config) -> DatabaseBase:
+    """Open and migrate the configured PostgreSQL database handle.
+
+    ``open_database`` owns the v2 fail-fast policy: an absent/non-PostgreSQL DSN is
+    rejected before any command can create an accidental local SQLite store.
+    """
+    database = open_database(config.storage)
     database.migrate()
     return database
 

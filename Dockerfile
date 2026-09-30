@@ -17,10 +17,10 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Storage defaults to the mounted volume, so a container without extra flags
-# already keeps its database and raw-event mirror somewhere durable.
-ENV CR_STORAGE__DATABASE_PATH=/data/companion.sqlite3 \
-    CR_STORAGE__RAW_LOG_PATH=/data/raw_events.jsonl \
+# Runtime v2 is PostgreSQL-only.  A deployment must provide CR_STORAGE__DSN;
+# there is deliberately no embedded SQLite fallback.  The optional JSONL mirror
+# remains a secondary audit trail in the mounted volume.
+ENV CR_STORAGE__RAW_LOG_PATH=/data/raw_events.jsonl \
     CR_SERVER__HOST=0.0.0.0 \
     CR_SERVER__PORT=8787
 

@@ -82,49 +82,61 @@ class ServerConfig:
 
 @dataclass(slots=True)
 class StorageConfig:
-    """Where the Runtime keeps its state.
+    """PostgreSQL-only Runtime storage configuration.
 
-    Two backends are supported and they are deliberately equivalent in *shape*:
-    SQLite (the default, a single file that can be snapshotted and shipped) and
-    PostgreSQL (chosen when ``dsn`` is set, for deployments that want a network
-    database, several Runtime processes or the operational tooling around a
-    server). The schema, the column types and the transaction semantics are the
-    same on both, so a deployment can move between them without a data-shape
-    change.
+    v2 deliberately has one production database contract. ``dsn`` is required at
+    startup; an empty value is a configuration error rather than permission to fall
+    back to SQLite.  ``database_path``/``wal`` survive temporarily only as
+    *legacy-import* coordinates for the stopped v1 databases and are never consulted
+    by :func:`companion_runtime.db.open_database`.
 
-    They are not equivalent in *durability tooling*: the checkpoint/verify/backup/
-    restore commands in :mod:`companion_runtime.maintenance` are built on SQLite
-    machinery, so a PostgreSQL deployment has none of them and gets a loud refusal
-    instead (see :attr:`durability_gap_acknowledged`). Everything the Runtime
-    itself needs to read and write works on both.
+    PostgreSQL durability is operated with the server's own tools (``pg_dump``, WAL
+    archiving, base backups and restore drills), not SQLite file commands.
     """
 
-    database_path: str = "./data/runtime.sqlite3"
-    raw_log_path: str = "./data/raw_events.jsonl"
-    #: PostgreSQL connection string. When set it wins over ``database_path``.
-    #: A DSN carries a password, so it is read from the environment or a config
-    #: file and is redacted by the inspection endpoints like any other secret.
+    #: PostgreSQL connection string. It is normally supplied through
+    #: ``CR_STORAGE__DSN`` and is always redacted from operator-facing output.
     dsn: str = ""
-    #: Write the raw event log to an append-only JSONL mirror as well as SQLite.
+    #: Optional append-only raw-event mirror. It is audit redundancy, not the
+    #: authoritative database and not a second writable projection.
+    raw_log_path: str = "./data/raw_events.jsonl"
     mirror_raw_events: bool = True
     busy_timeout_ms: int = 5000
-    wal: bool = True
-    #: Whether the operator has acknowledged that the backend ``dsn`` selects has
-    #: no implementation of the SQLite-only durability commands
-    #: (``checkpoint``/``verify``/``backup``/``restore``: PRAGMA, the WAL
-    #: checkpoint, ``VACUUM INTO`` and file-level copies). Default ``False``, which
-    #: is what a PostgreSQL DSN gets: ``open_database`` then logs one warning naming
-    #: the gap, so it is visible at startup instead of at the first scheduled
-    #: maintenance pass. ``True`` silences that warning and nothing else - it does
-    #: not add an implementation, and every one of those commands still raises
-    #: ``maintenance.DurabilityUnsupported``. Durability of a PostgreSQL deployment
-    #: is the server's own tooling (WAL archiving, pg_basebackup, pg_dump).
+    #: Schema containing the v2 tables. A dedicated schema keeps migration/replay
+    #: work isolated from unrelated databases served by the same PostgreSQL cluster.
+    schema: str = "companion_runtime"
+    #: Stopped v1 SQLite file used only by the explicit offline importer.
+    legacy_sqlite_path: str = ""
+    #: Deprecated alias retained while the offline importer and legacy tests are
+    #: extracted from the service package. The production opener never reads it.
+    database_path: str = ""
+    #: Deprecated SQLite knob; retained only so archived v1 configuration files can
+    #: be parsed for migration instead of rejected before the importer sees them.
+    wal: bool = False
+    #: PostgreSQL durability is external. This compatibility flag only controls the
+    #: startup reminder; it never enables SQLite durability commands.
     durability_gap_acknowledged: bool = False
 
     @property
     def is_postgres(self) -> bool:
-        """Return whether this configuration selects the PostgreSQL backend."""
+        """Return whether a PostgreSQL DSN has been configured."""
         return bool(self.dsn and self.dsn.strip())
+
+    def require_postgres_dsn(self) -> str:
+        """Return the configured PostgreSQL DSN or fail fast.
+
+        The error names the exact environment variable operators should set while
+        never interpolating a possibly partial credential into the message.
+        """
+        dsn = str(self.dsn or "").strip()
+        if not dsn:
+            raise ValueError(
+                "PostgreSQL storage is required; set CR_STORAGE__DSN "
+                "(SQLite is supported only by the offline v1 importer)"
+            )
+        if not (dsn.startswith("postgresql://") or dsn.startswith("postgres://")):
+            raise ValueError("CR_STORAGE__DSN must be a PostgreSQL DSN")
+        return dsn
 
 
 @dataclass(slots=True)
@@ -615,7 +627,7 @@ def resolve_paths(config: RuntimeConfig, base_dir: str | os.PathLike[str] | None
         The same configuration object, mutated.
     """
     root = Path(base_dir) if base_dir is not None else Path.cwd()
-    for attribute in ("database_path", "raw_log_path"):
+    for attribute in ("raw_log_path", "legacy_sqlite_path", "database_path"):
         value = getattr(config.storage, attribute)
         # The in-memory sentinel is not a filesystem path and must pass through.
         if not value or value == ":memory:":

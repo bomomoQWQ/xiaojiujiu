@@ -22,6 +22,10 @@ services:
     image: xiaojiujiu-runtime:local
     restart: unless-stopped
     environment:
+      # Runtime v2 is PostgreSQL-only; absence of this value is a fail-fast startup
+      # error, never permission to create a local SQLite database.
+      CR_STORAGE__DSN: ${CR_STORAGE__DSN:?set CR_STORAGE__DSN to a PostgreSQL DSN}
+      CR_STORAGE__SCHEMA: ${CR_STORAGE__SCHEMA:-companion_runtime}
       # The conversation this sidecar belongs to. In a multi-session deployment
       # set it to the AstrBot session origin, e.g. aiocqhttp:FriendMessage:10001,
       # otherwise proactive messages can only be routed in a single-session setup.
@@ -34,7 +38,8 @@ services:
       CR_SEMANTIC_API_KEY: ${CR_SEMANTIC_API_KEY:-}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
-      # SQLite WAL database, raw-event mirror and manual snapshots.
+      # Optional append-only raw-event mirror and migration/replay artefacts. The
+      # authoritative state lives in PostgreSQL.
       - runtime-data:/data
     ports:
       - "127.0.0.1:8787:8787"
