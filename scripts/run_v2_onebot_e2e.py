@@ -199,12 +199,12 @@ def strict_checks(before: Mapping[str, Any], after: Mapping[str, Any], *, scope:
             if version and version not in {"none", "prior-or-unavailable"}:
                 parameter_ids.update(part for part in str(version).split("+") if part)
 
-    exposures = delta["exposures"]
+    exposures = delta["exposures"] or new["exposures"]
     delivered = [row for row in exposures if (
         row.get("send_ack_id") or row.get("delivery_basis") in {"delivered", "send_ack"}
         or row.get("decision_id") in decision_ids
     )]
-    labels = delta["labels"]
+    labels = delta["labels"] or new["labels"]
     positive_reply = [row for row in labels if (
         str(row.get("target") or row.get("target_name") or "").lower() in {"reply", "r"}
         and (row.get("value") is True or row.get("target_value") is True
