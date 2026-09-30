@@ -75,8 +75,9 @@ import contextlib
 import hashlib
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from fastapi import APIRouter, Body
 
@@ -176,6 +177,50 @@ RESULT_RETRY_AFTER_MS = "retry_after_ms"
 
 #: Section header used by the rendered injection block, e.g. ``【必要记忆】``.
 _SECTION_RE = re.compile(r"^【([^【】]+)】$")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class V2WireSendAck:
+    """Dependency-light send facts accepted by the coordinator's structural hook."""
+
+    decision_id: str
+    attempt_id: str
+    send_outbox_id: str
+    acknowledged_at: datetime
+    sent: bool
+    action: Mapping[str, Any]
+    context_provider: Callable[[], Mapping[str, Any]]
+    source_event_ids: tuple[str, ...] = ()
+
+
+class V2WireCoordinator(Protocol):
+    """Optional post-legacy hooks used by the unchanged AstrBot v1 wire."""
+
+    def after_legacy_user_event(
+        self, *, event: Mapping[str, Any], legacy_outcome: Any
+    ) -> Any: ...
+
+    def after_legacy_rendered(
+        self, *, decision_id: str, outbox_id: str, now: datetime
+    ) -> Any: ...
+
+    def after_legacy_send_ack(self, ack: Any, *, confirmed: bool = True) -> Any: ...
+
+
+def _v2_coordinator(runtime: Any) -> V2WireCoordinator | None:
+    """Return the explicitly installed v2 coordinator, or keep legacy-only mode."""
+
+    coordinator = getattr(runtime, "v2_coordinator", None)
+    return coordinator if coordinator is not None else None
+
+
+def _require_v2_hook(coordinator: Any, name: str) -> Callable[..., Any]:
+    """Refuse partial production wiring instead of silently dropping v2 facts."""
+
+    hook = getattr(coordinator, name, None)
+    if not callable(hook):
+        raise RuntimeError(f"runtime.v2_coordinator missing required hook: {name}")
+    return hook
 
 
 # --------------------------------------------------------------------------------------
@@ -565,6 +610,11 @@ def _ingest_event(
         result = outcome.to_dict()
         if stamp_rejection:
             result["timestamp_rejected"] = stamp_rejection
+        coordinator = _v2_coordinator(runtime)
+        if coordinator is not None:
+            _require_v2_hook(coordinator, "after_legacy_user_event")(
+                event=data, legacy_outcome=outcome
+            )
         return result, "accepted"
 
     with runtime.db.transaction() as conn:
@@ -917,6 +967,41 @@ def _attempt_state(runtime: Any, row: Any) -> str:
     """Return the current state of a row's attempt, or an empty string."""
     attempt = _attempt_of(runtime, row)
     return attempt.state if attempt is not None else ""
+
+
+def _v2_decision_id(row: Any) -> str:
+    """Return the v2 decision identity carried by a v2-created outbox row."""
+
+    return _text(_mapping(getattr(row, "payload", None)).get("decision_id")).strip()
+
+
+def _v2_action(runtime: Any, row: Any) -> Mapping[str, Any]:
+    """Build the immutable action facts exposed to v2 after a confirmed send."""
+
+    payload = _mapping(getattr(row, "payload", None))
+    attempt = _attempt_of(runtime, row)
+    explicit = payload.get("action")
+    if isinstance(explicit, Mapping):
+        return dict(explicit)
+    return {
+        "type": _text(payload.get("type")) or "proactive_message",
+        "intent": _text(getattr(attempt, "intent", None)) or _text(payload.get("intent")),
+        "goal": _text(getattr(attempt, "goal", None)) or _text(payload.get("goal")),
+    }
+
+
+def _v2_context_provider(runtime: Any) -> Callable[[], Mapping[str, Any]]:
+    """Freeze a small exposure-time legacy context without changing wire output."""
+
+    def provide() -> Mapping[str, Any]:
+        state = runtime.state()
+        return {
+            "recent_contact_count": int(getattr(state, "contact_count_today", 0) or 0),
+            "user_active_now": False,
+            "ever_boundary": bool(runtime.projections.boundaries.list_all()),
+        }
+
+    return provide
 
 
 def _already_settled(*, row: Any, attempt: Any, action_type: str, status: str) -> bool:
@@ -1299,7 +1384,14 @@ def _apply_action_report(
                 state = render.state
                 if render.outbox_id:
                     extra["send_outbox_id"] = render.outbox_id
-                if not render.applied:
+                if render.applied:
+                    decision_id = _v2_decision_id(row)
+                    coordinator = _v2_coordinator(runtime)
+                    if decision_id and coordinator is not None:
+                        _require_v2_hook(coordinator, "after_legacy_rendered")(
+                            decision_id=decision_id, outbox_id=action_id, now=now
+                        )
+                else:
                     # The render was already absorbed (or the row is void). Report
                     # the recorded outcome instead of a second transition; a
                     # *rejection* (nothing was ever rendered for this attempt) is
@@ -1369,6 +1461,23 @@ def _apply_action_report(
             extra["delivered"] = bool(delivered.get("delivered"))
             if delivered.get("duplicate"):
                 extra["duplicate"] = True
+            if sent and delivered.get("delivered") and not delivered.get("duplicate"):
+                decision_id = _v2_decision_id(row)
+                coordinator = _v2_coordinator(runtime)
+                if decision_id and coordinator is not None:
+                    attempt_id = _text(delivered.get("attempt_id")).strip()
+                    _require_v2_hook(coordinator, "after_legacy_send_ack")(
+                        V2WireSendAck(
+                            decision_id=decision_id,
+                            attempt_id=attempt_id,
+                            send_outbox_id=action_id,
+                            acknowledged_at=now,
+                            sent=True,
+                            action=_v2_action(runtime, row),
+                            context_provider=_v2_context_provider(runtime),
+                        ),
+                        confirmed=True,
+                    )
             if reason:
                 extra["error"] = reason
 

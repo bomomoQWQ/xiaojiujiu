@@ -90,9 +90,9 @@ def test_idempotency_and_single_active_parameter_constraints_are_explicit() -> N
 
 
 def test_migration_versions_and_statement_order_are_stable() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 4
+    assert USER_MODEL_SCHEMA_VERSION == 5
     assert isinstance(MIGRATIONS, tuple)
-    assert tuple(version for version, _statements in MIGRATIONS) == (1, 2, 3, 4)
+    assert tuple(version for version, _statements in MIGRATIONS) == (1, 2, 3, 4, 5)
     assert all(isinstance(statements, tuple) for _version, statements in MIGRATIONS)
     assert schema_statements() == tuple(
         statement for _version, statements in MIGRATIONS for statement in statements
@@ -109,4 +109,9 @@ def test_migration_versions_and_statement_order_are_stable() -> None:
         for statement in CORE_SCHEMA_STATEMENTS
         if re.search(r"CREATE TABLE IF NOT EXISTS", statement, re.IGNORECASE)
     )
-    assert create_order == TABLES + ("user_model_active_labels_v2",) + core_create_order
+    assert create_order == (
+        TABLES
+        + ("user_model_active_labels_v2",)
+        + core_create_order
+        + ("user_model_migration_audits_v2", "user_model_migration_quarantine_v2")
+    )

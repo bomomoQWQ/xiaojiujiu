@@ -209,9 +209,20 @@ class EndogenousDecisionV2:
 
 
 class LegacyRuntimeV2Bridge(Protocol):
-    """Only legacy capabilities retained by the v2 production path."""
+    """Only legacy capabilities retained by the v2 production path.
+
+    ``ingest_user_event`` is used by callers that enter through the v2 composition
+    root itself.  The AstrBot v1 adapter already ran the legacy foreground path, so
+    it must instead call :meth:`V2RuntimeCoordinator.after_legacy_user_event` with
+    the translated legacy outcome.  Keeping those boundaries separate prevents a
+    wire event from being appended twice.
+    """
 
     def ingest_user_event(self, event: Mapping[str, Any]) -> LegacyUserEventResult: ...
+
+    def after_user_event(
+        self, *, event: Mapping[str, Any], legacy_outcome: Any
+    ) -> LegacyUserEventResult: ...
 
     def candidates(self, *, scope_key: str, now: datetime) -> Sequence[CandidateV2]: ...
 
@@ -284,9 +295,32 @@ class V2RuntimeCoordinator:
         self._chosen: dict[str, CandidateV2] = {}
 
     def process_user_event(self, event: Mapping[str, Any]) -> LegacyUserEventResult:
-        """Run legacy memory/candidate/boundary effects, then settle v2 observations."""
+        """Run legacy ingest once, then settle the resulting v2 observations."""
 
-        result = self.legacy.ingest_user_event(event)
+        return self._settle_after_user_event(self.legacy.ingest_user_event(event))
+
+    def after_legacy_user_event(
+        self, *, event: Mapping[str, Any], legacy_outcome: Any
+    ) -> LegacyUserEventResult:
+        """Continue v2 processing after another entry point completed legacy ingest.
+
+        This is the hook for ``api_v1``.  It deliberately never calls
+        ``legacy.ingest_user_event``: the wire handler has already invoked
+        ``Runtime.process_user_message`` and doing so again would double-write the
+        raw event and its foreground projections.  The bridge translates that
+        recorded legacy outcome into the small, v2-owned result contract.
+        """
+
+        result = self.legacy.after_user_event(
+            event=event, legacy_outcome=legacy_outcome
+        )
+        return self._settle_after_user_event(result)
+
+    def _settle_after_user_event(
+        self, result: LegacyUserEventResult
+    ) -> LegacyUserEventResult:
+        """Persist matter events and settle observations from one legacy outcome."""
+
         if result.duplicate:
             return result
         if result.matter_events:
@@ -497,10 +531,17 @@ class V2RuntimeCoordinator:
         )
 
     def mark_rendered(self, *, decision_id: str, outbox_id: str, now: datetime) -> None:
-        """Mirror a successful legacy render into the v2 audit."""
+        """Apply a render through the legacy bridge, then record it in v2."""
+
+        self.legacy.mark_rendered(decision_id=decision_id, outbox_id=outbox_id, now=now)
+        self.after_legacy_rendered(decision_id=decision_id, outbox_id=outbox_id, now=now)
+
+    def after_legacy_rendered(
+        self, *, decision_id: str, outbox_id: str, now: datetime
+    ) -> None:
+        """Record a render which the v1 wire already applied to legacy state."""
 
         recorder = self._require_audit(decision_id)
-        self.legacy.mark_rendered(decision_id=decision_id, outbox_id=outbox_id, now=now)
         recorder.record(
             DecisionStage.RENDERED, occurred_at=now, details={"outbox_id": outbox_id}
         )
@@ -509,8 +550,20 @@ class V2RuntimeCoordinator:
     def acknowledge_send(self, ack: SendAckV2) -> PreparedExposureV2 | None:
         """Apply the legacy acknowledgement, then and only then prepare a v2 exposure."""
 
-        recorder = self._require_audit(ack.decision_id)
         confirmed = self.legacy.acknowledge_send(ack)
+        return self.after_legacy_send_ack(ack, confirmed=confirmed)
+
+    def after_legacy_send_ack(
+        self, ack: SendAckV2, *, confirmed: bool = True
+    ) -> PreparedExposureV2 | None:
+        """Record a send acknowledgement which the v1 wire already applied.
+
+        Unlike :meth:`acknowledge_send`, this method never calls the legacy bridge.
+        It is therefore safe after ``Reducer.mark_delivered`` and cannot charge the
+        legacy delivery or append its outgoing events twice.
+        """
+
+        recorder = self._require_audit(ack.decision_id)
         sent = bool(ack.sent and confirmed)
         recorder.record(
             DecisionStage.SEND_ACK if sent else DecisionStage.SEND_FAIL,
@@ -529,7 +582,7 @@ class V2RuntimeCoordinator:
                 context_provider=ack.context_provider,
                 delivery_confirmed=True,
                 horizons=self.config.horizons,
-                delivery_basis=ack.delivery_basis,
+                delivery_basis=getattr(ack, "delivery_basis", DeliveryBasis.DELIVERED),
                 source_event_ids=tuple(
                     dict.fromkeys((*chosen.source_event_ids, *ack.source_event_ids))
                 ),

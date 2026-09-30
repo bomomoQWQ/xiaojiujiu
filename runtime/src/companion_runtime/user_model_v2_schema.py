@@ -12,7 +12,7 @@ from typing import Final
 
 from .runtime_core_v2_schema import CORE_SCHEMA_STATEMENTS, CORE_SCHEMA_VERSION
 
-USER_MODEL_SCHEMA_VERSION: Final[int] = CORE_SCHEMA_VERSION
+USER_MODEL_SCHEMA_VERSION: Final[int] = 5
 
 _INITIAL_SCHEMA: tuple[str, ...] = (
     """
@@ -293,6 +293,49 @@ _SERVICE_ADAPTER_SCHEMA: tuple[str, ...] = (
 )
 
 
+# Offline v1 imports need durable reconciliation without allowing rejected legacy
+# evidence into the active label tables.  These tables are append-only audit state;
+# their uniqueness constraints make replay of the same plan harmless.
+_IMPORT_AUDIT_SCHEMA: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS user_model_migration_audits_v2 (
+        migration_audit_id UUID PRIMARY KEY,
+        scope_key TEXT NOT NULL CHECK (btrim(scope_key) <> ''),
+        plan_sha256 TEXT NOT NULL CHECK (length(plan_sha256) = 64),
+        source_manifest_sha256 TEXT NOT NULL CHECK (length(source_manifest_sha256) = 64),
+        dry_run BOOLEAN NOT NULL,
+        reconciliation JSONB NOT NULL CHECK (jsonb_typeof(reconciliation) = 'object'),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_user_model_migration_audits_v2_plan
+            UNIQUE (scope_key, plan_sha256, source_manifest_sha256, dry_run)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS user_model_migration_quarantine_v2 (
+        migration_quarantine_id UUID PRIMARY KEY,
+        scope_key TEXT NOT NULL CHECK (btrim(scope_key) <> ''),
+        plan_sha256 TEXT NOT NULL CHECK (length(plan_sha256) = 64),
+        source_table TEXT NOT NULL CHECK (btrim(source_table) <> ''),
+        source_row TEXT NOT NULL CHECK (btrim(source_row) <> ''),
+        classification TEXT NOT NULL CHECK (btrim(classification) <> ''),
+        reason TEXT NOT NULL CHECK (btrim(reason) <> ''),
+        payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64),
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_user_model_migration_quarantine_v2_source
+            UNIQUE (scope_key, plan_sha256, source_table, source_row, payload_sha256)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_user_model_migration_audits_v2_scope_created
+    ON user_model_migration_audits_v2 (scope_key, created_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_user_model_migration_quarantine_v2_scope
+    ON user_model_migration_quarantine_v2 (scope_key, plan_sha256)
+    """,
+)
+
+
 MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     (1, _INITIAL_SCHEMA),
     (2, _ACTIVE_LABEL_SCHEMA),
@@ -301,6 +344,7 @@ MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     # Version 4 adds that complete core beside the user-model v2 tables, using
     # PostgreSQL-native types while preserving columns for projection reuse.
     (CORE_SCHEMA_VERSION, CORE_SCHEMA_STATEMENTS),
+    (5, _IMPORT_AUDIT_SCHEMA),
 )
 
 
