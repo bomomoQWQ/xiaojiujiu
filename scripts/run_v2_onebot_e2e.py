@@ -184,6 +184,17 @@ def strict_checks(before: Mapping[str, Any], after: Mapping[str, Any], *, scope:
         nested = row.get("parameter_snapshot_ids")
         if isinstance(nested, Mapping):
             parameter_ids.update(str(value) for value in nested.values() if value)
+        audit = row.get("audit")
+        if isinstance(audit, Mapping):
+            assessments = audit.get("assessments") or []
+            for assessment in assessments:
+                if isinstance(assessment, Mapping):
+                    snapshot = assessment.get("parameter_snapshot_id")
+                    if snapshot:
+                        parameter_ids.add(str(snapshot))
+            version = (audit.get("run") or {}).get("parameter_version")
+            if version and version not in {"none", "prior-or-unavailable"}:
+                parameter_ids.update(part for part in str(version).split("+") if part)
 
     exposures = delta["exposures"]
     delivered = [row for row in exposures if (
