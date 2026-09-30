@@ -12,7 +12,7 @@ from typing import Final
 
 from .runtime_core_v2_schema import CORE_SCHEMA_STATEMENTS, CORE_SCHEMA_VERSION
 
-USER_MODEL_SCHEMA_VERSION: Final[int] = 6
+USER_MODEL_SCHEMA_VERSION: Final[int] = 7
 
 _INITIAL_SCHEMA: tuple[str, ...] = (
     """
@@ -393,6 +393,32 @@ _RUNTIME_ADAPTER_SCHEMA: tuple[str, ...] = (
 )
 
 
+_MAINTENANCE_SCHEMA: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS runtime_v2_expectation_settlements (
+        scope_key TEXT NOT NULL CHECK (btrim(scope_key) <> ''),
+        revision_key TEXT NOT NULL CHECK (btrim(revision_key) <> ''),
+        settlement_key TEXT NOT NULL CHECK (btrim(settlement_key) <> ''),
+        expectation_id UUID NOT NULL,
+        exposure_id UUID NOT NULL,
+        target_name TEXT NOT NULL,
+        label_revision BIGINT NOT NULL CHECK (label_revision > 0),
+        settlement JSONB NOT NULL CHECK (jsonb_typeof(settlement) = 'object'),
+        emotion_shadow JSONB NOT NULL CHECK (jsonb_typeof(emotion_shadow) = 'object'),
+        settled_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (scope_key, revision_key),
+        CONSTRAINT fk_runtime_v2_expectation_settlement_expectation
+            FOREIGN KEY (scope_key, expectation_id)
+            REFERENCES expectations_v2 (scope_key, expectation_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_runtime_v2_expectation_settlements_logical
+    ON runtime_v2_expectation_settlements (scope_key, settlement_key, label_revision DESC)
+    """,
+)
+
+
 MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     (1, _INITIAL_SCHEMA),
     (2, _ACTIVE_LABEL_SCHEMA),
@@ -403,6 +429,7 @@ MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     (CORE_SCHEMA_VERSION, CORE_SCHEMA_STATEMENTS),
     (5, _IMPORT_AUDIT_SCHEMA),
     (6, _RUNTIME_ADAPTER_SCHEMA),
+    (7, _MAINTENANCE_SCHEMA),
 )
 
 

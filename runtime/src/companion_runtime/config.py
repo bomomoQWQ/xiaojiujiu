@@ -476,10 +476,18 @@ class ObservabilityConfig:
 
 @dataclass(slots=True)
 class RuntimeConfig:
-    """Aggregate configuration for the whole Runtime."""
+    """Aggregate configuration for the whole Runtime.
+
+    ``legacy_user_model_enabled`` and ``legacy_endogenous_enabled`` are migration
+    switches.  The production ``serve`` composition forces both off: the legacy
+    Runtime remains a mechanical memory/candidate/boundary/outbox capability, while
+    learning, prediction and proactive decisions are owned exclusively by v2.
+    """
 
     runtime_id: str = "companion"
     conversation_id: str = "default"
+    legacy_user_model_enabled: bool = True
+    legacy_endogenous_enabled: bool = True
     values: ValueProfile = field(default_factory=ValueProfile)
     server: ServerConfig = field(default_factory=ServerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)

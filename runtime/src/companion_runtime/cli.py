@@ -300,7 +300,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
     from .api import create_app
+    from .composition_v2 import build_v2_composition
+    from .legacy_bridge_v2 import ConcreteLegacyRuntimeV2Bridge
     from .scheduler import Scheduler
+    from .typing import new_id
 
     config = _resolve_config(args)
     if args.host:
@@ -309,8 +312,37 @@ def cmd_serve(args: argparse.Namespace) -> int:
         config.server.port = args.port
     configure_logging(config.server.log_level)
 
+    # Production keeps the legacy object only as a mechanical capability.  All
+    # learning/prediction and proactive decisions are owned by the PostgreSQL v2 graph.
+    config.legacy_user_model_enabled = False
+    config.legacy_endogenous_enabled = False
     runtime = Runtime(config, seed=args.seed)
-    app = create_app(runtime, config)
+    bridge = ConcreteLegacyRuntimeV2Bridge(runtime)
+    v2_composition = build_v2_composition(
+        config,
+        scope_key=config.runtime_id,
+        legacy_bridge=bridge,
+        rng=runtime.rng,
+    )
+    runtime.v2_coordinator = v2_composition.coordinator
+    app = create_app(runtime, config, v2_composition=v2_composition)
+
+    last_allowed_at: datetime | None = None
+
+    def run_v2_round() -> Any:
+        """Scheduler wrapper: create an id and spend only dispatch-allowed time."""
+
+        nonlocal last_allowed_at
+        now = utcnow()
+        elapsed = 0.0 if last_allowed_at is None else max(
+            0.0, (now - last_allowed_at).total_seconds()
+        )
+        last_allowed_at = now
+        return runtime.v2_coordinator.decide_endogenous(
+            decision_id=new_id("decision"),
+            now=now,
+            elapsed_allowed_seconds=elapsed,
+        )
 
     # The sidecar is autonomous, not request-driven: without this loop a standard
     # deployment would never run an endogenous round, so the character would only
@@ -319,7 +351,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # checks.
     scheduler = Scheduler(
         config=config,
-        round_callback=runtime.endogenous_round,
+        round_callback=run_v2_round,
         rng=runtime.rng,
         runtime=runtime,
     )
@@ -349,7 +381,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
         )
         maintenance: asyncio.Task[Any] | None = None
         if args.maintenance_interval and args.maintenance_interval > 0:
-            maintenance = asyncio.create_task(maintenance_loop(), name="runtime-maintenance")
+            LOGGER.warning(
+                "Automatic SQLite maintenance is disabled for PostgreSQL production; "
+                "use pg_dump/WAL/base-backup operations"
+            )
         await scheduler.start()
         try:
             await server.serve()
@@ -357,12 +392,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
             await scheduler.stop()
             if maintenance is not None:
                 maintenance.cancel()
-            # A clean shutdown folds the WAL back so the next start is fast and
-            # the on-disk layout is a single self-contained file.
-            try:
-                checkpoint(runtime.db, mode="TRUNCATE")
-            except Exception:  # noqa: BLE001 - shutdown path
-                LOGGER.exception("Final checkpoint failed")
+            # PostgreSQL durability is external (WAL archiving/base backups/pg_dump).
+            # Never run SQLite checkpoint machinery on the production service path.
+            v2_composition.close()
             runtime.close()
 
     LOGGER.info(
