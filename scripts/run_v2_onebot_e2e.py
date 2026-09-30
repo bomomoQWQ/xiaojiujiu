@@ -134,7 +134,10 @@ def _mappings(value: Any) -> list[Mapping[str, Any]]:
 
 
 def _stage_names(row: Mapping[str, Any]) -> set[str]:
-    candidates = row.get("stages") or row.get("events") or row.get("audit_events") or []
+    audit = row.get("audit")
+    candidates = row.get("stages") or row.get("events") or row.get("audit_events") or (
+        audit.get("events") if isinstance(audit, Mapping) else []
+    ) or []
     names: set[str] = set()
     if isinstance(candidates, Mapping):
         candidates = list(candidates.values())
