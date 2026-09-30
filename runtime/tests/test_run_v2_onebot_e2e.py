@@ -35,6 +35,7 @@ def evidence(*, ingress=False, complete=False):
         body["decision_audits"] = [{
             "decision_id": "decision:one", "scope_key": SCOPE,
             "parameter_snapshot_id": PARAMETER,
+            "audit": {"run": {"parameter_version": PARAMETER}, "assessments": []},
             "stages": [{"stage": name} for name in runner.REQUIRED_STAGES],
         }]
         body["evidence"].update({
