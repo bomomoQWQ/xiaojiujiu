@@ -320,7 +320,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     bridge = ConcreteLegacyRuntimeV2Bridge(runtime)
     v2_composition = build_v2_composition(
         config,
-        scope_key=config.runtime_id,
+        # runtime_id identifies the process/projection row; conversation_id is the
+        # externally stable per-user scope reconstructed from the stopped fleet.
+        scope_key=config.conversation_id,
         legacy_bridge=bridge,
         rng=runtime.rng,
     )
