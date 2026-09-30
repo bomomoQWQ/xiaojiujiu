@@ -302,6 +302,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from .api import create_app
     from .composition_v2 import build_v2_composition
     from .legacy_bridge_v2 import ConcreteLegacyRuntimeV2Bridge
+    from .maintenance_v2 import V2Maintenance
     from .scheduler import Scheduler
     from .typing import new_id
 
@@ -327,6 +328,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
         rng=runtime.rng,
     )
     runtime.v2_coordinator = v2_composition.coordinator
+    v2_maintenance = V2Maintenance(
+        scope_key=config.conversation_id,
+        repository=v2_composition.coordinator.repository,
+        user_model=v2_composition.user_model_service,
+    )
 
     last_allowed_at: datetime | None = None
 
@@ -365,6 +371,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             object.__setattr__(
                 runtime.v2_coordinator.config, "utility_threshold", previous_threshold
             )
+        if config.v2_simulation_fit_immediately:
+            v2_maintenance.run_due(now=utcnow(), force=True, fit=True)
         return {
             "acted": result.acted,
             "reason": result.reason,
