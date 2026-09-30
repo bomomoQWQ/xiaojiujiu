@@ -1019,6 +1019,13 @@ def _already_settled(*, row: Any, attempt: Any, action_type: str, status: str) -
     if row.status in SETTLED_OUTBOX_STATUSES:
         return True
     if row.status == OutboxStatus.FAILED.value:
+        # A successful send report may arrive after lease recovery exhausted the
+        # row. The platform already delivered it; treating the failed row as a
+        # duplicate would discard the acknowledgement and create no exposure. Let
+        # the send-success path call mark_delivered, whose terminal late-report
+        # branch records the truth without reviving/resending the attempt.
+        if action_type == ACTION_SEND and status == STATUS_OK:
+            return False
         return attempt is None or attempt.state in TERMINAL_ATTEMPT_STATES
     if attempt is None:
         return False
