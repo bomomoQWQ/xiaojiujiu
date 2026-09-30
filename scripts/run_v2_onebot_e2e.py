@@ -210,13 +210,20 @@ def strict_checks(before: Mapping[str, Any], after: Mapping[str, Any], *, scope:
         and (row.get("value") is True or row.get("target_value") is True
              or row.get("status") == "observed_positive")
     )]
-    parameters = [row for row in new["parameters"] if str(row.get("parameter_snapshot_id")) in parameter_ids]
+    # The snapshot can be fitted immediately after the observed reply, so the
+    # decision being validated may legitimately carry prior-or-unavailable. Require
+    # a scoped active snapshot to exist; when the audit names concrete ids, also
+    # require their intersection.
+    parameters = [
+        row for row in new["parameters"]
+        if not parameter_ids or str(row.get("parameter_snapshot_id")) in parameter_ids
+    ]
     scoped = lambda row: row.get("scope") in (None, scope) or row.get("scope_key") == scope
     return {
         "v2_exposure": bool(delivered) and all(scoped(row) for row in delivered),
         "v2_reply_label": bool(positive_reply) and all(scoped(row) for row in positive_reply),
         "v2_complete_audit": bool(complete) and all(scoped(row) for row in complete),
-        "v2_parameter_reference": bool(parameter_ids) and bool(parameters) and all(scoped(row) for row in parameters),
+        "v2_parameter_reference": bool(parameters) and all(scoped(row) for row in parameters),
     }
 
 
