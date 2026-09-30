@@ -357,7 +357,23 @@ def cmd_serve(args: argparse.Namespace) -> int:
         # Permit otherwise-safe low-pressure candidates to cross the utility eligibility
         # line; every hard boundary, limited-support and repeat gate still applies.
         previous_threshold = runtime.v2_coordinator.config.utility_threshold
+        previous_repeat = runtime.v2_coordinator.config.repeat
         object.__setattr__(runtime.v2_coordinator.config, "utility_threshold", -1_000_000.0)
+        if config.v2_simulation_ignore_repeat_limits:
+            from .repeat_v2 import RepeatPolicyConfigV2
+
+            object.__setattr__(
+                runtime.v2_coordinator.config,
+                "repeat",
+                RepeatPolicyConfigV2(
+                    contact_allowance=1_000_000,
+                    matter_repeat_allowance=1_000_000,
+                    hard_contact_limit=None,
+                    hard_matter_repeat_limit=None,
+                    contact_cost_per_excess=0.0,
+                    matter_cost_per_excess=0.0,
+                ),
+            )
         try:
             result = runtime.v2_coordinator.decide_endogenous(
                 decision_id=new_id("decision"),
@@ -371,6 +387,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             object.__setattr__(
                 runtime.v2_coordinator.config, "utility_threshold", previous_threshold
             )
+            object.__setattr__(runtime.v2_coordinator.config, "repeat", previous_repeat)
         if config.v2_simulation_fit_immediately:
             v2_maintenance.run_due(now=utcnow(), force=True, fit=True)
         return {
