@@ -611,6 +611,9 @@ class PostgresDatabase(DatabaseBase):
         connection-wide budget that also covers the autocommit statements issued
         outside any transaction.
         """
+        schema = str(getattr(self, "schema_name", "companion_runtime") or "companion_runtime")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
+            raise ValueError("storage.schema must be a simple PostgreSQL identifier")
         settings: list[tuple[str, str]] = [
             # Every instant the Runtime stores is ISO-8601 text produced in Python
             # with an explicit offset, so the server's zone cannot change a stored
@@ -622,6 +625,10 @@ class PostgresDatabase(DatabaseBase):
             # instead of blocking forever, and it bounds the advisory-lock wait in
             # _begin too.
             ("lock_timeout", f"{self.busy_timeout_ms}ms"),
+            # All projection SQL uses unqualified stable table names. Pin the v2
+            # schema for the whole connection so reads after migration resolve the
+            # same PostgreSQL-native tables created under that schema.
+            ("search_path", f'"{schema}", public'),
         ]
         if self.statement_timeout_ms is not None:
             settings.append(("statement_timeout", f"{self.statement_timeout_ms}ms"))
