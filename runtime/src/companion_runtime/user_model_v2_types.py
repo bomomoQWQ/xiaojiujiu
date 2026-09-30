@@ -276,11 +276,11 @@ class TargetPredictionV2:
     prediction_id: str
     scope_key: str
     target: Target
-    point: float
-    lower: float
-    upper: float
-    interval_level: float
-    interval_kind: str
+    point: float | None
+    lower: float | None
+    upper: float | None
+    interval_level: float | None
+    interval_kind: str | None
     support: SupportStatus
     predicted_at: datetime
     created_at: datetime
@@ -297,8 +297,13 @@ class TargetPredictionV2:
             raise TypeError("target must be a Target")
         if not isinstance(self.support, SupportStatus):
             raise TypeError("support must be a SupportStatus")
-        _require_text("interval_kind", self.interval_kind)
         _require_timestamp("predicted_at", self.predicted_at)
+        numeric_fields = (self.point, self.lower, self.upper, self.interval_level)
+        if self.support is SupportStatus.UNAVAILABLE:
+            if any(value is not None for value in numeric_fields) or self.interval_kind is not None:
+                raise ValueError("unavailable support cannot carry a prediction")
+            return
+        _require_text("interval_kind", self.interval_kind)  # type: ignore[arg-type]
         for name, value in (
             ("point", self.point),
             ("lower", self.lower),
@@ -309,22 +314,22 @@ class TargetPredictionV2:
                 raise TypeError(f"{name} must be a number")
             if not math.isfinite(float(value)) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be finite and in [0, 1]")
+        assert self.point is not None and self.lower is not None and self.upper is not None
+        assert self.interval_level is not None
         if not self.lower <= self.point <= self.upper:
             raise ValueError("prediction interval must satisfy lower <= point <= upper")
         if self.interval_level <= 0.0:
             raise ValueError("interval_level must be greater than zero")
-        if self.support is SupportStatus.UNAVAILABLE:
-            raise ValueError("unavailable support cannot carry a prediction")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "prediction_id": self.prediction_id,
             **_base_dict(self),
             "target": self.target.value,
-            "point": float(self.point),
-            "lower": float(self.lower),
-            "upper": float(self.upper),
-            "interval_level": float(self.interval_level),
+            "point": None if self.point is None else float(self.point),
+            "lower": None if self.lower is None else float(self.lower),
+            "upper": None if self.upper is None else float(self.upper),
+            "interval_level": None if self.interval_level is None else float(self.interval_level),
             "interval_kind": self.interval_kind,
             "support": self.support.value,
             "predicted_at": self.predicted_at.isoformat(),
@@ -342,6 +347,7 @@ class PredictionEnvelopeV2:
     based_on_state_version: int
     created_at: datetime
     updated_at: datetime
+    parameter_snapshot_ids: tuple[tuple[Target, str | None], ...] = ()
     source_event_ids: tuple[str, ...] = ()
     contract_version: str = USER_MODEL_V2_CONTRACT_VERSION
     feature_version: str = USER_MODEL_V2_FEATURE_VERSION
@@ -360,6 +366,22 @@ class PredictionEnvelopeV2:
         targets = tuple(item.target for item in self.predictions)
         if len(self.predictions) != len(Target) or set(targets) != set(Target):
             raise ValueError("prediction envelope must contain exactly one prediction per target")
+        if not isinstance(self.parameter_snapshot_ids, tuple):
+            raise TypeError("parameter_snapshot_ids must be a tuple")
+        parameter_targets: list[Target] = []
+        for item in self.parameter_snapshot_ids:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise TypeError("parameter_snapshot_ids entries must be (Target, id-or-None) tuples")
+            target, snapshot_id = item
+            if not isinstance(target, Target):
+                raise TypeError("parameter_snapshot_ids keys must be Target values")
+            if snapshot_id is not None:
+                _require_text("parameter snapshot id", snapshot_id)
+            parameter_targets.append(target)
+        if self.parameter_snapshot_ids and (
+            len(parameter_targets) != len(Target) or set(parameter_targets) != set(Target)
+        ):
+            raise ValueError("parameter_snapshot_ids must contain exactly one entry per target")
         for item in self.predictions:
             if item.scope_key != self.scope_key:
                 raise ValueError("all predictions must use the envelope scope_key")
@@ -379,6 +401,9 @@ class PredictionEnvelopeV2:
             **_base_dict(self),
             "predicted_at": self.predicted_at.isoformat(),
             "based_on_state_version": self.based_on_state_version,
+            "parameter_snapshot_ids": {
+                target.value: snapshot_id for target, snapshot_id in self.parameter_snapshot_ids
+            },
             "predictions": [
                 item.to_dict()
                 for item in sorted(self.predictions, key=lambda item: order[item.target])

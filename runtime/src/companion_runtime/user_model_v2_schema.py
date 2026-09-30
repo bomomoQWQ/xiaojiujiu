@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from typing import Final
 
-USER_MODEL_SCHEMA_VERSION: Final[int] = 2
+from .runtime_core_v2_schema import CORE_SCHEMA_STATEMENTS, CORE_SCHEMA_VERSION
+
+USER_MODEL_SCHEMA_VERSION: Final[int] = CORE_SCHEMA_VERSION
 
 _INITIAL_SCHEMA: tuple[str, ...] = (
     """
@@ -277,9 +279,28 @@ _ACTIVE_LABEL_SCHEMA: tuple[str, ...] = (
 
 # Migration identifiers are append-only and intentionally independent of the
 # active Runtime schema version in db.py.  Never renumber an existing entry.
+_SERVICE_ADAPTER_SCHEMA: tuple[str, ...] = (
+    """
+    ALTER TABLE interaction_exposures_v2
+    ADD COLUMN exposure_payload JSONB
+        CHECK (exposure_payload IS NULL OR jsonb_typeof(exposure_payload) = 'object')
+    """,
+    """
+    ALTER TABLE interaction_exposures_v2
+    ADD COLUMN feature_snapshot JSONB
+        CHECK (feature_snapshot IS NULL OR jsonb_typeof(feature_snapshot) = 'object')
+    """,
+)
+
+
 MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     (1, _INITIAL_SCHEMA),
     (2, _ACTIVE_LABEL_SCHEMA),
+    (3, _SERVICE_ADAPTER_SCHEMA),
+    # The active Runtime and api_v1 still use the stable projection table names.
+    # Version 4 adds that complete core beside the user-model v2 tables, using
+    # PostgreSQL-native types while preserving columns for projection reuse.
+    (CORE_SCHEMA_VERSION, CORE_SCHEMA_STATEMENTS),
 )
 
 

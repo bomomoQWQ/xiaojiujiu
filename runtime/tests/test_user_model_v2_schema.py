@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from companion_runtime.runtime_core_v2_schema import CORE_SCHEMA_STATEMENTS
 from companion_runtime.user_model_v2_schema import (
     MIGRATIONS,
     USER_MODEL_SCHEMA_VERSION,
@@ -89,9 +90,9 @@ def test_idempotency_and_single_active_parameter_constraints_are_explicit() -> N
 
 
 def test_migration_versions_and_statement_order_are_stable() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 2
+    assert USER_MODEL_SCHEMA_VERSION == 4
     assert isinstance(MIGRATIONS, tuple)
-    assert tuple(version for version, _statements in MIGRATIONS) == (1, 2)
+    assert tuple(version for version, _statements in MIGRATIONS) == (1, 2, 3, 4)
     assert all(isinstance(statements, tuple) for _version, statements in MIGRATIONS)
     assert schema_statements() == tuple(
         statement for _version, statements in MIGRATIONS for statement in statements
@@ -103,4 +104,9 @@ def test_migration_versions_and_statement_order_are_stable() -> None:
         for statement in schema_statements()
         if re.search(r"CREATE TABLE IF NOT EXISTS", statement, re.IGNORECASE)
     )
-    assert create_order == TABLES + ("user_model_active_labels_v2",)
+    core_create_order = tuple(
+        re.search(r"CREATE TABLE IF NOT EXISTS\s+([a-z0-9_]+)", statement, re.IGNORECASE).group(1)
+        for statement in CORE_SCHEMA_STATEMENTS
+        if re.search(r"CREATE TABLE IF NOT EXISTS", statement, re.IGNORECASE)
+    )
+    assert create_order == TABLES + ("user_model_active_labels_v2",) + core_create_order
