@@ -598,6 +598,14 @@ class V2RuntimeCoordinator:
                         concern_id=chosen.repeat_subject.concern_id,
                         action_goal_id=chosen.repeat_subject.action_goal_id,
                     )
+        # Delivery completes this decision's irreversible funnel. Persist the
+        # terminal reconciliation stage in the same post-legacy hook so black-box
+        # and operators never see a permanently half-finished successful audit.
+        recorder.record(
+            DecisionStage.RECONCILED,
+            occurred_at=ack.acknowledged_at,
+            details={"reason": "sent" if sent else "send_failed"},
+        )
         self._save_audit(recorder)
         return prepared
 
