@@ -28,7 +28,7 @@ def test_legacy_bridge_translates_only_mechanical_reply_and_candidate_pool():
     )
     runtime = SimpleNamespace(
         projections=SimpleNamespace(candidates=Candidates(item), boundaries=Boundaries()),
-        config=SimpleNamespace(candidate=SimpleNamespace(max_active=12)),
+        config=SimpleNamespace(candidate=SimpleNamespace(max_active=12), conversation_id="default"),
         _event_ids_behind=lambda source: ["evt-source"],
     )
     bridge = ConcreteLegacyRuntimeV2Bridge(runtime)
@@ -40,7 +40,7 @@ def test_legacy_bridge_translates_only_mechanical_reply_and_candidate_pool():
     )
     translated = bridge.after_user_event(event={}, legacy_outcome=outcome)
     assert [(o.target, o.candidate_exposure_ids) for o in translated.observations] == [
-        (Target.REPLY, ("att-1",))
+        (Target.REPLY, ("8c1a9eec-bdc3-562e-aaae-a3afe00045a7",))
     ]
     assert all(o.target not in {Target.ACCEPTANCE, Target.NEGATIVE} for o in translated.observations)
     candidate = bridge.candidates(scope_key="scope", now=NOW)[0]

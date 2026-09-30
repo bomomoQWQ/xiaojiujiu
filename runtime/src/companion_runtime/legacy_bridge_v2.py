@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Mapping, Sequence
+from uuid import NAMESPACE_URL, uuid5
 
 from . import boundaries as boundary_module
 from .motivation_v2 import CandidatePolicyV2, UserUtilityCoefficientsV2
@@ -75,6 +76,10 @@ class ConcreteLegacyRuntimeV2Bridge:
         occurred_at = ensure_aware(getattr(raw, "timestamp", None)) or _event_time(event)
         duplicate = bool(getattr(legacy_outcome, "duplicate", False))
         attributed = str(getattr(legacy_outcome, "attributed_attempt_id", None) or "")
+        exposure_id = (
+            str(uuid5(NAMESPACE_URL, f"prepared-exposure:{self.runtime.config.conversation_id}:{attributed}"))
+            if attributed else ""
+        )
         observations: tuple[TargetObservationV2, ...] = ()
         if attributed and not duplicate:
             observations = (
@@ -83,7 +88,7 @@ class ConcreteLegacyRuntimeV2Bridge:
                     target=Target.REPLY,
                     occurred_at=occurred_at,
                     value=True,
-                    candidate_exposure_ids=(attributed,),
+                    candidate_exposure_ids=(exposure_id,),
                     explicit=False,
                 ),
             )
