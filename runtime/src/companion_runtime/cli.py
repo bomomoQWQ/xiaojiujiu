@@ -347,14 +347,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     def simulate_v2_decision(_payload: dict[str, Any]) -> dict[str, Any]:
         """Guarded acceptance-only decision hook exposed while NapCat is stopped."""
-        result = runtime.v2_coordinator.decide_endogenous(
-            decision_id=new_id("decision"),
-            now=utcnow(),
-            # The guarded acceptance stack needs a deterministic traversal of the
-            # render/send path. Use an effectively complete allowed interval; hard
-            # boundary/cold-start/repeat gates still run before the hazard draw.
-            elapsed_allowed_seconds=1_000_000_000.0,
-        )
+        # The black-box path tests delivery plumbing rather than model calibration.
+        # Permit otherwise-safe low-pressure candidates to cross the utility eligibility
+        # line; every hard boundary, limited-support and repeat gate still applies.
+        previous_threshold = runtime.v2_coordinator.config.utility_threshold
+        object.__setattr__(runtime.v2_coordinator.config, "utility_threshold", -1_000_000.0)
+        try:
+            result = runtime.v2_coordinator.decide_endogenous(
+                decision_id=new_id("decision"),
+                now=utcnow(),
+                # The guarded acceptance stack needs a deterministic traversal of the
+                # render/send path. Use an effectively complete allowed interval; hard
+                # boundary/cold-start/repeat gates still run before the hazard draw.
+                elapsed_allowed_seconds=1_000_000_000.0,
+            )
+        finally:
+            object.__setattr__(
+                runtime.v2_coordinator.config, "utility_threshold", previous_threshold
+            )
         return {
             "acted": result.acted,
             "reason": result.reason,
