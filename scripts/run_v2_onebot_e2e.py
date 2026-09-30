@@ -176,7 +176,10 @@ def strict_checks(before: Mapping[str, Any], after: Mapping[str, Any], *, scope:
     old_ids = {name: {_identity(row) for row in rows} for name, rows in old.items()}
     delta = {name: [row for row in rows if _identity(row) not in old_ids[name]] for name, rows in new.items()}
 
-    audits = delta["audits"] or new["audits"]
+    # Later scheduler no-op decisions may be the only audit identities in the
+    # delta and would hide an earlier complete delivery audit. Search all current
+    # scoped audits; the remaining checks bind delivery/labels/parameters.
+    audits = new["audits"]
     complete = [row for row in audits if set(REQUIRED_STAGES).issubset(_stage_names(row))]
     decision_ids = {str(row.get("decision_id")) for row in complete}
     parameter_ids: set[str] = set()
