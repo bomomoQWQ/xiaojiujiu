@@ -105,6 +105,7 @@ class V2Composition:
     prediction_service: UserModelV2PredictionService
     semantic_judge: DisabledSemanticJudgeV2
     coordinator: V2RuntimeCoordinator
+    audit_repository: Any
     health: V2Health
 
     def close(self) -> None:
@@ -199,6 +200,7 @@ def build_v2_composition(
             prediction_service=prediction_service,
             semantic_judge=semantic_judge,
             coordinator=coordinator,
+            audit_repository=runtime_repository,
             health=health,
         )
     except BaseException:
