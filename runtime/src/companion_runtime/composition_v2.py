@@ -108,6 +108,8 @@ class V2Composition:
     coordinator: V2RuntimeCoordinator
     audit_repository: Any
     health: V2Health
+    enable_decision_run: bool = False
+    decision_simulation_runner: Any | None = None
 
     def close(self) -> None:
         self.database.close()

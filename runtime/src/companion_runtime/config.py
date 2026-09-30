@@ -488,6 +488,9 @@ class RuntimeConfig:
     conversation_id: str = "default"
     legacy_user_model_enabled: bool = True
     legacy_endogenous_enabled: bool = True
+    #: Explicit shadow/test-only switch for POST /v2/decisions/run. Production keeps
+    #: it false; the guarded OneBot acceptance stack turns it on while NapCat is stopped.
+    v2_simulation_enabled: bool = False
     values: ValueProfile = field(default_factory=ValueProfile)
     server: ServerConfig = field(default_factory=ServerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
