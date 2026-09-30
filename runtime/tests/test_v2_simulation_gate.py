@@ -10,3 +10,4 @@ def test_simulation_endpoint_is_controlled_by_explicit_config_flag():
     assert 'elapsed_allowed_seconds=1_000_000_000.0' in cli
     assert '"utility_threshold", -1_000_000.0' in cli
     assert '"utility_threshold", previous_threshold' in cli
+    assert 'v2_maintenance.run_due(now=utcnow(), force=True, fit=True)' in cli

@@ -491,6 +491,10 @@ class RuntimeConfig:
     #: Explicit shadow/test-only switch for POST /v2/decisions/run. Production keeps
     #: it false; the guarded OneBot acceptance stack turns it on while NapCat is stopped.
     v2_simulation_enabled: bool = False
+    #: Shadow acceptance can fit immediately after an observed label so the public
+    #: E2E contract proves the MAP/Laplace activation path without waiting for the
+    #: normal maintenance cadence. Production leaves this false.
+    v2_simulation_fit_immediately: bool = False
     values: ValueProfile = field(default_factory=ValueProfile)
     server: ServerConfig = field(default_factory=ServerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
