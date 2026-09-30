@@ -243,8 +243,8 @@ _INITIAL_SCHEMA: tuple[str, ...] = (
 _ACTIVE_LABEL_SCHEMA: tuple[str, ...] = (
     """
     ALTER TABLE interaction_target_labels_v2
-    ADD CONSTRAINT uq_interaction_target_labels_v2_scope_id
-        UNIQUE (scope_key, target_label_id)
+    ADD CONSTRAINT uq_interaction_target_labels_v2_active_identity
+        UNIQUE (scope_key, target_label_id, exposure_id, target_name)
     """,
     """
     CREATE TABLE IF NOT EXISTS user_model_active_labels_v2 (
@@ -259,8 +259,9 @@ _ACTIVE_LABEL_SCHEMA: tuple[str, ...] = (
         CONSTRAINT uq_user_model_active_labels_v2_idempotency
             UNIQUE (scope_key, idempotency_key),
         CONSTRAINT fk_user_model_active_labels_v2_label
-            FOREIGN KEY (scope_key, target_label_id)
-            REFERENCES interaction_target_labels_v2 (scope_key, target_label_id)
+            FOREIGN KEY (scope_key, target_label_id, exposure_id, target_name)
+            REFERENCES interaction_target_labels_v2
+                (scope_key, target_label_id, exposure_id, target_name)
             ON DELETE RESTRICT,
         CONSTRAINT fk_user_model_active_labels_v2_exposure
             FOREIGN KEY (scope_key, exposure_id)
