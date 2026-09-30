@@ -154,7 +154,11 @@ def build_v2_composition(
         if database_factory is open_database and not isinstance(database, PostgresDatabase):
             raise TypeError("the production v2 composition requires PostgresDatabase")
         migration_version = int(database.migrate())
-        connection = database._connection()  # one owned connection for all scoped adapters
+        compatibility_connection = database._connection()
+        # v2 repositories use PostgreSQL-native ``%s`` SQL. The compatibility
+        # adapter deliberately interprets SQLite ``?`` SQL for legacy projections,
+        # so hand the v2 graph the underlying psycopg connection instead.
+        connection = getattr(compatibility_connection, "raw", compatibility_connection)
         repository = UserModelV2Repository(connection)
         service_repository = service_repository_factory(connection, repository)
         prediction_repository = prediction_repository_factory(repository)
