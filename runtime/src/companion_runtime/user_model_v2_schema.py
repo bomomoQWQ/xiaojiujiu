@@ -237,9 +237,49 @@ _INITIAL_SCHEMA: tuple[str, ...] = (
     """,
 )
 
+# Target labels are immutable revisions.  This separate pointer table is the
+# schema contract required to choose one active revision without mutating the
+# revision row (and without confusing "largest version" with "active").
+_ACTIVE_LABEL_SCHEMA: tuple[str, ...] = (
+    """
+    ALTER TABLE interaction_target_labels_v2
+    ADD CONSTRAINT uq_interaction_target_labels_v2_scope_id
+        UNIQUE (scope_key, target_label_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS user_model_active_labels_v2 (
+        scope_key TEXT NOT NULL CHECK (btrim(scope_key) <> ''),
+        exposure_id UUID NOT NULL,
+        target_name TEXT NOT NULL CHECK (btrim(target_name) <> ''),
+        target_label_id UUID NOT NULL,
+        pointer_version BIGINT NOT NULL CHECK (pointer_version > 0),
+        idempotency_key TEXT NOT NULL CHECK (btrim(idempotency_key) <> ''),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (scope_key, exposure_id, target_name),
+        CONSTRAINT uq_user_model_active_labels_v2_idempotency
+            UNIQUE (scope_key, idempotency_key),
+        CONSTRAINT fk_user_model_active_labels_v2_label
+            FOREIGN KEY (scope_key, target_label_id)
+            REFERENCES interaction_target_labels_v2 (scope_key, target_label_id)
+            ON DELETE RESTRICT,
+        CONSTRAINT fk_user_model_active_labels_v2_exposure
+            FOREIGN KEY (scope_key, exposure_id)
+            REFERENCES interaction_exposures_v2 (scope_key, exposure_id)
+            ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_user_model_active_labels_v2_target
+    ON user_model_active_labels_v2 (scope_key, target_name)
+    """,
+)
+
 # Migration identifiers are append-only and intentionally independent of the
 # active Runtime schema version in db.py.  Never renumber an existing entry.
-MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = ((1, _INITIAL_SCHEMA),)
+MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
+    (1, _INITIAL_SCHEMA),
+    (2, _ACTIVE_LABEL_SCHEMA),
+)
 
 
 def schema_statements() -> tuple[str, ...]:

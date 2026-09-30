@@ -1,13 +1,12 @@
 """PostgreSQL storage layer: the same schema and the same transaction semantics.
 
-The SQLite backend (:mod:`companion_runtime.db`) is the reference. This module
-re-uses its :data:`~companion_runtime.db.SCHEMA_STATEMENTS`, its added-column list
-and its :data:`~companion_runtime.db.SCHEMA_VERSION` unchanged, and supplies only
-the primitives that genuinely differ: how a transaction starts, how "one writer at
-a time" is enforced, and how a statement reaches the server. The transaction
-template, the three hook kinds and the access helpers stay in
-:class:`~companion_runtime.db_base.DatabaseBase`, so a nested transaction, a
-released savepoint and a discarded one behave *identically* on both backends.
+Runtime v2 uses PostgreSQL as its sole production store. This module supplies
+the transaction primitives (including the single-writer advisory lock) and hands
+schema creation to the checksummed PostgreSQL-native v2 migration ledger. Legacy
+SQLite-flavoured statement translation remains temporarily for the projections
+that have not yet moved behind v2 repositories; it is a migration bridge, not a
+second production backend contract. Transaction hooks and savepoint semantics live
+in :class:`~companion_runtime.db_base.DatabaseBase`.
 
 Three choices are deliberate and worth stating up front:
 
@@ -75,13 +74,9 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
 from typing import Any, Sequence
 
-from .db import Database as _SqliteDatabase
-from .db import SCHEMA_STATEMENTS, SCHEMA_VERSION
 from .db_base import ConflictError, DatabaseBase
-from .utility import isoformat
 
 try:
     import psycopg
@@ -423,10 +418,6 @@ class PostgresDatabase(DatabaseBase):
     #: commands beside the SQLite ones in :mod:`companion_runtime.maintenance`.
     supports_durability_commands = False
 
-    #: Re-used from the SQLite backend rather than restated, so the two schemas
-    #: cannot drift apart.
-    ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = _SqliteDatabase.ADDED_COLUMNS
-
     def __init__(
         self,
         dsn: str,
@@ -688,30 +679,15 @@ class PostgresDatabase(DatabaseBase):
     # -------------------------------------------------------------- migration
 
     def migrate(self) -> int:
-        """Create every table, apply column additions and record the version.
+        """Apply the PostgreSQL-native v2 migration ledger.
 
-        The statements are the SQLite backend's, executed verbatim on PostgreSQL:
-        the shared DDL avoids every SQLite-only construct (no ``AUTOINCREMENT``,
-        no ``WITHOUT ROWID``, ``CREATE INDEX IF NOT EXISTS`` since PostgreSQL 9.5)
-        and carries no placeholders, so psycopg passes it through untouched.
-
-        Returns:
-            The current :data:`~companion_runtime.db.SCHEMA_VERSION`.
+        Production no longer mirrors the SQLite reference DDL. Legacy SQLite files
+        are stopped migration inputs; service startup creates only the checksummed
+        PostgreSQL-native v2 schema.
         """
+        from .user_model_v2_migrations import migrate as migrate_v2
+
+        schema = str(getattr(self, "schema_name", "companion_runtime") or "companion_runtime")
         with self.transaction() as connection:
-            for statement in SCHEMA_STATEMENTS:
-                connection.execute(statement)
-            for table, column, column_type in self.ADDED_COLUMNS:
-                # PostgreSQL can test for the column itself, so unlike the SQLite
-                # path this needs no column_names() round trip; the statement is
-                # also a no-op when the column is already there.
-                connection.execute(
-                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {column_type}"
-                )
-            connection.execute(
-                "INSERT INTO schema_meta(key, value, updated_at) VALUES('schema_version', ?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
-                "updated_at=excluded.updated_at",
-                (str(SCHEMA_VERSION), isoformat(datetime.now().astimezone())),
-            )
-        return SCHEMA_VERSION
+            result = migrate_v2(connection, schema=schema)
+        return result.current_version
