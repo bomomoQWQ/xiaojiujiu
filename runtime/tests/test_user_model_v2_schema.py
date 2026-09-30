@@ -90,9 +90,9 @@ def test_idempotency_and_single_active_parameter_constraints_are_explicit() -> N
 
 
 def test_migration_versions_and_statement_order_are_stable() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 6
+    assert USER_MODEL_SCHEMA_VERSION == 7
     assert isinstance(MIGRATIONS, tuple)
-    assert tuple(version for version, _statements in MIGRATIONS) == (1, 2, 3, 4, 5, 6)
+    assert tuple(version for version, _statements in MIGRATIONS) == (1, 2, 3, 4, 5, 6, 7)
     assert all(isinstance(statements, tuple) for _version, statements in MIGRATIONS)
     assert schema_statements() == tuple(
         statement for _version, statements in MIGRATIONS for statement in statements
@@ -118,5 +118,6 @@ def test_migration_versions_and_statement_order_are_stable() -> None:
             "runtime_v2_exposure_metadata",
             "runtime_v2_user_matter_events",
             "runtime_v2_decision_audits",
+            "runtime_v2_expectation_settlements",
         )
     )

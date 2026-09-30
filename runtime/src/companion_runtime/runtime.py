@@ -423,7 +423,11 @@ class Runtime:
         # character's dynamics, so it seeds the row rather than a neutral default.
         initial_state = self.projections.ensure_defaults(created_at, values=self.config.values)
         self.memory_store = memory_module.MemoryStore(self.projections.memory, self.config)
-        self.user_model = UserInteractionModel(self.projections.user_model, self.config)
+        self.user_model = (
+            UserInteractionModel(self.projections.user_model, self.config)
+            if self.config.legacy_user_model_enabled
+            else None
+        )
         self.rng = random.Random(seed)
         self._write_lock = threading.RLock()
         #: Per-thread state for the two re-entrancy questions this class has to answer:
@@ -554,9 +558,38 @@ class Runtime:
         Returns:
             The refreshed model, also stored on ``self.user_model``.
         """
+        if not self.config.legacy_user_model_enabled:
+            raise RuntimeError("legacy user model is disabled")
         with self._write_lock:
             self.user_model = UserInteractionModel(self.projections.user_model, self.config)
             return self.user_model
+
+    def _legacy_busy_probability(
+        self,
+        *,
+        hours_since_contact: float,
+        replied_recently: bool,
+        context: dict[str, Any] | None = None,
+    ) -> float:
+        """Return busy likelihood without consulting the disabled legacy model.
+
+        Production v2 uses this conservative, non-learning foreground rule only for
+        emotional damping.  It does not read parameters, observations, or predictions.
+        """
+
+        if not self.config.legacy_user_model_enabled:
+            stated_busy = bool((context or {}).get("stated_busy"))
+            if stated_busy:
+                return 0.85
+            if replied_recently:
+                return 0.15
+            return clamp(0.25 + min(max(hours_since_contact, 0.0), 24.0) / 80.0)
+        assert self.user_model is not None
+        return self.user_model.busy_probability(
+            hours_since_contact=hours_since_contact,
+            replied_recently=replied_recently,
+            context=context,
+        )
 
     def version(self) -> int:
         """Return the current runtime version."""
@@ -701,6 +734,9 @@ class Runtime:
         Returns:
             Identifiers of the observations recorded by this pass.
         """
+        if not self.config.legacy_user_model_enabled:
+            return []
+        assert self.user_model is not None
         horizon = self.config.user_model.silence_after_hours * 3600.0
         if horizon <= 0:
             return []
@@ -867,13 +903,12 @@ class Runtime:
 
         emotion_module.mood_relax(state, emotion_config, dt_seconds)
 
-        # --- user model: belief confidence ages with *time*, not only with new
-        # observations (design §28). Without this the model kept whatever certainty the
-        # last observation gave it, so a fortnight of silence left it as sure about the
-        # user as it was on the day they last spoke. The means are historical facts and
-        # do not move; what relaxes is the precision on top of the prior, which shows
-        # up as more uncertainty and a more conservative bound.
-        self.user_model.tick_drift(dt_seconds, connection=conn)
+        # The v2 production composition owns all learning and prediction.  Legacy
+        # confidence drift remains available only to explicitly enabled migration/test
+        # runtimes; the production bridge must never touch it.
+        if self.config.legacy_user_model_enabled:
+            assert self.user_model is not None
+            self.user_model.tick_drift(dt_seconds, connection=conn)
 
         # --- unfinished matters
         matters = self.projections.unfinished.list_open()
@@ -895,39 +930,46 @@ class Runtime:
         # --- memory activation decay
         self.memory_store.decay_pool(conn, dt_seconds=dt_seconds)
 
-        # --- drive dynamics
+        # --- legacy drive dynamics
+        # Production v2 must not call motivation.py.  The bridge still needs the
+        # boundary permission projected, but its candidate utility/decision is v2-owned.
         refreshed = self.projections.unfinished.list_open()
-        busy = self.user_model.busy_probability(
-            hours_since_contact=delta_seconds(now, state.last_user_message_at) / 3600.0,
-            replied_recently=delta_seconds(now, state.last_user_message_at) < 1800.0,
-        )
         boundary_verdict = boundary_module.evaluate(
             self.projections.boundaries.active(now),
             now=now,
             state=state,
             is_proactive=True,
         )
-        # ``allow_proactive`` is derived state, not something remembered: it is
-        # recomputed from the live boundaries on every tick so that an expired
-        # window cannot leave the character muted forever.
         state.allow_proactive = boundary_verdict.allow_proactive
-        boundary_pressure = 1.0 if not boundary_verdict.allow_proactive else 0.0
-        recent_contacts = self._recent_contact_count(now)
-        drive_inputs = motivation_module.DriveInputs(
-            emotion_tendency=self._emotion_tendency(state, survivors),
-            unfinished=unfinished_module.priority_of(refreshed),
-            memory_activation=self.memory_store.activation_strength(),
-            hours_since_contact=self._hours_since_exchange(state, now),
-            recent_contact_ratio=clamp(recent_contacts / max(1, self.config.utility.repeat_contact_tolerance)),
-            boundary_pressure=boundary_pressure,
-            user_busy=busy,
-            uncertainty=0.35 if self.user_model.numeric_view()["effective_count"] < 3 else 0.15,
-            mood_valence=state.mood_valence,
-        )
-        targets = motivation_module.target_drives(drive_inputs, state=state, config=self.config)
-        motivation_module.step_drives(
-            state=state, targets=targets, config=self.config, dt_seconds=dt_seconds
-        )
+        if self.config.legacy_endogenous_enabled:
+            busy = self._legacy_busy_probability(
+                hours_since_contact=delta_seconds(now, state.last_user_message_at) / 3600.0,
+                replied_recently=delta_seconds(now, state.last_user_message_at) < 1800.0,
+            )
+            boundary_pressure = 1.0 if not boundary_verdict.allow_proactive else 0.0
+            recent_contacts = self._recent_contact_count(now)
+            drive_inputs = motivation_module.DriveInputs(
+                emotion_tendency=self._emotion_tendency(state, survivors),
+                unfinished=unfinished_module.priority_of(refreshed),
+                memory_activation=self.memory_store.activation_strength(),
+                hours_since_contact=self._hours_since_exchange(state, now),
+                recent_contact_ratio=clamp(recent_contacts / max(1, self.config.utility.repeat_contact_tolerance)),
+                boundary_pressure=boundary_pressure,
+                user_busy=busy,
+                uncertainty=(
+                    0.35
+                    if self.user_model is None
+                    or self.user_model.numeric_view()["effective_count"] < 3
+                    else 0.15
+                ),
+                mood_valence=state.mood_valence,
+            )
+            targets = motivation_module.target_drives(
+                drive_inputs, state=state, config=self.config
+            )
+            motivation_module.step_drives(
+                state=state, targets=targets, config=self.config, dt_seconds=dt_seconds
+            )
 
         # --- daily counter rollover
         self._rollover_contact_day(state, now)
@@ -1133,7 +1175,7 @@ class Runtime:
                 # recorded as ``unresolved`` and revisited later. Guessing here
                 # would silently corrupt long-term state, while deferring costs only
                 # the chance to settle early.
-                busy = self.user_model.busy_probability(
+                busy = self._legacy_busy_probability(
                     hours_since_contact=delta_seconds(stamp, state.last_user_message_at) / 3600.0,
                     replied_recently=False,
                     context={"stated_busy": any(marker in content for marker in BUSY_MARKERS)},
@@ -1339,18 +1381,38 @@ class Runtime:
                 # awaiting one - exactly once, because the attempt is resolved as
                 # part of the attribution and a resolved attempt can never be
                 # attributed again.
-                (
-                    outcome.observation_id,
-                    outcome.attributed_attempt_id,
-                ) = self._attribute_user_reply(
-                    conn,
-                    event=event,
-                    content=content,
-                    reason=reason,
-                    busy=busy,
-                    now=stamp,
-                    boundary_declared=bool(declared),
-                )
+                if self.config.legacy_user_model_enabled:
+                    (
+                        outcome.observation_id,
+                        outcome.attributed_attempt_id,
+                    ) = self._attribute_user_reply(
+                        conn,
+                        event=event,
+                        content=content,
+                        reason=reason,
+                        busy=busy,
+                        now=stamp,
+                        boundary_declared=bool(declared),
+                    )
+                else:
+                    # Preserve mechanical reply attribution for the v2 bridge without
+                    # creating any legacy observation or updating learned parameters.
+                    attempt = self._newest_sent_attempt(
+                        conversation_id=event.conversation_id
+                    )
+                    if attempt is not None:
+                        outcome.attributed_attempt_id = attempt.attempt_id
+                        if attempt.state == AttemptState.SENT.value:
+                            action_module.resolve(
+                                self.projections.attempts,
+                                conn,
+                                attempt,
+                                reason="user_reply",
+                                now=stamp,
+                            )
+                            self.projections.outbox.cancel_for_attempt(
+                                conn, attempt.attempt_id, reason="attempt_resolved"
+                            )
 
                 # --- invalidate candidates whose premises just died
                 self._invalidate_candidates(conn, now=stamp, user_message=content)
@@ -1396,7 +1458,8 @@ class Runtime:
                 outcome.reconcile_decisions = decisions
                 outcome.version = self.projections.runtime.read().version
 
-        self.user_model = UserInteractionModel(self.projections.user_model, self.config)
+        if self.config.legacy_user_model_enabled:
+            self.user_model = UserInteractionModel(self.projections.user_model, self.config)
         return outcome
 
     # --------------------------------------------------------- endogenous entry
@@ -1601,6 +1664,9 @@ class Runtime:
     ) -> EndogenousOutcome:
         """Run one endogenous wake-up round (P2): the proactive decision.
 
+        This legacy decision entry is unavailable in the production v2 composition.
+        It remains only for offline migration and compatibility tests.
+
         This is the Runtime's periodic heartbeat, so it is also where the
         low-frequency deep cognition refresh belongs (patch v0.2 section 21):
         "later I understood" has to be able to happen without an operator asking.
@@ -1626,6 +1692,8 @@ class Runtime:
         Returns:
             An :class:`EndogenousOutcome`.
         """
+        if not self.config.legacy_endogenous_enabled:
+            raise RuntimeError("legacy endogenous decision is disabled; use runtime.v2_coordinator")
         stamp = ensure_aware(now) or utcnow()
         # The hazard rate is integrated over the interval between two *decisions* - the
         # character's opportunities to act - not between two advances of the clock.
