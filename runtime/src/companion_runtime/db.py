@@ -721,49 +721,37 @@ class Database(DatabaseBase):
 
 
 def open_database(config: Any) -> DatabaseBase:
-    """Open the store a :class:`~companion_runtime.config.StorageConfig` selects.
+    """Open the Runtime's PostgreSQL store.
 
-    SQLite is the default and needs nothing but a path. A DSN selects PostgreSQL
-    instead; the import is deferred so a deployment that never uses PG does not
-    need ``psycopg`` installed at all.
-
-    Selecting PostgreSQL logs one warning, once per open, because that backend has
-    no implementation of the SQLite-only durability commands (checkpoint, verify,
-    backup, restore): they refuse with
-    :class:`~companion_runtime.maintenance.DurabilityUnsupported`, and an operator
-    should learn that at startup rather than from a failed scheduled maintenance
-    pass. Setting ``storage.durability_gap_acknowledged`` records that the gap is
-    understood and silences the warning; it changes nothing else, and the warning
-    is the only thing this function says about it.
+    v2 intentionally has no production fallback. SQLite remains in this module only
+    so the explicit stopped-v1 importer and historical tests can read an archived
+    database; starting the Runtime without a PostgreSQL DSN is an error.
 
     Args:
-        config: The ``storage`` section of the Runtime configuration (or anything
-            exposing ``dsn``, ``database_path``, ``busy_timeout_ms``, ``wal`` and
-            optionally ``durability_gap_acknowledged``).
+        config: The ``storage`` section, exposing ``require_postgres_dsn`` (preferred)
+            or a PostgreSQL ``dsn`` plus ``busy_timeout_ms``.
 
     Returns:
-        A connected store; the caller owns closing it.
-    """
-    dsn = str(getattr(config, "dsn", "") or "").strip()
-    if dsn:
-        from .db_postgres import PostgresDatabase
+        A connected PostgreSQL store; the caller owns closing it.
 
-        if not bool(getattr(config, "durability_gap_acknowledged", False)):
-            LOGGER.warning(
-                "storage.dsn selects the PostgreSQL backend, which implements no durability "
-                "commands: checkpoint/verify/backup/restore refuse with DurabilityUnsupported. "
-                "PostgreSQL durability is the server's own (WAL archiving, pg_basebackup, "
-                "pg_dump, replication). Set storage.durability_gap_acknowledged=true once that "
-                "is understood to silence this warning."
-            )
-        return PostgresDatabase(
-            dsn,
-            busy_timeout_ms=int(getattr(config, "busy_timeout_ms", 5000) or 5000),
+    Raises:
+        ValueError: If the DSN is absent or selects anything other than PostgreSQL.
+    """
+    require = getattr(config, "require_postgres_dsn", None)
+    dsn = require() if callable(require) else str(getattr(config, "dsn", "") or "").strip()
+    if not dsn:
+        raise ValueError(
+            "PostgreSQL storage is required; set CR_STORAGE__DSN "
+            "(SQLite is supported only by the offline v1 importer)"
         )
-    return Database(
-        getattr(config, "database_path", "./data/runtime.sqlite3"),
+    if not (dsn.startswith("postgresql://") or dsn.startswith("postgres://")):
+        raise ValueError("CR_STORAGE__DSN must be a PostgreSQL DSN")
+
+    from .db_postgres import PostgresDatabase
+
+    return PostgresDatabase(
+        dsn,
         busy_timeout_ms=int(getattr(config, "busy_timeout_ms", 5000) or 5000),
-        wal=bool(getattr(config, "wal", True)),
     )
 
 
