@@ -81,8 +81,10 @@ from .db_base import ConflictError, DatabaseBase
 try:
     import psycopg
     from psycopg.rows import dict_row
+    from psycopg.types.string import StrDumperUnknown
 except ImportError:  # the driver is an optional dependency of the package
     psycopg = None
+    StrDumperUnknown = None
     dict_row = None
 
 LOGGER = logging.getLogger("companion_runtime.db")
@@ -154,6 +156,68 @@ _PASSWORD_ASSIGNMENT = re.compile(r"(?i)(password\s*=\s*)\S+")
 
 #: Matches the ``user:password@`` part of a connection URI.
 _URI_PASSWORD = re.compile(r"(?i)(://[^:/@\s]+:)([^@/\s]+)(@)")
+
+# Existing projections historically represented SQLite booleans as 0/1.  Native
+# PostgreSQL BOOLEAN rejects integers, so the compatibility connection normalises
+# parameters for these preserved column names at its boundary.
+_BOOLEAN_COLUMNS = frozenset({"allow_proactive", "allow_reply", "applied", "acted", "ran", "degraded"})
+_INSERT_COLUMNS = re.compile(
+    r"(?is)^\s*insert\s+into\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]*)\)\s*values\s*\(([^)]*)\)"
+)
+
+
+def _rewrite_boolean_literals(sql: str) -> str:
+    """Rewrite SQLite's literal 0/1 flags where PostgreSQL expects BOOLEAN."""
+    insert = _INSERT_COLUMNS.search(sql)
+    if insert:
+        columns = [part.strip().strip('"').lower() for part in insert.group(1).split(",")]
+        values = [part.strip() for part in insert.group(2).split(",")]
+        changed = False
+        for index, (column, value) in enumerate(zip(columns, values)):
+            if column in _BOOLEAN_COLUMNS and value in {"0", "1"}:
+                values[index] = "FALSE" if value == "0" else "TRUE"
+                changed = True
+        if changed:
+            start, end = insert.span(2)
+            sql = sql[:start] + ", ".join(values) + sql[end:]
+    for column in _BOOLEAN_COLUMNS:
+        sql = re.sub(
+            rf"(?i)(\b{column}\b\s*=\s*)([01])(?![0-9])",
+            lambda match: match.group(1) + ("TRUE" if match.group(2) == "1" else "FALSE"),
+            sql,
+        )
+    return sql
+
+
+def _adapt_legacy_parameters(sql: str, params: Sequence[Any] | dict[str, Any]) -> Sequence[Any] | dict[str, Any]:
+    """Convert legacy integer flags to bool for native BOOLEAN target columns.
+
+    Projection inserts consistently spell their column list and VALUES placeholders
+    in the same order.  Equality filters (``applied = ?``) are handled too. Named
+    mappings are already explicit and are left alone.
+    """
+    if not params or isinstance(params, dict):
+        return params
+    adapted = list(params)
+    insert = _INSERT_COLUMNS.search(sql)
+    if insert:
+        columns = [part.strip().strip('"').lower() for part in insert.group(1).split(",")]
+        values = [part.strip() for part in insert.group(2).split(",")]
+        parameter_index = 0
+        for column, value in zip(columns, values):
+            if "?" not in value:
+                continue
+            if column in _BOOLEAN_COLUMNS and parameter_index < len(adapted):
+                adapted[parameter_index] = bool(adapted[parameter_index])
+            parameter_index += value.count("?")
+    else:
+        # The Runtime's parameterised boolean predicates are simple equality tests.
+        for column in _BOOLEAN_COLUMNS:
+            for match in re.finditer(rf"(?i)\b{column}\b\s*=\s*\?", sql):
+                index = sql[: match.end()].count("?") - 1
+                if 0 <= index < len(adapted):
+                    adapted[index] = bool(adapted[index])
+    return tuple(adapted)
 
 
 def redact(text: Any) -> str:
@@ -365,9 +429,20 @@ class TranslatingConnection:
                 point, so a caller that wants to continue must roll back (or use a
                 savepoint) first.
         """
-        statement = translate_placeholders(sql, with_params=bool(params))
+        sql = _rewrite_boolean_literals(sql)
+        adapted = _adapt_legacy_parameters(sql, params)
+        # JSONB has no LIKE operator and PostgreSQL doesn't aggregate BOOLEAN.
+        # These two legacy read queries are semantic text/0-1 operations, so cast
+        # only at the expression site while leaving storage native.
+        sql = re.sub(r"(?i)\b([A-Za-z_][A-Za-z0-9_]*_json)\s+LIKE\b", r"\1::text LIKE", sql)
+        sql = re.sub(
+            r"(?i)\bSUM\s*\(\s*(allow_proactive|allow_reply|applied|acted|ran|degraded)\s*\)",
+            lambda match: f"SUM({match.group(1)}::integer)",
+            sql,
+        )
+        statement = translate_placeholders(sql, with_params=bool(adapted))
         try:
-            return self._raw.execute(statement, params or None)
+            return self._raw.execute(statement, adapted or None)
         except CONFLICT_ERRORS as error:
             raise ConflictError(
                 str(error), dialect="postgres", native=error
@@ -417,6 +492,13 @@ class PostgresDatabase(DatabaseBase):
     #: ``pg_dump``-based implementation would flip this flag to ``True`` and add the
     #: commands beside the SQLite ones in :mod:`companion_runtime.maintenance`.
     supports_durability_commands = False
+
+    # Kept as a compatibility/introspection surface for older tests and tooling.
+    # PostgreSQL's native core migration already includes these columns at create
+    # time; migrate() never executes SQLite ALTER type fragments.
+    from .db import Database as _LegacyDatabase
+    ADDED_COLUMNS = _LegacyDatabase.ADDED_COLUMNS
+    del _LegacyDatabase
 
     def __init__(
         self,
@@ -495,6 +577,13 @@ class PostgresDatabase(DatabaseBase):
                     connect_timeout=self.connect_timeout_s,
                     application_name=self.application_name,
                 )
+                # Legacy projections pass ISO timestamps and compact JSON as Python
+                # strings.  The default psycopg string dumper advertises VARCHAR,
+                # which PostgreSQL will not implicitly assign to TIMESTAMPTZ/JSONB.
+                # Sending strings as the protocol's "unknown" type lets the target
+                # column perform its native input conversion, preserving one set of
+                # projection statements without weakening those columns to TEXT.
+                raw.adapters.register_dumper(str, StrDumperUnknown)
                 self._apply_session_settings(raw)
             except Exception as error:
                 # `from None` keeps a libpq message from being echoed in a chained

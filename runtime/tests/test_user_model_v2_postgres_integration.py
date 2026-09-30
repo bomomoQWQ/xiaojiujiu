@@ -16,6 +16,9 @@ psycopg = pytest.importorskip("psycopg")
 
 from companion_runtime.user_model_v2_migrations import migrate
 from companion_runtime.user_model_v2_repository import UserModelV2Repository
+from companion_runtime.user_model_v2_service import UserModelV2Service
+from companion_runtime.user_model_v2_service_repository import PostgresUserModelV2ServiceRepository
+from companion_runtime.user_model_v2_types import Target
 
 _DSN = os.environ.get("CR_TEST_PG_DSN", "").strip()
 pytestmark = pytest.mark.skipif(not _DSN, reason="set CR_TEST_PG_DSN for live PostgreSQL tests")
@@ -29,7 +32,7 @@ def pg_schema():
     try:
         with connection.transaction():
             result = migrate(connection, schema=schema)
-        assert result.applied == (1, 2)
+        assert result.applied == (1, 2, 3, 4)
         yield connection, schema
     finally:
         connection.rollback()
@@ -48,7 +51,7 @@ def test_native_migrations_are_idempotent_and_create_scoped_tables(pg_schema) ->
     with connection.transaction():
         second = migrate(connection, schema=schema)
     assert second.applied == ()
-    assert second.already_present == (1, 2)
+    assert second.already_present == (1, 2, 3, 4)
 
     rows = connection.execute(
         "SELECT table_name FROM information_schema.tables "
@@ -144,3 +147,46 @@ def test_repository_idempotency_scope_and_label_revision_on_real_postgres(pg_sch
         )
         is None
     )
+
+
+def test_service_adapter_round_trip_and_scope_isolation_on_real_postgres(pg_schema) -> None:
+    connection, schema = pg_schema
+    _search_path(connection, schema)
+    adapter = PostgresUserModelV2ServiceRepository(connection)
+    service = UserModelV2Service(adapter)
+    now = datetime.now(timezone.utc)
+    horizons = {target: (index + 1) * 60 for index, target in enumerate(Target)}
+    exposure_id = str(uuid.uuid4())
+
+    first = service.prepare_exposure(
+        scope_key="scope:service-a",
+        exposure_id=exposure_id,
+        idempotency_key="delivery:service:one",
+        occurred_at=now,
+        action={"type": "follow_up", "proactive": True},
+        context_provider=lambda: {"busy_probability": 0.2, "recent_contact_count": 3},
+        delivery_confirmed=True,
+        horizons=horizons,
+        source_event_ids=("delivery-1",),
+    )
+    replay = service.prepare_exposure(
+        scope_key="scope:service-a",
+        exposure_id=str(uuid.uuid4()),
+        idempotency_key="delivery:service:one",
+        occurred_at=now,
+        action={},
+        context_provider=lambda: pytest.fail("replay must not recompute context"),
+        delivery_confirmed=True,
+        horizons=horizons,
+    )
+    assert first is not None and replay == first
+    assert tuple(label.target for label in first.labels) == tuple(Target)
+    assert adapter.get_active_label(
+        scope_key="scope:service-a", exposure_id=exposure_id, target=Target.REPLY
+    ) == (first.labels[0], 1)
+    assert adapter.get_active_label(
+        scope_key="scope:service-b", exposure_id=exposure_id, target=Target.REPLY
+    ) is None
+    assert tuple(
+        adapter.list_active_training_records(scope_key="scope:service-b", target=Target.REPLY)
+    ) == ()

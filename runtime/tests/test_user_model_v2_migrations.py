@@ -45,7 +45,7 @@ def test_records_have_stable_nonempty_checksums() -> None:
     first = migration_records()
     second = migration_records()
     assert first == second
-    assert tuple(record.version for record in first) == (1, 2)
+    assert tuple(record.version for record in first) == (1, 2, 3, 4)
     assert all(len(record.checksum) == 64 for record in first)
 
 
