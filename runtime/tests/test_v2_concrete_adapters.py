@@ -1,0 +1,129 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+from companion_runtime.legacy_bridge_v2 import ConcreteLegacyRuntimeV2Bridge
+from companion_runtime.runtime_repository_v2 import PostgresV2RuntimeRepository
+from companion_runtime.typing import CandidateIntent
+from companion_runtime.user_model_v2_types import Target
+
+NOW = datetime(2027, 1, 1, tzinfo=timezone.utc)
+
+
+class Candidates:
+    def __init__(self, item): self.item = item
+    def list_active(self, limit): return [self.item]
+    def get(self, candidate_id): return self.item if candidate_id == self.item.candidate_id else None
+
+
+class Boundaries:
+    def active(self, now): return []
+
+
+def test_legacy_bridge_translates_only_mechanical_reply_and_candidate_pool():
+    item = CandidateIntent(
+        candidate_id="c1", type="follow_up", intent="问结果", goal="ask-result",
+        sources=["unfinished:interview"], internal_need=.4, unfinished_relevance=.5,
+    )
+    runtime = SimpleNamespace(
+        projections=SimpleNamespace(candidates=Candidates(item), boundaries=Boundaries()),
+        config=SimpleNamespace(candidate=SimpleNamespace(max_active=12)),
+        _event_ids_behind=lambda source: ["evt-source"],
+    )
+    bridge = ConcreteLegacyRuntimeV2Bridge(runtime)
+    outcome = SimpleNamespace(
+        event=SimpleNamespace(event_id="evt-reply", timestamp=NOW),
+        duplicate=False, attributed_attempt_id="att-1", unfinished_resolved=[],
+        # These legacy-model-shaped values must not become v2 explicit labels.
+        observation_id="legacy-observation", appraisal_source="rule",
+    )
+    translated = bridge.after_user_event(event={}, legacy_outcome=outcome)
+    assert [(o.target, o.candidate_exposure_ids) for o in translated.observations] == [
+        (Target.REPLY, ("att-1",))
+    ]
+    assert all(o.target not in {Target.ACCEPTANCE, Target.NEGATIVE} for o in translated.observations)
+    candidate = bridge.candidates(scope_key="scope", now=NOW)[0]
+    assert candidate.candidate_id == "c1"
+    assert candidate.repeat_subject.concern_id == "interview"
+    assert candidate.source_event_ids == ("evt-source",)
+
+
+class Cursor:
+    def __init__(self, rows=()): self.rows = rows
+    def fetchall(self): return list(self.rows)
+    def fetchone(self): return self.rows[0] if self.rows else None
+
+
+class FakeConnection:
+    def __init__(self): self.calls = []; self.results = []
+    def execute(self, sql, params=()):
+        self.calls.append((" ".join(sql.split()), params))
+        return Cursor(self.results.pop(0) if self.results else ())
+
+
+class PredictionService:
+    def predict(self, **kwargs):
+        from companion_runtime.user_model_v2_types import SupportStatus, TargetPredictionV2
+        def p(target):
+            return TargetPredictionV2(
+                prediction_id=target.value, scope_key="scope", target=target,
+                point=.5, lower=.4, upper=.6, interval_level=.9,
+                interval_kind="laplace", support=SupportStatus.INFORMATIVE,
+                predicted_at=NOW, created_at=NOW, updated_at=NOW,
+            )
+        return SimpleNamespace(
+            envelope_id="env-1", predictions=tuple(p(t) for t in Target),
+            parameter_snapshot_ids=tuple((t, "params-1") for t in Target),
+        )
+
+
+class ServiceRepository:
+    def get_prepared_exposure(self, **kwargs): return SimpleNamespace(key=kwargs["idempotency_key"])
+
+
+def repository(connection):
+    return PostgresV2RuntimeRepository(
+        connection, prediction_service=PredictionService(),
+        service_repository=ServiceRepository(), scope_key="scope",
+        context_provider=lambda candidate, now: {
+            "busy_probability": 0.0, "recent_contact_count": 0,
+            "hours_since_contact": 2.0, "user_active_now": False,
+            "ever_boundary": False, "novelty": .5, "explicit_permission": False,
+        },
+    )
+
+
+def test_runtime_repository_reads_v2_history_and_writes_idempotently():
+    connection = FakeConnection()
+    connection.results = [[{
+        "exposure_id": "e1", "acknowledged_at": NOW,
+        "concern_id": "interview", "action_goal_id": "ask",
+    }]]
+    repo = repository(connection)
+    history = repo.acknowledged_exposures(scope_key="scope", now=NOW)
+    assert history[0].concern_id == "interview"
+    from companion_runtime.repeat_v2 import UserMatterEventKind, UserMatterEventV2
+    repo.append_user_matter_events(scope_key="scope", events=(UserMatterEventV2(
+        event_id="u1", occurred_at_utc=NOW, kind=UserMatterEventKind.PROGRESS,
+        concern_id="interview",
+    ),))
+    repo.save_decision_audit(decision_id="d1", audit={"events": []})
+    assert any("ON CONFLICT (scope_key, event_id) DO NOTHING" in sql for sql, _ in connection.calls)
+    assert any("runtime_v2_decision_audits" in sql for sql, _ in connection.calls)
+
+
+def test_runtime_repository_prediction_uses_v2_prediction_service():
+    from companion_runtime.motivation_v2 import CandidatePolicyV2, UserUtilityCoefficientsV2
+    from companion_runtime.repeat_v2 import RepeatSubjectV2
+    from companion_runtime.runtime_v2 import CandidateV2
+    repo = repository(FakeConnection())
+    result = repo.prediction_for(scope_key="scope", candidate=CandidateV2(
+        candidate_id="c1", action={"type": "share", "proactive": True},
+        internal_utility=0, coefficients=UserUtilityCoefficientsV2(
+            v_reply=1, v_continue=1, c_negative=1),
+        repeat_subject=RepeatSubjectV2(), policy=CandidatePolicyV2(),
+    ), now=NOW)
+    assert result.snapshot_id == "env-1"
+    assert result.reply.target is Target.REPLY
+    assert result.negative.target is Target.NEGATIVE

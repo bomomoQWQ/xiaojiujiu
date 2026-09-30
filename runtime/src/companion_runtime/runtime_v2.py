@@ -587,6 +587,17 @@ class V2RuntimeCoordinator:
                     dict.fromkeys((*chosen.source_event_ids, *ack.source_event_ids))
                 ),
             )
+            if prepared is not None:
+                record_exposure = getattr(
+                    self.repository, "record_acknowledged_exposure", None
+                )
+                if callable(record_exposure):
+                    record_exposure(
+                        exposure_id=prepared.exposure.exposure_id,
+                        acknowledged_at=ack.acknowledged_at,
+                        concern_id=chosen.repeat_subject.concern_id,
+                        action_goal_id=chosen.repeat_subject.action_goal_id,
+                    )
         self._save_audit(recorder)
         return prepared
 

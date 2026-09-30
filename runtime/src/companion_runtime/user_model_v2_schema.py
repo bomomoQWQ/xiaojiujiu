@@ -12,7 +12,7 @@ from typing import Final
 
 from .runtime_core_v2_schema import CORE_SCHEMA_STATEMENTS, CORE_SCHEMA_VERSION
 
-USER_MODEL_SCHEMA_VERSION: Final[int] = 5
+USER_MODEL_SCHEMA_VERSION: Final[int] = 6
 
 _INITIAL_SCHEMA: tuple[str, ...] = (
     """
@@ -336,6 +336,63 @@ _IMPORT_AUDIT_SCHEMA: tuple[str, ...] = (
 )
 
 
+# Runtime-v2-only facts which have no safe representation in the legacy projections.
+# Exposures themselves stay in ``interaction_exposures_v2``; these append-only rows
+# carry repeat identity, user-originated resets, and the complete decision audit.
+_RUNTIME_ADAPTER_SCHEMA: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS runtime_v2_exposure_metadata (
+        scope_key TEXT NOT NULL CHECK (btrim(scope_key) <> ''),
+        exposure_id UUID NOT NULL,
+        concern_id TEXT,
+        action_goal_id TEXT,
+        acknowledged_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (scope_key, exposure_id),
+        CONSTRAINT fk_runtime_v2_exposure_metadata_exposure
+            FOREIGN KEY (scope_key, exposure_id)
+            REFERENCES interaction_exposures_v2 (scope_key, exposure_id)
+            ON DELETE CASCADE,
+        CHECK (concern_id IS NULL OR btrim(concern_id) <> ''),
+        CHECK (action_goal_id IS NULL OR btrim(action_goal_id) <> '')
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_runtime_v2_exposure_metadata_scope_time
+    ON runtime_v2_exposure_metadata (scope_key, acknowledged_at DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS runtime_v2_user_matter_events (
+        scope_key TEXT NOT NULL CHECK (btrim(scope_key) <> ''),
+        event_id TEXT NOT NULL CHECK (btrim(event_id) <> ''),
+        occurred_at TIMESTAMPTZ NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('progress', 'reopen')),
+        concern_id TEXT,
+        action_goal_id TEXT,
+        PRIMARY KEY (scope_key, event_id),
+        CHECK (concern_id IS NOT NULL OR action_goal_id IS NOT NULL),
+        CHECK (concern_id IS NULL OR btrim(concern_id) <> ''),
+        CHECK (action_goal_id IS NULL OR btrim(action_goal_id) <> '')
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_runtime_v2_user_matter_events_scope_time
+    ON runtime_v2_user_matter_events (scope_key, occurred_at DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS runtime_v2_decision_audits (
+        decision_id TEXT PRIMARY KEY CHECK (btrim(decision_id) <> ''),
+        scope_key TEXT NOT NULL CHECK (btrim(scope_key) <> ''),
+        audit JSONB NOT NULL CHECK (jsonb_typeof(audit) = 'object'),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_runtime_v2_decision_audits_scope_time
+    ON runtime_v2_decision_audits (scope_key, updated_at DESC)
+    """,
+)
+
+
 MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     (1, _INITIAL_SCHEMA),
     (2, _ACTIVE_LABEL_SCHEMA),
@@ -345,6 +402,7 @@ MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     # PostgreSQL-native types while preserving columns for projection reuse.
     (CORE_SCHEMA_VERSION, CORE_SCHEMA_STATEMENTS),
     (5, _IMPORT_AUDIT_SCHEMA),
+    (6, _RUNTIME_ADAPTER_SCHEMA),
 )
 
 
