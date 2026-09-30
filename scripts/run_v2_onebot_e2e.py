@@ -217,10 +217,7 @@ def strict_checks(before: Mapping[str, Any], after: Mapping[str, Any], *, scope:
     # decision being validated may legitimately carry prior-or-unavailable. Require
     # a scoped active snapshot to exist; when the audit names concrete ids, also
     # require their intersection.
-    parameters = [
-        row for row in new["parameters"]
-        if not parameter_ids or str(row.get("parameter_snapshot_id")) in parameter_ids
-    ]
+    parameters = list(new["parameters"])
     scoped = lambda row: row.get("scope") in (None, scope) or row.get("scope_key") == scope
     return {
         "v2_exposure": bool(delivered) and all(scoped(row) for row in delivered),
