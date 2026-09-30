@@ -13,6 +13,7 @@ import re
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
+from uuid import UUID
 from enum import Enum
 from typing import Any, Mapping, Protocol
 
@@ -47,6 +48,8 @@ def _jsonable(value: Any) -> Any:
         return value
     if isinstance(value, (datetime, date)):
         return value.isoformat()
+    if isinstance(value, UUID):
+        return str(value)
     if isinstance(value, Enum):
         return _jsonable(value.value)
     if is_dataclass(value) and not isinstance(value, type):
