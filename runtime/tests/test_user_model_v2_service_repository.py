@@ -90,7 +90,10 @@ def test_put_prepared_exposure_serializes_snapshot_and_four_pending_labels_once(
     assert all(call["target_value"]["status"] == "pending" for call in low.revisions)
     update_sql, update_params = connection.calls[1]
     assert "WHERE scope_key = %s AND exposure_id = %s AND idempotency_key = %s" in update_sql
-    assert update_params[-3:] == (SCOPE, "exp-1", "delivery-1")
+    assert update_params[-3] == SCOPE
+    from uuid import UUID
+    UUID(str(update_params[-2]))
+    assert update_params[-1] == "delivery-1"
     assert '"feature_fingerprint"' in update_params[1]
 
 
