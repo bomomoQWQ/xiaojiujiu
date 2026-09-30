@@ -426,6 +426,44 @@ class PostgresV2RuntimeRepository:
                 idempotency_key=f"{idempotency_key}:active",
             )
 
+    def read_blackbox_evidence(self, *, scope_key: str) -> Mapping[str, Any]:
+        """Return normalized, scope-bound evidence for the public black-box API."""
+        self._scope(scope_key)
+        def maps(rows: Sequence[Any]) -> list[Any]:
+            return [dict(row) if isinstance(row, Mapping) else row for row in rows]
+        events = self.connection.execute(
+            "SELECT event_id, event_type AS kind, conversation_id AS scope_key, timestamp "
+            "FROM raw_events WHERE conversation_id = %s ORDER BY timestamp", (scope_key,)
+        ).fetchall()
+        exposures = self.connection.execute(
+            "SELECT exposure_id, scope_key, occurred_at, action, context, exposure_payload "
+            "FROM interaction_exposures_v2 WHERE scope_key = %s ORDER BY occurred_at",
+            (scope_key,),
+        ).fetchall()
+        labels = self.connection.execute(
+            "SELECT l.target_label_id, l.scope_key, l.exposure_id, l.target_name, "
+            "l.target_value, l.label_version FROM interaction_target_labels_v2 l "
+            "JOIN user_model_active_labels_v2 a ON a.scope_key=l.scope_key "
+            "AND a.target_label_id=l.target_label_id WHERE l.scope_key=%s ORDER BY l.labelled_at",
+            (scope_key,),
+        ).fetchall()
+        parameters = self.connection.execute(
+            "SELECT s.parameter_snapshot_id,s.scope_key,s.parameter_version,s.parameters "
+            "FROM user_model_parameter_snapshots_v2 s JOIN user_model_active_parameters_v2 a "
+            "ON a.scope_key=s.scope_key AND a.parameter_snapshot_id=s.parameter_snapshot_id "
+            "WHERE s.scope_key=%s AND a.deactivated_at IS NULL", (scope_key,)
+        ).fetchall()
+        return {"events": maps(events), "exposures": maps(exposures), "labels": maps(labels),
+                "parameter_snapshots": maps(parameters)}
+
+    def list_decision_audits(self, *, scope_key: str) -> Sequence[Mapping[str, Any]]:
+        self._scope(scope_key)
+        rows = self.connection.execute(
+            "SELECT decision_id,scope_key,audit,updated_at FROM runtime_v2_decision_audits "
+            "WHERE scope_key=%s ORDER BY updated_at", (scope_key,)
+        ).fetchall()
+        return tuple(dict(row) if isinstance(row, Mapping) else row for row in rows)
+
     def _scope(self, scope_key: str) -> None:
         if scope_key != self.scope_key:
             raise ValueError("runtime repository cannot cross its configured scope")
