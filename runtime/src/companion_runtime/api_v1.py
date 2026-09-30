@@ -1016,16 +1016,14 @@ def _already_settled(*, row: Any, attempt: Any, action_type: str, status: str) -
     * a successful ``render`` report whose attempt already left the render stage;
     * a successful ``send`` report whose attempt is already ``sent``/``resolved``.
     """
+    # A successful send report is an irreversible platform fact even when lease
+    # recovery has already settled/cancelled/failed the row.  It must reach the
+    # Reducer's late-report path so v2 can record an exposure without resending.
+    if action_type == ACTION_SEND and status == STATUS_OK:
+        return attempt is not None and attempt.state in SENT_ATTEMPT_STATES
     if row.status in SETTLED_OUTBOX_STATUSES:
         return True
     if row.status == OutboxStatus.FAILED.value:
-        # A successful send report may arrive after lease recovery exhausted the
-        # row. The platform already delivered it; treating the failed row as a
-        # duplicate would discard the acknowledgement and create no exposure. Let
-        # the send-success path call mark_delivered, whose terminal late-report
-        # branch records the truth without reviving/resending the attempt.
-        if action_type == ACTION_SEND and status == STATUS_OK:
-            return False
         return attempt is None or attempt.state in TERMINAL_ATTEMPT_STATES
     if attempt is None:
         return False
