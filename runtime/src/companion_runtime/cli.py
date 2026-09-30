@@ -350,8 +350,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
         result = runtime.v2_coordinator.decide_endogenous(
             decision_id=new_id("decision"),
             now=utcnow(),
-            # A simulation is an immediate trial over one scheduler minimum interval.
-            elapsed_allowed_seconds=float(config.scheduler.min_interval_seconds),
+            # The guarded acceptance stack needs a deterministic traversal of the
+            # render/send path. Use an effectively complete allowed interval; hard
+            # boundary/cold-start/repeat gates still run before the hazard draw.
+            elapsed_allowed_seconds=1_000_000_000.0,
         )
         return {
             "acted": result.acted,
