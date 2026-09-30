@@ -117,6 +117,8 @@ class ConcreteLegacyRuntimeV2Bridge:
         legacy = self.runtime.projections.candidates.list_active(
             limit=self.runtime.config.candidate.max_active
         )
+        if not legacy:
+            legacy = self.runtime.refresh_candidates_for_v2(now=now)
         self._legacy_candidates = {item.candidate_id: item for item in legacy}
         return tuple(self._candidate(item) for item in legacy)
 
