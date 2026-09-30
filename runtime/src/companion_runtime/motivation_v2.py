@@ -20,7 +20,9 @@ from typing import Any
 
 from .user_model_v2_types import SupportStatus, Target, TargetPredictionV2
 
-_COLD_SUPPORT = frozenset({SupportStatus.PRIOR_ONLY, SupportStatus.SPARSE})
+_COLD_SUPPORT = frozenset(
+    {SupportStatus.PRIOR_ONLY, SupportStatus.SPARSE, SupportStatus.UNAVAILABLE}
+)
 
 
 def _non_negative(name: str, value: float) -> float:
@@ -194,10 +196,14 @@ def user_utility(
     if len(scopes) != 1:
         raise ValueError("all predictions must have the same scope_key")
 
+    # An unavailable head has no numeric interval. Fail closed for benefits and
+    # conservatively charge the full negative-event range until evidence exists.
     used = UsedBoundsV2(
-        p_reply_lower=float(reply.lower),
-        p_continue_given_reply_lower=float(continuation.lower),
-        p_negative_upper=float(negative.upper),
+        p_reply_lower=0.0 if reply.lower is None else float(reply.lower),
+        p_continue_given_reply_lower=(
+            0.0 if continuation.lower is None else float(continuation.lower)
+        ),
+        p_negative_upper=1.0 if negative.upper is None else float(negative.upper),
     )
     reply_benefit = coefficients.v_reply * used.p_reply_lower
     continuation_benefit = (
