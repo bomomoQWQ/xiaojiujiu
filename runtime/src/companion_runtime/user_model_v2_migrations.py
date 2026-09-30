@@ -127,7 +127,11 @@ def migrate(
     present_rows = executor.execute(
         "SELECT version, checksum FROM schema_migrations_v2 ORDER BY version"
     ).fetchall()
-    present = {int(row[0]): str(row[1]) for row in present_rows}
+    present = {
+        int(row["version"] if isinstance(row, dict) else row[0]):
+        str(row["checksum"] if isinstance(row, dict) else row[1])
+        for row in present_rows
+    }
 
     known_versions = {record.version for record in records}
     unknown = sorted(set(present) - known_versions)
