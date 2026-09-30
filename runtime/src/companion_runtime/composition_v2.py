@@ -40,6 +40,7 @@ from .user_model_v2_types import Target
 DatabaseFactory = Callable[[Any], Any]
 ServiceRepositoryFactory = Callable[[Any, UserModelV2Repository], Any]
 PredictionRepositoryFactory = Callable[[UserModelV2Repository], Any]
+RuntimeRepositoryFactory = Callable[..., V2RuntimeRepository]
 
 
 class PostgresUserModelV2PredictionRepository:
@@ -123,7 +124,7 @@ def build_v2_composition(
     *,
     scope_key: str,
     legacy_bridge: LegacyRuntimeV2Bridge,
-    runtime_repository: V2RuntimeRepository,
+    runtime_repository: V2RuntimeRepository | None = None,
     decision_config: DecisionConfigV2 | None = None,
     rng: Any | None = None,
     database_factory: DatabaseFactory = open_database,
@@ -131,6 +132,7 @@ def build_v2_composition(
     prediction_repository_factory: PredictionRepositoryFactory = (
         PostgresUserModelV2PredictionRepository
     ),
+    runtime_repository_factory: RuntimeRepositoryFactory | None = None,
 ) -> V2Composition:
     """Build and migrate the PostgreSQL-only v2 runtime graph.
 
@@ -158,6 +160,17 @@ def build_v2_composition(
         prediction_repository = prediction_repository_factory(repository)
         user_model_service = UserModelV2Service(service_repository)
         prediction_service = UserModelV2PredictionService(prediction_repository)
+        if runtime_repository is None:
+            if runtime_repository_factory is None:
+                from .runtime_repository_v2 import PostgresV2RuntimeRepository
+
+                runtime_repository_factory = PostgresV2RuntimeRepository
+            runtime_repository = runtime_repository_factory(
+                connection,
+                prediction_service=prediction_service,
+                service_repository=service_repository,
+                scope_key=scope_key,
+            )
         semantic_judge = DisabledSemanticJudgeV2()
         coordinator = V2RuntimeCoordinator(
             scope_key=scope_key,
