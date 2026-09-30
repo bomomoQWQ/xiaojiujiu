@@ -1679,6 +1679,16 @@ class Reducer:
                 "text": attempt.rendered_text,
                 "intent": attempt.intent,
                 "goal": attempt.goal,
+                **(
+                    {"decision_id": item.payload["decision_id"]}
+                    if item is not None and item.payload.get("decision_id")
+                    else {}
+                ),
+                **(
+                    {"action": item.payload["action"]}
+                    if item is not None and isinstance(item.payload.get("action"), Mapping)
+                    else {}
+                ),
             },
             priority=10,
             available_at=stamp,
