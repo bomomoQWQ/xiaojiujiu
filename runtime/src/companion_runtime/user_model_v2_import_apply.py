@@ -115,19 +115,46 @@ def _source_reconciliation(plan: MigrationPlan, scope: str) -> tuple[TableReconc
     return tuple(sorted(result, key=lambda item: (item.source_path, item.table)))
 
 
+def _reliable_replies(plan: MigrationPlan, scope: str) -> tuple[ReplyCandidate, ...]:
+    """Return at most one reliable reply fact per exposure.
+
+    Several historical user events can point at the same delivered action. They are
+    not independent reply labels and must not become successive active revisions.
+    Keep the earliest deterministic fact; the extras are quarantined below.
+    """
+    candidates = sorted(
+        (
+            item for item in plan.reply_candidates
+            if item.scope_key == scope and item.importable and item.observed_at is not None
+        ),
+        key=lambda item: (str(item.exposure_id), str(item.observed_at), item.label_id),
+    )
+    first_by_exposure: dict[str, ReplyCandidate] = {}
+    for item in candidates:
+        first_by_exposure.setdefault(str(item.exposure_id), item)
+    return tuple(first_by_exposure.values())
+
+
 def _quarantine_records(plan: MigrationPlan, scope: str) -> tuple[QuarantineRecord, ...]:
     records = [item for item in plan.quarantine if item.scope_key == scope]
+    chosen = {item.label_id for item in _reliable_replies(plan, scope)}
     for item in plan.reply_candidates:
-        if item.scope_key != scope or (item.importable and item.observed_at is not None):
+        if item.scope_key != scope:
+            continue
+        if item.importable and item.observed_at is not None and item.label_id in chosen:
             continue
         payload = asdict(item)
+        duplicate = item.importable and item.observed_at is not None
         records.append(
             QuarantineRecord(
                 scope_key=scope,
                 source_table="raw_events",
                 source_row=item.evidence[0] if item.evidence else f"reply:{item.label_id}",
-                classification=f"reply_{item.status}",
-                reason=item.reason or "reply candidate failed reliability gate",
+                classification=("reply_duplicate_exposure" if duplicate else f"reply_{item.status}"),
+                reason=(
+                    "additional reply fact for an exposure already assigned one R label"
+                    if duplicate else item.reason or "reply candidate failed reliability gate"
+                ),
                 payload_sha256=hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest(),
             )
         )
@@ -138,7 +165,7 @@ def _quarantine_records(plan: MigrationPlan, scope: str) -> tuple[QuarantineReco
 def _base_report(plan: MigrationPlan, scope: str, *, dry_run: bool) -> ReconciliationReport:
     exposures = tuple(item for item in plan.exposures if item.scope_key == scope)
     replies = tuple(item for item in plan.reply_candidates if item.scope_key == scope)
-    reliable = tuple(item for item in replies if item.importable and item.observed_at is not None)
+    reliable = _reliable_replies(plan, scope)
     quarantine = _quarantine_records(plan, scope)
     return ReconciliationReport(
         scope_key=scope,
@@ -246,10 +273,7 @@ def apply_migration_plan(
         raise TypeError("service_repository must expose PostgreSQL connection and repository")
 
     exposures = tuple(item for item in plan.exposures if item.scope_key == scope)
-    reliable = tuple(
-        item for item in plan.reply_candidates
-        if item.scope_key == scope and item.importable and item.observed_at is not None
-    )
+    reliable = _reliable_replies(plan, scope)
     quarantine = _quarantine_records(plan, scope)
     written_exposures = duplicate_exposures = 0
     written_labels = duplicate_labels = 0
