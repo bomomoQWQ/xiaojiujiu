@@ -749,10 +749,12 @@ def open_database(config: Any) -> DatabaseBase:
 
     from .db_postgres import PostgresDatabase
 
-    return PostgresDatabase(
+    store = PostgresDatabase(
         dsn,
         busy_timeout_ms=int(getattr(config, "busy_timeout_ms", 5000) or 5000),
     )
+    store.schema_name = str(getattr(config, "schema", "companion_runtime") or "companion_runtime")
+    return store
 
 
 def row_to_dict(row: sqlite3.Row | None, table: str | None = None) -> dict[str, Any] | None:

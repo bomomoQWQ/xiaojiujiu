@@ -116,10 +116,15 @@ def migrate(
         raise ValueError("applied_at must be timezone-aware")
 
     records = migration_records(migrations)
+    # ``PostgresDatabase.transaction`` yields a compatibility adapter whose
+    # ``execute`` translates legacy ``?`` SQL.  v2 migrations are deliberately
+    # PostgreSQL-native (``%s``, JSONB, TIMESTAMPTZ), so execute against the raw
+    # psycopg connection when that adapter is supplied.
+    executor = getattr(connection, "raw", connection)
     for statement in migration_bootstrap_statements(schema):
-        connection.execute(statement)
+        executor.execute(statement)
 
-    present_rows = connection.execute(
+    present_rows = executor.execute(
         "SELECT version, checksum FROM schema_migrations_v2 ORDER BY version"
     ).fetchall()
     present = {int(row[0]): str(row[1]) for row in present_rows}
@@ -142,8 +147,8 @@ def migrate(
             already.append(record.version)
             continue
         for statement in record.statements:
-            connection.execute(statement)
-        connection.execute(
+            executor.execute(statement)
+        executor.execute(
             "INSERT INTO schema_migrations_v2(version, checksum, applied_at, runner_version) "
             "VALUES (%s, %s, %s, %s)",
             (record.version, record.checksum, stamp, runner_version),
