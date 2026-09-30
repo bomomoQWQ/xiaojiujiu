@@ -149,12 +149,20 @@ def _ack_conflict_detail(runtime: Any, outbox_id: str, owner: str | None) -> str
     return f"row is {item.status}, not leased"
 
 
-def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
+def create_app(
+    runtime: Any,
+    config: RuntimeConfig | None = None,
+    *,
+    v2_composition: Any | None = None,
+) -> FastAPI:
     """Build the FastAPI application for a Runtime instance.
 
     Args:
         runtime: A :class:`~companion_runtime.runtime.Runtime`.
         config: Configuration override; defaults to the runtime's own config.
+        v2_composition: Optional explicitly constructed v2 graph.  Supplying it mounts
+            the isolated public/read-only v2 observability router; omitting it preserves
+            the historical API (including every v1 response shape) exactly.
 
     Returns:
         A configured :class:`fastapi.FastAPI` application.
@@ -1098,6 +1106,28 @@ def create_app(runtime: Any, config: RuntimeConfig | None = None) -> FastAPI:
     from .api_v1 import create_v1_router
 
     app.include_router(create_v1_router(runtime, settings))
+
+    if v2_composition is not None:
+        from .api_v2_observability import create_v2_observability_router
+
+        app.include_router(
+            create_v2_observability_router(
+                scope_key=v2_composition.coordinator.scope_key,
+                runtime_repository=v2_composition.coordinator.repository,
+                audit_repository=getattr(
+                    v2_composition,
+                    "audit_repository",
+                    v2_composition.coordinator.repository,
+                ),
+                health=v2_composition.health,
+                enable_decision_run=bool(
+                    getattr(v2_composition, "enable_decision_run", False)
+                ),
+                decision_simulation_runner=getattr(
+                    v2_composition, "decision_simulation_runner", None
+                ),
+            )
+        )
 
     @app.exception_handler(ValueError)
     async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
