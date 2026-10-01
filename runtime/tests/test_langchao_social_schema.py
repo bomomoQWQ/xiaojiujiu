@@ -106,10 +106,12 @@ def test_every_cross_reference_carries_scope_and_restricts_deletion() -> None:
 
 
 def test_social_schema_is_registry_migration_v17_with_stable_checksum() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 17
-    assert MIGRATIONS[-1] == (17, LANGCHAO_SOCIAL_SCHEMA_STATEMENTS)
-    assert tuple(version for version, _statements in MIGRATIONS) == tuple(range(1, 18))
-    assert registry_schema_statements()[-len(LANGCHAO_SOCIAL_SCHEMA_STATEMENTS) :] == (
+    assert USER_MODEL_SCHEMA_VERSION >= 17
+    assert MIGRATIONS[16] == (17, LANGCHAO_SOCIAL_SCHEMA_STATEMENTS)
+    assert tuple(version for version, _statements in MIGRATIONS[:17]) == tuple(range(1, 18))
+    flattened = registry_schema_statements()
+    start = flattened.index(LANGCHAO_SOCIAL_SCHEMA_STATEMENTS[0])
+    assert flattened[start:start + len(LANGCHAO_SOCIAL_SCHEMA_STATEMENTS)] == (
         LANGCHAO_SOCIAL_SCHEMA_STATEMENTS
     )
 
