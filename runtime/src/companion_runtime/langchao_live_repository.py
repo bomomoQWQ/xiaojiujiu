@@ -24,6 +24,7 @@ class LangchaoLiveCommit:
     expected_tokens: tuple[OutcomeToken, ...]
     attempt_id: str
     render_outbox_id: str
+    claim_id: str
     committed_at: datetime
     terminal_ack_id: str | None = None
     terminal_ack_kind: str | None = None
@@ -46,15 +47,15 @@ class LangchaoLiveRepository:
             """INSERT INTO langchao_live_commits
                (scope_key, round_id, langchao_candidate_id, candidate_revision,
                 source_candidate_id, reward_contract_id, reward_revision,
-                expected_token_ids, snapshot, attempt_id, render_outbox_id, committed_at)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)
+                expected_token_ids, snapshot, attempt_id, render_outbox_id, claim_id, committed_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s)
                ON CONFLICT (scope_key, round_id) DO NOTHING RETURNING round_id""",
             (self.scope_key, commit.round_id, commit.langchao_candidate_id,
              commit.candidate_revision, commit.source_candidate_id,
              commit.reward_contract_id, commit.reward_revision,
              json.dumps([token.token_id for token in commit.expected_tokens]),
              json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-             commit.attempt_id, commit.render_outbox_id, commit.committed_at),
+             commit.attempt_id, commit.render_outbox_id, commit.claim_id, commit.committed_at),
         )
         if cursor.fetchone() is None:
             existing = self.get(commit.round_id)
@@ -65,7 +66,7 @@ class LangchaoLiveRepository:
         row = self.connection.execute(
             """SELECT scope_key,round_id,langchao_candidate_id,candidate_revision,
                       source_candidate_id,reward_contract_id,reward_revision,snapshot,
-                      attempt_id,render_outbox_id,committed_at,terminal_ack_id,terminal_ack_kind
+                      attempt_id,render_outbox_id,claim_id,committed_at,terminal_ack_id,terminal_ack_kind
                FROM langchao_live_commits WHERE scope_key=%s AND round_id=%s""",
             (self.scope_key, round_id),
         ).fetchone()
@@ -75,7 +76,7 @@ class LangchaoLiveRepository:
         rows = self.connection.execute(
             """SELECT scope_key,round_id,langchao_candidate_id,candidate_revision,
                       source_candidate_id,reward_contract_id,reward_revision,snapshot,
-                      attempt_id,render_outbox_id,committed_at,terminal_ack_id,terminal_ack_kind
+                      attempt_id,render_outbox_id,claim_id,committed_at,terminal_ack_id,terminal_ack_kind
                FROM langchao_live_commits
                WHERE scope_key=%s AND terminal_ack_kind IS NULL ORDER BY committed_at,round_id""",
             (self.scope_key,),
@@ -150,8 +151,9 @@ class LangchaoLiveRepository:
             reward_contract_id=str(value("reward_contract_id", 5)),
             reward_revision=int(value("reward_revision", 6)), expected_tokens=tokens,
             attempt_id=str(value("attempt_id", 8)), render_outbox_id=str(value("render_outbox_id", 9)),
-            committed_at=value("committed_at", 10), terminal_ack_id=value("terminal_ack_id", 11),
-            terminal_ack_kind=value("terminal_ack_kind", 12),
+            claim_id=str(value("claim_id", 10)), committed_at=value("committed_at", 11),
+            terminal_ack_id=value("terminal_ack_id", 12),
+            terminal_ack_kind=value("terminal_ack_kind", 13),
         )
 
 

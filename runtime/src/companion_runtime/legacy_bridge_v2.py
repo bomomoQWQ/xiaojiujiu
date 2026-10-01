@@ -231,6 +231,7 @@ class ConcreteLegacyRuntimeV2Bridge:
                     candidate_id=candidate.candidate_id,
                     attempt_id=attempt_id,
                     render_outbox_id=outbox_id,
+                    dispatch_claim_id=claim_id,
                 )
                 persist_snapshot(receipt)
         return receipt
@@ -244,6 +245,8 @@ class ConcreteLegacyRuntimeV2Bridge:
         candidate_revision: int,
         candidate_version: str,
         source_candidate: CandidateV2,
+        reward_contract_id: str,
+        reward_revision: int,
         now: datetime,
         persist_snapshot: Any,
     ) -> CommitReceiptV2:
@@ -309,6 +312,8 @@ class ConcreteLegacyRuntimeV2Bridge:
             "langchao_candidate_id": langchao_candidate_id,
             "langchao_candidate_revision": candidate_revision,
             "source_candidate_id": source_candidate.candidate_id,
+            "reward_contract_id": reward_contract_id,
+            "reward_revision": reward_revision,
             "action": dict(source_candidate.action),
         })
         row.payload = payload
@@ -318,6 +323,7 @@ class ConcreteLegacyRuntimeV2Bridge:
             candidate_id=source_candidate.candidate_id,
             attempt_id=attempt_id,
             render_outbox_id=outbox_id,
+            dispatch_claim_id=claim_id,
         )
         persist_snapshot(receipt)
         return receipt
@@ -330,6 +336,8 @@ class ConcreteLegacyRuntimeV2Bridge:
         candidate_revision: int,
         candidate_version: str,
         source_candidate: CandidateV2,
+        reward_contract_id: str,
+        reward_revision: int,
         now: datetime,
         persist_snapshot: Any,
     ) -> CommitReceiptV2:
@@ -344,6 +352,8 @@ class ConcreteLegacyRuntimeV2Bridge:
                     candidate_revision=candidate_revision,
                     candidate_version=candidate_version,
                     source_candidate=source_candidate,
+                    reward_contract_id=reward_contract_id,
+                    reward_revision=reward_revision,
                     now=now,
                     persist_snapshot=persist_snapshot,
                 )

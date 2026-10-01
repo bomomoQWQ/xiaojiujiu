@@ -91,9 +91,9 @@ def test_idempotency_and_single_active_parameter_constraints_are_explicit() -> N
 
 
 def test_migration_versions_and_statement_order_are_stable() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 19
+    assert USER_MODEL_SCHEMA_VERSION == 20
     assert isinstance(MIGRATIONS, tuple)
-    assert tuple(version for version, _statements in MIGRATIONS) == tuple(range(1, 20))
+    assert tuple(version for version, _statements in MIGRATIONS) == tuple(range(1, 21))
     assert all(isinstance(statements, tuple) for _version, statements in MIGRATIONS)
     assert schema_statements() == tuple(
         statement for _version, statements in MIGRATIONS for statement in statements
@@ -175,6 +175,19 @@ def test_v18_requires_live_claim_before_new_attempt_and_send_outbox() -> None:
     assert "DEFERRABLE INITIALLY DEFERRED" in ddl
     assert "UNIQUE (SCOPE_KEY, ENGINE_KEY, ROUND_ID)" in ddl
     assert "BEFORE UPDATE OR DELETE ON LIVE_DISPATCH_CLAIMS" in ddl
+
+
+def test_v20_binds_live_commit_to_exact_scope_attempt_render_and_claim() -> None:
+    version, statements = MIGRATIONS[19]
+    ddl = _normalise("\n".join(statements))
+    assert version == 20
+    assert "ADD COLUMN CLAIM_ID TEXT NOT NULL" in ddl
+    assert "UNIQUE (SCOPE_KEY, ATTEMPT_ID, RENDER_OUTBOX_ID, CLAIM_ID)" in ddl
+    assert (
+        "FOREIGN KEY (SCOPE_KEY, ATTEMPT_ID, RENDER_OUTBOX_ID, CLAIM_ID) "
+        "REFERENCES LIVE_DISPATCH_CLAIMS (SCOPE_KEY, ATTEMPT_ID, RENDER_OUTBOX_ID, CLAIM_ID)"
+    ) in ddl
+    assert "DEFERRABLE INITIALLY DEFERRED" in ddl
 
 
 def test_v10_mechanical_history_audit_is_independent_and_privacy_minimal() -> None:
