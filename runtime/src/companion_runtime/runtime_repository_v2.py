@@ -29,7 +29,14 @@ from .repeat_v2 import (
     UserMatterEventKind,
     UserMatterEventV2,
 )
-from .runtime_v2 import CandidateV2, PredictionSetV2
+from .motivation_v2 import CandidatePolicyV2, UserUtilityCoefficientsV2
+from .repeat_v2 import RepeatSubjectV2
+from .runtime_v2 import (
+    COMMITTED_DECISION_SNAPSHOT_VERSION,
+    CandidateV2,
+    CommittedDecisionV2,
+    PredictionSetV2,
+)
 from .user_model_v2_features import FeatureSnapshotV2
 from .user_model_v2_prediction import UserModelV2PredictionService
 from .user_model_v2_repository import canonical_json
@@ -217,6 +224,107 @@ class PostgresV2RuntimeRepository:
                WHERE runtime_v2_decision_audits.scope_key = EXCLUDED.scope_key""",
             (decision_id, self.scope_key, canonical_json(audit)),
         )
+        # Once a delivery placeholder exists, keep its recovery copy at the same
+        # append-only audit frontier (notably the rendered stage).  The candidate and
+        # prediction witness remain immutable.
+        self.connection.execute(
+            """UPDATE runtime_v2_committed_decisions
+               SET audit_snapshot = %s::jsonb
+               WHERE decision_id = %s AND scope_key = %s AND terminal_status IS NULL""",
+            (canonical_json(audit), decision_id, self.scope_key),
+        )
+
+    def save_committed_decision(self, *, committed: CommittedDecisionV2) -> None:
+        """Append the immutable decision/delivery placeholder, rejecting conflicts."""
+
+        self._scope(committed.scope_key)
+        payload = _committed_candidate_payload(committed)
+        cursor = self.connection.execute(
+            """INSERT INTO runtime_v2_committed_decisions
+               (decision_id, scope_key, snapshot_version, candidate_snapshot,
+                cold_start_exploration, audit_snapshot, audit_version,
+                attempt_id, render_outbox_id, committed_at)
+               VALUES (%s, %s, %s, %s::jsonb, %s, %s::jsonb, %s, %s, %s, %s)
+               ON CONFLICT (decision_id) DO NOTHING
+               RETURNING decision_id""",
+            (
+                committed.decision_id,
+                committed.scope_key,
+                committed.snapshot_version,
+                canonical_json(payload),
+                committed.cold_start_exploration,
+                canonical_json(committed.audit),
+                str(committed.audit.get("audit_contract_version", "")),
+                committed.attempt_id,
+                committed.render_outbox_id,
+                committed.committed_at,
+            ),
+        )
+        if cursor.fetchone() is None:
+            existing = self.recover_committed_decision(
+                scope_key=committed.scope_key, decision_id=committed.decision_id
+            )
+            if existing != committed:
+                raise ValueError("conflicting committed decision snapshot")
+
+    def recover_committed_decision(
+        self, *, scope_key: str, decision_id: str
+    ) -> CommittedDecisionV2 | None:
+        self._scope(scope_key)
+        row = self.connection.execute(
+            """SELECT decision_id, scope_key, snapshot_version, candidate_snapshot,
+                      cold_start_exploration, audit_snapshot, attempt_id,
+                      render_outbox_id, committed_at, terminal_ack_id, terminal_status
+               FROM runtime_v2_committed_decisions
+               WHERE decision_id = %s""",
+            (decision_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        stored_scope = str(_row(row, "scope_key", 1))
+        if stored_scope != scope_key:
+            raise ValueError("committed decision belongs to a different scope")
+        version = int(_row(row, "snapshot_version", 2))
+        if version != COMMITTED_DECISION_SNAPSHOT_VERSION:
+            raise ValueError("unsupported committed decision snapshot version")
+        snapshot = _json(_row(row, "candidate_snapshot", 3))
+        return CommittedDecisionV2(
+            decision_id=str(_row(row, "decision_id", 0)),
+            scope_key=stored_scope,
+            snapshot_version=version,
+            candidate=_candidate_from_snapshot(snapshot),
+            predictions=_predictions_from_snapshot(snapshot),
+            cold_start_exploration=bool(_row(row, "cold_start_exploration", 4)),
+            audit=_json(_row(row, "audit_snapshot", 5)),
+            attempt_id=str(_row(row, "attempt_id", 6)),
+            render_outbox_id=str(_row(row, "render_outbox_id", 7)),
+            committed_at=_datetime(_row(row, "committed_at", 8)),
+            terminal_ack_id=_optional_text(_row(row, "terminal_ack_id", 9)),
+            terminal_status=_optional_text(_row(row, "terminal_status", 10)),
+        )
+
+    def mark_committed_decision_ack_once(
+        self,
+        *,
+        scope_key: str,
+        decision_id: str,
+        ack_id: str,
+        status: str,
+        acknowledged_at: datetime,
+    ) -> bool:
+        """Claim a terminal acknowledgement exactly once, including failures."""
+
+        self._scope(scope_key)
+        if status not in {"sent", "failed"}:
+            raise ValueError("terminal acknowledgement status must be sent or failed")
+        cursor = self.connection.execute(
+            """UPDATE runtime_v2_committed_decisions
+               SET terminal_ack_id = %s, terminal_status = %s, terminal_acknowledged_at = %s
+               WHERE decision_id = %s AND scope_key = %s AND terminal_status IS NULL
+               RETURNING decision_id""",
+            (ack_id, status, acknowledged_at, decision_id, scope_key),
+        )
+        return cursor.fetchone() is not None
 
     def get_acknowledged_prepared_exposure(
         self, *, scope_key: str, idempotency_key: str
@@ -675,6 +783,81 @@ def _json(value: Any) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("stored runtime-v2 payload must be a JSON object")
     return value
+
+
+def _committed_candidate_payload(committed: CommittedDecisionV2) -> dict[str, Any]:
+    candidate = committed.candidate
+    return {
+        "candidate": {
+            "candidate_id": candidate.candidate_id,
+            "action": dict(candidate.action),
+            "internal_utility": candidate.internal_utility,
+            "coefficients": {
+                "v_reply": candidate.coefficients.v_reply,
+                "v_continue": candidate.coefficients.v_continue,
+                "c_negative": candidate.coefficients.c_negative,
+            },
+            "policy": {
+                "low_pressure": candidate.policy.low_pressure,
+                "low_frequency": candidate.policy.low_frequency,
+                "easy_to_ignore": candidate.policy.easy_to_ignore,
+                "continuous_follow_up": candidate.policy.continuous_follow_up,
+                "sensitive": candidate.policy.sensitive,
+            },
+            "repeat_subject": {
+                "concern_id": candidate.repeat_subject.concern_id,
+                "action_goal_id": candidate.repeat_subject.action_goal_id,
+            },
+            "source_event_ids": list(candidate.source_event_ids),
+        },
+        "prediction_witness": {
+            "snapshot_id": committed.predictions.snapshot_id,
+            "parameter_version": committed.predictions.parameter_version,
+            "reply": committed.predictions.reply.to_dict(),
+            "continuation": committed.predictions.continuation.to_dict(),
+            "negative": committed.predictions.negative.to_dict(),
+        },
+    }
+
+
+def _candidate_from_snapshot(payload: Mapping[str, Any]) -> CandidateV2:
+    item = _json(payload.get("candidate"))
+    coefficients = _json(item.get("coefficients"))
+    policy = _json(item.get("policy"))
+    repeat = _json(item.get("repeat_subject"))
+    action = item.get("action")
+    if not isinstance(action, Mapping):
+        raise ValueError("committed candidate action must be a JSON object")
+    return CandidateV2(
+        candidate_id=str(item["candidate_id"]),
+        action=dict(action),
+        internal_utility=float(item["internal_utility"]),
+        coefficients=UserUtilityCoefficientsV2(
+            v_reply=coefficients["v_reply"],
+            v_continue=coefficients["v_continue"],
+            c_negative=coefficients["c_negative"],
+        ),
+        policy=CandidatePolicyV2(**{name: bool(policy[name]) for name in (
+            "low_pressure", "low_frequency", "easy_to_ignore",
+            "continuous_follow_up", "sensitive"
+        )}),
+        repeat_subject=RepeatSubjectV2(
+            concern_id=_optional_text(repeat.get("concern_id")),
+            action_goal_id=_optional_text(repeat.get("action_goal_id")),
+        ),
+        source_event_ids=tuple(str(value) for value in item.get("source_event_ids", ())),
+    )
+
+
+def _predictions_from_snapshot(payload: Mapping[str, Any]) -> PredictionSetV2:
+    witness = _json(payload.get("prediction_witness"))
+    return PredictionSetV2(
+        snapshot_id=str(witness["snapshot_id"]),
+        parameter_version=str(witness["parameter_version"]),
+        reply=_prediction(witness["reply"]),
+        continuation=_prediction(witness["continuation"]),
+        negative=_prediction(witness["negative"]),
+    )
 
 
 def _prediction(payload: Any) -> TargetPredictionV2:

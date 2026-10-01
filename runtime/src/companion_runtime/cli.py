@@ -326,6 +326,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         scope_key=config.conversation_id,
         legacy_bridge=bridge,
         rng=runtime.rng,
+        database=runtime.db,
+        owns_database=False,
     )
     runtime.v2_coordinator = v2_composition.coordinator
     v2_maintenance = V2Maintenance(

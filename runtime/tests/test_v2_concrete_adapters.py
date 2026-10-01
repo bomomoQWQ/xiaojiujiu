@@ -113,6 +113,53 @@ def test_runtime_repository_reads_v2_history_and_writes_idempotently():
     assert any("runtime_v2_decision_audits" in sql for sql, _ in connection.calls)
 
 
+def test_legacy_atomic_commit_rolls_back_when_snapshot_insert_fails():
+    item = CandidateIntent(
+        candidate_id="c1", type="share", intent="说句话", goal="contact",
+        sources=[], internal_need=.4,
+    )
+    durable = {"attempts": [], "outbox": {}}
+
+    class Transaction:
+        def __enter__(self):
+            self.snapshot = (list(durable["attempts"]), dict(durable["outbox"]))
+            return object()
+        def __exit__(self, exc_type, exc, tb):
+            if exc_type is not None:
+                durable["attempts"][:] = self.snapshot[0]
+                durable["outbox"].clear(); durable["outbox"].update(self.snapshot[1])
+            return False
+
+    class Outbox:
+        def get(self, outbox_id): return durable["outbox"].get(outbox_id)
+        def enqueue(self, connection, row): durable["outbox"][row.outbox_id] = row
+
+    row = SimpleNamespace(outbox_id="o1", payload={"attempt_id": "a1"})
+    runtime = SimpleNamespace(
+        projections=SimpleNamespace(
+            candidates=Candidates(item), outbox=Outbox(),
+            runtime=SimpleNamespace(ensure=lambda: SimpleNamespace()),
+        ),
+        db=SimpleNamespace(transaction=lambda: Transaction()),
+        write_session=lambda: Transaction(),
+        _commit_attempt=lambda connection, chosen, state, now: (
+            durable["attempts"].append("a1") or durable["outbox"].update({"o1": row}) or ("a1", "o1")
+        ),
+    )
+    bridge = ConcreteLegacyRuntimeV2Bridge(runtime)
+    bridge._legacy_candidates["c1"] = item
+    candidate = bridge._candidate(item)
+    import pytest
+    with pytest.raises(RuntimeError, match="snapshot insert failed"):
+        bridge.commit_candidate_with_snapshot(
+            decision_id="d1", candidate=candidate, now=NOW,
+            persist_snapshot=lambda receipt: (_ for _ in ()).throw(
+                RuntimeError("snapshot insert failed")
+            ),
+        )
+    assert durable == {"attempts": [], "outbox": {}}
+
+
 def test_runtime_repository_prediction_uses_v2_prediction_service():
     from companion_runtime.motivation_v2 import CandidatePolicyV2, UserUtilityCoefficientsV2
     from companion_runtime.repeat_v2 import RepeatSubjectV2
