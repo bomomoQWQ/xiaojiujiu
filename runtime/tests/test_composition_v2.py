@@ -56,6 +56,9 @@ class FakeDatabase:
         self.closed = True
 
 
+AUTHORITY_BOOTSTRAPS = []
+
+
 class FakeAuthorityRepository:
     def __init__(self, connection, *, scope_key):
         self.connection = connection
@@ -66,6 +69,7 @@ class FakeAuthorityRepository:
         return self.active
 
     def bootstrap(self):
+        AUTHORITY_BOOTSTRAPS.append(self.scope_key)
         self.active = {"engine_key": "runtime_v2", "mode": "live"}
         return self.active
 
@@ -107,6 +111,7 @@ def test_factory_builds_v2_graph_from_injected_protocols_and_reports_health() ->
     )
 
     assert database.migrate_calls == 1
+    assert AUTHORITY_BOOTSTRAPS[-1] == "user:42/channel:direct"
     assert isinstance(composition.user_model_service, UserModelV2Service)
     assert composition.user_model_service.repository is composition.service_repository
     assert composition.prediction_service.repository is composition.prediction_repository
