@@ -309,6 +309,28 @@ class V2RuntimeRepository(Protocol):
 
     def save_decision_audit(self, *, decision_id: str, audit: Mapping[str, Any]) -> None: ...
 
+    def get_acknowledged_prepared_exposure(
+        self, *, scope_key: str, idempotency_key: str
+    ) -> PreparedExposureV2 | None: ...
+
+    def prepare_exposure_and_expectation(
+        self,
+        *,
+        user_model: UserModelV2Service,
+        scope_key: str,
+        exposure_id: str,
+        idempotency_key: str,
+        occurred_at: datetime,
+        action: Mapping[str, Any],
+        context_provider: Callable[[], Mapping[str, Any]],
+        horizons: Mapping[Target, int],
+        delivery_basis: DeliveryBasis,
+        source_event_ids: tuple[str, ...],
+        concern_id: str | None = None,
+        action_goal_id: str | None = None,
+        cold_start_exploration: bool = False,
+    ) -> PreparedExposureV2: ...
+
 
 class V2RuntimeCoordinator:
     """Small orchestration layer suitable for ``api_v1`` delegation.
@@ -672,8 +694,17 @@ class V2RuntimeCoordinator:
         legacy delivery or append its outgoing events twice.
         """
 
-        recorder = self._require_audit(ack.decision_id)
         sent = bool(ack.sent and confirmed)
+        ack_idempotency_key = f"send-ack:{ack.send_outbox_id}"
+        if sent:
+            recover = getattr(self.repository, "get_acknowledged_prepared_exposure", None)
+            if callable(recover):
+                recovered = recover(
+                    scope_key=self.scope_key, idempotency_key=ack_idempotency_key
+                )
+                if recovered is not None:
+                    return recovered
+        recorder = self._require_audit(ack.decision_id)
         recorder.record(
             DecisionStage.SEND_ACK if sent else DecisionStage.SEND_FAIL,
             occurred_at=ack.acknowledged_at,
@@ -682,34 +713,56 @@ class V2RuntimeCoordinator:
         prepared: PreparedExposureV2 | None = None
         if sent:
             chosen = self._chosen[ack.decision_id]
-            prepared = self.user_model.prepare_exposure(
-                scope_key=self.scope_key,
-                exposure_id=ack.attempt_id,
-                idempotency_key=f"send-ack:{ack.send_outbox_id}",
-                occurred_at=ack.acknowledged_at,
-                action=ack.action,
-                context_provider=ack.context_provider,
-                delivery_confirmed=True,
-                horizons=self.config.horizons,
-                delivery_basis=getattr(ack, "delivery_basis", DeliveryBasis.DELIVERED),
-                source_event_ids=tuple(
-                    dict.fromkeys((*chosen.source_event_ids, *ack.source_event_ids))
-                ),
+            sources = tuple(dict.fromkeys((*chosen.source_event_ids, *ack.source_event_ids)))
+            prepare_and_freeze = getattr(
+                self.repository, "prepare_exposure_and_expectation", None
             )
-            if prepared is not None:
-                record_exposure = getattr(
-                    self.repository, "record_acknowledged_exposure", None
+            if callable(prepare_and_freeze):
+                prepared = prepare_and_freeze(
+                    user_model=self.user_model,
+                    scope_key=self.scope_key,
+                    exposure_id=ack.attempt_id,
+                    idempotency_key=ack_idempotency_key,
+                    occurred_at=ack.acknowledged_at,
+                    action=ack.action,
+                    context_provider=ack.context_provider,
+                    horizons=self.config.horizons,
+                    delivery_basis=getattr(ack, "delivery_basis", DeliveryBasis.DELIVERED),
+                    source_event_ids=sources,
+                    concern_id=chosen.repeat_subject.concern_id,
+                    action_goal_id=chosen.repeat_subject.action_goal_id,
+                    cold_start_exploration=bool(self._explored.get(ack.decision_id, False)),
                 )
-                if callable(record_exposure):
-                    record_exposure(
-                        exposure_id=prepared.exposure.exposure_id,
-                        acknowledged_at=ack.acknowledged_at,
-                        concern_id=chosen.repeat_subject.concern_id,
-                        action_goal_id=chosen.repeat_subject.action_goal_id,
-                        cold_start_exploration=bool(
-                            self._explored.get(ack.decision_id, False)
-                        ),
+            else:
+                # Compatibility for protocol fakes. Production PostgreSQL repositories
+                # implement the atomic method above and freeze the prediction in the same
+                # transaction as exposure creation.
+                prepared = self.user_model.prepare_exposure(
+                    scope_key=self.scope_key,
+                    exposure_id=ack.attempt_id,
+                    idempotency_key=ack_idempotency_key,
+                    occurred_at=ack.acknowledged_at,
+                    action=ack.action,
+                    context_provider=ack.context_provider,
+                    delivery_confirmed=True,
+                    horizons=self.config.horizons,
+                    delivery_basis=getattr(ack, "delivery_basis", DeliveryBasis.DELIVERED),
+                    source_event_ids=sources,
+                )
+                if prepared is not None:
+                    record_exposure = getattr(
+                        self.repository, "record_acknowledged_exposure", None
                     )
+                    if callable(record_exposure):
+                        record_exposure(
+                            exposure_id=prepared.exposure.exposure_id,
+                            acknowledged_at=ack.acknowledged_at,
+                            concern_id=chosen.repeat_subject.concern_id,
+                            action_goal_id=chosen.repeat_subject.action_goal_id,
+                            cold_start_exploration=bool(
+                                self._explored.get(ack.decision_id, False)
+                            ),
+                        )
         # Delivery completes this decision's irreversible funnel. Persist the
         # terminal reconciliation stage in the same post-legacy hook so black-box
         # and operators never see a permanently half-finished successful audit.

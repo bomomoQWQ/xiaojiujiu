@@ -11,7 +11,7 @@ import json
 from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Callable, Mapping, Sequence
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from .emotion_v2_interface import (
     EmotionDomainEventV2,
@@ -33,7 +33,7 @@ from .runtime_v2 import CandidateV2, PredictionSetV2
 from .user_model_v2_features import FeatureSnapshotV2
 from .user_model_v2_prediction import UserModelV2PredictionService
 from .user_model_v2_repository import canonical_json
-from .user_model_v2_service import PreparedExposureV2
+from .user_model_v2_service import PreparedExposureV2, UserModelV2Service
 from .user_model_v2_service_repository import PostgresUserModelV2ServiceRepository
 from .user_model_v2_types import (
     ExpectationV2,
@@ -218,6 +218,169 @@ class PostgresV2RuntimeRepository:
             (decision_id, self.scope_key, canonical_json(audit)),
         )
 
+    def get_acknowledged_prepared_exposure(
+        self, *, scope_key: str, idempotency_key: str
+    ) -> PreparedExposureV2 | None:
+        """Recover the committed ack result after duplicate delivery or process restart."""
+
+        self._scope(scope_key)
+        row = self.connection.execute(
+            """SELECT 1
+               FROM expectations_v2 AS x
+               JOIN interaction_exposures_v2 AS e
+                 ON e.scope_key = x.scope_key AND e.exposure_id = x.exposure_id
+               WHERE e.scope_key = %s AND e.idempotency_key = %s""",
+            (scope_key, idempotency_key),
+        ).fetchone()
+        if row is None:
+            return None
+        return self.service_repository.get_prepared_exposure(
+            scope_key=scope_key, idempotency_key=idempotency_key
+        )
+
+    def prepare_exposure_and_expectation(
+        self,
+        *,
+        user_model: UserModelV2Service,
+        scope_key: str,
+        exposure_id: str,
+        idempotency_key: str,
+        occurred_at: datetime,
+        action: Mapping[str, Any],
+        context_provider: Callable[[], Mapping[str, Any]],
+        horizons: Mapping[Target, int],
+        delivery_basis: Any,
+        source_event_ids: tuple[str, ...],
+        concern_id: str | None = None,
+        action_goal_id: str | None = None,
+        cold_start_exploration: bool = False,
+    ) -> PreparedExposureV2:
+        """Atomically create/recover an ack exposure and its frozen prediction."""
+
+        self._scope(scope_key)
+        transaction = getattr(self.connection, "transaction", None)
+        with (transaction() if transaction is not None else nullcontext()):
+            self.connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"runtime-v2-send-ack:{scope_key}:{idempotency_key}",),
+            )
+            existing = self.service_repository.get_prepared_exposure(
+                scope_key=scope_key, idempotency_key=idempotency_key
+            )
+            if existing is not None:
+                row = self.connection.execute(
+                    "SELECT 1 FROM expectations_v2 WHERE scope_key = %s AND exposure_id = %s",
+                    (scope_key, existing.exposure.exposure_id),
+                ).fetchone()
+                if row is not None:
+                    return existing
+                prepared = existing
+            else:
+                prepared = user_model.prepare_exposure(
+                    scope_key=scope_key,
+                    exposure_id=exposure_id,
+                    idempotency_key=idempotency_key,
+                    occurred_at=occurred_at,
+                    action=action,
+                    context_provider=context_provider,
+                    delivery_confirmed=True,
+                    horizons=horizons,
+                    delivery_basis=delivery_basis,
+                    source_event_ids=source_event_ids,
+                )
+                if prepared is None:  # delivery_confirmed is true; defensive contract guard
+                    raise RuntimeError("confirmed send did not prepare an exposure")
+            envelope = self.prediction_service.predict(
+                features=prepared.features,
+                predicted_at=prepared.exposure.occurred_at,
+                based_on_state_version=int(self.state_version_provider()),
+                source_event_ids=prepared.exposure.source_event_ids,
+            )
+            self.freeze_acknowledged_expectation(
+                prepared=prepared,
+                envelope=envelope,
+                idempotency_key=f"{idempotency_key}:expectation",
+                concern_id=concern_id,
+                action_goal_id=action_goal_id,
+                cold_start_exploration=cold_start_exploration,
+            )
+            return prepared
+
+    def freeze_acknowledged_expectation(
+        self,
+        *,
+        prepared: PreparedExposureV2,
+        envelope: PredictionEnvelopeV2,
+        idempotency_key: str,
+        concern_id: str | None = None,
+        action_goal_id: str | None = None,
+        cold_start_exploration: bool = False,
+    ) -> ExpectationV2:
+        """Freeze the send-time envelope and repeat metadata exactly once.
+
+        The exposure is already inserted by ``put_prepared_exposure`` in the caller's
+        transaction.  An advisory transaction lock serializes duplicate acknowledgements;
+        the exposure unique index is the durable replay guard after restart.  The winning
+        JSON envelope is returned on every replay and is never recomputed from later active
+        parameters.
+        """
+
+        self._scope(prepared.exposure.scope_key)
+        if envelope.scope_key != self.scope_key:
+            raise ValueError("prediction envelope and exposure must use the same scope")
+        if envelope.predicted_at > prepared.exposure.occurred_at:
+            raise ValueError("send-time prediction cannot be made after acknowledgement")
+        exposure_id = prepared.exposure.exposure_id
+        expectation_id = str(
+            uuid5(NAMESPACE_URL, f"runtime-v2-expectation:{self.scope_key}:{exposure_id}")
+        )
+        expectation = ExpectationV2(
+            expectation_id=expectation_id,
+            exposure_id=exposure_id,
+            envelope=envelope,
+            scope_key=self.scope_key,
+            fixed_at=prepared.exposure.occurred_at,
+            window_started_at=prepared.exposure.window_started_at,
+            window_ends_at=prepared.exposure.window_ends_at,
+            horizon_seconds=prepared.exposure.horizon_seconds,
+            created_at=prepared.exposure.created_at,
+            updated_at=prepared.exposure.updated_at,
+            source_event_ids=prepared.exposure.source_event_ids,
+        )
+        transaction = getattr(self.connection, "transaction", None)
+        with (transaction() if transaction is not None else nullcontext()):
+            self.connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"runtime-v2-expectation:{self.scope_key}:{exposure_id}",),
+            )
+            row = self.connection.execute(
+                """SELECT expectation FROM expectations_v2
+                   WHERE scope_key = %s AND exposure_id = %s""",
+                (self.scope_key, exposure_id),
+            ).fetchone()
+            if row is not None:
+                return _expectation(_row(row, "expectation", 0))
+            self.connection.execute(
+                """INSERT INTO expectations_v2
+                   (expectation_id, scope_key, idempotency_key, prediction_snapshot_id,
+                    exposure_id, due_at, expectation, expected_value, tolerance,
+                    expectation_version)
+                   VALUES (%s, %s, %s, NULL, %s, %s, %s::jsonb, %s, 0.0, 1)""",
+                (
+                    UUID(expectation_id), self.scope_key, idempotency_key, exposure_id,
+                    expectation.window_ends_at, canonical_json(expectation.to_dict()),
+                    0.0,
+                ),
+            )
+            self.record_acknowledged_exposure(
+                exposure_id=exposure_id,
+                acknowledged_at=prepared.exposure.occurred_at,
+                concern_id=concern_id,
+                action_goal_id=action_goal_id,
+                cold_start_exploration=cold_start_exploration,
+            )
+        return expectation
+
     def record_acknowledged_exposure(
         self,
         *,
@@ -227,12 +390,7 @@ class PostgresV2RuntimeRepository:
         action_goal_id: str | None = None,
         cold_start_exploration: bool = False,
     ) -> None:
-        """Attach repeat-policy identity to an already prepared v2 exposure.
-
-        ``cold_start_exploration`` marks that this delivery was authorised by the
-        bounded cold-start exploration allowance rather than by a positive estimate,
-        so it can be counted against that allowance later.
-        """
+        """Attach repeat-policy identity to an already prepared v2 exposure."""
 
         self.connection.execute(
             """INSERT INTO runtime_v2_exposure_metadata
@@ -400,8 +558,10 @@ class PostgresV2RuntimeRepository:
             # resolved only once no active target label remains pending.
             self.connection.execute(
                 """UPDATE expectations_v2 AS e
-                   SET status = 'met', resolved_at = %s,
-                       resolution = jsonb_build_object('maintenance_v2', true)
+                   SET status = 'settled', resolved_at = %s,
+                       resolution = jsonb_build_object(
+                           'maintenance_v2', true,
+                           'semantics', 'target outcomes stored separately; status is not goal satisfaction')
                    WHERE e.scope_key = %s AND e.expectation_id = %s
                      AND NOT EXISTS (
                        SELECT 1 FROM user_model_active_labels_v2 AS a
@@ -569,7 +729,8 @@ def _settlement(payload: Any) -> ExpectationSettlementV2:
         settlement_key=str(item["settlement_key"]), revision_key=str(item["revision_key"]),
         expectation_id=str(item["expectation_id"]), exposure_id=str(item["exposure_id"]),
         target=Target(str(item["target"])), label_id=str(item["label_id"]),
-        label_revision=int(item["label_revision"]), expected_point=float(item["expected_point"]),
+        label_revision=int(item["label_revision"]),
+        expected_point=(None if item.get("expected_point") is None else float(item["expected_point"])),
         actual_outcome=item.get("actual_outcome"), completeness=OutcomeCompletenessV2(str(item["completeness"])),
         residual=item.get("residual"), support=SupportStatus(str(item["support"])),
         source_event_ids=tuple(str(value) for value in item.get("source_event_ids", ())),

@@ -74,7 +74,7 @@ class ExpectationSettlementV2:
     target: Target
     label_id: str
     label_revision: int
-    expected_point: float
+    expected_point: float | None
     actual_outcome: float | None
     completeness: OutcomeCompletenessV2
     residual: float | None
@@ -111,9 +111,15 @@ class ExpectationSettlementV2:
                 raise ValueError("intervened settlements require an intervention source")
         elif self.intervention_source_event_ids:
             raise ValueError("intervention sources require intervened completeness")
+        if self.expected_point is not None and not 0.0 <= self.expected_point <= 1.0:
+            raise ValueError("expected_point must be None or in [0, 1]")
         if self.completeness is OutcomeCompletenessV2.OBSERVED:
-            if self.actual_outcome is None or self.residual is None:
-                raise ValueError("observed settlements require actual_outcome and residual")
+            if self.actual_outcome is None:
+                raise ValueError("observed settlements require actual_outcome")
+            if self.expected_point is None and self.residual is not None:
+                raise ValueError("unavailable predictions cannot emit a residual")
+            if self.expected_point is not None and self.residual is None:
+                raise ValueError("available observed predictions require a residual")
         elif self.actual_outcome is not None or self.residual is not None:
             raise ValueError("non-observed settlements cannot carry an outcome or residual")
         if self.disposition is SettlementDispositionV2.CORRECTION:
@@ -188,7 +194,7 @@ def settle_expectation_target(
     elif active_label.status in {LabelStatus.OBSERVED_POSITIVE, LabelStatus.OBSERVED_NEGATIVE}:
         completeness = OutcomeCompletenessV2.OBSERVED
         actual = float(active_label.value)  # validated by TargetLabelV2
-        residual = actual - float(prediction.point)
+        residual = None if prediction.point is None else actual - float(prediction.point)
     else:
         completeness = _NON_OBSERVED_COMPLETENESS[active_label.status]
         actual = None
@@ -215,7 +221,7 @@ def settle_expectation_target(
         target=active_label.target,
         label_id=active_label.label_id,
         label_revision=label_revision,
-        expected_point=float(prediction.point),
+        expected_point=None if prediction.point is None else float(prediction.point),
         actual_outcome=actual,
         completeness=completeness,
         residual=residual,

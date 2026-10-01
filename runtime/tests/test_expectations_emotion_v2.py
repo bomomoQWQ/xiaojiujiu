@@ -219,6 +219,40 @@ def test_time_13_unknown_is_not_neutral_or_zero() -> None:
     assert item.residual is None
 
 
+def test_unavailable_prediction_preserves_observed_negative_without_residual() -> None:
+    saved = expectation()
+    unavailable = replace(
+        next(item for item in saved.envelope.predictions if item.target is Target.NEGATIVE),
+        point=None,
+        lower=None,
+        upper=None,
+        interval_level=None,
+        interval_kind=None,
+        support=SupportStatus.UNAVAILABLE,
+    )
+    saved = replace(
+        saved,
+        envelope=replace(
+            saved.envelope,
+            predictions=tuple(
+                unavailable if item.target is Target.NEGATIVE else item
+                for item in saved.envelope.predictions
+            ),
+        ),
+    )
+    negative = label(
+        LabelStatus.OBSERVED_NEGATIVE,
+        target=Target.NEGATIVE,
+        value=False,
+        observed_at=END,
+    )
+    settlement = settle_expectation_target(saved, negative, label_revision=1)
+    assert settlement.actual_outcome == 0.0
+    assert settlement.expected_point is None
+    assert settlement.residual is None
+    assert settlement.emits_prediction_error is False
+
+
 def test_time_14_repeated_interpretation_does_not_add_independent_sample() -> None:
     saved = expectation()
     observed = label(

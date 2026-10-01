@@ -12,7 +12,7 @@ from typing import Final
 
 from .runtime_core_v2_schema import CORE_SCHEMA_STATEMENTS, CORE_SCHEMA_VERSION
 
-USER_MODEL_SCHEMA_VERSION: Final[int] = 8
+USER_MODEL_SCHEMA_VERSION: Final[int] = 9
 
 _INITIAL_SCHEMA: tuple[str, ...] = (
     """
@@ -436,6 +436,44 @@ _COLD_START_EXPLORATION_SCHEMA: tuple[str, ...] = (
 )
 
 
+# Send acknowledgement creates the exposure and freezes its prediction atomically.
+# The existing prediction table requires a parameter snapshot even for prior-only or
+# unavailable heads, so the production envelope is stored directly on the expectation;
+# this nullable FK is intentionally removed only for rows whose full v2 envelope is the
+# durable prediction witness.
+_EXPECTATION_PRODUCTION_SCHEMA: tuple[str, ...] = (
+    """
+    ALTER TABLE expectations_v2
+        ALTER COLUMN prediction_snapshot_id DROP NOT NULL
+    """,
+    """
+    ALTER TABLE expectations_v2
+        DROP CONSTRAINT expectations_v2_status_check
+    """,
+    """
+    ALTER TABLE expectations_v2
+        ADD CONSTRAINT expectations_v2_status_check
+        CHECK (status IN ('pending', 'met', 'missed', 'cancelled', 'settled'))
+    """,
+    """
+    ALTER TABLE expectations_v2
+        ADD COLUMN IF NOT EXISTS exposure_id UUID
+    """,
+    """
+    ALTER TABLE expectations_v2
+        ADD CONSTRAINT fk_expectations_v2_exposure
+        FOREIGN KEY (scope_key, exposure_id)
+        REFERENCES interaction_exposures_v2 (scope_key, exposure_id)
+        ON DELETE CASCADE
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_expectations_v2_exposure
+    ON expectations_v2 (scope_key, exposure_id)
+    WHERE exposure_id IS NOT NULL
+    """,
+)
+
+
 MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     (1, _INITIAL_SCHEMA),
     (2, _ACTIVE_LABEL_SCHEMA),
@@ -448,6 +486,7 @@ MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     (6, _RUNTIME_ADAPTER_SCHEMA),
     (7, _MAINTENANCE_SCHEMA),
     (8, _COLD_START_EXPLORATION_SCHEMA),
+    (9, _EXPECTATION_PRODUCTION_SCHEMA),
 )
 
 
