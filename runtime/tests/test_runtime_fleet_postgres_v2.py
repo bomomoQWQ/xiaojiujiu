@@ -6,4 +6,5 @@ def test_fleet_children_inherit_postgres_and_do_not_create_sqlite_paths():
     assert 'self.env["CR_STORAGE__DATABASE_PATH"] =' not in source
     assert 'self.env["CR_CONVERSATION_ID"] = session' in source
     assert 'self.env["CR_RUNTIME_ID"] = f"companion-{self.slug}"' in source
-    assert 'self.env["CR_STORAGE__SCHEMA"] = f"cr_{self.slug.replace' in source
+    assert 'self.env["CR_STORAGE__SCHEMA"] = raw_schema' in source
+    assert 'len(raw_schema.encode("utf-8")) > 63' in source

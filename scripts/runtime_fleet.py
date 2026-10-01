@@ -92,7 +92,15 @@ class RuntimeProcess:
         # tables carry scope_key. Keep the former one-database-per-person invariant
         # as one-schema-per-person and give runtime_state a unique row identity too.
         self.env["CR_RUNTIME_ID"] = f"companion-{self.slug}"
-        self.env["CR_STORAGE__SCHEMA"] = f"cr_{self.slug.replace('-', '_')}"
+        # Keep schema identifiers within PostgreSQL's 63-byte limit while retaining
+        # the QQ/session suffix that makes operator diagnostics recognizable.
+        raw_schema = f"cr_{self.slug.replace('-', '_')}"
+        if len(raw_schema.encode("utf-8")) > 63:
+            import hashlib
+
+            suffix = hashlib.sha256(raw_schema.encode("utf-8")).hexdigest()[:12]
+            raw_schema = raw_schema.encode("utf-8")[:50].decode("utf-8", "ignore") + "_" + suffix
+        self.env["CR_STORAGE__SCHEMA"] = raw_schema
         # v2 is PostgreSQL-only. Every process shares the configured server/schema,
         # while every user-facing table/query is isolated by CR_CONVERSATION_ID.
         # A per-person JSONL mirror remains useful for forensic correlation only.
