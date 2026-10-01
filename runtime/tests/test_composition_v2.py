@@ -35,7 +35,7 @@ class FakeConnection:
 class FakeDatabase:
     dialect = "postgres"
 
-    def __init__(self, *, version=7, fail=False):
+    def __init__(self, *, version=8, fail=False):
         self.version = version
         self.fail = fail
         self.connection = FakeConnection()
@@ -100,7 +100,7 @@ def test_factory_builds_v2_graph_from_injected_protocols_and_reports_health() ->
     assert composition.coordinator.user_model is composition.user_model_service
     health = composition.health.to_dict()
     assert health["storage"] == {"dialect": "postgres", "schema": "runtime_v2"}
-    assert health["migrations"]["current_version"] == 7
+    assert health["migrations"]["current_version"] == 8
     assert health["migrations"]["up_to_date"] is True
     assert health["versions"]["decision_policy"].startswith("runtime-v2")
     assert health["jev"] == {

@@ -1,4 +1,4 @@
-"""Live PostgreSQL integration tests for the v2 migration/repository slice.
+﻿"""Live PostgreSQL integration tests for the v2 migration/repository slice.
 
 Set ``CR_TEST_PG_DSN`` to a disposable database.  The tests create and drop their own
 schema, so they never depend on or mutate the legacy Runtime tables.
@@ -32,7 +32,7 @@ def pg_schema():
     try:
         with connection.transaction():
             result = migrate(connection, schema=schema)
-        assert result.applied == (1, 2, 3, 4, 5, 6, 7)
+        assert result.applied == (1, 2, 3, 4, 5, 6, 7, 8)
         yield connection, schema
     finally:
         connection.rollback()
@@ -51,7 +51,7 @@ def test_native_migrations_are_idempotent_and_create_scoped_tables(pg_schema) ->
     with connection.transaction():
         second = migrate(connection, schema=schema)
     assert second.applied == ()
-    assert second.already_present == (1, 2, 3, 4, 5, 6, 7)
+    assert second.already_present == (1, 2, 3, 4, 5, 6, 7, 8)
 
     rows = connection.execute(
         "SELECT table_name FROM information_schema.tables "

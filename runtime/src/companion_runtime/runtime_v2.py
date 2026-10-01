@@ -167,6 +167,21 @@ class DecisionConfigV2:
             Target.NEGATIVE: 24 * 60 * 60,
         }
     )
+    #: Bounded cold-start exploration.  While every target head is still cold the
+    #: conservative bounds charge the full negative range against a structurally zero
+    #: benefit, so a candidate can never clear ``utility_threshold`` -- yet the only
+    #: way to earn data is to send once.  ``user_utility`` already decides whether a
+    #: candidate is *safe* to explore (low pressure, low frequency, ignorable,
+    #: non-sensitive, not a continuous follow-up); this switch lets that verdict
+    #: actually authorise a delivery, capped by an explicit spend budget.
+    cold_start_exploration_reason: str = "limited_support_safe_exploration_allowed"
+    cold_start_exploration_limit: int = 1
+    cold_start_exploration_window: timedelta = timedelta(hours=24)
+    #: An exploration delivery has no measured edge, so its hazard advantage would be
+    #: negative and the calibrated base rate (3e-5/s) would postpone the first send by
+    #: days.  Give the exploration at least this much advantage; the budget, not the
+    #: hazard, is what bounds how often she may spend it.
+    cold_start_exploration_advantage: float = 1.0
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -184,6 +199,26 @@ class DecisionConfigV2:
             raise ValueError("hazard_beta must be positive")
         if set(self.horizons) != set(Target):
             raise ValueError("horizons must contain every v2 target exactly once")
+        if not isinstance(self.cold_start_exploration_reason, str) or not (
+            self.cold_start_exploration_reason.strip()
+        ):
+            raise ValueError("cold_start_exploration_reason must be a non-empty string")
+        if (
+            isinstance(self.cold_start_exploration_limit, bool)
+            or not isinstance(self.cold_start_exploration_limit, int)
+            or self.cold_start_exploration_limit < 0
+        ):
+            raise ValueError("cold_start_exploration_limit must be a non-negative integer")
+        if not isinstance(self.cold_start_exploration_window, timedelta) or (
+            self.cold_start_exploration_window <= timedelta(0)
+        ):
+            raise ValueError("cold_start_exploration_window must be a positive timedelta")
+        if (
+            isinstance(self.cold_start_exploration_advantage, bool)
+            or not isinstance(self.cold_start_exploration_advantage, (int, float))
+            or not math.isfinite(float(self.cold_start_exploration_advantage))
+        ):
+            raise ValueError("cold_start_exploration_advantage must be finite")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -293,6 +328,24 @@ class V2RuntimeCoordinator:
         self.rng = rng or random.Random()
         self._audits: dict[str, DecisionAuditRecorder] = {}
         self._chosen: dict[str, CandidateV2] = {}
+        self._explored: dict[str, bool] = {}
+
+    def _exploration_spent(self, *, now: datetime) -> int:
+        """Return how much cold-start exploration budget this scope has already used.
+
+        A repository without the counter (older adapter, or a test double) is treated
+        as "nothing spent yet" only when it cannot answer at all; once a delivery is
+        acknowledged the counter is the sole authority, so a missing implementation
+        degrades to the configured limit rather than to unlimited exploration.
+        """
+
+        counter = getattr(self.repository, "count_cold_start_explorations", None)
+        if not callable(counter):
+            return 0
+        since = now - self.config.cold_start_exploration_window
+        return int(
+            counter(scope_key=self.scope_key, since=since) or 0
+        )
 
     def process_user_event(self, event: Mapping[str, Any]) -> LegacyUserEventResult:
         """Run legacy ingest once, then settle the resulting v2 observations."""
@@ -422,14 +475,35 @@ class V2RuntimeCoordinator:
                 )
             )
 
+        exploration_spent = self._exploration_spent(now=now)
+        exploration_available = exploration_spent < self.config.cold_start_exploration_limit
+
         eligible = [
             item
             for item in assessed
             if not item.blocked and item.net_utility >= self.config.utility_threshold
         ]
         chosen = max(eligible, key=lambda item: item.net_utility, default=None)
+        # A hard boundary, a repeat limit or an unsafe candidate is never overridden:
+        # exploration only replaces the *numeric* threshold, which is uninformative
+        # while every head is cold.
+        explored = False
+        if chosen is None and exploration_available:
+            explorable = [
+                item
+                for item in assessed
+                if not item.blocked
+                and self.config.cold_start_exploration_reason in item.reasons
+            ]
+            chosen = max(explorable, key=lambda item: item.net_utility, default=None)
+            explored = chosen is not None
         advantage = (
-            0.0 if chosen is None else chosen.net_utility - self.config.utility_threshold
+            0.0
+            if chosen is None
+            else max(
+                chosen.net_utility - self.config.utility_threshold,
+                self.config.cold_start_exploration_advantage if explored else 0.0,
+            )
         )
         # Preserve the calibrated legacy hazard form.  The supplied interval is the
         # accumulated *allowed* time (foreground pauses/boundary-blocked time excluded by
@@ -485,7 +559,10 @@ class V2RuntimeCoordinator:
         recorder.record(
             DecisionStage.CANDIDATE_ELIGIBLE,
             occurred_at=now,
-            details={"candidate_id": chosen.candidate.candidate_id},
+            details={
+                "candidate_id": chosen.candidate.candidate_id,
+                "cold_start_exploration": explored,
+            },
         )
         assert probability is not None and draw is not None
         recorder.record(
@@ -519,6 +596,7 @@ class V2RuntimeCoordinator:
             details={"attempt_id": commit.attempt_id, "outbox_id": commit.render_outbox_id},
         )
         self._chosen[decision_id] = chosen.candidate
+        self._explored[decision_id] = explored
         audit = self._save_audit(recorder)
         return EndogenousDecisionV2(
             decision_id=decision_id,
@@ -597,6 +675,9 @@ class V2RuntimeCoordinator:
                         acknowledged_at=ack.acknowledged_at,
                         concern_id=chosen.repeat_subject.concern_id,
                         action_goal_id=chosen.repeat_subject.action_goal_id,
+                        cold_start_exploration=bool(
+                            self._explored.get(ack.decision_id, False)
+                        ),
                     )
         # Delivery completes this decision's irreversible funnel. Persist the
         # terminal reconciliation stage in the same post-legacy hook so black-box
