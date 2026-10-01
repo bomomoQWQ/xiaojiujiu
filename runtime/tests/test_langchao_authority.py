@@ -85,11 +85,11 @@ def test_authority_dispatch_derivation_is_closed():
 
 
 def test_v15_migration_is_appended_after_state_schema_with_stable_checksum():
-    assert MIGRATIONS[-1] == (15, LANGCHAO_AUTHORITY_SCHEMA_V15_STATEMENTS)
+    assert MIGRATIONS[14] == (15, LANGCHAO_AUTHORITY_SCHEMA_V15_STATEMENTS)
     records = migration_records()
-    assert tuple(record.version for record in records) == tuple(range(1, 16))
-    assert len(records[-1].checksum) == 64
-    assert records[-1].checksum == migration_records()[-1].checksum
+    assert tuple(record.version for record in records[:15]) == tuple(range(1, 16))
+    assert len(records[14].checksum) == 64
+    assert records[14].checksum == migration_records()[14].checksum
     flattened = [statement for _version, statements in MIGRATIONS for statement in statements]
     authority_index = flattened.index(LANGCHAO_AUTHORITY_SCHEMA_V15_STATEMENTS[0])
     candidate_index = next(

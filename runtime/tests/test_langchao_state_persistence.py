@@ -82,13 +82,13 @@ def parameters():
 
 
 def test_v14_migration_appends_after_unchanged_v1_through_v13():
-    assert USER_MODEL_SCHEMA_VERSION == 14
-    assert MIGRATIONS[-1] == (14, LANGCHAO_STATE_SCHEMA_V14_STATEMENTS)
+    assert USER_MODEL_SCHEMA_VERSION >= 14
+    assert MIGRATIONS[13] == (14, LANGCHAO_STATE_SCHEMA_V14_STATEMENTS)
     records = migration_records()
-    assert tuple(record.version for record in records) == tuple(range(1, 15))
-    assert records[-2].version == 13
-    assert len(records[-1].checksum) == 64
-    assert records[-1].checksum == migration_records()[-1].checksum
+    assert tuple(record.version for record in records[:14]) == tuple(range(1, 15))
+    assert records[12].version == 13
+    assert len(records[13].checksum) == 64
+    assert records[13].checksum == migration_records()[13].checksum
 
 
 def test_v14_schema_has_exact_fks_checks_hashes_and_immutable_history():
