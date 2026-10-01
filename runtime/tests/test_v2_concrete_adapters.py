@@ -118,16 +118,17 @@ def test_legacy_atomic_commit_rolls_back_when_snapshot_insert_fails():
         candidate_id="c1", type="share", intent="说句话", goal="contact",
         sources=[], internal_need=.4,
     )
-    durable = {"attempts": [], "outbox": {}}
+    durable = {"claims": [], "attempts": [], "outbox": {}}
 
     class Transaction:
         def __enter__(self):
-            self.snapshot = (list(durable["attempts"]), dict(durable["outbox"]))
+            self.snapshot = (list(durable["claims"]), list(durable["attempts"]), dict(durable["outbox"]))
             return object()
         def __exit__(self, exc_type, exc, tb):
             if exc_type is not None:
-                durable["attempts"][:] = self.snapshot[0]
-                durable["outbox"].clear(); durable["outbox"].update(self.snapshot[1])
+                durable["claims"][:] = self.snapshot[0]
+                durable["attempts"][:] = self.snapshot[1]
+                durable["outbox"].clear(); durable["outbox"].update(self.snapshot[2])
             return False
 
     class Outbox:
@@ -142,11 +143,20 @@ def test_legacy_atomic_commit_rolls_back_when_snapshot_insert_fails():
         ),
         db=SimpleNamespace(transaction=lambda: Transaction()),
         write_session=lambda: Transaction(),
-        _commit_attempt=lambda connection, chosen, state, now: (
-            durable["attempts"].append("a1") or durable["outbox"].update({"o1": row}) or ("a1", "o1")
+        _commit_attempt=lambda connection, chosen, state, now, attempt_id=None, outbox_id=None: (
+            durable["attempts"].append(attempt_id) or durable["outbox"].update(
+                {outbox_id: SimpleNamespace(outbox_id=outbox_id, payload={"attempt_id": attempt_id})}
+            ) or (attempt_id, outbox_id)
         ),
     )
-    bridge = ConcreteLegacyRuntimeV2Bridge(runtime)
+    class DispatchCoordinator:
+        def create_live_dispatch_claim(self, **kwargs):
+            durable["claims"].append(kwargs["claim_id"])
+            return kwargs
+
+    bridge = ConcreteLegacyRuntimeV2Bridge(
+        runtime, scope_key="scope", dispatch_coordinator=DispatchCoordinator()
+    )
     bridge._legacy_candidates["c1"] = item
     candidate = bridge._candidate(item)
     import pytest
@@ -157,7 +167,7 @@ def test_legacy_atomic_commit_rolls_back_when_snapshot_insert_fails():
                 RuntimeError("snapshot insert failed")
             ),
         )
-    assert durable == {"attempts": [], "outbox": {}}
+    assert durable == {"claims": [], "attempts": [], "outbox": {}}
 
 
 def test_runtime_repository_prediction_uses_v2_prediction_service():

@@ -91,9 +91,9 @@ def test_idempotency_and_single_active_parameter_constraints_are_explicit() -> N
 
 
 def test_migration_versions_and_statement_order_are_stable() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 17
+    assert USER_MODEL_SCHEMA_VERSION == 18
     assert isinstance(MIGRATIONS, tuple)
-    assert tuple(version for version, _statements in MIGRATIONS) == tuple(range(1, 18))
+    assert tuple(version for version, _statements in MIGRATIONS) == tuple(range(1, 19))
     assert all(isinstance(statements, tuple) for _version, statements in MIGRATIONS)
     assert schema_statements() == tuple(
         statement for _version, statements in MIGRATIONS for statement in statements
@@ -156,7 +156,25 @@ def test_migration_versions_and_statement_order_are_stable() -> None:
             for statement in LANGCHAO_SOCIAL_SCHEMA_STATEMENTS
             if re.search(r"CREATE TABLE IF NOT EXISTS", statement, re.IGNORECASE)
         )
+        + ("live_dispatch_claims",)
     )
+
+
+def test_v18_requires_live_claim_before_new_attempt_and_send_outbox() -> None:
+    version, statements = MIGRATIONS[-1]
+    ddl = _normalise("\n".join(statements))
+    assert version == 18
+    assert "CREATE TABLE IF NOT EXISTS LIVE_DISPATCH_CLAIMS" in ddl
+    assert "FOREIGN KEY (SCOPE_KEY, AUTHORITY_ID, AUTHORITY_REVISION, ENGINE_KEY, MAY_DISPATCH)" in ddl
+    assert "LANGCHAO_AUTHORITY_ACTIVE" in ddl
+    assert "R.MODE = 'LIVE'" in ddl
+    assert "R.MAY_DISPATCH" in ddl
+    assert "ACTION_ATTEMPTS_REQUIRE_LIVE_DISPATCH_CLAIM" in ddl
+    assert "OUTBOX_REQUIRE_LIVE_DISPATCH_CLAIM" in ddl
+    assert "NEW.KIND NOT IN ('RENDER', 'SEND')" in ddl
+    assert "DEFERRABLE INITIALLY DEFERRED" in ddl
+    assert "UNIQUE (SCOPE_KEY, ENGINE_KEY, ROUND_ID)" in ddl
+    assert "BEFORE UPDATE OR DELETE ON LIVE_DISPATCH_CLAIMS" in ddl
 
 
 def test_v10_mechanical_history_audit_is_independent_and_privacy_minimal() -> None:

@@ -236,6 +236,99 @@ class LangchaoAuthorityRepository:
              reason, encoded, digest, stamp),
         ).fetchone()
 
+    def create_live_dispatch_claim(
+        self,
+        *,
+        claim_id: str,
+        round_id: str,
+        candidate_id: str,
+        candidate_version: str,
+        attempt_id: str,
+        render_outbox_id: str,
+        idempotency_key: str,
+        expected_engine: AuthorityEngine | str,
+        created_at: datetime | None = None,
+    ) -> Any:
+        """Issue the production attempt/outbox witness under active live authority.
+
+        The caller must invoke this on the same connection and transaction that inserts
+        the attempt and render outbox.  Identity conflicts are explicit; an exact retry
+        returns the existing immutable claim.
+        """
+        claim_id = _text(claim_id, "claim_id")
+        round_id = _text(round_id, "round_id")
+        candidate_id = _text(candidate_id, "candidate_id")
+        candidate_version = _text(candidate_version, "candidate_version")
+        attempt_id = _text(attempt_id, "attempt_id")
+        render_outbox_id = _text(render_outbox_id, "render_outbox_id")
+        idempotency_key = _text(idempotency_key, "idempotency_key")
+        engine = AuthorityEngine(expected_engine)
+        if engine is AuthorityEngine.NONE:
+            raise ValueError("expected_engine must be a live engine")
+        stamp = created_at or datetime.now(timezone.utc)
+        if stamp.tzinfo is None or stamp.utcoffset() is None:
+            raise ValueError("created_at must be timezone-aware")
+        with self._transaction():
+            self._lock_scope()
+            authority = self.connection.execute(
+                """SELECT r.authority_id, r.revision, r.engine_key, r.mode, r.may_dispatch
+                   FROM langchao_authority_active AS a
+                   JOIN langchao_authority_revisions AS r
+                     ON r.scope_key = a.scope_key
+                    AND r.authority_id = a.authority_id
+                    AND r.revision = a.revision
+                   WHERE a.scope_key = %s FOR UPDATE OF a""",
+                (self.scope_key,),
+            ).fetchone()
+            if (authority is None
+                    or str(_row(authority, "engine_key", 2)) != engine.value
+                    or str(_row(authority, "mode", 3)) != AuthorityMode.LIVE.value
+                    or not bool(_row(authority, "may_dispatch", 4))):
+                raise DispatchNotAuthorizedError(
+                    f"scope has no active {engine.value}/live dispatch authority"
+                )
+            authority_id = str(_row(authority, "authority_id", 0))
+            authority_revision = int(_row(authority, "revision", 1))
+            document = {
+                "attempt_id": attempt_id,
+                "authority_id": authority_id,
+                "authority_revision": authority_revision,
+                "candidate_id": candidate_id,
+                "candidate_version": candidate_version,
+                "claim_id": claim_id,
+                "engine_key": engine.value,
+                "idempotency_key": idempotency_key,
+                "render_outbox_id": render_outbox_id,
+                "round_id": round_id,
+                "scope_key": self.scope_key,
+            }
+            _encoded, digest = _canonical(document)
+            existing = self.connection.execute(
+                """SELECT *, claim_sha256 = %s AS claim_matches
+                   FROM live_dispatch_claims
+                   WHERE scope_key = %s
+                     AND (claim_id = %s OR attempt_id = %s OR render_outbox_id = %s
+                          OR idempotency_key = %s OR (engine_key = %s AND round_id = %s))
+                   FOR UPDATE""",
+                (digest, self.scope_key, claim_id, attempt_id, render_outbox_id,
+                 idempotency_key, engine.value, round_id),
+            ).fetchall()
+            if existing:
+                if len(existing) == 1 and bool(_row(existing[0], "claim_matches", -1)):
+                    return existing[0]
+                raise AuthorityConflictError("live dispatch claim identity already has different content")
+            return self.connection.execute(
+                """INSERT INTO live_dispatch_claims
+                   (scope_key, claim_id, authority_id, authority_revision, engine_key,
+                    may_dispatch, round_id, candidate_id, candidate_version, attempt_id,
+                    render_outbox_id, idempotency_key, claim_sha256, created_at)
+                   VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, %s, %s, %s, %s)
+                   RETURNING *""",
+                (self.scope_key, claim_id, authority_id, authority_revision, engine.value,
+                 round_id, candidate_id, candidate_version, attempt_id, render_outbox_id,
+                 idempotency_key, digest, stamp),
+            ).fetchone()
+
     def create_dispatch_claim(
         self,
         *,

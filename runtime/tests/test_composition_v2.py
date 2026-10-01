@@ -56,6 +56,20 @@ class FakeDatabase:
         self.closed = True
 
 
+class FakeAuthorityRepository:
+    def __init__(self, connection, *, scope_key):
+        self.connection = connection
+        self.scope_key = scope_key
+        self.active = None
+
+    def get_active(self):
+        return self.active
+
+    def bootstrap(self):
+        self.active = {"engine_key": "runtime_v2", "mode": "live"}
+        return self.active
+
+
 class FakeServiceRepository:
     def __init__(self, connection, repository):
         self.connection = connection
@@ -89,6 +103,7 @@ def test_factory_builds_v2_graph_from_injected_protocols_and_reports_health() ->
         database_factory=lambda _storage: database,
         service_repository_factory=FakeServiceRepository,
         prediction_repository_factory=FakePredictionRepository,
+        authority_repository_factory=FakeAuthorityRepository,
     )
 
     assert database.migrate_calls == 1
@@ -135,6 +150,7 @@ def test_factory_reuses_borrowed_database_without_closing_it() -> None:
         database=database,
         service_repository_factory=FakeServiceRepository,
         prediction_repository_factory=FakePredictionRepository,
+        authority_repository_factory=FakeAuthorityRepository,
     )
     assert composition.database is database
     assert composition.owns_database is False

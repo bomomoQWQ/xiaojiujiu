@@ -238,6 +238,40 @@ def test_dispatch_claim_idempotency_returns_same_hash_and_rejects_conflict():
     assert conflict.rollbacks == 1
 
 
+def test_live_dispatch_claim_requires_exact_engine_and_is_idempotent():
+    inserted = {"claim_id": "claim:1"}
+    conn = Connection([{}, live_row("runtime_v2"), [], inserted])
+    repo = LangchaoAuthorityRepository(conn, scope_key=SCOPE)
+    row = repo.create_live_dispatch_claim(
+        claim_id="claim:1", round_id="round:1", candidate_id="candidate:1",
+        candidate_version="v1", attempt_id="attempt:1", render_outbox_id="outbox:1",
+        idempotency_key="key:1", expected_engine="runtime_v2", created_at=NOW,
+    )
+    assert row is inserted
+    assert "live_dispatch_claims" in conn.calls[-1][0]
+    assert conn.calls[-1][1][:12] == (
+        SCOPE, "claim:1", "authority:1", 3, "runtime_v2", "round:1",
+        "candidate:1", "v1", "attempt:1", "outbox:1", "key:1",
+        conn.calls[-1][1][11],
+    )
+
+    retry = {"claim_id": "claim:1", "claim_matches": True}
+    same = Connection([{}, live_row("runtime_v2"), [retry]])
+    assert LangchaoAuthorityRepository(same, scope_key=SCOPE).create_live_dispatch_claim(
+        claim_id="claim:1", round_id="round:1", candidate_id="candidate:1",
+        candidate_version="v1", attempt_id="attempt:1", render_outbox_id="outbox:1",
+        idempotency_key="key:1", expected_engine="runtime_v2", created_at=NOW,
+    ) is retry
+
+    wrong_engine = Connection([{}, live_row("langchao")])
+    with pytest.raises(DispatchNotAuthorizedError, match="runtime_v2/live"):
+        LangchaoAuthorityRepository(wrong_engine, scope_key=SCOPE).create_live_dispatch_claim(
+            claim_id="claim:1", round_id="round:1", candidate_id="candidate:1",
+            candidate_version="v1", attempt_id="attempt:1", render_outbox_id="outbox:1",
+            idempotency_key="key:1", expected_engine="runtime_v2", created_at=NOW,
+        )
+
+
 def test_repository_scope_is_present_in_every_dispatch_query_and_hash():
     conn_a = Connection([{}, live_row(), [], {"dispatch_id": "same"}])
     conn_b = Connection([{}, live_row(), [], {"dispatch_id": "same"}])
