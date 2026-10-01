@@ -18,7 +18,15 @@ from companion_runtime.user_model_v2_migrations import migrate
 from companion_runtime.user_model_v2_repository import UserModelV2Repository
 from companion_runtime.user_model_v2_service import UserModelV2Service
 from companion_runtime.user_model_v2_service_repository import PostgresUserModelV2ServiceRepository
-from companion_runtime.composition_v2 import PostgresUserModelV2PredictionRepository
+from companion_runtime.composition_v2 import (
+    PostgresUserModelV2PredictionRepository,
+    build_v2_composition,
+)
+from companion_runtime.config import RuntimeConfig
+from companion_runtime.db_postgres import PostgresDatabase
+from companion_runtime.legacy_bridge_v2 import ConcreteLegacyRuntimeV2Bridge
+from companion_runtime.runtime import Runtime
+from companion_runtime.typing import CandidateIntent
 from companion_runtime.maintenance_v2 import V2Maintenance, V2MaintenanceConfig
 from companion_runtime.motivation_v2 import CandidatePolicyV2, UserUtilityCoefficientsV2
 from companion_runtime.repeat_v2 import RepeatSubjectV2
@@ -42,7 +50,7 @@ def pg_schema():
     try:
         with connection.transaction():
             result = migrate(connection, schema=schema)
-        assert result.applied == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+        assert result.applied == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
         yield connection, schema
     finally:
         connection.rollback()
@@ -61,7 +69,7 @@ def test_native_migrations_are_idempotent_and_create_scoped_tables(pg_schema) ->
     with connection.transaction():
         second = migrate(connection, schema=schema)
     assert second.applied == ()
-    assert second.already_present == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+    assert second.already_present == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
 
     rows = connection.execute(
         "SELECT table_name FROM information_schema.tables "
@@ -362,6 +370,24 @@ def test_committed_decision_round_trips_and_terminal_ack_is_once(pg_schema) -> N
         predictions=predictions, cold_start_exploration=True, audit=audit,
         attempt_id="attempt:one", render_outbox_id="outbox:render:one", committed_at=now,
     )
+    # Prove the v2 repository participates in the same physical psycopg transaction as
+    # legacy outbox writes: a failure after both inserts rolls both back.
+    with pytest.raises(RuntimeError, match="injected commit failure"):
+        with connection.transaction():
+            connection.execute(
+                "INSERT INTO outbox (outbox_id,kind,payload_json,status,priority,created_at) "
+                "VALUES (%s,'render','{}'::jsonb,'pending',100,%s)",
+                ("outbox:rollback", now),
+            )
+            runtime.save_committed_decision(committed=committed)
+            raise RuntimeError("injected commit failure")
+    assert connection.execute(
+        "SELECT 1 FROM outbox WHERE outbox_id = %s", ("outbox:rollback",)
+    ).fetchone() is None
+    assert runtime.recover_committed_decision(
+        scope_key=scope, decision_id="decision:one"
+    ) is None
+
     runtime.save_committed_decision(committed=committed)
     assert runtime.recover_committed_decision(scope_key=scope, decision_id="decision:one") == committed
     assert runtime.mark_committed_decision_ack_once(
@@ -376,6 +402,158 @@ def test_committed_decision_round_trips_and_terminal_ack_is_once(pg_schema) -> N
     assert recovered is not None
     assert recovered.terminal_ack_id == "outbox:send:one"
     assert recovered.terminal_status == "failed"
+
+
+def _langchao_committed_snapshot(*, scope: str, candidate: CandidateV2, receipt, now: datetime):
+    def prediction(target: Target) -> TargetPredictionV2:
+        return TargetPredictionV2(
+            prediction_id=f"langchao:{receipt.decision_id}:{target.value}",
+            scope_key=scope,
+            target=target,
+            point=0.5,
+            lower=0.25,
+            upper=0.75,
+            interval_level=0.9,
+            interval_kind="integration-test",
+            support=SupportStatus.UNAVAILABLE,
+            predicted_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+
+    return CommittedDecisionV2(
+        decision_id=receipt.decision_id,
+        scope_key=scope,
+        candidate=candidate,
+        predictions=PredictionSetV2(
+            snapshot_id=f"langchao:{receipt.decision_id}",
+            parameter_version="integration-test",
+            reply=prediction(Target.REPLY),
+            continuation=prediction(Target.CONTINUE),
+            negative=prediction(Target.NEGATIVE),
+        ),
+        cold_start_exploration=False,
+        audit={"audit_contract_version": "integration-test", "name": "浪潮"},
+        attempt_id=receipt.attempt_id,
+        render_outbox_id=receipt.render_outbox_id,
+        committed_at=now,
+    )
+
+
+@pytest.mark.parametrize("outcome", ("commit", "snapshot_sql_failure", "callback_failure"))
+def test_shared_runtime_database_commit_is_atomic_on_real_postgres(outcome: str) -> None:
+    """The legacy attempt and every v2 witness share one physical PG transaction."""
+
+    schema = "langchao_atomic_" + uuid.uuid4().hex[:12]
+    scope = "integration:浪潮"
+    decision_id = f"langchao:{outcome}:{uuid.uuid4()}"
+    config = RuntimeConfig()
+    config.storage.dsn = _DSN
+    config.storage.schema = schema
+    config.storage.mirror_raw_events = False
+    database = PostgresDatabase(_DSN, application_name="runtime-langchao-atomicity-test")
+    database.schema_name = schema
+    runtime = None
+    composition = None
+    observer = psycopg.connect(_DSN, autocommit=True, row_factory=psycopg.rows.dict_row)
+    try:
+        runtime = Runtime(config, database=database)
+        bridge = ConcreteLegacyRuntimeV2Bridge(runtime)
+        composition = build_v2_composition(
+            config,
+            scope_key=scope,
+            legacy_bridge=bridge,
+            database=runtime.db,
+        )
+        compatibility_connection = runtime.db._connection()
+        raw = compatibility_connection.raw
+        assert composition.repository.connection is raw
+        assert composition.audit_repository.connection is raw
+
+        legacy_candidate = CandidateIntent(
+            candidate_id=f"langchao-candidate:{uuid.uuid4()}",
+            type="share",
+            intent="浪潮",
+            goal="浪潮",
+            internal_need=1.0,
+        )
+        with runtime.db.transaction() as connection:
+            runtime.projections.candidates.upsert(connection, legacy_candidate)
+        candidate = bridge.candidates(scope_key=scope, now=datetime.now(timezone.utc))[0]
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        callback_statuses = []
+        receipt_box = []
+
+        def persist_snapshot(receipt):
+            receipt_box.append(receipt)
+            callback_statuses.append(raw.info.transaction_status)
+            composition.audit_repository.save_decision_audit(
+                decision_id=decision_id,
+                audit={"audit_contract_version": "integration-test", "name": "浪潮"},
+            )
+            if outcome == "snapshot_sql_failure":
+                raw.execute(
+                    "INSERT INTO runtime_v2_committed_decisions (missing_langchao_column) VALUES (1)"
+                )
+            composition.audit_repository.save_committed_decision(
+                committed=_langchao_committed_snapshot(
+                    scope=scope, candidate=candidate, receipt=receipt, now=now
+                )
+            )
+            if outcome == "callback_failure":
+                raise RuntimeError("injected langchao callback failure")
+
+        if outcome == "commit":
+            bridge.commit_candidate_with_snapshot(
+                decision_id=decision_id,
+                candidate=candidate,
+                now=now,
+                persist_snapshot=persist_snapshot,
+            )
+        else:
+            expected = psycopg.Error if outcome == "snapshot_sql_failure" else RuntimeError
+            with pytest.raises(expected):
+                bridge.commit_candidate_with_snapshot(
+                    decision_id=decision_id,
+                    candidate=candidate,
+                    now=now,
+                    persist_snapshot=persist_snapshot,
+                )
+
+        assert callback_statuses == [psycopg.pq.TransactionStatus.INTRANS]
+        receipt = receipt_box[0]
+        names = (
+            "action_attempts",
+            "outbox",
+            "runtime_v2_decision_audits",
+            "runtime_v2_committed_decisions",
+        )
+        predicates = (
+            ("attempt_id", receipt.attempt_id),
+            ("outbox_id", receipt.render_outbox_id),
+            ("decision_id", decision_id),
+            ("decision_id", decision_id),
+        )
+        observed = []
+        for table, (column, value) in zip(names, predicates):
+            row = observer.execute(
+                f'SELECT count(*) AS count FROM "{schema}"."{table}" WHERE {column} = %s',
+                (value,),
+            ).fetchone()
+            observed.append(row["count"])
+        assert observed == ([1, 1, 1, 1] if outcome == "commit" else [0, 0, 0, 0])
+
+        composition.close()
+        assert raw.closed is False
+        runtime.close()
+        assert raw.closed is True
+    finally:
+        if composition is not None:
+            composition.close()
+        if runtime is not None:
+            runtime.close()
+        observer.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        observer.close()
 
 
 def first_basis():
