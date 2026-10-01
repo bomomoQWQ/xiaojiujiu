@@ -82,11 +82,11 @@ def candidate(*, revision=1):
 
 
 def test_v12_is_append_only_and_has_stable_checksum():
-    assert MIGRATIONS[-1] == (12, LANGCHAO_SCHEMA_V12_STATEMENTS)
+    assert MIGRATIONS[11] == (12, LANGCHAO_SCHEMA_V12_STATEMENTS)
     records = migration_records()
-    assert tuple(record.version for record in records) == tuple(range(1, 13))
-    assert len(records[-1].checksum) == 64
-    assert records[-1].checksum == migration_records()[-1].checksum
+    assert tuple(record.version for record in records[:12]) == tuple(range(1, 13))
+    assert len(records[11].checksum) == 64
+    assert records[11].checksum == migration_records()[11].checksum
 
 
 def test_schema_has_scoped_identity_revision_pointer_and_exact_refs():

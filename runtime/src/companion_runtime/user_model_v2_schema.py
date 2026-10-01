@@ -12,10 +12,11 @@ from typing import Final
 
 from .langchao_outcome_schema import LANGCHAO_OUTCOME_SCHEMA_V13_STATEMENTS
 from .langchao_schema import LANGCHAO_SCHEMA_V12_STATEMENTS
+from .langchao_state_schema import LANGCHAO_STATE_SCHEMA_V14_STATEMENTS
 from .runtime_committed_decision_v2_schema import COMMITTED_DECISION_SCHEMA_STATEMENTS
 from .runtime_core_v2_schema import CORE_SCHEMA_STATEMENTS, CORE_SCHEMA_VERSION
 
-USER_MODEL_SCHEMA_VERSION: Final[int] = 13
+USER_MODEL_SCHEMA_VERSION: Final[int] = 14
 
 _INITIAL_SCHEMA: tuple[str, ...] = (
     """
@@ -542,6 +543,7 @@ MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     (11, COMMITTED_DECISION_SCHEMA_STATEMENTS),
     (12, LANGCHAO_SCHEMA_V12_STATEMENTS),
     (13, LANGCHAO_OUTCOME_SCHEMA_V13_STATEMENTS),
+    (14, LANGCHAO_STATE_SCHEMA_V14_STATEMENTS),
 )
 
 

@@ -109,15 +109,15 @@ def reward_row(*, cap=1.0):
 
 
 def test_v13_is_append_only_and_checksum_is_stable():
-    assert USER_MODEL_SCHEMA_VERSION == 13
+    assert USER_MODEL_SCHEMA_VERSION >= 13
     assert next(item for item in MIGRATIONS if item[0] == 12)[0] == 12
     assert next(item for item in MIGRATIONS if item[0] == 13) == (
         13, LANGCHAO_OUTCOME_SCHEMA_V13_STATEMENTS
     )
     records = migration_records()
-    assert tuple(record.version for record in records) == tuple(range(1, 14))
-    assert len(records[-1].checksum) == 64
-    assert records[-1].checksum == migration_records()[-1].checksum
+    record = next(item for item in records if item.version == 13)
+    assert len(record.checksum) == 64
+    assert record.checksum == next(item for item in migration_records() if item.version == 13).checksum
 
 
 def test_schema_has_scoped_exact_lineage_membership_invariants_and_immutability():
