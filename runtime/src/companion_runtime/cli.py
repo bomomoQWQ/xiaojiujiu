@@ -355,6 +355,20 @@ def cmd_serve(args: argparse.Namespace) -> int:
         # previous heartbeat can update parameters without contaminating that prior
         # decision's saved prediction.
         v2_maintenance.run_due(now=now, fit=True)
+        # Long-term memory has exactly one unattended writer (the rule-based
+        # consolidation pass) and the legacy endogenous round used to be its only
+        # scheduler. Production replaced that round, so without this call the
+        # ``memories`` table is never written: candidates pile up as ``pending`` and
+        # the character stops forming long-term memory entirely. It runs last, so a
+        # memory formed here can inform the next round but never this one.
+        consolidation = runtime.consolidate_memories_if_due(now=now)
+        if consolidation.get("ran"):
+            LOGGER.info(
+                "Memory consolidation: %s (consolidated=%s archived=%s)",
+                consolidation.get("reason"),
+                len(consolidation.get("consolidated") or ()),
+                len(consolidation.get("archived") or ()),
+            )
         return result
 
     def simulate_v2_decision(_payload: dict[str, Any]) -> dict[str, Any]:
