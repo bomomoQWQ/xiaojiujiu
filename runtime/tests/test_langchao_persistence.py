@@ -14,7 +14,9 @@ from companion_runtime.langchao_repository import (
 )
 from companion_runtime.langchao_schema import LANGCHAO_SCHEMA_V12_STATEMENTS
 from companion_runtime.langchao_types import (
+    ActionCandidateContract,
     CandidateKind,
+    CandidateState,
     GoalContract,
     GoalKind,
     GoalOwnership,
@@ -66,6 +68,19 @@ def goal(*, scope=SCOPE, revision=1, desired_change="help"):
     )
 
 
+def candidate(*, revision=1):
+    return ActionCandidateContract(
+        candidate_id="candidate:1", scope_key=SCOPE, semantic_key="candidate:semantic",
+        goal_refs=("goal:1",), kind=CandidateKind.INTERNAL_PROCESS,
+        action_template="think", input_refs=(), reward_contract_ref="reward:1",
+        expected_outcome_token_ids=("token:1",), capability_refs=(),
+        permission_ref="permission:1", precondition_refs=(), invalidation_refs=(),
+        envelope=(), state=CandidateState.PROPOSED, available_from=NOW, expires_at=None,
+        resource_budget=1.0, based_on_state_version=0, created_at=NOW,
+        updated_at=NOW, semantic_revision=revision,
+    )
+
+
 def test_v12_is_append_only_and_has_stable_checksum():
     assert MIGRATIONS[-1] == (12, LANGCHAO_SCHEMA_V12_STATEMENTS)
     records = migration_records()
@@ -88,6 +103,9 @@ def test_schema_has_scoped_identity_revision_pointer_and_exact_refs():
     assert "POINTER_VERSION BIGINT" in ddl
     assert "LANGCHAO_CANDIDATE_GOAL_REFS" in ddl
     assert "FOREIGN KEY (SCOPE_KEY, GOAL_ID, GOAL_REVISION)" in ddl
+    assert "(SCOPE_KEY, REWARD_CONTRACT_ID, REWARD_REVISION)" in ddl
+    assert "REFERENCES LANGCHAO_REWARD_REVISIONS (SCOPE_KEY, REWARD_CONTRACT_ID, REVISION)" in ddl
+    assert "GOAL REVISION 1 MAY LEAVE REWARD_CONTRACT_ID NULL" in ddl
     assert "ON DELETE RESTRICT" in ddl
     assert "NAN" not in ddl  # excluded through x = x; infinities are explicit literals
     assert "'INFINITY'::DOUBLE PRECISION" in ddl
@@ -133,6 +151,35 @@ def test_activate_uses_advisory_lock_first_creation_zero_and_cas():
         goal_id="goal:1", revision=1, expected_pointer_version=2
     )
     assert len(mismatch.calls) == 3
+
+
+def test_candidate_freezes_active_reward_revision_and_requires_active_reward():
+    # identity insert/select, no existing candidate, active reward rev 1, active goal
+    # rev 4, candidate insert, then candidate-goal exact-ref insert.
+    conn = Connection(rows=[
+        None, {"semantic_key": "candidate:semantic"}, None,
+        {"revision": 1}, {"revision": 4}, {"candidate_id": "candidate:1"}, None,
+    ])
+    repository = LangchaoRepository(conn, scope_key=SCOPE)
+    repository.put_candidate_revision(candidate(revision=1))
+    insert_sql, insert_params = conn.calls[5]
+    assert "reward_contract_id, reward_revision" in insert_sql
+    assert insert_params[8:11] == ("reward:1", 1, 1.0)
+
+    # After the active reward pointer advances, a new candidate revision freezes 2;
+    # the prior immutable candidate insert remains bound to revision 1.
+    advanced = Connection(rows=[
+        None, {"semantic_key": "candidate:semantic"}, None,
+        {"revision": 2}, {"revision": 4}, {"candidate_id": "candidate:1"}, None,
+    ])
+    LangchaoRepository(advanced, scope_key=SCOPE).put_candidate_revision(candidate(revision=2))
+    assert advanced.calls[5][1][8:11] == ("reward:1", 2, 1.0)
+    assert conn.calls[5][1][9] == 1
+
+    missing = Connection(rows=[None, {"semantic_key": "candidate:semantic"}, None, None])
+    with pytest.raises(LangchaoReferenceError, match="has no active revision"):
+        LangchaoRepository(missing, scope_key=SCOPE).put_candidate_revision(candidate())
+    assert len(missing.calls) == 4  # no candidate revision was inserted
 
 
 def test_get_active_joins_exact_pointer_revision_without_max():
