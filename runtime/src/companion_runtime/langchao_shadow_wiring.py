@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Mapping
 
@@ -42,6 +43,26 @@ DEFAULT_LANGCHAO_PARAMETERS = LangchaoParameters(
     crossing_tolerance=1e-7,
     tie_tolerance=1e-6,
 )
+
+
+class _BorrowedConnection:
+    """Forward SQL while leaving transaction ownership to the service.
+
+    Psycopg nested ``connection.transaction()`` contexts are savepoints.  The shadow
+    service already owns one atomic transaction spanning every repository; allowing
+    each repository to open another context caused savepoint lifetime failures on the
+    shared autocommit connection.  Repository transaction blocks therefore become
+    no-ops only in this composition, while all SQL still uses the same connection.
+    """
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def transaction(self) -> Any:
+        return nullcontext()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
 
 
 class _ReadOnlyAuthority:
@@ -275,19 +296,23 @@ class LangchaoShadowRunner:
 
 def build_langchao_shadow_runner(*, connection: Any, scope_key: str, runtime: Any) -> LangchaoShadowRunner:
     """Build safe repositories on the same migrated PostgreSQL connection."""
-    contracts = LangchaoRepository(connection, scope_key=scope_key)
-    outcomes = LangchaoOutcomeRepository(connection, scope_key=scope_key)
-    states = LangchaoStateRepository(connection, scope_key=scope_key)
+    borrowed = _BorrowedConnection(connection)
+    contracts = LangchaoRepository(borrowed, scope_key=scope_key)
+    outcomes = LangchaoOutcomeRepository(borrowed, scope_key=scope_key)
+    states = LangchaoStateRepository(borrowed, scope_key=scope_key)
+    # Bootstrap precedes service execution and retains its repository-owned atomic
+    # transaction. During a run this collaborator is read-only.
     authority = LangchaoAuthorityRepository(connection, scope_key=scope_key)
     if authority.get_active() is None:
         authority.bootstrap()  # runtime_v2/live only; bootstrap itself rechecks under lock.
-    shadow = LangchaoShadowPostgresRepository(connection, state_repository=states)
+    shadow = LangchaoShadowPostgresRepository(borrowed, state_repository=states)
     service = LangchaoShadowService(
         contract_repository=contracts,
         outcome_repository=outcomes,
         state_repository=states,
         shadow_repository=shadow,
         authority_reader=_ReadOnlyAuthority(authority),
+        transaction_factory=connection.transaction,
     )
     return LangchaoShadowRunner(scope_key=scope_key, runtime=runtime, service=service,
                                 state_repository=states,

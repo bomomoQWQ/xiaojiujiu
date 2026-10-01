@@ -536,7 +536,11 @@ def run_langchao_shadow(
             return verified_existing(race)
         repository.put_state_revision(
             result=advanced,
-            input_state=prepared_state,
+            # append_advance compares against the exact snapshot currently published
+            # by begin_round/load_active_state. ``prepared_state`` is an ephemeral
+            # numerical input (compiled attraction/profile values), not that stored
+            # before-image, so using it here makes every non-zero attraction conflict.
+            input_state=previous_state,
             candidate_revisions={item.candidate.candidate_id: item.candidate.semantic_revision for item in inputs},
             expected_pointer_version=expected_state_pointer_version,
         )

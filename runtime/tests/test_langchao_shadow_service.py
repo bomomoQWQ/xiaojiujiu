@@ -138,6 +138,8 @@ class Shadow(FakeLangchaoShadowRepository):
         self.a.events.append("audit")
     def put_state_revision(self, **kwargs):
         super().put_state_revision(**kwargs)
+        self.last_input_state = kwargs["input_state"]
+        self.last_expected_pointer = kwargs["expected_pointer_version"]
         result = kwargs["result"]
         self.a.pointer += 1
         self.a.active_state = result.state
@@ -197,6 +199,16 @@ def test_order_contract_stability_expected_tokens_zero_send_and_baseline_compari
     assert set(aggregate.bindings[(item.reward.reward_contract_id, 1)]) == {
         (token.token_id, 1) for token in item.reward.outcome_tokens
     }
+
+
+def test_new_round_appends_from_exact_built_snapshot_and_begin_pointer():
+    built = build((source("a"),))
+    aggregate, shadow, service = harness()
+
+    execute(service, built)
+
+    assert shadow.last_input_state is built.state
+    assert shadow.last_expected_pointer == 1
 
 
 def test_exact_service_replay_adds_no_revision_state_or_audit():

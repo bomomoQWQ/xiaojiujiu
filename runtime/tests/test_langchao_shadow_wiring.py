@@ -4,7 +4,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from companion_runtime.config import RuntimeConfig
-from companion_runtime.langchao_shadow_wiring import LangchaoShadowRunner, _facts_for
+from companion_runtime.langchao_shadow_wiring import (
+    LangchaoShadowRunner,
+    _BorrowedConnection,
+    _facts_for,
+)
 from companion_runtime.runtime_v2 import EndogenousDecisionV2
 from test_langchao_runtime_adapter import source
 
@@ -60,6 +64,23 @@ def test_enabled_runner_builds_contact_plus_synthetic_rest_and_state_cursor():
     }
     assert built.state.event_cursor == "runtime-version:7"
     assert captured["kwargs"]["idempotency_key"] == "runtime-v2:d1"
+
+
+def test_borrowed_connection_forwards_sql_but_never_opens_nested_transaction():
+    calls = []
+
+    class Connection:
+        def execute(self, sql, params=()):
+            calls.append((sql, params))
+            return "cursor"
+
+        def transaction(self):
+            raise AssertionError("repository must not own a nested transaction")
+
+    borrowed = _BorrowedConnection(Connection())
+    with borrowed.transaction():
+        assert borrowed.execute("SELECT 1") == "cursor"
+    assert calls == [("SELECT 1", ())]
 
 
 def test_cli_shadow_failure_isolation_is_after_baseline_decision():
