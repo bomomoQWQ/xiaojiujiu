@@ -184,9 +184,9 @@ def test_atomic_report_replaces_complete_json_and_leaves_no_temp(tmp_path):
 
 def test_replay_scope_reports_zero_protected_deltas(monkeypatch):
     class Migration:
-        current_version = 19
+        current_version = 20
         applied = ()
-        already_present = tuple(range(1, 20))
+        already_present = tuple(range(1, 21))
 
     class Connection:
         def execute(self, sql, params=()):
