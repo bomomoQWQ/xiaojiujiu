@@ -86,6 +86,13 @@ class RuntimeProcess:
         self.log_path = log_dir / f"{self.slug}.log"
         self.env = dict(env)
         self.env["CR_CONVERSATION_ID"] = session
+        # Shared PostgreSQL server, isolated schemas: the retained mechanical
+        # projections (memory/candidates/outbox) are not tenant-keyed, so putting
+        # several people in one schema would blend them even though the v2 model
+        # tables carry scope_key. Keep the former one-database-per-person invariant
+        # as one-schema-per-person and give runtime_state a unique row identity too.
+        self.env["CR_RUNTIME_ID"] = f"companion-{self.slug}"
+        self.env["CR_STORAGE__SCHEMA"] = f"cr_{self.slug.replace('-', '_')}"
         # v2 is PostgreSQL-only. Every process shares the configured server/schema,
         # while every user-facing table/query is isolated by CR_CONVERSATION_ID.
         # A per-person JSONL mirror remains useful for forensic correlation only.
