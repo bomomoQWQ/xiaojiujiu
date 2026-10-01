@@ -30,9 +30,11 @@ class Aggregate:
         self.fail_on = None
         self.cas_loss = None
         self.claims = 0
+        self.transaction_entries = 0
 
     @contextmanager
     def transaction(self):
+        self.transaction_entries += 1
         snapshot = copy.deepcopy(self.__dict__)
         try:
             yield
@@ -209,6 +211,7 @@ def test_new_round_appends_from_exact_built_snapshot_and_begin_pointer():
 
     assert shadow.last_input_state is built.state
     assert shadow.last_expected_pointer == 1
+    assert aggregate.transaction_entries == 1
 
 
 def test_exact_service_replay_adds_no_revision_state_or_audit():
