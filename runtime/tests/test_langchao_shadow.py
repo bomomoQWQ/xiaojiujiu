@@ -264,17 +264,18 @@ def test_postgres_existing_audit_rejects_hash_mismatch_before_state_write():
     assert state_repository.writes == 0
 
 
-def test_v16_migration_is_appended_after_v15_with_stable_checksum_and_create_order():
-    assert USER_MODEL_SCHEMA_VERSION == 16
-    assert MIGRATIONS[-1] == (16, LANGCHAO_SHADOW_SCHEMA_V16_STATEMENTS)
-    assert tuple(version for version, _ in MIGRATIONS) == tuple(range(1, 17))
+def test_v16_migration_remains_unchanged_after_v15_with_stable_checksum():
+    assert USER_MODEL_SCHEMA_VERSION >= 16
+    assert MIGRATIONS[15] == (16, LANGCHAO_SHADOW_SCHEMA_V16_STATEMENTS)
+    assert tuple(version for version, _ in MIGRATIONS[:16]) == tuple(range(1, 17))
     records = migration_records()
-    assert records[-1].version == 16
-    assert len(records[-1].checksum) == 64
-    assert records[-1].checksum == migration_records()[-1].checksum
+    record = records[15]
+    assert record.version == 16
+    assert len(record.checksum) == 64
+    assert record.checksum == migration_records()[15].checksum
     tables = tuple(
         match.group(1)
-        for statement in schema_statements()
+        for statement in MIGRATIONS[15][1]
         if (match := re.search(
             r"CREATE TABLE IF NOT EXISTS\s+([a-z0-9_]+)", statement, re.IGNORECASE
         ))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from companion_runtime.langchao_social_schema import LANGCHAO_SOCIAL_SCHEMA_STATEMENTS
 from companion_runtime.runtime_core_v2_schema import CORE_SCHEMA_STATEMENTS
 from companion_runtime.user_model_v2_schema import (
     MIGRATIONS,
@@ -90,9 +91,9 @@ def test_idempotency_and_single_active_parameter_constraints_are_explicit() -> N
 
 
 def test_migration_versions_and_statement_order_are_stable() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 16
+    assert USER_MODEL_SCHEMA_VERSION == 17
     assert isinstance(MIGRATIONS, tuple)
-    assert tuple(version for version, _statements in MIGRATIONS) == tuple(range(1, 17))
+    assert tuple(version for version, _statements in MIGRATIONS) == tuple(range(1, 18))
     assert all(isinstance(statements, tuple) for _version, statements in MIGRATIONS)
     assert schema_statements() == tuple(
         statement for _version, statements in MIGRATIONS for statement in statements
@@ -145,6 +146,15 @@ def test_migration_versions_and_statement_order_are_stable() -> None:
             "langchao_authority_active",
             "langchao_dispatch_claims",
             "langchao_shadow_runs",
+        )
+        + tuple(
+            re.search(
+                r"CREATE TABLE IF NOT EXISTS\s+([a-z0-9_]+)",
+                statement,
+                re.IGNORECASE,
+            ).group(1)
+            for statement in LANGCHAO_SOCIAL_SCHEMA_STATEMENTS
+            if re.search(r"CREATE TABLE IF NOT EXISTS", statement, re.IGNORECASE)
         )
     )
 
