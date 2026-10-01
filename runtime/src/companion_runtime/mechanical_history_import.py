@@ -242,6 +242,8 @@ def _convert(column: str, kind: str, nullable: bool, value: Any) -> Any:
     if kind == "bigint":
         if type(value) is not int:
             raise ValueError("expected SQLite INTEGER")
+        if value < -(1 << 63) or value > (1 << 63) - 1:
+            raise ValueError("integer outside signed bigint range")
         return value
     if kind == "double":
         if type(value) not in (int, float):
