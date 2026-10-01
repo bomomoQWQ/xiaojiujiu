@@ -90,9 +90,9 @@ def test_idempotency_and_single_active_parameter_constraints_are_explicit() -> N
 
 
 def test_migration_versions_and_statement_order_are_stable() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 11
+    assert USER_MODEL_SCHEMA_VERSION == 12
     assert isinstance(MIGRATIONS, tuple)
-    assert tuple(version for version, _statements in MIGRATIONS) == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+    assert tuple(version for version, _statements in MIGRATIONS) == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
     assert all(isinstance(statements, tuple) for _version, statements in MIGRATIONS)
     assert schema_statements() == tuple(
         statement for _version, statements in MIGRATIONS for statement in statements
@@ -122,12 +122,22 @@ def test_migration_versions_and_statement_order_are_stable() -> None:
             "mechanical_history_import_audits_v1",
             "mechanical_history_import_quarantine_v1",
             "runtime_v2_committed_decisions",
+            "langchao_goal_identities",
+            "langchao_reward_identities",
+            "langchao_candidate_identities",
+            "langchao_goal_revisions",
+            "langchao_reward_revisions",
+            "langchao_candidate_revisions",
+            "langchao_goal_active",
+            "langchao_reward_active",
+            "langchao_candidate_active",
+            "langchao_candidate_goal_refs",
         )
     )
 
 
 def test_v10_mechanical_history_audit_is_independent_and_privacy_minimal() -> None:
-    version, statements = MIGRATIONS[-2]
+    version, statements = next(item for item in MIGRATIONS if item[0] == 10)
     ddl = _normalise("\n".join(statements))
     assert version == 10
     assert "MECHANICAL_HISTORY_IMPORT_AUDITS_V1" in ddl
@@ -144,7 +154,7 @@ def test_v10_mechanical_history_audit_is_independent_and_privacy_minimal() -> No
 
 
 def test_v11_committed_decision_snapshot_has_terminal_placeholder() -> None:
-    version, statements = MIGRATIONS[-1]
+    version, statements = MIGRATIONS[-2]
     ddl = _normalise("\n".join(statements))
     assert version == 11
     assert "RUNTIME_V2_COMMITTED_DECISIONS" in ddl
