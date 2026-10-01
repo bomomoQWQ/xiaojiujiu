@@ -151,6 +151,25 @@ def test_begin_round_cas_conflict_rolls_back_everything():
     assert conn.commits == 0
 
 
+def test_abort_open_round_requires_exact_active_pointer_and_only_updates_open():
+    conn = Connection(rows=[{"round_id": "round:1", "pointer_version": 3}], rowcounts=[1, 1])
+    changed = LangchaoStateRepository(conn, scope_key=SCOPE).abort_open_round(
+        round_id="round:1", ended_at=NOW + timedelta(seconds=1), expected_pointer_version=3,
+    )
+    assert changed
+    assert conn.transactions == conn.commits == 1
+    assert "FOR UPDATE" in conn.calls[0][0]
+    assert "status = 'aborted'" in conn.calls[1][0]
+    assert "status = 'open'" in conn.calls[1][0]
+
+    conflict = Connection(rows=[{"round_id": "other", "pointer_version": 3}])
+    with pytest.raises(LangchaoStateConflictError, match="changed before abort"):
+        LangchaoStateRepository(conflict, scope_key=SCOPE).abort_open_round(
+            round_id="round:1", ended_at=NOW, expected_pointer_version=3,
+        )
+    assert conflict.rollbacks == 1
+
+
 def test_append_writes_snapshot_then_steps_in_engine_order_then_cas_and_finishes_deferred():
     before = state()
     result = advance_langchao(
