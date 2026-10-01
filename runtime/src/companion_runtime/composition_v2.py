@@ -110,6 +110,7 @@ class V2Composition:
     health: V2Health
     enable_decision_run: bool = False
     decision_simulation_runner: Any | None = None
+    langchao_shadow_runner: Any | None = None
     owns_database: bool = True
 
     def close(self) -> None:
@@ -200,6 +201,21 @@ def build_v2_composition(
             rng=rng,
         )
         expected = tuple(record.version for record in migration_records())
+        shadow_enabled = bool(
+            config.langchao.shadow_enabled
+            or config.extras.get("langchao.shadow_enabled", False)
+            or (isinstance(config.extras.get("langchao"), Mapping)
+                and config.extras["langchao"].get("shadow_enabled", False))
+        )
+        langchao_shadow_runner = None
+        if shadow_enabled:
+            from .langchao_shadow_wiring import build_langchao_shadow_runner
+
+            # Reuse runtime.db's raw PostgreSQL connection. Schema migrations are
+            # unconditional above, while object construction remains explicitly opt-in.
+            langchao_shadow_runner = build_langchao_shadow_runner(
+                connection=connection, scope_key=scope_key, runtime=legacy_bridge.runtime,
+            )
         health = V2Health(
             versions={
                 "runtime": __version__,
@@ -234,6 +250,7 @@ def build_v2_composition(
             coordinator=coordinator,
             audit_repository=runtime_repository,
             health=health,
+            langchao_shadow_runner=langchao_shadow_runner,
             owns_database=effective_owns_database,
         )
     except BaseException:

@@ -16,6 +16,7 @@ from companion_runtime.composition_v2 import (
 from companion_runtime.config import RuntimeConfig
 from companion_runtime.db_postgres import PSYCOPG_AVAILABLE
 from companion_runtime.runtime_v2 import V2RuntimeCoordinator
+from companion_runtime.user_model_v2_schema import USER_MODEL_SCHEMA_VERSION
 from companion_runtime.user_model_v2_service import UserModelV2Service
 from companion_runtime.user_model_v2_types import Target
 
@@ -35,7 +36,7 @@ class FakeConnection:
 class FakeDatabase:
     dialect = "postgres"
 
-    def __init__(self, *, version=12, fail=False):
+    def __init__(self, *, version=USER_MODEL_SCHEMA_VERSION, fail=False):
         self.version = version
         self.fail = fail
         self.connection = FakeConnection()
@@ -100,7 +101,7 @@ def test_factory_builds_v2_graph_from_injected_protocols_and_reports_health() ->
     assert composition.coordinator.user_model is composition.user_model_service
     health = composition.health.to_dict()
     assert health["storage"] == {"dialect": "postgres", "schema": "runtime_v2"}
-    assert health["migrations"]["current_version"] == 12
+    assert health["migrations"]["current_version"] == USER_MODEL_SCHEMA_VERSION
     assert health["migrations"]["up_to_date"] is True
     assert health["versions"]["decision_policy"].startswith("runtime-v2")
     assert health["jev"] == {

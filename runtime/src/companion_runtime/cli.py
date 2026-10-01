@@ -352,6 +352,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
             now=now,
             elapsed_allowed_seconds=elapsed,
         )
+        # Shadow observes the completed baseline decision (which may already have
+        # committed). It has no sender/claim capability; failures must never alter the
+        # baseline scheduler round.
+        if v2_composition.langchao_shadow_runner is not None:
+            try:
+                v2_composition.langchao_shadow_runner.run(result, now=now)
+            except Exception:  # noqa: BLE001 - isolated shadow must fail open
+                LOGGER.exception(
+                    "Langchao shadow round failed after baseline decision %s",
+                    result.decision_id,
+                )
         # The same scheduler heartbeat owns bounded v2 window settlement and model
         # fitting. It runs after the decision, so a user reply observed since the
         # previous heartbeat can update parameters without contaminating that prior

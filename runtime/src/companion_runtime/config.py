@@ -475,6 +475,17 @@ class ObservabilityConfig:
 
 
 @dataclass(slots=True)
+class LangchaoConfig:
+    """Opt-in production wiring for the isolated 浪潮 shadow evaluator.
+
+    The evaluator has no dispatch capability and remains disabled unless this
+    explicit switch is set (test/simulation deployments may opt in).
+    """
+
+    shadow_enabled: bool = False
+
+
+@dataclass(slots=True)
 class RuntimeConfig:
     """Aggregate configuration for the whole Runtime.
 
@@ -518,6 +529,7 @@ class RuntimeConfig:
     semantic: SemanticConfig = field(default_factory=SemanticConfig)
     task: TaskConfig = field(default_factory=TaskConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
+    langchao: LangchaoConfig = field(default_factory=LangchaoConfig)
     #: Free-form extras; useful for experiments without touching the schema.
     extras: dict[str, Any] = field(default_factory=dict)
 
