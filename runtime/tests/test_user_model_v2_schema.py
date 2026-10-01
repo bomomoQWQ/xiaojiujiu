@@ -90,9 +90,9 @@ def test_idempotency_and_single_active_parameter_constraints_are_explicit() -> N
 
 
 def test_migration_versions_and_statement_order_are_stable() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 9
+    assert USER_MODEL_SCHEMA_VERSION == 11
     assert isinstance(MIGRATIONS, tuple)
-    assert tuple(version for version, _statements in MIGRATIONS) == (1, 2, 3, 4, 5, 6, 7, 8, 9)
+    assert tuple(version for version, _statements in MIGRATIONS) == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
     assert all(isinstance(statements, tuple) for _version, statements in MIGRATIONS)
     assert schema_statements() == tuple(
         statement for _version, statements in MIGRATIONS for statement in statements
@@ -119,5 +119,39 @@ def test_migration_versions_and_statement_order_are_stable() -> None:
             "runtime_v2_user_matter_events",
             "runtime_v2_decision_audits",
             "runtime_v2_expectation_settlements",
+            "mechanical_history_import_audits_v1",
+            "mechanical_history_import_quarantine_v1",
+            "runtime_v2_committed_decisions",
         )
     )
+
+
+def test_v10_mechanical_history_audit_is_independent_and_privacy_minimal() -> None:
+    version, statements = MIGRATIONS[-2]
+    ddl = _normalise("\n".join(statements))
+    assert version == 10
+    assert "MECHANICAL_HISTORY_IMPORT_AUDITS_V1" in ddl
+    assert "RUN_ID UUID PRIMARY KEY" in ddl
+    assert "STATUS IN ('APPLIED', 'FAILED')" in ddl
+    assert "RECONCILIATION JSONB" in ddl
+    assert "UNIQUE (SCOPE_KEY, SOURCE_SNAPSHOT_SHA256, PLAN_SHA256, IMPORTER_VERSION)" in ddl
+    assert "MECHANICAL_HISTORY_IMPORT_QUARANTINE_V1" in ddl
+    assert "SOURCE_TABLE TEXT" in ddl
+    assert "SOURCE_PK TEXT" in ddl
+    assert "PAYLOAD_SHA256 TEXT" in ddl
+    assert "PAYLOAD JSONB" not in ddl
+    assert "CONTENT TEXT" not in ddl
+
+
+def test_v11_committed_decision_snapshot_has_terminal_placeholder() -> None:
+    version, statements = MIGRATIONS[-1]
+    ddl = _normalise("\n".join(statements))
+    assert version == 11
+    assert "RUNTIME_V2_COMMITTED_DECISIONS" in ddl
+    assert "DECISION_ID TEXT PRIMARY KEY" in ddl
+    assert "CANDIDATE_SNAPSHOT JSONB NOT NULL" in ddl
+    assert "AUDIT_SNAPSHOT JSONB NOT NULL" in ddl
+    assert "ATTEMPT_ID TEXT NOT NULL" in ddl
+    assert "RENDER_OUTBOX_ID TEXT NOT NULL" in ddl
+    assert "TERMINAL_STATUS IN ('SENT', 'FAILED')" in ddl
+    assert "WHERE TERMINAL_STATUS IS NULL" in ddl
