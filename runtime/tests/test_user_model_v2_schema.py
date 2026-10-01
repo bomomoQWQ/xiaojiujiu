@@ -90,9 +90,9 @@ def test_idempotency_and_single_active_parameter_constraints_are_explicit() -> N
 
 
 def test_migration_versions_and_statement_order_are_stable() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 15
+    assert USER_MODEL_SCHEMA_VERSION == 16
     assert isinstance(MIGRATIONS, tuple)
-    assert tuple(version for version, _statements in MIGRATIONS) == tuple(range(1, 16))
+    assert tuple(version for version, _statements in MIGRATIONS) == tuple(range(1, 17))
     assert all(isinstance(statements, tuple) for _version, statements in MIGRATIONS)
     assert schema_statements() == tuple(
         statement for _version, statements in MIGRATIONS for statement in statements
@@ -144,6 +144,7 @@ def test_migration_versions_and_statement_order_are_stable() -> None:
             "langchao_authority_revisions",
             "langchao_authority_active",
             "langchao_dispatch_claims",
+            "langchao_shadow_runs",
         )
     )
 
