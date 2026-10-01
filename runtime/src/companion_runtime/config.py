@@ -476,13 +476,19 @@ class ObservabilityConfig:
 
 @dataclass(slots=True)
 class LangchaoConfig:
-    """Opt-in production wiring for the isolated 浪潮 shadow evaluator.
+    """Opt-in production wiring for 浪潮 shadow/live execution.
 
-    The evaluator has no dispatch capability and remains disabled unless this
-    explicit switch is set (test/simulation deployments may opt in).
+    Live execution is deny-by-default twice: the feature switch must be enabled and
+    the exact conversation scope must appear in ``live_scope_allowlist``. Authority
+    itself is still switched separately through the persisted CAS pointer.
     """
 
     shadow_enabled: bool = False
+    live_enabled: bool = False
+    live_scope_allowlist: list[str] = field(default_factory=list)
+
+    def live_allowed(self, scope_key: str) -> bool:
+        return bool(self.live_enabled and scope_key in self.live_scope_allowlist)
 
 
 @dataclass(slots=True)

@@ -113,6 +113,8 @@ class V2Composition:
     enable_decision_run: bool = False
     decision_simulation_runner: Any | None = None
     langchao_shadow_runner: Any | None = None
+    langchao_live_runner: Any | None = None
+    authority_round_router: Any | None = None
     owns_database: bool = True
 
     def close(self) -> None:
@@ -224,6 +226,24 @@ def build_v2_composition(
             langchao_shadow_runner = build_langchao_shadow_runner(
                 connection=connection, scope_key=scope_key, runtime=legacy_bridge.runtime,
             )
+        live_enabled = bool(config.langchao.live_allowed(scope_key))
+        langchao_live_runner = None
+        if live_enabled:
+            from .langchao_live_wiring import build_langchao_live_runner
+
+            langchao_live_runner = build_langchao_live_runner(
+                connection=connection, scope_key=scope_key,
+                runtime=legacy_bridge.runtime, legacy_bridge=legacy_bridge,
+            )
+        from .langchao_live_wiring import AuthorityRoutedEndogenousRound
+        authority_round_router = AuthorityRoutedEndogenousRound(
+            scope_key=scope_key, v2_coordinator=coordinator,
+            authority_reader=authority,
+            langchao_live_runner=langchao_live_runner,
+            langchao_shadow_runner=langchao_shadow_runner,
+            live_enabled=live_enabled,
+            live_scope_allowlist=tuple(config.langchao.live_scope_allowlist),
+        )
         health = V2Health(
             versions={
                 "runtime": __version__,
@@ -259,6 +279,8 @@ def build_v2_composition(
             audit_repository=runtime_repository,
             health=health,
             langchao_shadow_runner=langchao_shadow_runner,
+            langchao_live_runner=langchao_live_runner,
+            authority_round_router=authority_round_router,
             owns_database=effective_owns_database,
         )
     except BaseException:

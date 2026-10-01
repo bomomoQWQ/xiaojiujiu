@@ -88,6 +88,7 @@ class LangchaoShadowService:
         shadow_repository: LangchaoShadowRepository,
         authority_reader: AuthorityReader,
         transaction_factory: Any | None = None,
+        allow_live_evaluation: bool = False,
     ) -> None:
         if not isinstance(authority_reader, AuthorityReader):
             raise TypeError("authority_reader must implement AuthorityReader")
@@ -99,6 +100,7 @@ class LangchaoShadowService:
         self.shadow = shadow_repository
         self.authority_reader = authority_reader
         self._transaction_factory = transaction_factory
+        self._allow_live_evaluation = bool(allow_live_evaluation)
 
     def _transaction(self) -> ContextManager[None]:
         if self._transaction_factory is not None:
@@ -107,8 +109,7 @@ class LangchaoShadowService:
         transaction = getattr(connection, "transaction", None)
         return transaction() if transaction is not None else nullcontext()
 
-    @staticmethod
-    def _validate_authority(value: Any) -> _Authority:
+    def _validate_authority(self, value: Any) -> _Authority:
         if value is None:
             raise LangchaoShadowAuthorityError("scope has no active authority")
         active = _authority(value)
@@ -120,10 +121,17 @@ class LangchaoShadowService:
             active.engine_key == AuthorityEngine.LANGCHAO.value
             and active.mode == AuthorityMode.SHADOW.value
             and not active.may_dispatch
+        ) or (
+            # Live reuses the same deterministic contract/state/audit phase, then a
+            # separate capability-bearing service performs the dispatch transaction.
+            self._allow_live_evaluation
+            and active.engine_key == AuthorityEngine.LANGCHAO.value
+            and active.mode == AuthorityMode.LIVE.value
+            and active.may_dispatch
         )
         if not allowed:
             raise LangchaoShadowAuthorityError(
-                "shadow requires runtime_v2/live dispatch authority or langchao/shadow non-dispatch authority"
+                "evaluation requires runtime_v2/live, langchao/shadow, or langchao/live authority"
             )
         return active
 

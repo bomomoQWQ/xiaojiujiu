@@ -485,14 +485,36 @@ class V2RuntimeCoordinator:
             )
         return result
 
-    def decide_endogenous(
+    def assess_endogenous(
         self,
         *,
         decision_id: str,
         now: datetime,
         elapsed_allowed_seconds: float,
     ) -> EndogenousDecisionV2:
-        """Evaluate legacy candidates using v2 predictions and policy only."""
+        """Purely assess candidates without hazard, commit, or decision-audit writes.
+
+        This is the comparator phase used when another engine owns live authority.  It
+        deliberately returns the same candidate assessments as the ordinary v2 path,
+        but stops before drawing randomness or constructing/persisting an audit.
+        """
+
+        return self.decide_endogenous(
+            decision_id=decision_id,
+            now=now,
+            elapsed_allowed_seconds=elapsed_allowed_seconds,
+            commit=False,
+        )
+
+    def decide_endogenous(
+        self,
+        *,
+        decision_id: str,
+        now: datetime,
+        elapsed_allowed_seconds: float,
+        commit: bool = True,
+    ) -> EndogenousDecisionV2:
+        """Evaluate candidates and, unless ``commit=False``, run hazard/commit."""
 
         if not decision_id.strip():
             raise ValueError("decision_id is required")
@@ -562,6 +584,27 @@ class V2RuntimeCoordinator:
                     ),
                     reasons=reasons or ("eligible",),
                 )
+            )
+
+        if not isinstance(commit, bool):
+            raise TypeError("commit must be bool")
+        if not commit:
+            # Important ordering invariant: no exploration counter query, random draw,
+            # DecisionAuditRecorder construction, audit persistence, or legacy commit
+            # is reachable from the comparator phase.
+            eligible = [
+                item for item in assessed
+                if not item.blocked and item.net_utility >= self.config.utility_threshold
+            ]
+            comparator = max(eligible, key=lambda item: item.net_utility, default=None)
+            return EndogenousDecisionV2(
+                decision_id=decision_id,
+                acted=False,
+                reason="assessment_only",
+                assessments=tuple(assessed),
+                chosen_candidate_id=(
+                    None if comparator is None else comparator.candidate.candidate_id
+                ),
             )
 
         exploration_available = self._exploration_available(now=now)
