@@ -104,15 +104,28 @@ class MechanicalHistoryAudit:
 class _Collector:
     def __init__(self, *, strict_soft: bool):
         self.strict_soft = strict_soft
-        self.hard: list[AuditFinding] = []
-        self.soft: list[AuditFinding] = []
+        self._evidence: dict[tuple[bool, str, str | None], list[Any]] = defaultdict(list)
 
-    def add(self, code: str, table: str | None, evidence: Iterable[Any], *, soft: bool = False) -> None:
-        items = list(evidence)
-        if not items:
-            return
-        finding = AuditFinding(code, table, len(items), _identity_hash(items))
-        (self.hard if self.strict_soft or not soft else self.soft).append(finding)
+    def add(
+        self,
+        code: str,
+        table: str | None,
+        evidence: Iterable[Any],
+        *,
+        soft: bool = False,
+    ) -> None:
+        effective_soft = soft and not self.strict_soft
+        self._evidence[(effective_soft, code, table)].extend(evidence)
+
+    def findings(self, *, soft: bool) -> tuple[AuditFinding, ...]:
+        result = (
+            AuditFinding(code, table, len(items), _identity_hash(items))
+            for (is_soft, code, table), items in self._evidence.items()
+            if is_soft is soft and items
+        )
+        return tuple(
+            sorted(result, key=lambda item: (item.code, item.table or "", item.evidence_sha256))
+        )
 
 
 def _parse_json(value: Any) -> Any:
@@ -309,8 +322,8 @@ def audit_mechanical_plan(
         duplicate_rows = [digest for group in grouped.values() if len(group) > 1 for digest in group]
         findings.add("duplicate_natural_key", table, duplicate_rows)
 
-    hard = tuple(sorted(findings.hard, key=lambda item: (item.code, item.table or "", item.evidence_sha256)))
-    soft = tuple(sorted(findings.soft, key=lambda item: (item.code, item.table or "", item.evidence_sha256)))
+    hard = findings.findings(soft=False)
+    soft = findings.findings(soft=True)
     table_counts = tuple((name, len(rows[name])) for name in sorted(rows))
     unfinished_counts = tuple(sorted(Counter(str(row.get("status")) for row in rows["unfinished_matters"]).items()))
     boundary_counts = tuple(sorted(boundary_states.items()))
