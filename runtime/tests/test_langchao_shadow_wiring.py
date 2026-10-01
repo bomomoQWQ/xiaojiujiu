@@ -83,11 +83,12 @@ def test_borrowed_connection_forwards_sql_but_never_opens_nested_transaction():
     assert calls == [("SELECT 1", ())]
 
 
-def test_cli_shadow_failure_isolation_is_after_baseline_decision():
+def test_cli_routes_authority_before_any_engine_can_commit():
     source_text = (Path(__file__).parents[1] / "src" / "companion_runtime" / "cli.py").read_text(encoding="utf-8")
     body = source_text.split("def run_v2_round", 1)[1].split("def simulate_v2_decision", 1)[0]
-    assert body.index("decide_endogenous(") < body.index("langchao_shadow_runner.run")
-    assert "except Exception" in body and "LOGGER.exception" in body
+    assert "authority_round_router.run(" in body
+    assert "decide_endogenous(" not in body
+    assert "langchao_shadow_runner.run" not in body
 
 
 def _decision(candidate_id: str, action_type: str):

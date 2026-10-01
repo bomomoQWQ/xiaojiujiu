@@ -145,6 +145,8 @@ def _facts_for(item: CandidateDecisionV2) -> RuntimeCandidateFacts | None:
         candidate_id=candidate.candidate_id,
         ownership=GoalOwnership.SELF_WISH,
         evidence_refs=evidence,
+        capability_refs=(() if kind in {"rest", "defer", "internal_rest"}
+                         else ("external_message",)),
         repeat_soft_cost=float(item.repeat.total_cost),
         repeat_cost_refs=(item.repeat.policy_version,),
         blocked=item.blocked,
@@ -208,6 +210,7 @@ class LangchaoShadowRunner:
     state_repository: LangchaoStateRepository
     revisions: LangchaoRevisionResolver
     parameters: LangchaoParameters = DEFAULT_LANGCHAO_PARAMETERS
+    last_built: BuiltShadowRound | None = None
 
     def run(self, decision: EndogenousDecisionV2, *, now: datetime) -> Any | None:
         pairs = tuple((item, _facts_for(item)) for item in decision.assessments)
@@ -284,6 +287,9 @@ class LangchaoShadowRunner:
         snapshot = replace(preliminary, candidates=tuple(allocated))
         built = build_shadow_round(snapshot=snapshot, inputs=inputs, advanced_at=now,
                                    previous_state=previous, based_on_state_version=state_version)
+        # Live wiring consumes this exact immutable build after numerical evaluation;
+        # it must never rebuild from a potentially changed legacy candidate pool.
+        self.last_built = built
         baseline = decision.chosen_candidate_id if decision.acted else None
         defer = None if decision.acted else decision.reason
         return self.service.run(
@@ -294,7 +300,9 @@ class LangchaoShadowRunner:
         )
 
 
-def build_langchao_shadow_runner(*, connection: Any, scope_key: str, runtime: Any) -> LangchaoShadowRunner:
+def build_langchao_shadow_runner(
+    *, connection: Any, scope_key: str, runtime: Any, allow_live_evaluation: bool = False,
+) -> LangchaoShadowRunner:
     """Build safe repositories on the same migrated PostgreSQL connection."""
     borrowed = _BorrowedConnection(connection)
     contracts = LangchaoRepository(borrowed, scope_key=scope_key)
@@ -313,6 +321,7 @@ def build_langchao_shadow_runner(*, connection: Any, scope_key: str, runtime: An
         shadow_repository=shadow,
         authority_reader=_ReadOnlyAuthority(authority),
         transaction_factory=connection.transaction,
+        allow_live_evaluation=allow_live_evaluation,
     )
     return LangchaoShadowRunner(scope_key=scope_key, runtime=runtime, service=service,
                                 state_repository=states,
