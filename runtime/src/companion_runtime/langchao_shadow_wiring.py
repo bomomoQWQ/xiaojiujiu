@@ -9,8 +9,8 @@ outbox, exposure, quota, or authority-claim capability is exposed to the runner.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, replace
 from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Mapping
 
