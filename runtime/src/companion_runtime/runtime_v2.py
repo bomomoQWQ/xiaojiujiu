@@ -133,6 +133,7 @@ class CommitReceiptV2:
     candidate_id: str
     attempt_id: str
     render_outbox_id: str
+    dispatch_claim_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

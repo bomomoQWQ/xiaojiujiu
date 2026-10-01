@@ -50,7 +50,7 @@ def pg_schema():
     try:
         with connection.transaction():
             result = migrate(connection, schema=schema)
-        assert result.applied == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+        assert result.applied == tuple(range(1, 21))
         yield connection, schema
     finally:
         connection.rollback()
@@ -69,7 +69,7 @@ def test_native_migrations_are_idempotent_and_create_scoped_tables(pg_schema) ->
     with connection.transaction():
         second = migrate(connection, schema=schema)
     assert second.applied == ()
-    assert second.already_present == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+    assert second.already_present == tuple(range(1, 21))
 
     rows = connection.execute(
         "SELECT table_name FROM information_schema.tables "

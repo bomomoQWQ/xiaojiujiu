@@ -221,6 +221,7 @@ def test_langchao_in_transaction_bridge_does_not_open_transaction():
     bridge.commit_langchao_candidate_in_transaction(
         object(), round_id="round", langchao_candidate_id="lang:c1",
         candidate_revision=1, candidate_version="v1", source_candidate=candidate,
+        reward_contract_id="reward", reward_revision=1,
         now=NOW, persist_snapshot=lambda receipt: durable.setdefault("snapshot", receipt),
     )
     assert calls == {"transactions": 0, "write_sessions": 0}

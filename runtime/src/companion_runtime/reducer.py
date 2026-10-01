@@ -1689,6 +1689,21 @@ class Reducer:
                     if item is not None and isinstance(item.payload.get("action"), Mapping)
                     else {}
                 ),
+                # Engine/provenance are frozen by the committed render witness. The
+                # terminal ACK router must see the same engine on the derived SEND row;
+                # otherwise an externally delivered 浪潮 action can be retried locally.
+                **(
+                    {
+                        key: item.payload[key]
+                        for key in (
+                            "engine", "langchao_candidate_id",
+                            "langchao_candidate_revision", "source_candidate_id",
+                            "reward_contract_id", "reward_revision",
+                        )
+                        if key in item.payload
+                    }
+                    if item is not None else {}
+                ),
             },
             priority=10,
             available_at=stamp,

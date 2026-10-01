@@ -37,7 +37,7 @@ class Connection:
                 "source_candidate_id": params[4], "reward_contract_id": params[5],
                 "reward_revision": params[6], "snapshot": params[8],
                 "attempt_id": params[9], "render_outbox_id": params[10],
-                "committed_at": params[11], "terminal_ack_id": None,
+                "claim_id": params[11], "committed_at": params[12], "terminal_ack_id": None,
                 "terminal_ack_kind": None,
             }
             return Cursor(row={"round_id": params[1]})
@@ -75,7 +75,7 @@ def repository():
         scope_key="scope", round_id="round", langchao_candidate_id="lc", candidate_revision=2,
         source_candidate_id="legacy", reward_contract_id="reward", reward_revision=3,
         expected_tokens=(token("reply"), token("continuation"), token("negative", -1), token("delivery", 0)),
-        attempt_id="attempt", render_outbox_id="render", committed_at=NOW,
+        attempt_id="attempt", render_outbox_id="render", claim_id="claim", committed_at=NOW,
     )
     repo.save_commit(commit)
     return repo, connection, writes, activations

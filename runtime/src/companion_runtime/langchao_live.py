@@ -118,6 +118,8 @@ class LangchaoLiveService:
             raise LangchaoLiveValidationError("live dispatch requires durable snapshot persistence")
 
         def persist(receipt: CommitReceiptV2) -> Any:
+            if not receipt.dispatch_claim_id:
+                raise LangchaoLiveValidationError("live dispatch receipt has no claim identity")
             snapshot = LangchaoLiveCommit(
                 scope_key=self.scope_key,
                 round_id=round_id,
@@ -129,6 +131,7 @@ class LangchaoLiveService:
                 expected_tokens=item.reward.outcome_tokens,
                 attempt_id=receipt.attempt_id,
                 render_outbox_id=receipt.render_outbox_id,
+                claim_id=receipt.dispatch_claim_id,
                 committed_at=now,
             )
             return persist_snapshot(snapshot)
@@ -140,6 +143,8 @@ class LangchaoLiveService:
             candidate_revision=item.candidate.semantic_revision,
             candidate_version=_digest(item.candidate),
             source_candidate=source,
+            reward_contract_id=item.reward.reward_contract_id,
+            reward_revision=item.reward.revision,
             now=now,
             persist_snapshot=persist,
         )
