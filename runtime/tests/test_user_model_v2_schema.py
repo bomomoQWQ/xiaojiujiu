@@ -90,9 +90,9 @@ def test_idempotency_and_single_active_parameter_constraints_are_explicit() -> N
 
 
 def test_migration_versions_and_statement_order_are_stable() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 12
+    assert USER_MODEL_SCHEMA_VERSION == 13
     assert isinstance(MIGRATIONS, tuple)
-    assert tuple(version for version, _statements in MIGRATIONS) == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+    assert tuple(version for version, _statements in MIGRATIONS) == tuple(range(1, 14))
     assert all(isinstance(statements, tuple) for _version, statements in MIGRATIONS)
     assert schema_statements() == tuple(
         statement for _version, statements in MIGRATIONS for statement in statements
@@ -132,6 +132,10 @@ def test_migration_versions_and_statement_order_are_stable() -> None:
             "langchao_reward_active",
             "langchao_candidate_active",
             "langchao_candidate_goal_refs",
+            "langchao_outcome_identities",
+            "langchao_outcome_revisions",
+            "langchao_outcome_active",
+            "langchao_reward_outcomes",
         )
     )
 
@@ -154,7 +158,7 @@ def test_v10_mechanical_history_audit_is_independent_and_privacy_minimal() -> No
 
 
 def test_v11_committed_decision_snapshot_has_terminal_placeholder() -> None:
-    version, statements = MIGRATIONS[-2]
+    version, statements = next(item for item in MIGRATIONS if item[0] == 11)
     ddl = _normalise("\n".join(statements))
     assert version == 11
     assert "RUNTIME_V2_COMMITTED_DECISIONS" in ddl
