@@ -12,7 +12,7 @@ import json
 import math
 import uuid
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from .decision_v2_audit import CandidateAssessment
@@ -328,7 +328,8 @@ def _build_one(snapshot: RuntimeFactSnapshot, facts: RuntimeCandidateFacts, sour
                 status=OutcomeStatus.UNEXECUTED, base_amount=float(amount), direction_weights=((direction, 1.0),),
                 evidence_version=TEMPLATE_REWARD_POLICY_VERSION,
                 idempotency_key=_stable_id("token-idempotency", *identity, outcome),
-                evidence_refs=tuple(dict.fromkeys((source.predictions.snapshot_id, prediction.prediction_id)))))
+                # Forecast prediction ids are audit inputs, not stable reward terms.
+                evidence_refs=(facts.template_key, outcome)))
             forecasts.append(OutcomeForecast(token_id=token_id, probability=probability,
                 support=prediction.support.value, status="available" if probability is not None else "unknown",
                 source_version=source.predictions.parameter_version))
@@ -351,16 +352,19 @@ def _build_one(snapshot: RuntimeFactSnapshot, facts: RuntimeCandidateFacts, sour
             template_policy = ((token_id, 1.0),)
 
     completion = (local_outcome,) if has_local_outcome else ("reply", "continuation", "negative")
+    # Template contracts are timeless semantic definitions. Round/state time remains
+    # on the candidate and state snapshot, allowing goal/reward revisions to be reused.
+    contract_at = datetime(1970, 1, 1, tzinfo=timezone.utc)
     initial_goal = GoalContract(goal_id=goal_id, scope_key=snapshot.scope_key, episode_id=episode_id,
         semantic_key=f"{facts.template_key}:{subject}", kind=goal_kind, ownership=facts.ownership,
         desired_change=local_outcome, status=GoalStatus.ACTIONABLE, evidence_refs=facts.evidence_refs,
         excluded_outcomes=("user_intent_inference",), completion_outcome_keys=completion,
-        allowed_candidate_kinds=(kind,), matter_id=facts.unfinished_id, created_at=advanced_at, updated_at=advanced_at,
+        allowed_candidate_kinds=(kind,), matter_id=facts.unfinished_id, created_at=contract_at, updated_at=contract_at,
         revision=facts.initial_goal_revision)
     reward = RewardContract(reward_contract_id=reward_id, scope_key=snapshot.scope_key, goal_id=goal_id,
         episode_id=episode_id, template_key=facts.template_key, unit="utility",
         outcome_tokens=tuple(tokens), total_cap=math.fsum(abs(token.base_amount) for token in tokens),
-        overlap_group=f"{facts.template_key}:{subject}", created_at=advanced_at, updated_at=advanced_at,
+        overlap_group=f"{facts.template_key}:{subject}", created_at=contract_at, updated_at=contract_at,
         revision=facts.reward_revision)
     # Goal1 -> reward -> goal2 uses distinct revisions allocated upstream.
     goal = replace(initial_goal, reward_contract_id=reward_id, revision=facts.bound_goal_revision)
