@@ -91,9 +91,9 @@ def test_idempotency_and_single_active_parameter_constraints_are_explicit() -> N
 
 
 def test_migration_versions_and_statement_order_are_stable() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 18
+    assert USER_MODEL_SCHEMA_VERSION == 19
     assert isinstance(MIGRATIONS, tuple)
-    assert tuple(version for version, _statements in MIGRATIONS) == tuple(range(1, 19))
+    assert tuple(version for version, _statements in MIGRATIONS) == tuple(range(1, 20))
     assert all(isinstance(statements, tuple) for _version, statements in MIGRATIONS)
     assert schema_statements() == tuple(
         statement for _version, statements in MIGRATIONS for statement in statements
@@ -156,12 +156,12 @@ def test_migration_versions_and_statement_order_are_stable() -> None:
             for statement in LANGCHAO_SOCIAL_SCHEMA_STATEMENTS
             if re.search(r"CREATE TABLE IF NOT EXISTS", statement, re.IGNORECASE)
         )
-        + ("live_dispatch_claims",)
+        + ("live_dispatch_claims", "langchao_live_commits")
     )
 
 
 def test_v18_requires_live_claim_before_new_attempt_and_send_outbox() -> None:
-    version, statements = MIGRATIONS[-1]
+    version, statements = MIGRATIONS[17]
     ddl = _normalise("\n".join(statements))
     assert version == 18
     assert "CREATE TABLE IF NOT EXISTS LIVE_DISPATCH_CLAIMS" in ddl

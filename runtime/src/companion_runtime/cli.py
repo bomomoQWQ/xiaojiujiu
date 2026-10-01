@@ -330,6 +330,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
         owns_database=False,
     )
     runtime.v2_coordinator = v2_composition.coordinator
+    # api_v1 routes terminal send reports by the persisted outbox engine marker.
+    # Keeping this runner on the long-lived Runtime makes restart acknowledgements
+    # recover the committed 浪潮 snapshot instead of depending on in-memory state.
+    runtime.langchao_live_runner = v2_composition.langchao_live_runner
     v2_maintenance = V2Maintenance(
         scope_key=config.conversation_id,
         repository=v2_composition.coordinator.repository,

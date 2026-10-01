@@ -235,8 +235,9 @@ class ConcreteLegacyRuntimeV2Bridge:
                 persist_snapshot(receipt)
         return receipt
 
-    def commit_langchao_candidate_with_snapshot(
+    def commit_langchao_candidate_in_transaction(
         self,
+        connection: Any,
         *,
         round_id: str,
         langchao_candidate_id: str,
@@ -246,11 +247,13 @@ class ConcreteLegacyRuntimeV2Bridge:
         now: datetime,
         persist_snapshot: Any,
     ) -> CommitReceiptV2:
-        """Atomically claim and commit the exact legacy candidate selected by 浪潮.
+        """Commit a 浪潮 winner using a caller-owned transaction.
 
-        ``source_candidate`` is provenance only: its action must still be the exact
-        adapter view of the stored legacy candidate.  This prevents a live caller from
-        substituting generated text or changing an action after numerical selection.
+        This method deliberately opens neither ``write_session`` nor a database
+        transaction. ``connection`` is the Runtime compatibility connection yielded by
+        ``runtime.db.transaction()``; SQL repositories use its ``raw`` connection so
+        every contract, audit, claim, attempt, outbox and snapshot write shares one
+        physical transaction.
         """
 
         if not self.scope_key:
@@ -266,61 +269,84 @@ class ConcreteLegacyRuntimeV2Bridge:
         attempt_id = str(uuid5(NAMESPACE_URL, f"langchao-attempt:{self.scope_key}:{round_id}"))
         outbox_id = str(uuid5(NAMESPACE_URL, f"langchao-render:{self.scope_key}:{round_id}"))
         claim_id = str(uuid5(NAMESPACE_URL, f"langchao-claim:{self.scope_key}:{round_id}"))
+        raw = getattr(connection, "raw", connection)
+        coordinator = self.dispatch_coordinator or LangchaoAuthorityRepository(
+            raw, scope_key=self.scope_key
+        )
+        # The mechanical claim names the legacy candidate inserted into attempts;
+        # the semantic claim separately binds the selected 浪潮 revision.
+        coordinator.create_live_dispatch_claim(
+            claim_id=claim_id,
+            round_id=round_id,
+            candidate_id=source_candidate.candidate_id,
+            candidate_version=candidate_version,
+            attempt_id=attempt_id,
+            render_outbox_id=outbox_id,
+            idempotency_key=f"langchao:{round_id}",
+            expected_engine="langchao",
+            created_at=now,
+        )
+        coordinator.create_dispatch_claim(
+            dispatch_id=f"semantic:{claim_id}",
+            candidate_id=langchao_candidate_id,
+            candidate_revision=candidate_revision,
+            attempt_id=attempt_id,
+            idempotency_key=f"langchao-semantic:{round_id}",
+            created_at=now,
+        )
+        state = self.runtime.projections.runtime.ensure()
+        attempt_id, outbox_id = self.runtime._commit_attempt(
+            connection, chosen=item, state=state, now=now,
+            attempt_id=attempt_id, outbox_id=outbox_id,
+        )
+        row = self.runtime.projections.outbox.get(outbox_id)
+        if row is None:
+            raise RuntimeError("legacy commit did not create its render outbox row")
+        payload = dict(row.payload)
+        payload.update({
+            "decision_id": round_id,
+            "engine": "langchao",
+            "langchao_candidate_id": langchao_candidate_id,
+            "langchao_candidate_revision": candidate_revision,
+            "source_candidate_id": source_candidate.candidate_id,
+            "action": dict(source_candidate.action),
+        })
+        row.payload = payload
+        self.runtime.projections.outbox.enqueue(connection, row)
+        receipt = CommitReceiptV2(
+            decision_id=round_id,
+            candidate_id=source_candidate.candidate_id,
+            attempt_id=attempt_id,
+            render_outbox_id=outbox_id,
+        )
+        persist_snapshot(receipt)
+        return receipt
+
+    def commit_langchao_candidate_with_snapshot(
+        self,
+        *,
+        round_id: str,
+        langchao_candidate_id: str,
+        candidate_revision: int,
+        candidate_version: str,
+        source_candidate: CandidateV2,
+        now: datetime,
+        persist_snapshot: Any,
+    ) -> CommitReceiptV2:
+        """Atomically claim and commit the exact legacy candidate selected by 浪潮."""
+
         with self.runtime.write_session():
             with self.runtime.db.transaction() as connection:
-                raw = getattr(connection, "raw", connection)
-                coordinator = self.dispatch_coordinator or LangchaoAuthorityRepository(
-                    raw, scope_key=self.scope_key
-                )
-                # v18 is the mechanical delivery witness and therefore names the
-                # exact legacy candidate inserted into action_attempts.  The v15
-                # semantic claim below separately binds the selected 浪潮 revision.
-                coordinator.create_live_dispatch_claim(
-                    claim_id=claim_id,
+                return self.commit_langchao_candidate_in_transaction(
+                    connection,
                     round_id=round_id,
-                    candidate_id=source_candidate.candidate_id,
-                    candidate_version=candidate_version,
-                    attempt_id=attempt_id,
-                    render_outbox_id=outbox_id,
-                    idempotency_key=f"langchao:{round_id}",
-                    expected_engine="langchao",
-                    created_at=now,
-                )
-                coordinator.create_dispatch_claim(
-                    dispatch_id=f"semantic:{claim_id}",
-                    candidate_id=langchao_candidate_id,
+                    langchao_candidate_id=langchao_candidate_id,
                     candidate_revision=candidate_revision,
-                    attempt_id=attempt_id,
-                    idempotency_key=f"langchao-semantic:{round_id}",
-                    created_at=now,
+                    candidate_version=candidate_version,
+                    source_candidate=source_candidate,
+                    now=now,
+                    persist_snapshot=persist_snapshot,
                 )
-                state = self.runtime.projections.runtime.ensure()
-                attempt_id, outbox_id = self.runtime._commit_attempt(
-                    connection, chosen=item, state=state, now=now,
-                    attempt_id=attempt_id, outbox_id=outbox_id,
-                )
-                row = self.runtime.projections.outbox.get(outbox_id)
-                if row is None:
-                    raise RuntimeError("legacy commit did not create its render outbox row")
-                payload = dict(row.payload)
-                payload.update({
-                    "decision_id": round_id,
-                    "engine": "langchao",
-                    "langchao_candidate_id": langchao_candidate_id,
-                    "langchao_candidate_revision": candidate_revision,
-                    "source_candidate_id": source_candidate.candidate_id,
-                    "action": dict(source_candidate.action),
-                })
-                row.payload = payload
-                self.runtime.projections.outbox.enqueue(connection, row)
-                receipt = CommitReceiptV2(
-                    decision_id=round_id,
-                    candidate_id=source_candidate.candidate_id,
-                    attempt_id=attempt_id,
-                    render_outbox_id=outbox_id,
-                )
-                persist_snapshot(receipt)
-        return receipt
 
     def mark_rendered(self, *, decision_id: str, outbox_id: str, now: datetime) -> None:
         del decision_id

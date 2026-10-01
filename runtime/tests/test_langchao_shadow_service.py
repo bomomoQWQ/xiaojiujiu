@@ -167,13 +167,14 @@ def parameters():
         time_scale_seconds=10, max_step_seconds=.5, crossing_tolerance=1e-7, tie_tolerance=1e-6)
 
 
-def harness(*, authority=None):
+def harness(*, authority=None, allow_live_evaluation=False):
     aggregate = Aggregate()
     shadow = Shadow(aggregate)
     service = LangchaoShadowService(contract_repository=Contracts(aggregate),
         outcome_repository=Outcomes(aggregate), state_repository=States(aggregate),
         shadow_repository=shadow, authority_reader=authority or ForbiddenAuthority(),
-        transaction_factory=aggregate.transaction)
+        transaction_factory=aggregate.transaction,
+        allow_live_evaluation=allow_live_evaluation)
     return aggregate, shadow, service
 
 
@@ -233,6 +234,43 @@ def test_transaction_rolls_back_all_contract_work_on_failure():
         execute(service, built)
     assert not any(aggregate.revisions.values())
     assert aggregate.active_state is None and aggregate.audit_count == 0 and aggregate.events == []
+
+
+def test_live_before_commit_failure_rolls_back_aggregate_in_one_transaction():
+    built = build((source("a"),))
+    aggregate, _, service = harness(
+        authority=Authority("langchao", "live", True), allow_live_evaluation=True
+    )
+
+    def fail(result, callback_built, connection):
+        assert result.candidate_id in callback_built.state.working_set or result.candidate_id is None
+        assert connection is None  # fake transaction context yields no connection
+        aggregate.claims += 1
+        aggregate.events.append("live:attempt-outbox-snapshot")
+        raise RuntimeError("live callback failed")
+
+    with pytest.raises(RuntimeError, match="live callback failed"):
+        service.run(
+            built, now=NOW + timedelta(seconds=1), parameters=parameters(),
+            decision_budget=1, run_id="run:live", idempotency_key="idem:live",
+            before_commit=fail,
+        )
+    assert aggregate.transaction_entries == 1
+    assert not any(aggregate.revisions.values())
+    assert aggregate.active_state is None and aggregate.audit_count == 0
+    assert aggregate.claims == 0 and aggregate.events == []
+
+
+def test_shadow_authority_cannot_receive_before_commit_capability():
+    built = build((source("a"),))
+    aggregate, _, service = harness(authority=Authority("langchao", "shadow", False))
+    with pytest.raises(LangchaoShadowAuthorityError, match="explicit live-evaluation"):
+        service.run(
+            built, now=NOW + timedelta(seconds=1), parameters=parameters(),
+            decision_budget=1, run_id="run:forbidden", idempotency_key="idem:forbidden",
+            before_commit=lambda *_: None,
+        )
+    assert aggregate.transaction_entries == 0
 
 
 def test_authority_allows_only_runtime_live_or_langchao_shadow_and_never_claims():

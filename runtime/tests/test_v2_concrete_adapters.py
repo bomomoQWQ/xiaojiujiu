@@ -170,6 +170,64 @@ def test_legacy_atomic_commit_rolls_back_when_snapshot_insert_fails():
     assert durable == {"claims": [], "attempts": [], "outbox": {}}
 
 
+def test_langchao_in_transaction_bridge_does_not_open_transaction():
+    from contextlib import contextmanager
+
+    calls = {"transactions": 0, "write_sessions": 0}
+    durable = {"claims": [], "attempts": [], "outbox": {}}
+
+    class Candidates:
+        def get(self, candidate_id): return item
+    class Outbox:
+        def get(self, outbox_id): return durable["outbox"].get(outbox_id)
+        def enqueue(self, connection, row): durable["outbox"][row.outbox_id] = row
+    class Coordinator:
+        def create_live_dispatch_claim(self, **kwargs): durable["claims"].append("live")
+        def create_dispatch_claim(self, **kwargs): durable["claims"].append("semantic")
+
+    @contextmanager
+    def forbidden_transaction():
+        calls["transactions"] += 1
+        raise AssertionError("inner transaction opened")
+        yield
+    @contextmanager
+    def forbidden_write_session():
+        calls["write_sessions"] += 1
+        raise AssertionError("inner write session opened")
+        yield
+
+    item = CandidateIntent(
+        candidate_id="c1", type="share", intent="说句话", goal="contact",
+        sources=[], internal_need=.4,
+    )
+    runtime = SimpleNamespace(
+        projections=SimpleNamespace(
+            candidates=Candidates(), outbox=Outbox(),
+            runtime=SimpleNamespace(ensure=lambda: SimpleNamespace()),
+        ),
+        db=SimpleNamespace(transaction=forbidden_transaction),
+        write_session=forbidden_write_session,
+        _commit_attempt=lambda connection, chosen, state, now, attempt_id=None, outbox_id=None: (
+            durable["attempts"].append(attempt_id) or durable["outbox"].update(
+                {outbox_id: SimpleNamespace(outbox_id=outbox_id, payload={})}
+            ) or (attempt_id, outbox_id)
+        ),
+    )
+    bridge = ConcreteLegacyRuntimeV2Bridge(
+        runtime, scope_key="scope", dispatch_coordinator=Coordinator()
+    )
+    bridge._legacy_candidates["c1"] = item
+    candidate = bridge._candidate(item)
+    bridge.commit_langchao_candidate_in_transaction(
+        object(), round_id="round", langchao_candidate_id="lang:c1",
+        candidate_revision=1, candidate_version="v1", source_candidate=candidate,
+        now=NOW, persist_snapshot=lambda receipt: durable.setdefault("snapshot", receipt),
+    )
+    assert calls == {"transactions": 0, "write_sessions": 0}
+    assert durable["claims"] == ["live", "semantic"]
+    assert len(durable["attempts"]) == 1 and "snapshot" in durable
+
+
 def test_runtime_repository_prediction_uses_v2_prediction_service():
     from companion_runtime.motivation_v2 import CandidatePolicyV2, UserUtilityCoefficientsV2
     from companion_runtime.repeat_v2 import RepeatSubjectV2

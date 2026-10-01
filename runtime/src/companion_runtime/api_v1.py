@@ -214,6 +214,18 @@ def _v2_coordinator(runtime: Any) -> V2WireCoordinator | None:
     return coordinator if coordinator is not None else None
 
 
+def _terminal_coordinator(runtime: Any, row: Any) -> Any | None:
+    """Route terminal send acknowledgements to the engine which committed the row."""
+
+    payload = _mapping(getattr(row, "payload", None))
+    if _text(payload.get("engine")).strip() == "langchao":
+        runner = getattr(runtime, "langchao_live_runner", None)
+        if runner is None:
+            raise RuntimeError("langchao live outbox has no installed terminal hook")
+        return runner
+    return _v2_coordinator(runtime)
+
+
 def _require_v2_hook(coordinator: Any, name: str) -> Callable[..., Any]:
     """Refuse partial production wiring instead of silently dropping v2 facts."""
 
@@ -1468,7 +1480,7 @@ def _apply_action_report(
                 extra["duplicate"] = True
             if not delivered.get("duplicate"):
                 decision_id = _v2_decision_id(row)
-                coordinator = _v2_coordinator(runtime)
+                coordinator = _terminal_coordinator(runtime, row)
                 if decision_id and coordinator is not None:
                     attempt_id = _text(delivered.get("attempt_id")).strip() or _text(
                         _mapping(getattr(row, "payload", None)).get("attempt_id")

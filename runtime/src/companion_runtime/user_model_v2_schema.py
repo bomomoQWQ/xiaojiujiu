@@ -15,12 +15,13 @@ from .langchao_outcome_schema import LANGCHAO_OUTCOME_SCHEMA_V13_STATEMENTS
 from .langchao_schema import LANGCHAO_SCHEMA_V12_STATEMENTS
 from .langchao_shadow_schema import LANGCHAO_SHADOW_SCHEMA_V16_STATEMENTS
 from .langchao_social_schema import LANGCHAO_SOCIAL_SCHEMA_STATEMENTS
+from .langchao_live_schema import LANGCHAO_LIVE_SCHEMA_V19_STATEMENTS
 from .langchao_state_schema import LANGCHAO_STATE_SCHEMA_V14_STATEMENTS
 from .live_dispatch_schema import LIVE_DISPATCH_SCHEMA_V18_STATEMENTS
 from .runtime_committed_decision_v2_schema import COMMITTED_DECISION_SCHEMA_STATEMENTS
 from .runtime_core_v2_schema import CORE_SCHEMA_STATEMENTS, CORE_SCHEMA_VERSION
 
-USER_MODEL_SCHEMA_VERSION: Final[int] = 18
+USER_MODEL_SCHEMA_VERSION: Final[int] = 19
 
 _INITIAL_SCHEMA: tuple[str, ...] = (
     """
@@ -552,6 +553,7 @@ MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     (16, LANGCHAO_SHADOW_SCHEMA_V16_STATEMENTS),
     (17, LANGCHAO_SOCIAL_SCHEMA_STATEMENTS),
     (18, LIVE_DISPATCH_SCHEMA_V18_STATEMENTS),
+    (19, LANGCHAO_LIVE_SCHEMA_V19_STATEMENTS),
 )
 
 

@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 from .langchao_authority import AuthorityEngine, AuthorityMode
 from .langchao_runtime_adapter import BuiltCandidateContracts, BuiltShadowRound
+from .langchao_live_repository import LangchaoLiveCommit
 from .langchao_types import CandidateKind, CandidateState
 from .runtime_v2 import CandidateV2, CommitReceiptV2
 
@@ -71,14 +72,15 @@ class LangchaoLiveService:
         self.legacy = legacy_bridge
         self.contracts = contract_repository
 
-    def execute(
+    def execute_in_transaction(
         self,
+        connection: Any,
         *,
         built: BuiltShadowRound,
         decision_candidate_id: str | None,
         assessed_candidates: Mapping[str, CandidateV2],
         now: datetime,
-        persist_snapshot: Any,
+        persist_snapshot: Any | None = None,
     ) -> LangchaoLiveResult:
         """Commit at most one exact external candidate; rest/defer never sends."""
 
@@ -112,14 +114,34 @@ class LangchaoLiveService:
         )
         if boundary.blocked:
             raise LangchaoLiveValidationError("current boundary blocks selected candidate")
-        receipt = self.legacy.commit_langchao_candidate_with_snapshot(
+        if persist_snapshot is None:
+            raise LangchaoLiveValidationError("live dispatch requires durable snapshot persistence")
+
+        def persist(receipt: CommitReceiptV2) -> Any:
+            snapshot = LangchaoLiveCommit(
+                scope_key=self.scope_key,
+                round_id=round_id,
+                langchao_candidate_id=item.candidate.candidate_id,
+                candidate_revision=item.candidate.semantic_revision,
+                source_candidate_id=item.source_candidate_id,
+                reward_contract_id=item.reward.reward_contract_id,
+                reward_revision=item.reward.revision,
+                expected_tokens=item.reward.outcome_tokens,
+                attempt_id=receipt.attempt_id,
+                render_outbox_id=receipt.render_outbox_id,
+                committed_at=now,
+            )
+            return persist_snapshot(snapshot)
+
+        receipt = self.legacy.commit_langchao_candidate_in_transaction(
+            connection,
             round_id=round_id,
             langchao_candidate_id=item.candidate.candidate_id,
             candidate_revision=item.candidate.semantic_revision,
             candidate_version=_digest(item.candidate),
             source_candidate=source,
             now=now,
-            persist_snapshot=persist_snapshot,
+            persist_snapshot=persist,
         )
         return LangchaoLiveResult(
             round_id, decision_candidate_id, item.source_candidate_id, True, "committed", receipt

@@ -47,6 +47,10 @@ TEMPLATE_V1_REWARD_AMOUNTS = {
     "reply": 1.0,
     "continuation": 0.5,
     "negative": -1.5,
+    # Delivery is an execution witness, not a forecasted user reward.  A zero
+    # default keeps it out of expected utility while preserving a token which the
+    # terminal send hook can settle explicitly.
+    "delivery": 0.0,
     "local": 0.25,
 }
 FIXED_VALUE_TOTAL = 8.0
@@ -333,6 +337,19 @@ def _build_one(snapshot: RuntimeFactSnapshot, facts: RuntimeCandidateFacts, sour
             forecasts.append(OutcomeForecast(token_id=token_id, probability=probability,
                 support=prediction.support.value, status="available" if probability is not None else "unknown",
                 source_version=source.predictions.parameter_version))
+        # A deterministic, zero-valued delivery placeholder is forecast explicitly at
+        # probability zero: it cannot accrue utility before an actual send ack.
+        delivery_id = _stable_id("token", *identity, "delivery")
+        tokens.append(OutcomeToken(token_id=delivery_id, scope_key=snapshot.scope_key,
+            goal_id=goal_id, episode_id=episode_id, outcome_key="delivery",
+            settlement_type=SettlementType.EXPECTED, status=OutcomeStatus.UNEXECUTED,
+            base_amount=TEMPLATE_V1_REWARD_AMOUNTS["delivery"],
+            direction_weights=((direction, 1.0),), evidence_version=TEMPLATE_REWARD_POLICY_VERSION,
+            idempotency_key=_stable_id("token-idempotency", *identity, "delivery"),
+            evidence_refs=(facts.template_key, "delivery")))
+        forecasts.append(OutcomeForecast(token_id=delivery_id, probability=0.0,
+            support="execution_only", status="deterministic_zero",
+            source_version=TEMPLATE_REWARD_POLICY_VERSION))
 
     template_policy: tuple[tuple[str, float], ...] = ()
     local_policy = ((facts.template_key == "expression.v1" and facts.expression_delivered_policy) or
