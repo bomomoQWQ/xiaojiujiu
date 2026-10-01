@@ -196,6 +196,49 @@ class LangchaoStateRepository:
             raise LangchaoStateConflictError("active state CAS failed")
         return next_version
 
+    def get_round_status(self, *, round_id: str) -> str | None:
+        """Return the persisted lifecycle status for one scoped round."""
+        if not isinstance(round_id, str) or not round_id.strip():
+            raise ValueError("round_id must be a non-empty string")
+        row = self.connection.execute(
+            "SELECT status FROM langchao_rounds WHERE scope_key = %s AND round_id = %s",
+            (self.scope_key, round_id),
+        ).fetchone()
+        return None if row is None else str(_value(row, "status"))
+
+    def abort_open_round(
+        self, *, round_id: str, ended_at: datetime, expected_pointer_version: int,
+    ) -> bool:
+        """Abort the exact active open round before replacing its working set.
+
+        The active pointer is deliberately retained until ``begin_round`` CAS-publishes
+        the replacement in the same outer transaction.
+        """
+        if not isinstance(round_id, str) or not round_id.strip():
+            raise ValueError("round_id must be a non-empty string")
+        if ended_at.tzinfo is None or ended_at.utcoffset() is None:
+            raise ValueError("ended_at must be timezone-aware")
+        if not isinstance(expected_pointer_version, int) or isinstance(expected_pointer_version, bool) or expected_pointer_version < 1:
+            raise ValueError("expected_pointer_version must be a positive integer")
+        with self._transaction():
+            active = self.connection.execute(
+                """SELECT round_id, pointer_version FROM langchao_active_state
+                   WHERE scope_key = %s FOR UPDATE""",
+                (self.scope_key,),
+            ).fetchone()
+            if active is None:
+                raise LangchaoStateReferenceError("no active 浪潮 state")
+            if (str(_value(active, "round_id")), int(_value(active, "pointer_version", 1))) != (
+                round_id, expected_pointer_version,
+            ):
+                raise LangchaoStateConflictError("active round changed before abort")
+            cursor = self.connection.execute(
+                """UPDATE langchao_rounds SET status = 'aborted', ended_at = %s
+                   WHERE scope_key = %s AND round_id = %s AND status = 'open'""",
+                (ended_at, self.scope_key, round_id),
+            )
+            return getattr(cursor, "rowcount", 1) == 1
+
     def begin_round(
         self, state: LangchaoState, *, run_mode: str,
         candidate_revisions: Mapping[str, int], expected_pointer_version: int = 0,

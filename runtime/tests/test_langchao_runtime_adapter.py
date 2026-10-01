@@ -102,6 +102,40 @@ def test_different_legacy_ids_with_same_semantics_share_stable_ids_and_one_slot(
     assert len(merged.contracts) == len(merged.state.working_set) == 1
     assert merged.contracts[0].source_candidate_id == "legacy-a"
     assert merged.dropped[0].reasons == ("duplicate_semantic_candidate",)
+    assert a.candidate.to_dict() == b.candidate.to_dict()
+    assert a.provenance.candidate_id != b.provenance.candidate_id
+    assert dict(a.candidate.envelope) == {"subject_ref": "relationship-continuity"}
+
+
+def test_revisions_are_explicit_and_independent_of_state_version():
+    revisions = dict(initial_goal_revision=3, reward_revision=6,
+                     bound_goal_revision=8, candidate_revision=4)
+    first = build((source("c"),), (facts("c", **revisions),), based_on_state_version=0)
+    later = build((source("c"),), (facts("c", **revisions),), based_on_state_version=7)
+    assert first.contracts[0].initial_goal.revision == 3
+    assert first.contracts[0].reward.revision == 6
+    assert first.contracts[0].goal.revision == 8
+    assert first.contracts[0].candidate.semantic_revision == 4
+    assert later.contracts[0].candidate.semantic_revision == 4
+    assert later.contracts[0].candidate.based_on_state_version == 7
+    changed = revisions | {"candidate_revision": 5}
+    advanced = build((source("c"),), (facts("c", **changed),), based_on_state_version=7)
+    assert advanced.contracts[0].candidate.semantic_revision == 5
+
+
+def test_default_sequence_is_goal1_reward1_goal2_candidate1():
+    built = build((source("c"),)).contracts[0]
+    assert (built.initial_goal.revision, built.reward.revision,
+            built.goal.revision, built.candidate.semantic_revision) == (1, 1, 2, 1)
+
+
+def test_revision_resolver_values_must_be_positive_and_bound_goal_later():
+    with pytest.raises(ValueError):
+        facts("c", initial_goal_revision=0)
+    with pytest.raises(ValueError):
+        facts("c", candidate_revision=True)
+    with pytest.raises(ValueError):
+        facts("c", initial_goal_revision=3, bound_goal_revision=3)
 
 
 def test_identity_ignores_time_decision_and_prediction_identity():

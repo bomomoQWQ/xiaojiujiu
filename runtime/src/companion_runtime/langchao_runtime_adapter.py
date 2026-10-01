@@ -106,6 +106,10 @@ class RuntimeCandidateFacts:
     block_reasons: tuple[str, ...] = ()
     expression_delivered_policy: bool = False
     rest_realized_policy: bool = False
+    initial_goal_revision: int = 1
+    reward_revision: int = 1
+    bound_goal_revision: int = 2
+    candidate_revision: int = 1
     legacy_internal_need: float | None = None
     legacy_internal_utility: float | None = None
     legacy_relevance: float | None = None
@@ -120,6 +124,12 @@ class RuntimeCandidateFacts:
             raise TypeError("repeat_soft_cost must be numeric")
         if not math.isfinite(float(self.repeat_soft_cost)) or self.repeat_soft_cost < 0:
             raise ValueError("repeat_soft_cost must be finite and non-negative")
+        for name in ("initial_goal_revision", "reward_revision", "bound_goal_revision", "candidate_revision"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer supplied by the revision resolver")
+        if self.bound_goal_revision <= self.initial_goal_revision:
+            raise ValueError("bound_goal_revision must be greater than initial_goal_revision")
         if self.template_key == "contact.v1" and self.subject_ref != "relationship-continuity":
             raise ValueError("contact.v1 subject_ref must be 'relationship-continuity'")
         if self.template_key == "expression.v1" and not (self.memory_ref or self.social_ref):
@@ -345,23 +355,29 @@ def _build_one(snapshot: RuntimeFactSnapshot, facts: RuntimeCandidateFacts, sour
         semantic_key=f"{facts.template_key}:{subject}", kind=goal_kind, ownership=facts.ownership,
         desired_change=local_outcome, status=GoalStatus.ACTIONABLE, evidence_refs=facts.evidence_refs,
         excluded_outcomes=("user_intent_inference",), completion_outcome_keys=completion,
-        allowed_candidate_kinds=(kind,), matter_id=facts.unfinished_id, created_at=advanced_at, updated_at=advanced_at)
+        allowed_candidate_kinds=(kind,), matter_id=facts.unfinished_id, created_at=advanced_at, updated_at=advanced_at,
+        revision=facts.initial_goal_revision)
     reward = RewardContract(reward_contract_id=reward_id, scope_key=snapshot.scope_key, goal_id=goal_id,
         episode_id=episode_id, template_key=facts.template_key, unit="utility",
         outcome_tokens=tuple(tokens), total_cap=math.fsum(abs(token.base_amount) for token in tokens),
-        overlap_group=f"{facts.template_key}:{subject}", created_at=advanced_at, updated_at=advanced_at)
-    # Binding the reward is a second immutable goal revision: reward revision 1
-    # references published goal revision 1, then this revision binds the reward.
-    goal = replace(initial_goal, reward_contract_id=reward_id, revision=2)
+        overlap_group=f"{facts.template_key}:{subject}", created_at=advanced_at, updated_at=advanced_at,
+        revision=facts.reward_revision)
+    # Goal1 -> reward -> goal2 uses distinct revisions allocated upstream.
+    goal = replace(initial_goal, reward_contract_id=reward_id, revision=facts.bound_goal_revision)
     contract = ActionCandidateContract(candidate_id=candidate_id, scope_key=snapshot.scope_key,
         semantic_key=f"{facts.template_key}:{subject}", goal_refs=(goal_id,), kind=kind,
         action_template=facts.template_key, input_refs=tuple(dict.fromkeys(facts.evidence_refs + source.candidate.source_event_ids)),
         reward_contract_ref=reward_id, expected_outcome_token_ids=tuple(token.token_id for token in tokens),
         capability_refs=facts.capability_refs, permission_ref=facts.permission_ref,
         precondition_refs=facts.precondition_refs, invalidation_refs=facts.invalidation_refs,
-        envelope=(("source_candidate_id", source.candidate.candidate_id), ("subject_ref", subject)),
+        # Legacy runtime candidate ids are provenance, not semantic contract data.
+        # Keeping them out of the envelope makes identity and payload agree.
+        envelope=(("subject_ref", subject),),
         state=CandidateState.COMPETITIVE, available_from=advanced_at, expires_at=None, resource_budget=0.0,
-        based_on_state_version=based_on_state_version, created_at=advanced_at, updated_at=advanced_at)
+        based_on_state_version=based_on_state_version, created_at=advanced_at, updated_at=advanced_at,
+        # State version is an optimistic reference, not a semantic contract revision.
+        # The service/repository resolver supplies candidate_revision explicitly.
+        semantic_revision=facts.candidate_revision)
     costs = (() if facts.repeat_soft_cost == 0 else (CandidateCostTerm(kind="repeat_soft_cost",
         amount=float(facts.repeat_soft_cost), evidence_refs=facts.repeat_cost_refs),))
     shadow = ShadowCandidateInput(goal=goal, reward=reward, candidate=contract, forecasts=tuple(forecasts),
