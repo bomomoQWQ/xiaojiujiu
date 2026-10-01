@@ -175,13 +175,17 @@ class DecisionConfigV2:
     #: non-sensitive, not a continuous follow-up); this switch lets that verdict
     #: actually authorise a delivery, capped by an explicit spend budget.
     cold_start_exploration_reason: str = "limited_support_safe_exploration_allowed"
-    cold_start_exploration_limit: int = 1
+    cold_start_exploration_limit: int = 3
     cold_start_exploration_window: timedelta = timedelta(hours=24)
+    #: A rolling daily cap alone makes the allowance spend in a burst: once the window
+    #: frees, nothing stops three unprompted messages landing within a couple of hours.
+    #: Spacing is what turns "three per day" into "spread across the day".
+    cold_start_exploration_min_spacing: timedelta = timedelta(hours=8)
     #: An exploration delivery has no measured edge, so its hazard advantage would be
     #: negative and the calibrated base rate (3e-5/s) would postpone the first send by
     #: days.  Give the exploration at least this much advantage; the budget, not the
     #: hazard, is what bounds how often she may spend it.
-    cold_start_exploration_advantage: float = 1.0
+    cold_start_exploration_advantage: float = 2.0
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -213,6 +217,12 @@ class DecisionConfigV2:
             self.cold_start_exploration_window <= timedelta(0)
         ):
             raise ValueError("cold_start_exploration_window must be a positive timedelta")
+        if not isinstance(self.cold_start_exploration_min_spacing, timedelta) or (
+            self.cold_start_exploration_min_spacing < timedelta(0)
+        ):
+            raise ValueError(
+                "cold_start_exploration_min_spacing must be a non-negative timedelta"
+            )
         if (
             isinstance(self.cold_start_exploration_advantage, bool)
             or not isinstance(self.cold_start_exploration_advantage, (int, float))
@@ -330,22 +340,44 @@ class V2RuntimeCoordinator:
         self._chosen: dict[str, CandidateV2] = {}
         self._explored: dict[str, bool] = {}
 
-    def _exploration_spent(self, *, now: datetime) -> int:
-        """Return how much cold-start exploration budget this scope has already used.
+    def _exploration_available(self, *, now: datetime) -> bool:
+        """Return whether cold-start exploration may be spent right now.
 
-        A repository without the counter (older adapter, or a test double) is treated
-        as "nothing spent yet" only when it cannot answer at all; once a delivery is
-        acknowledged the counter is the sole authority, so a missing implementation
-        degrades to the configured limit rather than to unlimited exploration.
+        Two independent caps, because they answer different questions: the rolling
+        window answers "how much of this allowance has this person already received
+        today", and the spacing answers "would spending it now arrive as a second
+        unprompted message minutes after the first".
+
+        A repository that cannot answer either question is read as "nothing spent
+        yet".  That is the deliberate direction: the counter exists only to *limit*
+        exploration, so a test double without it keeps the allowance reachable
+        instead of silently disabling the only path out of a cold start.
         """
 
+        if self.config.cold_start_exploration_limit <= 0:
+            return False
         counter = getattr(self.repository, "count_cold_start_explorations", None)
-        if not callable(counter):
-            return 0
-        since = now - self.config.cold_start_exploration_window
-        return int(
-            counter(scope_key=self.scope_key, since=since) or 0
-        )
+        if callable(counter):
+            spent = int(
+                counter(
+                    scope_key=self.scope_key,
+                    since=now - self.config.cold_start_exploration_window,
+                )
+                or 0
+            )
+            if spent >= self.config.cold_start_exploration_limit:
+                return False
+        if self.config.cold_start_exploration_min_spacing > timedelta(0):
+            last = getattr(self.repository, "last_cold_start_exploration_at", None)
+            if callable(last):
+                previous = last(scope_key=self.scope_key)
+                if previous is not None:
+                    _require_utc("last cold-start exploration", previous)
+                    if (
+                        now - previous < self.config.cold_start_exploration_min_spacing
+                    ):
+                        return False
+        return True
 
     def process_user_event(self, event: Mapping[str, Any]) -> LegacyUserEventResult:
         """Run legacy ingest once, then settle the resulting v2 observations."""
@@ -475,8 +507,7 @@ class V2RuntimeCoordinator:
                 )
             )
 
-        exploration_spent = self._exploration_spent(now=now)
-        exploration_available = exploration_spent < self.config.cold_start_exploration_limit
+        exploration_available = self._exploration_available(now=now)
 
         eligible = [
             item

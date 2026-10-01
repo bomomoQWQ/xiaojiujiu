@@ -267,6 +267,21 @@ class PostgresV2RuntimeRepository:
         value = _row(row, "count", 0)
         return int(value or 0)
 
+    def last_cold_start_exploration_at(self, *, scope_key: str) -> datetime | None:
+        """Return when this scope last spent exploration budget, if ever."""
+
+        self._scope(scope_key)
+        row = self.connection.execute(
+            """SELECT max(acknowledged_at)
+               FROM runtime_v2_exposure_metadata
+               WHERE scope_key = %s AND cold_start_exploration""",
+            (scope_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        value = _row(row, "max", 0)
+        return None if value is None else _datetime(value)
+
     def list_due_pending_exposures(
         self, *, scope_key: str, as_of: datetime, limit: int
     ) -> Sequence[PreparedExposureV2]:
