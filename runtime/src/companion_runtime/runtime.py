@@ -2129,6 +2129,30 @@ class Runtime:
                     limit=limit,
                 )
 
+    def consolidate_memories_if_due(self, *, now: datetime | None = None) -> dict[str, Any]:
+        """Run the unattended consolidation pass when its interval has elapsed.
+
+        This is the public entry point for a scheduler that is *not* the legacy
+        endogenous round.  Production ``serve`` replaced that round with the v2
+        coordinator, and consolidation has no other unattended caller: the protocol
+        ``memory_summary`` path needs a semantic provider, and
+        ``companion-runtime consolidate`` needs an operator.  Without this the
+        ``memories`` table is never written at all - candidates accumulate as
+        ``pending`` forever and the character keeps no long-term memory.
+
+        The pass is rule-based and needs no model, so it is safe on a deployment with
+        ``semantic.provider = "disabled"``.  It runs after a decision has been
+        committed, so it can inform the *next* round but can never change this one.
+
+        Args:
+            now: Reference time; defaults to the wall clock.
+
+        Returns:
+            A rendering of the pass; see :meth:`_consolidate_if_due`.
+        """
+        stamp = ensure_aware(now) or utcnow()
+        return self._consolidate_if_due(now=stamp)
+
     def _consolidate_if_due(self, *, now: datetime) -> dict[str, Any]:
         """Consolidate pending memory candidates when the interval has elapsed.
 
