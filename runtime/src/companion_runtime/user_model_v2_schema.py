@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from typing import Final
 
+from .runtime_committed_decision_v2_schema import COMMITTED_DECISION_SCHEMA_STATEMENTS
 from .runtime_core_v2_schema import CORE_SCHEMA_STATEMENTS, CORE_SCHEMA_VERSION
 
-USER_MODEL_SCHEMA_VERSION: Final[int] = 9
+USER_MODEL_SCHEMA_VERSION: Final[int] = 11
 
 _INITIAL_SCHEMA: tuple[str, ...] = (
     """
@@ -474,6 +475,54 @@ _EXPECTATION_PRODUCTION_SCHEMA: tuple[str, ...] = (
 )
 
 
+# Independent append-only evidence for the stopped SQLite mechanical-history import.
+# It is deliberately separate from the user-model migration audit: the target core
+# tables have no scope column, so scope is a run-level binding enforced by the applier.
+_MECHANICAL_HISTORY_IMPORT_AUDIT_SCHEMA: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS mechanical_history_import_audits_v1 (
+        run_id UUID PRIMARY KEY,
+        scope_key TEXT NOT NULL CHECK (btrim(scope_key) <> ''),
+        source_snapshot_sha256 TEXT NOT NULL CHECK (length(source_snapshot_sha256) = 64),
+        plan_sha256 TEXT NOT NULL CHECK (length(plan_sha256) = 64),
+        importer_version TEXT NOT NULL CHECK (btrim(importer_version) <> ''),
+        started_at TIMESTAMPTZ NOT NULL,
+        completed_at TIMESTAMPTZ NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('applied', 'failed')),
+        reconciliation JSONB NOT NULL CHECK (jsonb_typeof(reconciliation) = 'object'),
+        CONSTRAINT ck_mechanical_history_import_audits_v1_interval
+            CHECK (completed_at >= started_at),
+        CONSTRAINT uq_mechanical_history_import_audits_v1_identity
+            UNIQUE (scope_key, source_snapshot_sha256, plan_sha256, importer_version)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS mechanical_history_import_quarantine_v1 (
+        quarantine_id UUID PRIMARY KEY,
+        run_id UUID NOT NULL,
+        source_table TEXT NOT NULL CHECK (btrim(source_table) <> ''),
+        source_pk TEXT,
+        reason TEXT NOT NULL CHECK (btrim(reason) <> ''),
+        payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64),
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT fk_mechanical_history_import_quarantine_v1_run
+            FOREIGN KEY (run_id) REFERENCES mechanical_history_import_audits_v1 (run_id)
+            ON DELETE RESTRICT,
+        CONSTRAINT uq_mechanical_history_import_quarantine_v1_item
+            UNIQUE (run_id, source_table, source_pk, reason, payload_sha256)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_mechanical_history_import_audits_v1_scope_time
+    ON mechanical_history_import_audits_v1 (scope_key, completed_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_mechanical_history_import_quarantine_v1_run
+    ON mechanical_history_import_quarantine_v1 (run_id)
+    """,
+)
+
+
 MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     (1, _INITIAL_SCHEMA),
     (2, _ACTIVE_LABEL_SCHEMA),
@@ -487,6 +536,8 @@ MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     (7, _MAINTENANCE_SCHEMA),
     (8, _COLD_START_EXPLORATION_SCHEMA),
     (9, _EXPECTATION_PRODUCTION_SCHEMA),
+    (10, _MECHANICAL_HISTORY_IMPORT_AUDIT_SCHEMA),
+    (11, COMMITTED_DECISION_SCHEMA_STATEMENTS),
 )
 
 

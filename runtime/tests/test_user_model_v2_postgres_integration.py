@@ -20,9 +20,15 @@ from companion_runtime.user_model_v2_service import UserModelV2Service
 from companion_runtime.user_model_v2_service_repository import PostgresUserModelV2ServiceRepository
 from companion_runtime.composition_v2 import PostgresUserModelV2PredictionRepository
 from companion_runtime.maintenance_v2 import V2Maintenance, V2MaintenanceConfig
+from companion_runtime.motivation_v2 import CandidatePolicyV2, UserUtilityCoefficientsV2
+from companion_runtime.repeat_v2 import RepeatSubjectV2
 from companion_runtime.runtime_repository_v2 import PostgresV2RuntimeRepository
+from companion_runtime.runtime_v2 import CandidateV2, CommittedDecisionV2, PredictionSetV2
 from companion_runtime.user_model_v2_prediction import UserModelV2PredictionService
-from companion_runtime.user_model_v2_types import LabelStatus, Target
+from companion_runtime.decision_v2_audit import (
+    CandidateAssessment, DecisionAuditRecorder, DecisionRun, DecisionStage,
+)
+from companion_runtime.user_model_v2_types import LabelStatus, SupportStatus, Target, TargetPredictionV2
 
 _DSN = os.environ.get("CR_TEST_PG_DSN", "").strip()
 pytestmark = pytest.mark.skipif(not _DSN, reason="set CR_TEST_PG_DSN for live PostgreSQL tests")
@@ -36,7 +42,7 @@ def pg_schema():
     try:
         with connection.transaction():
             result = migrate(connection, schema=schema)
-        assert result.applied == (1, 2, 3, 4, 5, 6, 7, 8, 9)
+        assert result.applied == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
         yield connection, schema
     finally:
         connection.rollback()
@@ -55,7 +61,7 @@ def test_native_migrations_are_idempotent_and_create_scoped_tables(pg_schema) ->
     with connection.transaction():
         second = migrate(connection, schema=schema)
     assert second.applied == ()
-    assert second.already_present == (1, 2, 3, 4, 5, 6, 7, 8, 9)
+    assert second.already_present == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
 
     rows = connection.execute(
         "SELECT table_name FROM information_schema.tables "
@@ -73,6 +79,8 @@ def test_native_migrations_are_idempotent_and_create_scoped_tables(pg_schema) ->
         "user_model_active_parameters_v2",
         "wait_processes_v2",
         "schema_migrations_v2",
+        "mechanical_history_import_audits_v1",
+        "mechanical_history_import_quarantine_v1",
     } <= names
 
 
@@ -292,6 +300,82 @@ def test_send_ack_freezes_expectation_once_and_maintenance_settles_real_postgres
         now=now + timedelta(seconds=3), force=True, fit=False
     )
     assert replay_result.expectation_revisions_written == 0
+
+
+def test_committed_decision_round_trips_and_terminal_ack_is_once(pg_schema) -> None:
+    connection, schema = pg_schema
+    _search_path(connection, schema)
+    scope = "scope:committed"
+    adapter = PostgresUserModelV2ServiceRepository(connection)
+    prediction_service = UserModelV2PredictionService(
+        PostgresUserModelV2PredictionRepository(adapter.repository)
+    )
+    runtime = PostgresV2RuntimeRepository(
+        connection,
+        prediction_service=prediction_service,
+        service_repository=adapter,
+        scope_key=scope,
+    )
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    def prediction(target: Target) -> TargetPredictionV2:
+        return TargetPredictionV2(
+            prediction_id=f"prediction:{target.value}", scope_key=scope, target=target,
+            point=.5, lower=.4, upper=.6, interval_level=.9, interval_kind="laplace",
+            support=SupportStatus.INFORMATIVE, predicted_at=now,
+            created_at=now, updated_at=now,
+        )
+
+    candidate = CandidateV2(
+        candidate_id="candidate:one", action={"type": "share", "proactive": True},
+        internal_utility=.25,
+        coefficients=UserUtilityCoefficientsV2(v_reply=1, v_continue=.5, c_negative=1),
+        repeat_subject=RepeatSubjectV2(concern_id="concern:one"),
+        policy=CandidatePolicyV2(low_pressure=True, low_frequency=True, easy_to_ignore=True),
+        source_event_ids=("event:source",),
+    )
+    predictions = PredictionSetV2(
+        snapshot_id="snapshot:one", parameter_version="parameter:one",
+        reply=prediction(Target.REPLY), continuation=prediction(Target.CONTINUE),
+        negative=prediction(Target.NEGATIVE),
+    )
+    recorder = DecisionAuditRecorder(DecisionRun(
+        decision_id="decision:one", scope=scope, policy_version="runtime-v2.0",
+        contract_version="runtime-v2-coordinator.0", feature_version="user-model-v2.0",
+        parameter_version="parameter:one", D=1, lambda_rate=1,
+        delta_allowed_seconds=1, cumulative_lambda=1,
+        trial_probability=1, random_draw=0, chosen="candidate:one",
+    ), (CandidateAssessment(
+        candidate_id="candidate:one", prediction_snapshot_id="snapshot:one",
+        used_bounds={"reply": .4}, utility_terms={"net": .1},
+        repeat_key="concern:one", reasons=("eligible",),
+    ),))
+    recorder.record(DecisionStage.WAKE, occurred_at=now)
+    recorder.record(DecisionStage.PERMISSIONS, occurred_at=now)
+    recorder.record(DecisionStage.CANDIDATE_ELIGIBLE, occurred_at=now)
+    recorder.record(DecisionStage.HAZARD_TRIAL_PERFORMED, occurred_at=now)
+    recorder.record(DecisionStage.HAZARD_TRIAL_WON, occurred_at=now)
+    recorder.record(DecisionStage.COMMITTED, occurred_at=now)
+    audit = recorder.to_dict()
+    committed = CommittedDecisionV2(
+        decision_id="decision:one", scope_key=scope, candidate=candidate,
+        predictions=predictions, cold_start_exploration=True, audit=audit,
+        attempt_id="attempt:one", render_outbox_id="outbox:render:one", committed_at=now,
+    )
+    runtime.save_committed_decision(committed=committed)
+    assert runtime.recover_committed_decision(scope_key=scope, decision_id="decision:one") == committed
+    assert runtime.mark_committed_decision_ack_once(
+        scope_key=scope, decision_id="decision:one", ack_id="outbox:send:one",
+        status="failed", acknowledged_at=now + timedelta(seconds=1),
+    ) is True
+    assert runtime.mark_committed_decision_ack_once(
+        scope_key=scope, decision_id="decision:one", ack_id="outbox:send:two",
+        status="sent", acknowledged_at=now + timedelta(seconds=2),
+    ) is False
+    recovered = runtime.recover_committed_decision(scope_key=scope, decision_id="decision:one")
+    assert recovered is not None
+    assert recovered.terminal_ack_id == "outbox:send:one"
+    assert recovered.terminal_status == "failed"
 
 
 def first_basis():
