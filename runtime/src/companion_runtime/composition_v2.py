@@ -17,6 +17,7 @@ from . import RUNTIME_API_VERSION, __version__
 from .config import RuntimeConfig
 from .db import open_database
 from .db_postgres import PostgresDatabase
+from .langchao_authority_repository import LangchaoAuthorityRepository
 from .runtime_v2 import (
     DECISION_CONTRACT_VERSION,
     DECISION_POLICY_VERSION,
@@ -41,6 +42,7 @@ DatabaseFactory = Callable[[Any], Any]
 ServiceRepositoryFactory = Callable[[Any, UserModelV2Repository], Any]
 PredictionRepositoryFactory = Callable[[UserModelV2Repository], Any]
 RuntimeRepositoryFactory = Callable[..., V2RuntimeRepository]
+AuthorityRepositoryFactory = Callable[..., Any]
 
 
 class PostgresUserModelV2PredictionRepository:
@@ -140,6 +142,7 @@ def build_v2_composition(
         PostgresUserModelV2PredictionRepository
     ),
     runtime_repository_factory: RuntimeRepositoryFactory | None = None,
+    authority_repository_factory: AuthorityRepositoryFactory = LangchaoAuthorityRepository,
 ) -> V2Composition:
     """Build and migrate the PostgreSQL-only v2 runtime graph.
 
@@ -175,6 +178,11 @@ def build_v2_composition(
         # adapter deliberately interprets SQLite ``?`` SQL for legacy projections,
         # so hand the v2 graph the underlying psycopg connection instead.
         connection = getattr(compatibility_connection, "raw", compatibility_connection)
+        authority = authority_repository_factory(connection, scope_key=scope_key)
+        if authority.get_active() is None:
+            authority.bootstrap()
+        if hasattr(legacy_bridge, "scope_key"):
+            legacy_bridge.scope_key = scope_key
         repository = UserModelV2Repository(connection)
         service_repository = service_repository_factory(connection, repository)
         prediction_repository = prediction_repository_factory(repository)

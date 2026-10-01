@@ -2033,10 +2033,12 @@ class Runtime:
         chosen: CandidateIntent,
         state: RuntimeState,
         now: datetime,
+        attempt_id: str | None = None,
+        outbox_id: str | None = None,
     ) -> tuple[str, str]:
         """Create the action attempt, apply the post-contact transition, enqueue rendering."""
         attempt = action_module.create_proposal(
-            candidate=chosen, based_on_version=state.version, now=now
+            candidate=chosen, based_on_version=state.version, now=now, attempt_id=attempt_id
         )
         action_module.commit(
             self.projections.attempts, conn, attempt, now=now, reason="motivational_game"
@@ -2068,7 +2070,7 @@ class Runtime:
         motivation_module.rollover_contact_day(state, now=now)
 
         item = OutboxItem(
-            outbox_id=new_id("outbox"),
+            outbox_id=outbox_id or new_id("outbox"),
             kind=OutboxKind.RENDER.value,
             payload={
                 "attempt_id": attempt.attempt_id,

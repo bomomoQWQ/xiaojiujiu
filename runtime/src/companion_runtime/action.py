@@ -119,6 +119,7 @@ def create_proposal(
     candidate: CandidateIntent,
     based_on_version: int,
     now: datetime | None = None,
+    attempt_id: str | None = None,
 ) -> ActionAttempt:
     """Build an attempt in the ``proposed`` state.
 
@@ -132,7 +133,7 @@ def create_proposal(
     """
     stamp = now or utcnow()
     return ActionAttempt(
-        attempt_id=new_id("attempt"),
+        attempt_id=attempt_id or new_id("attempt"),
         candidate_id=candidate.candidate_id,
         state=AttemptState.PROPOSED.value,
         intent=candidate.intent,

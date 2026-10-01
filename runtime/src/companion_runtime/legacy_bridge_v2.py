@@ -8,11 +8,14 @@ foreground, render, or delivery transition that the wire handler already applied
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
 from typing import Any, Mapping, Sequence
 from uuid import NAMESPACE_URL, uuid5
 
 from . import boundaries as boundary_module
+from .langchao_authority_repository import LangchaoAuthorityRepository
 from .motivation_v2 import CandidatePolicyV2, UserUtilityCoefficientsV2
 from .repeat_v2 import RepeatSubjectV2, UserMatterEventKind, UserMatterEventV2
 from .runtime_v2 import (
@@ -36,8 +39,12 @@ class ConcreteLegacyRuntimeV2Bridge:
         runtime: Any,
         *,
         coefficients: UserUtilityCoefficientsV2 | None = None,
+        scope_key: str | None = None,
+        dispatch_coordinator: Any | None = None,
     ) -> None:
         self.runtime = runtime
+        self.scope_key = scope_key
+        self.dispatch_coordinator = dispatch_coordinator
         self.coefficients = coefficients or UserUtilityCoefficientsV2(
             v_reply=1.0, v_continue=0.5, c_negative=1.0
         )
@@ -181,11 +188,36 @@ class ConcreteLegacyRuntimeV2Bridge:
         """
 
         item = self._legacy_candidate(candidate.candidate_id)
+        if not self.scope_key:
+            raise RuntimeError("production v2 dispatch requires a scoped live authority coordinator")
+        attempt_id = str(uuid5(NAMESPACE_URL, f"runtime-v2-attempt:{self.scope_key}:{decision_id}"))
+        outbox_id = str(uuid5(NAMESPACE_URL, f"runtime-v2-render:{self.scope_key}:{decision_id}"))
+        claim_id = str(uuid5(NAMESPACE_URL, f"runtime-v2-claim:{self.scope_key}:{decision_id}"))
+        candidate_version = hashlib.sha256(
+            json.dumps(dict(candidate.action), sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
         with self.runtime.write_session():
             with self.runtime.db.transaction() as connection:
+                raw = getattr(connection, "raw", connection)
+                coordinator = self.dispatch_coordinator or LangchaoAuthorityRepository(
+                    raw, scope_key=self.scope_key
+                )
+                coordinator.create_live_dispatch_claim(
+                    claim_id=claim_id,
+                    round_id=decision_id,
+                    candidate_id=candidate.candidate_id,
+                    candidate_version=candidate_version,
+                    attempt_id=attempt_id,
+                    render_outbox_id=outbox_id,
+                    idempotency_key=f"runtime-v2:{decision_id}",
+                    expected_engine="runtime_v2",
+                    created_at=now,
+                )
                 state = self.runtime.projections.runtime.ensure()
                 attempt_id, outbox_id = self.runtime._commit_attempt(
-                    connection, chosen=item, state=state, now=now
+                    connection, chosen=item, state=state, now=now,
+                    attempt_id=attempt_id, outbox_id=outbox_id,
                 )
                 row = self.runtime.projections.outbox.get(outbox_id)
                 if row is None:
