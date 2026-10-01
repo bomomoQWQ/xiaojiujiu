@@ -49,6 +49,7 @@ from .user_model_v2_types import DeliveryBasis, Target, TargetPredictionV2
 
 DECISION_POLICY_VERSION = "runtime-v2.0"
 DECISION_CONTRACT_VERSION = "runtime-v2-coordinator.0"
+COMMITTED_DECISION_SNAPSHOT_VERSION = 1
 
 
 def _require_utc(name: str, value: datetime) -> None:
@@ -132,6 +133,24 @@ class CommitReceiptV2:
     candidate_id: str
     attempt_id: str
     render_outbox_id: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CommittedDecisionV2:
+    """Durable facts needed to finish one committed delivery after restart."""
+
+    decision_id: str
+    scope_key: str
+    candidate: CandidateV2
+    predictions: PredictionSetV2
+    cold_start_exploration: bool
+    audit: Mapping[str, Any]
+    attempt_id: str
+    render_outbox_id: str
+    committed_at: datetime
+    snapshot_version: int = COMMITTED_DECISION_SNAPSHOT_VERSION
+    terminal_ack_id: str | None = None
+    terminal_status: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -308,6 +327,22 @@ class V2RuntimeRepository(Protocol):
     ) -> None: ...
 
     def save_decision_audit(self, *, decision_id: str, audit: Mapping[str, Any]) -> None: ...
+
+    def save_committed_decision(self, *, committed: CommittedDecisionV2) -> None: ...
+
+    def recover_committed_decision(
+        self, *, scope_key: str, decision_id: str
+    ) -> CommittedDecisionV2 | None: ...
+
+    def mark_committed_decision_ack_once(
+        self,
+        *,
+        scope_key: str,
+        decision_id: str,
+        ack_id: str,
+        status: str,
+        acknowledged_at: datetime,
+    ) -> bool: ...
 
     def get_acknowledged_prepared_exposure(
         self, *, scope_key: str, idempotency_key: str
@@ -640,17 +675,50 @@ class V2RuntimeCoordinator:
             )
 
         recorder.record(DecisionStage.HAZARD_TRIAL_WON, occurred_at=now)
-        commit = self.legacy.commit_candidate(
-            decision_id=decision_id, candidate=chosen.candidate, now=now
-        )
-        recorder.record(
-            DecisionStage.COMMITTED,
-            occurred_at=now,
-            details={"attempt_id": commit.attempt_id, "outbox_id": commit.render_outbox_id},
-        )
+        save_committed = getattr(self.repository, "save_committed_decision", None)
+
+        def persist_committed(commit: CommitReceiptV2) -> Mapping[str, Any]:
+            recorder.record(
+                DecisionStage.COMMITTED,
+                occurred_at=now,
+                details={"attempt_id": commit.attempt_id, "outbox_id": commit.render_outbox_id},
+            )
+            audit_payload = self._save_audit(recorder)
+            if callable(save_committed):
+                save_committed(
+                    committed=CommittedDecisionV2(
+                        decision_id=decision_id,
+                        scope_key=self.scope_key,
+                        candidate=chosen.candidate,
+                        predictions=chosen.predictions,
+                        cold_start_exploration=explored,
+                        audit=audit_payload,
+                        attempt_id=commit.attempt_id,
+                        render_outbox_id=commit.render_outbox_id,
+                        committed_at=now,
+                    )
+                )
+            return audit_payload
+
+        atomic_commit = getattr(self.legacy, "commit_candidate_with_snapshot", None)
+        if callable(atomic_commit) and callable(save_committed):
+            commit = atomic_commit(
+                decision_id=decision_id,
+                candidate=chosen.candidate,
+                now=now,
+                persist_snapshot=persist_committed,
+            )
+            audit = recorder.to_dict()
+        else:
+            # Compatibility for old protocol fakes. Production's concrete bridge exposes
+            # the atomic hook above so attempt/outbox and recovery placeholder commit in
+            # one PostgreSQL transaction.
+            commit = self.legacy.commit_candidate(
+                decision_id=decision_id, candidate=chosen.candidate, now=now
+            )
+            audit = persist_committed(commit)
         self._chosen[decision_id] = chosen.candidate
         self._explored[decision_id] = explored
-        audit = self._save_audit(recorder)
         return EndogenousDecisionV2(
             decision_id=decision_id,
             acted=True,
@@ -691,27 +759,46 @@ class V2RuntimeCoordinator:
 
         Unlike :meth:`acknowledge_send`, this method never calls the legacy bridge.
         It is therefore safe after ``Reducer.mark_delivered`` and cannot charge the
-        legacy delivery or append its outgoing events twice.
+        legacy delivery or append its outgoing events twice.  If the process restarted
+        after commit, all decision facts are restored from the immutable committed
+        snapshot; the current candidate pool and prediction parameters are never queried.
         """
 
         sent = bool(ack.sent and confirmed)
         ack_idempotency_key = f"send-ack:{ack.send_outbox_id}"
+        committed = self._recover_committed(ack.decision_id)
+        if committed is not None:
+            if committed.scope_key != self.scope_key:
+                raise ValueError("committed decision belongs to a different scope")
+            if committed.attempt_id != ack.attempt_id:
+                raise ValueError("send acknowledgement attempt does not match committed decision")
+            if committed.terminal_ack_id is not None:
+                if committed.terminal_ack_id != ack.send_outbox_id:
+                    raise ValueError("committed decision already has a different terminal acknowledgement")
+                if committed.terminal_status != ("sent" if sent else "failed"):
+                    raise ValueError("committed decision terminal acknowledgement conflicts")
+                if sent:
+                    recover = getattr(self.repository, "get_acknowledged_prepared_exposure", None)
+                    if callable(recover):
+                        return recover(
+                            scope_key=self.scope_key, idempotency_key=ack_idempotency_key
+                        )
+                return None
+        recovered_prepared: PreparedExposureV2 | None = None
         if sent:
             recover = getattr(self.repository, "get_acknowledged_prepared_exposure", None)
             if callable(recover):
-                recovered = recover(
+                recovered_prepared = recover(
                     scope_key=self.scope_key, idempotency_key=ack_idempotency_key
                 )
-                if recovered is not None:
-                    return recovered
         recorder = self._require_audit(ack.decision_id)
         recorder.record(
             DecisionStage.SEND_ACK if sent else DecisionStage.SEND_FAIL,
             occurred_at=ack.acknowledged_at,
             details={"outbox_id": ack.send_outbox_id, "attempt_id": ack.attempt_id},
         )
-        prepared: PreparedExposureV2 | None = None
-        if sent:
+        prepared: PreparedExposureV2 | None = recovered_prepared
+        if sent and prepared is None:
             chosen = self._chosen[ack.decision_id]
             sources = tuple(dict.fromkeys((*chosen.source_event_ids, *ack.source_event_ids)))
             prepare_and_freeze = getattr(
@@ -724,7 +811,7 @@ class V2RuntimeCoordinator:
                     exposure_id=ack.attempt_id,
                     idempotency_key=ack_idempotency_key,
                     occurred_at=ack.acknowledged_at,
-                    action=ack.action,
+                    action=chosen.action,
                     context_provider=ack.context_provider,
                     horizons=self.config.horizons,
                     delivery_basis=getattr(ack, "delivery_basis", DeliveryBasis.DELIVERED),
@@ -742,7 +829,7 @@ class V2RuntimeCoordinator:
                     exposure_id=ack.attempt_id,
                     idempotency_key=ack_idempotency_key,
                     occurred_at=ack.acknowledged_at,
-                    action=ack.action,
+                    action=chosen.action,
                     context_provider=ack.context_provider,
                     delivery_confirmed=True,
                     horizons=self.config.horizons,
@@ -772,6 +859,21 @@ class V2RuntimeCoordinator:
             details={"reason": "sent" if sent else "send_failed"},
         )
         self._save_audit(recorder)
+        mark_terminal = getattr(self.repository, "mark_committed_decision_ack_once", None)
+        if callable(mark_terminal):
+            marked = mark_terminal(
+                scope_key=self.scope_key,
+                decision_id=ack.decision_id,
+                ack_id=ack.send_outbox_id,
+                status="sent" if sent else "failed",
+                acknowledged_at=ack.acknowledged_at,
+            )
+            if not marked:
+                winner = self._recover_committed(ack.decision_id, refresh=True)
+                if winner is None or winner.terminal_ack_id != ack.send_outbox_id or (
+                    winner.terminal_status != ("sent" if sent else "failed")
+                ):
+                    raise ValueError("committed decision terminal acknowledgement conflicts")
         return prepared
 
     def reconcile(self, *, decision_id: str, now: datetime, reason: str) -> None:
@@ -779,11 +881,47 @@ class V2RuntimeCoordinator:
         recorder.record(DecisionStage.RECONCILED, occurred_at=now, details={"reason": reason})
         self._save_audit(recorder)
 
+    def _recover_committed(
+        self, decision_id: str, *, refresh: bool = False
+    ) -> CommittedDecisionV2 | None:
+        if not refresh and decision_id in self._audits:
+            return None
+        recover = getattr(self.repository, "recover_committed_decision", None)
+        if not callable(recover):
+            return None
+        committed = recover(scope_key=self.scope_key, decision_id=decision_id)
+        if committed is None:
+            return None
+        if committed.snapshot_version != COMMITTED_DECISION_SNAPSHOT_VERSION:
+            raise ValueError("unsupported committed decision snapshot version")
+        if committed.decision_id != decision_id:
+            raise ValueError("committed decision snapshot identity mismatch")
+        if committed.scope_key != self.scope_key:
+            raise ValueError("committed decision belongs to a different scope")
+        recorder = DecisionAuditRecorder.from_dict(committed.audit)
+        if recorder.run.decision_id != decision_id or recorder.run.scope != self.scope_key:
+            raise ValueError("committed decision audit identity mismatch")
+        if recorder.current_stage not in {
+            DecisionStage.COMMITTED,
+            DecisionStage.RENDERED,
+            DecisionStage.SEND_ACK,
+            DecisionStage.SEND_FAIL,
+            DecisionStage.RECONCILED,
+        }:
+            raise ValueError("committed decision audit is not committed")
+        self._audits[decision_id] = recorder
+        self._chosen[decision_id] = committed.candidate
+        self._explored[decision_id] = committed.cold_start_exploration
+        return committed
+
     def _require_audit(self, decision_id: str) -> DecisionAuditRecorder:
-        try:
-            return self._audits[decision_id]
-        except KeyError as exc:
-            raise KeyError(f"unknown in-process decision_id: {decision_id}") from exc
+        recorder = self._audits.get(decision_id)
+        if recorder is None:
+            self._recover_committed(decision_id)
+            recorder = self._audits.get(decision_id)
+        if recorder is None:
+            raise KeyError(f"unknown decision_id: {decision_id}")
+        return recorder
 
     def _save_audit(self, recorder: DecisionAuditRecorder) -> Mapping[str, Any]:
         payload = recorder.to_dict()
@@ -798,6 +936,8 @@ __all__ = [
     "CandidateDecisionV2",
     "CandidateV2",
     "CommitReceiptV2",
+    "CommittedDecisionV2",
+    "COMMITTED_DECISION_SNAPSHOT_VERSION",
     "DECISION_CONTRACT_VERSION",
     "DECISION_POLICY_VERSION",
     "DecisionConfigV2",

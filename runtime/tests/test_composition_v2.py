@@ -35,7 +35,7 @@ class FakeConnection:
 class FakeDatabase:
     dialect = "postgres"
 
-    def __init__(self, *, version=8, fail=False):
+    def __init__(self, *, version=12, fail=False):
         self.version = version
         self.fail = fail
         self.connection = FakeConnection()
@@ -100,7 +100,7 @@ def test_factory_builds_v2_graph_from_injected_protocols_and_reports_health() ->
     assert composition.coordinator.user_model is composition.user_model_service
     health = composition.health.to_dict()
     assert health["storage"] == {"dialect": "postgres", "schema": "runtime_v2"}
-    assert health["migrations"]["current_version"] == 8
+    assert health["migrations"]["current_version"] == 12
     assert health["migrations"]["up_to_date"] is True
     assert health["versions"]["decision_policy"].startswith("runtime-v2")
     assert health["jev"] == {
@@ -123,6 +123,34 @@ def test_factory_rejects_non_postgres_before_constructing_any_dependency() -> No
             database_factory=lambda storage: calls.append(storage),
         )
     assert calls == []
+
+
+def test_factory_reuses_borrowed_database_without_closing_it() -> None:
+    database = FakeDatabase()
+    composition = build_v2_composition(
+        configured(), scope_key="scope",
+        legacy_bridge=DummyLegacyBridge(),  # type: ignore[arg-type]
+        runtime_repository=DummyRuntimeRepository(),  # type: ignore[arg-type]
+        database=database,
+        service_repository_factory=FakeServiceRepository,
+        prediction_repository_factory=FakePredictionRepository,
+    )
+    assert composition.database is database
+    assert composition.owns_database is False
+    composition.close()
+    assert database.closed is False
+
+
+def test_factory_does_not_close_borrowed_database_when_build_fails() -> None:
+    database = FakeDatabase(fail=True)
+    with pytest.raises(RuntimeError, match="migration failed"):
+        build_v2_composition(
+            configured(), scope_key="scope",
+            legacy_bridge=DummyLegacyBridge(),  # type: ignore[arg-type]
+            runtime_repository=DummyRuntimeRepository(),  # type: ignore[arg-type]
+            database=database,
+        )
+    assert database.closed is False
 
 
 def test_factory_closes_owned_database_when_migration_fails() -> None:

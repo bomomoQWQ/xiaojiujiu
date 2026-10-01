@@ -146,11 +146,12 @@ def test_render_then_successful_send_hook_and_duplicate_ack_are_idempotent(wired
     assert coordinator.acks[0].decision_id == "decision:v2"
 
 
-def test_failed_send_creates_no_v2_ack_or_exposure(wired):
+def test_failed_send_terminally_notifies_v2_without_claiming_exposure(wired):
     client, runtime, coordinator, order = wired
     commit_v2_attempt(runtime)
     report(client, lease(client, "render"), result={"text": "想问问面试结果。"})
     failed = report(client, lease(client, "send"), status="failed", result={})
     assert failed["ok"] is True and failed["delivered"] is False
-    assert order == ["v2_render"]
-    assert coordinator.acks == []
+    assert order == ["v2_render", "v2_send"]
+    assert len(coordinator.acks) == 1
+    assert coordinator.acks[0].sent is False

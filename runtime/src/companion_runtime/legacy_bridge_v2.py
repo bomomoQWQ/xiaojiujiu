@@ -158,6 +158,28 @@ class ConcreteLegacyRuntimeV2Bridge:
     def commit_candidate(
         self, *, decision_id: str, candidate: CandidateV2, now: datetime
     ) -> CommitReceiptV2:
+        return self.commit_candidate_with_snapshot(
+            decision_id=decision_id,
+            candidate=candidate,
+            now=now,
+            persist_snapshot=lambda _receipt: None,
+        )
+
+    def commit_candidate_with_snapshot(
+        self,
+        *,
+        decision_id: str,
+        candidate: CandidateV2,
+        now: datetime,
+        persist_snapshot: Any,
+    ) -> CommitReceiptV2:
+        """Commit legacy delivery and its v2 recovery placeholder atomically.
+
+        ``persist_snapshot`` is invoked inside the existing database transaction after the
+        receipt identities exist.  It must only perform writes on that same connection;
+        the coordinator supplies the repository write and does not call external services.
+        """
+
         item = self._legacy_candidate(candidate.candidate_id)
         with self.runtime.write_session():
             with self.runtime.db.transaction() as connection:
@@ -172,12 +194,14 @@ class ConcreteLegacyRuntimeV2Bridge:
                 payload.update({"decision_id": decision_id, "action": dict(candidate.action)})
                 row.payload = payload
                 self.runtime.projections.outbox.enqueue(connection, row)
-        return CommitReceiptV2(
-            decision_id=decision_id,
-            candidate_id=candidate.candidate_id,
-            attempt_id=attempt_id,
-            render_outbox_id=outbox_id,
-        )
+                receipt = CommitReceiptV2(
+                    decision_id=decision_id,
+                    candidate_id=candidate.candidate_id,
+                    attempt_id=attempt_id,
+                    render_outbox_id=outbox_id,
+                )
+                persist_snapshot(receipt)
+        return receipt
 
     def mark_rendered(self, *, decision_id: str, outbox_id: str, now: datetime) -> None:
         del decision_id

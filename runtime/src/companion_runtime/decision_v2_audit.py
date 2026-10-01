@@ -373,3 +373,68 @@ class DecisionAuditRecorder:
             "assessments": [item.to_dict() for item in self.assessments],
             "events": [event.to_dict() for event in self._events],
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "DecisionAuditRecorder":
+        """Restore and validate a persisted audit snapshot through the state machine.
+
+        Recovery deliberately replays every event rather than assigning private fields.  A
+        corrupt, newer, or internally inconsistent snapshot is therefore rejected before it
+        can authorise a late acknowledgement.
+        """
+
+        if not isinstance(payload, Mapping):
+            raise DecisionAuditError("audit snapshot must be a mapping")
+        if payload.get("audit_contract_version") != DECISION_V2_AUDIT_CONTRACT_VERSION:
+            raise DecisionAuditError("unsupported decision audit contract version")
+        run_payload = payload.get("run")
+        if not isinstance(run_payload, Mapping):
+            raise DecisionAuditError("audit run must be a mapping")
+        run = DecisionRun(
+            decision_id=str(run_payload.get("decision_id", "")),
+            scope=str(run_payload.get("scope", "")),
+            policy_version=str(run_payload.get("policy_version", "")),
+            contract_version=str(run_payload.get("contract_version", "")),
+            feature_version=str(run_payload.get("feature_version", "")),
+            parameter_version=str(run_payload.get("parameter_version", "")),
+            D=run_payload.get("D"),
+            lambda_rate=run_payload.get("lambda"),
+            delta_allowed_seconds=run_payload.get("delta_allowed_seconds"),
+            cumulative_lambda=run_payload.get("cumulative_lambda"),
+            trial_probability=run_payload.get("trial_probability"),
+            random_draw=run_payload.get("random_draw"),
+            chosen=run_payload.get("chosen"),
+        )
+        assessments_payload = payload.get("assessments")
+        if not isinstance(assessments_payload, list):
+            raise DecisionAuditError("audit assessments must be a list")
+        assessments: list[CandidateAssessment] = []
+        for item in assessments_payload:
+            if not isinstance(item, Mapping):
+                raise DecisionAuditError("audit assessment must be a mapping")
+            assessments.append(
+                CandidateAssessment(
+                    candidate_id=str(item.get("candidate_id", "")),
+                    prediction_snapshot_id=str(item.get("prediction_snapshot_id", "")),
+                    used_bounds=item.get("used_bounds", {}),
+                    utility_terms=item.get("utility_terms", {}),
+                    repeat_key=str(item.get("repeat_key", "")),
+                    reasons=tuple(item.get("reasons", ())),
+                )
+            )
+        recorder = cls(run, tuple(assessments))
+        events = payload.get("events")
+        if not isinstance(events, list):
+            raise DecisionAuditError("audit events must be a list")
+        for event in events:
+            if not isinstance(event, Mapping):
+                raise DecisionAuditError("audit event must be a mapping")
+            occurred_at = event.get("occurred_at")
+            if isinstance(occurred_at, str):
+                occurred_at = datetime.fromisoformat(occurred_at)
+            recorder.record(
+                str(event.get("stage", "")),
+                occurred_at=occurred_at,
+                details=event.get("details", {}),
+            )
+        return recorder

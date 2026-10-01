@@ -1466,18 +1466,20 @@ def _apply_action_report(
             extra["delivered"] = bool(delivered.get("delivered"))
             if delivered.get("duplicate"):
                 extra["duplicate"] = True
-            if sent and delivered.get("delivered") and not delivered.get("duplicate"):
+            if not delivered.get("duplicate"):
                 decision_id = _v2_decision_id(row)
                 coordinator = _v2_coordinator(runtime)
                 if decision_id and coordinator is not None:
-                    attempt_id = _text(delivered.get("attempt_id")).strip()
+                    attempt_id = _text(delivered.get("attempt_id")).strip() or _text(
+                        _mapping(getattr(row, "payload", None)).get("attempt_id")
+                    ).strip()
                     _require_v2_hook(coordinator, "after_legacy_send_ack")(
                         V2WireSendAck(
                             decision_id=decision_id,
                             attempt_id=attempt_id,
                             send_outbox_id=action_id,
                             acknowledged_at=now,
-                            sent=True,
+                            sent=sent,
                             action=_v2_action(runtime, row),
                             context_provider=_v2_context_provider(runtime),
                         ),

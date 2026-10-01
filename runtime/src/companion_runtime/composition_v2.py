@@ -110,9 +110,11 @@ class V2Composition:
     health: V2Health
     enable_decision_run: bool = False
     decision_simulation_runner: Any | None = None
+    owns_database: bool = True
 
     def close(self) -> None:
-        self.database.close()
+        if self.owns_database:
+            self.database.close()
 
     def __enter__(self) -> "V2Composition":
         return self
@@ -129,6 +131,8 @@ def build_v2_composition(
     runtime_repository: V2RuntimeRepository | None = None,
     decision_config: DecisionConfigV2 | None = None,
     rng: Any | None = None,
+    database: Any | None = None,
+    owns_database: bool | None = None,
     database_factory: DatabaseFactory = open_database,
     service_repository_factory: ServiceRepositoryFactory = PostgresUserModelV2ServiceRepository,
     prediction_repository_factory: PredictionRepositoryFactory = (
@@ -151,9 +155,18 @@ def build_v2_composition(
 
     # Fail before any factory call if configuration attempts SQLite/fallback storage.
     config.storage.require_postgres_dsn()
-    database = database_factory(config.storage)
+    database_was_injected = database is not None
+    if database is None:
+        database = database_factory(config.storage)
+        effective_owns_database = True if owns_database is None else bool(owns_database)
+    else:
+        effective_owns_database = False if owns_database is None else bool(owns_database)
     try:
-        if database_factory is open_database and not isinstance(database, PostgresDatabase):
+        if (
+            not database_was_injected
+            and database_factory is open_database
+            and not isinstance(database, PostgresDatabase)
+        ):
             raise TypeError("the production v2 composition requires PostgresDatabase")
         migration_version = int(database.migrate())
         compatibility_connection = database._connection()
@@ -221,9 +234,11 @@ def build_v2_composition(
             coordinator=coordinator,
             audit_repository=runtime_repository,
             health=health,
+            owns_database=effective_owns_database,
         )
     except BaseException:
-        database.close()
+        if effective_owns_database:
+            database.close()
         raise
 
 

@@ -11,6 +11,7 @@ from companion_runtime.runtime_v2 import (
     BoundaryVerdictV2,
     CandidateV2,
     CommitReceiptV2,
+    CommittedDecisionV2,
     DecisionConfigV2,
     LegacyUserEventResult,
     PredictionSetV2,
@@ -60,6 +61,7 @@ class FakePostgresRepository:
         self.prepared: dict[tuple[str, str], PreparedExposureV2] = {}
         self.active: dict[tuple[str, str, Target], tuple[TargetLabelV2, int]] = {}
         self.audits: dict[str, dict] = {}
+        self.committed: dict[str, CommittedDecisionV2] = {}
         self.matter_events = []
         self.exposures: list[SendAcknowledgedExposureV2] = []
         self.predictions = PredictionSetV2(
@@ -140,6 +142,36 @@ class FakePostgresRepository:
 
     def save_decision_audit(self, *, decision_id, audit):
         self.audits[decision_id] = dict(audit)
+        previous = self.committed.get(decision_id)
+        if previous is not None and previous.terminal_status is None:
+            from dataclasses import replace
+            self.committed[decision_id] = replace(previous, audit=dict(audit))
+
+    def save_committed_decision(self, *, committed):
+        previous = self.committed.setdefault(committed.decision_id, committed)
+        if previous != committed:
+            raise ValueError("conflicting committed decision snapshot")
+
+    def recover_committed_decision(self, *, scope_key, decision_id):
+        item = self.committed.get(decision_id)
+        if item is not None and item.scope_key != scope_key:
+            raise ValueError("committed decision belongs to a different scope")
+        return item
+
+    def mark_committed_decision_ack_once(
+        self, *, scope_key, decision_id, ack_id, status, acknowledged_at
+    ):
+        from dataclasses import replace
+        item = self.recover_committed_decision(scope_key=scope_key, decision_id=decision_id)
+        if item is None or item.terminal_status is not None:
+            return False
+        self.committed[decision_id] = replace(
+            item, terminal_ack_id=ack_id, terminal_status=status
+        )
+        return True
+
+    def get_acknowledged_prepared_exposure(self, *, scope_key, idempotency_key):
+        return self.prepared.get((scope_key, idempotency_key))
 
 
 class FakeLegacyBridge:
@@ -338,3 +370,142 @@ def test_endogenous_path_honours_legacy_boundary_before_commit() -> None:
     assert decision.assessments[0].blocked is True
     assert "boundary:topic_avoid" in decision.assessments[0].reasons
     assert repository.audits["decision:blocked"]["events"][-1]["stage"] == "reconciled"
+
+
+def _restart(runtime, legacy, repository, *, scope=SCOPE):
+    return V2RuntimeCoordinator(
+        scope_key=scope,
+        legacy=legacy,
+        user_model=UserModelV2Service(repository),
+        repository=repository,
+        config=runtime.config,
+        rng=random.Random(0),
+    )
+
+
+def _ack(legacy, *, decision_id="decision:restart", sent=True, outbox="outbox:send:restart"):
+    return SendAckV2(
+        decision_id=decision_id,
+        attempt_id="attempt:1",
+        send_outbox_id=outbox,
+        acknowledged_at=NOW + timedelta(seconds=2),
+        sent=sent,
+        action={"type": "newer-action-must-not-win"},
+        context_provider=lambda: {"recent_contact_count": 0},
+        source_event_ids=("ack:event",),
+    )
+
+
+def test_late_ack_after_restart_recovers_committed_candidate_snapshot() -> None:
+    order: list[str] = []
+    runtime, legacy, repository = coordinator(order)
+    runtime.decide_endogenous(
+        decision_id="decision:restart", now=NOW, elapsed_allowed_seconds=10.0
+    )
+    runtime.mark_rendered(
+        decision_id="decision:restart", outbox_id="outbox:render:1", now=NOW + timedelta(seconds=1)
+    )
+    legacy.candidate = CandidateV2(
+        candidate_id="candidate:newer",
+        action={"type": "newer"}, internal_utility=99,
+        coefficients=legacy.candidate.coefficients,
+        repeat_subject=RepeatSubjectV2(concern_id="wrong", action_goal_id="wrong"),
+        policy=legacy.candidate.policy, source_event_ids=("newer:event",),
+    )
+    restarted = _restart(runtime, legacy, repository)
+    prepared = restarted.after_legacy_send_ack(_ack(legacy), confirmed=True)
+    assert prepared is not None
+    assert prepared.features.action_json["intent"] == "问面试结果"
+    assert prepared.exposure.source_event_ids == ("source:user:1", "ack:event")
+    assert repository.committed["decision:restart"].terminal_status == "sent"
+    assert "legacy_send_ack" not in order[-2:]
+
+
+def test_duplicate_and_conflicting_late_ack_are_exactly_once() -> None:
+    order: list[str] = []
+    runtime, legacy, repository = coordinator(order)
+    runtime.decide_endogenous(
+        decision_id="decision:restart", now=NOW, elapsed_allowed_seconds=10.0
+    )
+    runtime.mark_rendered(
+        decision_id="decision:restart", outbox_id="outbox:render:1", now=NOW + timedelta(seconds=1)
+    )
+    restarted = _restart(runtime, legacy, repository)
+    first = restarted.after_legacy_send_ack(_ack(legacy), confirmed=True)
+    again = _restart(runtime, legacy, repository).after_legacy_send_ack(
+        _ack(legacy), confirmed=True
+    )
+    assert again == first
+    assert len(repository.prepared) == 1
+    import pytest
+    with pytest.raises(ValueError, match="different terminal|conflicts"):
+        _restart(runtime, legacy, repository).after_legacy_send_ack(
+            _ack(legacy, outbox="outbox:send:other"), confirmed=True
+        )
+
+
+def test_restart_between_exposure_and_terminal_mark_finishes_placeholder() -> None:
+    order: list[str] = []
+    runtime, legacy, repository = coordinator(order)
+    runtime.decide_endogenous(
+        decision_id="decision:restart", now=NOW, elapsed_allowed_seconds=10.0
+    )
+    runtime.mark_rendered(
+        decision_id="decision:restart", outbox_id="outbox:render:1", now=NOW + timedelta(seconds=1)
+    )
+    before_ack = repository.committed["decision:restart"]
+    first = _restart(runtime, legacy, repository).after_legacy_send_ack(
+        _ack(legacy), confirmed=True
+    )
+    assert first is not None
+    # Simulate the process dying after the atomic exposure/expectation write but before
+    # audit reconciliation and the terminal placeholder update became durable.
+    repository.committed["decision:restart"] = before_ack
+    repository.audits["decision:restart"] = dict(before_ack.audit)
+    replay = _restart(runtime, legacy, repository).after_legacy_send_ack(
+        _ack(legacy), confirmed=True
+    )
+    assert replay == first
+    assert len(repository.prepared) == 1
+    assert repository.committed["decision:restart"].terminal_status == "sent"
+    assert repository.audits["decision:restart"]["events"][-1]["stage"] == "reconciled"
+
+
+def test_failed_late_ack_terminally_closes_placeholder_without_exposure() -> None:
+    order: list[str] = []
+    runtime, legacy, repository = coordinator(order)
+    runtime.decide_endogenous(
+        decision_id="decision:restart", now=NOW, elapsed_allowed_seconds=10.0
+    )
+    runtime.mark_rendered(
+        decision_id="decision:restart", outbox_id="outbox:render:1", now=NOW + timedelta(seconds=1)
+    )
+    restarted = _restart(runtime, legacy, repository)
+    assert restarted.after_legacy_send_ack(_ack(legacy, sent=False), confirmed=True) is None
+    assert repository.prepared == {}
+    assert repository.committed["decision:restart"].terminal_status == "failed"
+    assert repository.audits["decision:restart"]["events"][-2]["stage"] == "send_fail"
+
+
+def test_recovery_rejects_scope_mismatch_and_bad_snapshot_version() -> None:
+    from dataclasses import replace
+    import pytest
+    order: list[str] = []
+    runtime, legacy, repository = coordinator(order)
+    runtime.decide_endogenous(
+        decision_id="decision:restart", now=NOW, elapsed_allowed_seconds=10.0
+    )
+    runtime.mark_rendered(
+        decision_id="decision:restart", outbox_id="outbox:render:1", now=NOW + timedelta(seconds=1)
+    )
+    with pytest.raises(ValueError, match="different scope"):
+        _restart(runtime, legacy, repository, scope="other").after_legacy_send_ack(
+            _ack(legacy), confirmed=True
+        )
+    repository.committed["decision:restart"] = replace(
+        repository.committed["decision:restart"], snapshot_version=999
+    )
+    with pytest.raises(ValueError, match="unsupported committed decision snapshot version"):
+        _restart(runtime, legacy, repository).after_legacy_send_ack(
+            _ack(legacy), confirmed=True
+        )
