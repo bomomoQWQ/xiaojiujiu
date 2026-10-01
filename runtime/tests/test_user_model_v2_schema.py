@@ -1,4 +1,4 @@
-"""Contract tests for the isolated PostgreSQL user-model v2 schema."""
+﻿"""Contract tests for the isolated PostgreSQL user-model v2 schema."""
 
 from __future__ import annotations
 
@@ -90,9 +90,9 @@ def test_idempotency_and_single_active_parameter_constraints_are_explicit() -> N
 
 
 def test_migration_versions_and_statement_order_are_stable() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 7
+    assert USER_MODEL_SCHEMA_VERSION == 8
     assert isinstance(MIGRATIONS, tuple)
-    assert tuple(version for version, _statements in MIGRATIONS) == (1, 2, 3, 4, 5, 6, 7)
+    assert tuple(version for version, _statements in MIGRATIONS) == (1, 2, 3, 4, 5, 6, 7, 8)
     assert all(isinstance(statements, tuple) for _version, statements in MIGRATIONS)
     assert schema_statements() == tuple(
         statement for _version, statements in MIGRATIONS for statement in statements

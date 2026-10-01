@@ -12,7 +12,7 @@ from typing import Final
 
 from .runtime_core_v2_schema import CORE_SCHEMA_STATEMENTS, CORE_SCHEMA_VERSION
 
-USER_MODEL_SCHEMA_VERSION: Final[int] = 7
+USER_MODEL_SCHEMA_VERSION: Final[int] = 8
 
 _INITIAL_SCHEMA: tuple[str, ...] = (
     """
@@ -418,6 +418,23 @@ _MAINTENANCE_SCHEMA: tuple[str, ...] = (
     """,
 )
 
+# Cold-start safe exploration needs a *spend record*.  Without one, "she may
+# explore when she knows nothing" would be an unbounded licence to poke people.
+# The flag lives on the acknowledged-exposure row because that row already means
+# "a proactive message actually reached the user" -- the only event that may
+# consume exploration budget.
+_COLD_START_EXPLORATION_SCHEMA: tuple[str, ...] = (
+    """
+    ALTER TABLE runtime_v2_exposure_metadata
+        ADD COLUMN IF NOT EXISTS cold_start_exploration BOOLEAN NOT NULL DEFAULT FALSE
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_runtime_v2_exposure_metadata_cold_start
+    ON runtime_v2_exposure_metadata (scope_key, acknowledged_at DESC)
+    WHERE cold_start_exploration
+    """,
+)
+
 
 MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     (1, _INITIAL_SCHEMA),
@@ -430,6 +447,7 @@ MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     (5, _IMPORT_AUDIT_SCHEMA),
     (6, _RUNTIME_ADAPTER_SCHEMA),
     (7, _MAINTENANCE_SCHEMA),
+    (8, _COLD_START_EXPLORATION_SCHEMA),
 )
 
 

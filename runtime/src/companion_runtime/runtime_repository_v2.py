@@ -225,13 +225,20 @@ class PostgresV2RuntimeRepository:
         acknowledged_at: datetime,
         concern_id: str | None = None,
         action_goal_id: str | None = None,
+        cold_start_exploration: bool = False,
     ) -> None:
-        """Attach repeat-policy identity to an already prepared v2 exposure."""
+        """Attach repeat-policy identity to an already prepared v2 exposure.
+
+        ``cold_start_exploration`` marks that this delivery was authorised by the
+        bounded cold-start exploration allowance rather than by a positive estimate,
+        so it can be counted against that allowance later.
+        """
 
         self.connection.execute(
             """INSERT INTO runtime_v2_exposure_metadata
-               (scope_key, exposure_id, acknowledged_at, concern_id, action_goal_id)
-               VALUES (%s, %s, %s, %s, %s)
+               (scope_key, exposure_id, acknowledged_at, concern_id, action_goal_id,
+                cold_start_exploration)
+               VALUES (%s, %s, %s, %s, %s, %s)
                ON CONFLICT (scope_key, exposure_id) DO NOTHING""",
             (
                 self.scope_key,
@@ -239,8 +246,26 @@ class PostgresV2RuntimeRepository:
                 acknowledged_at,
                 _optional_text(concern_id),
                 _optional_text(action_goal_id),
+                bool(cold_start_exploration),
             ),
         )
+
+    def count_cold_start_explorations(self, *, scope_key: str, since: datetime) -> int:
+        """Count acknowledged proactive deliveries that spent exploration budget."""
+
+        self._scope(scope_key)
+        row = self.connection.execute(
+            """SELECT count(*)
+               FROM runtime_v2_exposure_metadata
+               WHERE scope_key = %s
+                 AND acknowledged_at >= %s
+                 AND cold_start_exploration""",
+            (scope_key, since),
+        ).fetchone()
+        if row is None:
+            return 0
+        value = _row(row, "count", 0)
+        return int(value or 0)
 
     def list_due_pending_exposures(
         self, *, scope_key: str, as_of: datetime, limit: int
