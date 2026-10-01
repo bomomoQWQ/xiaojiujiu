@@ -212,7 +212,10 @@ class LangchaoShadowRunner:
     parameters: LangchaoParameters = DEFAULT_LANGCHAO_PARAMETERS
     last_built: BuiltShadowRound | None = None
 
-    def run(self, decision: EndogenousDecisionV2, *, now: datetime) -> Any | None:
+    def run(
+        self, decision: EndogenousDecisionV2, *, now: datetime,
+        before_commit: Any | None = None,
+    ) -> Any | None:
         pairs = tuple((item, _facts_for(item)) for item in decision.assessments)
         pairs = tuple((item, facts) for item, facts in pairs if facts is not None)
         inputs = [RuntimeCandidateInput(candidate=item.candidate, predictions=item.predictions,
@@ -297,11 +300,13 @@ class LangchaoShadowRunner:
             baseline_candidate_id=baseline, baseline_defer_reason=defer,
             run_id=f"langchao-shadow:{decision.decision_id}",
             idempotency_key=f"runtime-v2:{decision.decision_id}",
+            before_commit=before_commit,
         )
 
 
 def build_langchao_shadow_runner(
     *, connection: Any, scope_key: str, runtime: Any, allow_live_evaluation: bool = False,
+    transaction_factory: Any | None = None,
 ) -> LangchaoShadowRunner:
     """Build safe repositories on the same migrated PostgreSQL connection."""
     borrowed = _BorrowedConnection(connection)
@@ -320,7 +325,7 @@ def build_langchao_shadow_runner(
         state_repository=states,
         shadow_repository=shadow,
         authority_reader=_ReadOnlyAuthority(authority),
-        transaction_factory=connection.transaction,
+        transaction_factory=transaction_factory or connection.transaction,
         allow_live_evaluation=allow_live_evaluation,
     )
     return LangchaoShadowRunner(scope_key=scope_key, runtime=runtime, service=service,

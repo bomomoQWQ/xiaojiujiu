@@ -10,7 +10,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, ContextManager, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, ContextManager, Mapping, Protocol, runtime_checkable
 
 from .langchao_authority import AuthorityEngine, AuthorityMode
 from .langchao_engine import CompetitionEdge, LangchaoParameters
@@ -102,12 +102,12 @@ class LangchaoShadowService:
         self._transaction_factory = transaction_factory
         self._allow_live_evaluation = bool(allow_live_evaluation)
 
-    def _transaction(self) -> ContextManager[None]:
+    def _transaction(self) -> ContextManager[Any]:
         if self._transaction_factory is not None:
             return self._transaction_factory()
         connection = getattr(self.contracts, "connection", None)
         transaction = getattr(connection, "transaction", None)
-        return transaction() if transaction is not None else nullcontext()
+        return transaction() if transaction is not None else nullcontext(connection)
 
     def _validate_authority(self, value: Any) -> _Authority:
         if value is None:
@@ -215,6 +215,7 @@ class LangchaoShadowService:
         idempotency_key: str,
         utility_scale: float = 1.0,
         tie_break_order: tuple[str, ...] = (),
+        before_commit: Callable[[ShadowRunResult, BuiltShadowRound, Any], Any] | None = None,
     ) -> ShadowRunResult:
         if not isinstance(built, BuiltShadowRound):
             raise TypeError("built must be BuiltShadowRound")
@@ -224,6 +225,10 @@ class LangchaoShadowService:
             raise ValueError("built shadow round has no admitted candidates")
 
         authority = self._validate_authority(self.authority_reader.get_active())
+        if before_commit is not None and not self._allow_live_evaluation:
+            raise LangchaoShadowAuthorityError(
+                "before_commit requires an explicit live-evaluation capability"
+            )
         existing = self.shadow.get_shadow_run(
             scope_key=built.state.scope_key, idempotency_key=idempotency_key,
         )
@@ -237,7 +242,7 @@ class LangchaoShadowService:
                 raise RuntimeError("shadow service idempotency conflict")
             return existing
 
-        with self._transaction():
+        with self._transaction() as connection:
             for item in built.contracts:
                 self._persist_contract(item)
 
@@ -275,7 +280,7 @@ class LangchaoShadowService:
                         expected_pointer_version=pointer, authority_revision=authority.revision,
                     )
 
-            return run_langchao_shadow(
+            result = run_langchao_shadow(
                 repository=self.shadow, run_id=run_id, idempotency_key=idempotency_key,
                 source_input_cursor=built.state.event_cursor,
                 source_input_version=built.adapter_version,
@@ -287,6 +292,12 @@ class LangchaoShadowService:
                 baseline_candidate_id=baseline_candidate_id,
                 baseline_defer_reason=baseline_defer_reason,
             )
+            # Deliberately after contract/state/evaluation-audit writes and before the
+            # single outer transaction exits. Any callback failure rolls all of them
+            # back together with its live claim/attempt/outbox/snapshot writes.
+            if before_commit is not None:
+                before_commit(result, built, connection)
+            return result
 
 
 __all__ = [

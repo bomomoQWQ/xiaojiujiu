@@ -9,6 +9,7 @@ from typing import Any, Mapping
 from .langchao_authority import AuthorityEngine, AuthorityMode
 from .langchao_authority_repository import LangchaoAuthorityRepository
 from .langchao_live import LangchaoLiveService
+from .langchao_live_repository import LangchaoLiveRepository
 from .langchao_repository import LangchaoRepository
 from .langchao_shadow_wiring import build_langchao_shadow_runner
 
@@ -35,26 +36,47 @@ class LangchaoLiveRunner:
 
     evaluator: Any
     service: LangchaoLiveService
+    repository: LangchaoLiveRepository
 
     def run(self, assessment: Any, *, now: datetime) -> Any:
-        evaluated = self.evaluator.run(assessment, now=now)
-        candidate_id = getattr(evaluated, "candidate_id", None)
-        if candidate_id is None and hasattr(evaluated, "payload"):
-            candidate_id = evaluated.payload.get("candidate_id")
-        # Evaluator retains the exact last built round so execution cannot rebuild
-        # from changed candidates between numerical decision and commit.
-        built = getattr(self.evaluator, "last_built", None)
-        if built is None:
-            return evaluated
         sources = {
             item.candidate.candidate_id: item.candidate
             for item in assessment.assessments
         }
-        return self.service.execute(
-            built=built, decision_candidate_id=candidate_id,
-            assessed_candidates=sources, now=now,
-            persist_snapshot=lambda _receipt: None,
+        live_result: Any | None = None
+
+        def commit(result: Any, built: Any, connection: Any) -> None:
+            nonlocal live_result
+            candidate_id = getattr(result, "candidate_id", None)
+            if candidate_id is None and hasattr(result, "payload"):
+                candidate_id = result.payload.get("candidate_id")
+            live_result = self.service.execute_in_transaction(
+                connection,
+                built=built, decision_candidate_id=candidate_id,
+                assessed_candidates=sources, now=now,
+                persist_snapshot=self.repository.save_commit,
+            )
+
+        evaluated = self.evaluator.run(assessment, now=now, before_commit=commit)
+        return evaluated if live_result is None else live_result
+
+    def after_legacy_rendered(self, *, decision_id: str, outbox_id: str, now: datetime) -> None:
+        """Rendering has no reward effect; the durable commit already names its outbox."""
+        del decision_id, outbox_id, now
+
+    def after_legacy_send_ack(self, ack: Any, *, confirmed: bool = True) -> tuple[Any, ...]:
+        """Settle one terminal send result, recovering the snapshot after restart."""
+        return self.repository.settle_terminal(
+            round_id=ack.decision_id,
+            attempt_id=ack.attempt_id,
+            ack_id=ack.send_outbox_id,
+            sent=bool(ack.sent and confirmed),
+            acknowledged_at=ack.acknowledged_at,
         )
+
+    def recover_pending(self) -> tuple[Any, ...]:
+        """Expose durable pending commits for startup/recovery diagnostics."""
+        return self.repository.pending()
 
 
 def build_langchao_live_runner(
@@ -63,6 +85,7 @@ def build_langchao_live_runner(
     evaluator = build_langchao_shadow_runner(
         connection=connection, scope_key=scope_key, runtime=runtime,
         allow_live_evaluation=True,
+        transaction_factory=runtime.db.transaction,
     )
     authority = LangchaoAuthorityRepository(connection, scope_key=scope_key)
     contracts = LangchaoRepository(connection, scope_key=scope_key)
@@ -70,7 +93,10 @@ def build_langchao_live_runner(
         scope_key=scope_key, authority_reader=authority,
         legacy_bridge=legacy_bridge, contract_repository=contracts,
     )
-    return LangchaoLiveRunner(evaluator=evaluator, service=service)
+    live_repository = LangchaoLiveRepository(connection, scope_key=scope_key)
+    return LangchaoLiveRunner(
+        evaluator=evaluator, service=service, repository=live_repository
+    )
 
 
 @dataclass(slots=True)
