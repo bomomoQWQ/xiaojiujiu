@@ -345,11 +345,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
             0.0, (now - last_allowed_at).total_seconds()
         )
         last_allowed_at = now
-        return runtime.v2_coordinator.decide_endogenous(
+        result = runtime.v2_coordinator.decide_endogenous(
             decision_id=new_id("decision"),
             now=now,
             elapsed_allowed_seconds=elapsed,
         )
+        # The same scheduler heartbeat owns bounded v2 window settlement and model
+        # fitting. It runs after the decision, so a user reply observed since the
+        # previous heartbeat can update parameters without contaminating that prior
+        # decision's saved prediction.
+        v2_maintenance.run_due(now=now, fit=True)
+        return result
 
     def simulate_v2_decision(_payload: dict[str, Any]) -> dict[str, Any]:
         """Guarded acceptance-only decision hook exposed while NapCat is stopped."""
@@ -388,8 +394,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 runtime.v2_coordinator.config, "utility_threshold", previous_threshold
             )
             object.__setattr__(runtime.v2_coordinator.config, "repeat", previous_repeat)
-        if config.v2_simulation_fit_immediately:
-            v2_maintenance.run_due(now=utcnow(), force=True, fit=True)
+        # Fitting happens after the simulated user's reply reaches /v1/events; the
+        # normal v2 maintenance loop below observes it without coupling prediction
+        # updates to the pre-reply decision request.
         return {
             "acted": result.acted,
             "reason": result.reason,
