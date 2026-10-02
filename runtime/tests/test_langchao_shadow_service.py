@@ -31,6 +31,7 @@ class Aggregate:
         self.cas_loss = None
         self.claims = 0
         self.transaction_entries = 0
+        self.begun_authority_revisions = []
 
     @contextmanager
     def transaction(self):
@@ -117,6 +118,7 @@ class States:
     def get_round_status(self, *, round_id): return self.a.rounds.get(round_id)
     def begin_round(self, state, *, run_mode, candidate_revisions, expected_pointer_version, authority_revision):
         assert run_mode == "shadow" and set(candidate_revisions) == set(state.working_set)
+        self.a.begun_authority_revisions.append(authority_revision)
         if self.a.pointer != expected_pointer_version: raise RuntimeError("state CAS")
         self.a.pointer += 1
         self.a.active_state = state
@@ -259,6 +261,27 @@ def test_live_before_commit_failure_rolls_back_aggregate_in_one_transaction():
     assert not any(aggregate.revisions.values())
     assert aggregate.active_state is None and aggregate.audit_count == 0
     assert aggregate.claims == 0 and aggregate.events == []
+
+
+def test_shadow_audit_requires_and_records_the_routed_authority_revision():
+    built = build((source("a"),))
+    aggregate, _, service = harness(authority=Authority("langchao", "shadow", False))
+    service.run(
+        built, now=NOW + timedelta(seconds=1), parameters=parameters(),
+        decision_budget=1, run_id="run:matched", idempotency_key="idem:matched",
+        expected_authority_revision=7,
+    )
+    assert aggregate.begun_authority_revisions == [7]
+
+    aggregate, _, service = harness(authority=Authority("langchao", "shadow", False))
+    with pytest.raises(LangchaoShadowAuthorityError, match="revision changed"):
+        service.run(
+            built, now=NOW + timedelta(seconds=1), parameters=parameters(),
+            decision_budget=1, run_id="run:stale", idempotency_key="idem:stale",
+            expected_authority_revision=6,
+        )
+    assert aggregate.transaction_entries == 0
+    assert not any(aggregate.revisions.values()) and aggregate.audit_count == 0
 
 
 def test_shadow_authority_cannot_receive_before_commit_capability():

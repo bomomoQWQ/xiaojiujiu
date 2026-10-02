@@ -115,6 +115,7 @@ class V2Composition:
     langchao_shadow_runner: Any | None = None
     langchao_live_runner: Any | None = None
     authority_round_router: Any | None = None
+    social_service: Any | None = None
     owns_database: bool = True
 
     def close(self) -> None:
@@ -211,8 +212,33 @@ def build_v2_composition(
             rng=rng,
         )
         expected = tuple(record.version for record in migration_records())
+        social_enabled = bool(
+            config.langchao.social_enabled
+            or config.extras.get("langchao.social_enabled", False)
+            or (isinstance(config.extras.get("langchao"), Mapping)
+                and config.extras["langchao"].get("social_enabled", False))
+        )
+        social_service = None
+        if social_enabled:
+            from .langchao_social_wiring import build_langchao_social_service
+
+            social_service = build_langchao_social_service(
+                connection=connection, scope_key=scope_key, runtime=legacy_bridge.runtime,
+            )
+            legacy_bridge.social_service = social_service
+        from .langchao_live_wiring import active_authority_coordinates
+
+        active_engine, active_mode, active_may_dispatch = active_authority_coordinates(
+            authority.get_active()
+        )
+        shadow_authority_active = (
+            active_engine == "langchao"
+            and active_mode == "shadow"
+            and not active_may_dispatch
+        )
         shadow_enabled = bool(
-            config.langchao.shadow_enabled
+            shadow_authority_active
+            or config.langchao.shadow_enabled
             or config.extras.get("langchao.shadow_enabled", False)
             or (isinstance(config.extras.get("langchao"), Mapping)
                 and config.extras["langchao"].get("shadow_enabled", False))
@@ -235,6 +261,14 @@ def build_v2_composition(
                 connection=connection, scope_key=scope_key,
                 runtime=legacy_bridge.runtime, legacy_bridge=legacy_bridge,
             )
+            from .langchao_user_outcomes import LangchaoUserOutcomeSettler
+
+            user_model_service.outcome_observer = LangchaoUserOutcomeSettler(
+                langchao_live_runner.repository
+            )
+            langchao_live_runner.exposure_repository = runtime_repository
+            langchao_live_runner.user_model = user_model_service
+            langchao_live_runner.horizons = coordinator.config.horizons
         from .langchao_live_wiring import AuthorityRoutedEndogenousRound
         authority_round_router = AuthorityRoutedEndogenousRound(
             scope_key=scope_key, v2_coordinator=coordinator,
@@ -281,6 +315,7 @@ def build_v2_composition(
             langchao_shadow_runner=langchao_shadow_runner,
             langchao_live_runner=langchao_live_runner,
             authority_round_router=authority_round_router,
+            social_service=social_service,
             owns_database=effective_owns_database,
         )
     except BaseException:

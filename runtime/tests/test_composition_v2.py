@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -70,7 +71,10 @@ class FakeAuthorityRepository:
 
     def bootstrap(self):
         AUTHORITY_BOOTSTRAPS.append(self.scope_key)
-        self.active = {"engine_key": "runtime_v2", "mode": "live"}
+        self.active = {
+            "engine_key": "runtime_v2", "mode": "live", "may_dispatch": True,
+            "revision": 1,
+        }
         return self.active
 
 
@@ -131,6 +135,41 @@ def test_factory_builds_v2_graph_from_injected_protocols_and_reports_health() ->
     }
     composition.close()
     assert database.closed is True
+
+
+def test_active_shadow_authority_composes_shadow_runner_without_feature_switch(monkeypatch) -> None:
+    class ShadowAuthorityRepository(FakeAuthorityRepository):
+        def __init__(self, connection, *, scope_key):
+            super().__init__(connection, scope_key=scope_key)
+            self.active = {
+                "engine_key": "langchao", "mode": "shadow", "may_dispatch": False,
+                "revision": 9,
+            }
+
+    runner = SimpleNamespace(run=lambda *_args, **_kwargs: None)
+    calls = []
+
+    def build_runner(**kwargs):
+        calls.append(kwargs)
+        return runner
+
+    import companion_runtime.langchao_shadow_wiring as wiring
+    monkeypatch.setattr(wiring, "build_langchao_shadow_runner", build_runner)
+    config = configured()
+    assert config.langchao.shadow_enabled is False
+    legacy = DummyLegacyBridge()
+    legacy.runtime = object()
+    composition = build_v2_composition(
+        config, scope_key="scope", legacy_bridge=legacy,  # type: ignore[arg-type]
+        runtime_repository=DummyRuntimeRepository(),  # type: ignore[arg-type]
+        database=FakeDatabase(), service_repository_factory=FakeServiceRepository,
+        prediction_repository_factory=FakePredictionRepository,
+        authority_repository_factory=ShadowAuthorityRepository,
+    )
+
+    assert composition.langchao_shadow_runner is runner
+    assert composition.authority_round_router.langchao_shadow_runner is runner
+    assert len(calls) == 1 and calls[0]["scope_key"] == "scope"
 
 
 def test_factory_rejects_non_postgres_before_constructing_any_dependency() -> None:

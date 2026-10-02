@@ -27,6 +27,7 @@ from .runtime_v2 import (
 )
 from .typing import CandidateIntent
 from .user_model_v2_labels import TargetObservationV2
+from .user_model_v2_service import canonical_exposure_id
 from .user_model_v2_types import Target
 from .utility import ensure_aware, utcnow
 
@@ -41,10 +42,12 @@ class ConcreteLegacyRuntimeV2Bridge:
         coefficients: UserUtilityCoefficientsV2 | None = None,
         scope_key: str | None = None,
         dispatch_coordinator: Any | None = None,
+        social_service: Any | None = None,
     ) -> None:
         self.runtime = runtime
         self.scope_key = scope_key
         self.dispatch_coordinator = dispatch_coordinator
+        self.social_service = social_service
         self.coefficients = coefficients or UserUtilityCoefficientsV2(
             v_reply=1.0, v_continue=0.5, c_negative=1.0
         )
@@ -83,10 +86,8 @@ class ConcreteLegacyRuntimeV2Bridge:
         occurred_at = ensure_aware(getattr(raw, "timestamp", None)) or _event_time(event)
         duplicate = bool(getattr(legacy_outcome, "duplicate", False))
         attributed = str(getattr(legacy_outcome, "attributed_attempt_id", None) or "")
-        exposure_id = (
-            str(uuid5(NAMESPACE_URL, f"prepared-exposure:{self.runtime.config.conversation_id}:{attributed}"))
-            if attributed else ""
-        )
+        attribution_scope = self.scope_key or str(self.runtime.config.conversation_id)
+        exposure_id = canonical_exposure_id(attribution_scope, attributed) if attributed else ""
         observations: tuple[TargetObservationV2, ...] = ()
         if attributed and not duplicate:
             observations = (
@@ -188,6 +189,8 @@ class ConcreteLegacyRuntimeV2Bridge:
         """
 
         item = self._legacy_candidate(candidate.candidate_id)
+        if self.social_service is not None and not self.social_service.validate_candidate_action(candidate.action):
+            raise ValueError("candidate social/memory source is stale, tombstoned, or cross-scope")
         if not self.scope_key:
             raise RuntimeError("production v2 dispatch requires a scoped live authority coordinator")
         attempt_id = str(uuid5(NAMESPACE_URL, f"runtime-v2-attempt:{self.scope_key}:{decision_id}"))
@@ -269,6 +272,8 @@ class ConcreteLegacyRuntimeV2Bridge:
         exact = self._candidate(item)
         if exact != source_candidate:
             raise ValueError("浪潮 source candidate identity/provenance no longer matches legacy")
+        if self.social_service is not None and not self.social_service.validate_candidate_action(source_candidate.action):
+            raise ValueError("candidate social/memory source is stale, tombstoned, or cross-scope")
         attempt_id = str(uuid5(NAMESPACE_URL, f"langchao-attempt:{self.scope_key}:{round_id}"))
         outbox_id = str(uuid5(NAMESPACE_URL, f"langchao-render:{self.scope_key}:{round_id}"))
         claim_id = str(uuid5(NAMESPACE_URL, f"langchao-claim:{self.scope_key}:{round_id}"))
@@ -393,6 +398,8 @@ class ConcreteLegacyRuntimeV2Bridge:
             "emotional_expression": item.type in {"share", "emotional_expression"},
             "topic_shift": item.type == "curious_question",
         }
+        if self.social_service is not None:
+            action.update(self.social_service.candidate_refs(item.sources))
         concern = next(
             (
                 source.split(":", 1)[1]

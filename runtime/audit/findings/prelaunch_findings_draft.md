@@ -37,9 +37,9 @@
 | PF-009 | **P0** | T06 伪完成声明缺口 | D/C；局部 T 不足 | 阻断 |
 | PF-010 | **P0** | T07 plan→render 范围漂移缺口 | D/C | 阻断 |
 | PF-011 | **P2** | T09 完成→退休→不重开缺口 | D/C | 限定能力 |
-| PF-012 | **P1** | Txx 编号在审查工件间语义漂移 | C | 先统一 crosswalk |
+| PF-012 | **P1** | canonical ID / namespaced legacy crosswalk | D/C/T | **已关闭** |
 
-合计：P0=5，P1=4，P2=3，P3=0。
+合计 12 项：开放 P0=5、P1=3、P2=3、P3=0；关闭 P1=1。
 
 ---
 
@@ -208,17 +208,15 @@
 
 **正向回归**：30 秒/6 小时变体均只结算一次且不复活；显式 REOPEN 正控创建新 episode；无完成 token 不得完成。
 
-## PF-012｜P1｜T02/T06/T07/T09 编号在审查工件间语义漂移
+## PF-012｜P1｜canonical requirement identity（已关闭）
 
-**当前答案**：同一裸 Txx 在不同工件指不同场景。例如 scenario map T02 是“检索能力与产物真实性”，manifest T02 是“作用域与私人材料隔离”；T06/T07/T09 也发生标题和 oracle 偏移。
+**整改结果**：已冻结 `LC-<family>-NN` canonical requirement IDs，并新增 `langchao_requirement_crosswalk_v1.json`。acceptance manifest、附件 T01–T32 场景、structural plan/result、结果汇总均保留带 namespace 的 legacy aliases；裸 `Txx` 不再作为唯一主键或跨工件关联键。
 
-**风险**：可能对错 oracle，形成“T09 已通过”但实际是另一场景的证据串线。
+**冲突防线**：registry 的 `definition_sha256` 绑定 title、oracle hash 与 fixture hash；manifest validator 会拒绝 registry hash 漂移、canonical definition hash 漂移、同一 namespaced alias 指向多个 canonical IDs，以及 manifest 内容与 registry 定义不一致。
 
-**证据**：C=`scenarios/T01-T16.json`、`T01-T16_REVIEW_MAPPING.md` 与 `langchao_prelaunch_acceptance_20261002.json` 的对应条目直接对照。
+**兼容性**：历史 `T01`–`T32` 字段继续保留，但只能解释为诸如 `acceptance-manifest-20261002:T09` 或 `attachment-review-v1:T09` 的 legacy alias。历史 evidence 不被重写为另一题义。
 
-**最小整改**：冻结 canonical scenario id（族前缀或 UUID），给旧编号显式 crosswalk；更新 manifest、fixture 路径、问题单和结果汇总，历史工件用 superseding revision，不覆写。
-
-**正向回归**：schema 保证一个 canonical id 只对应一个 title/oracle/fixture hash；旧编号可唯一解析；历史 evidence 仍按原 revision 可追溯。
+**回归证据**：`runtime/tests/test_langchao_acceptance_manifest.py` 覆盖唯一性、裸 alias 拒绝、语义冲突与 hash 漂移；两份 scenario manifest tests 覆盖 canonical IDs 和 aliases。
 
 ---
 

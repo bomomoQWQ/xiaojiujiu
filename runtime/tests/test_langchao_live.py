@@ -77,6 +77,68 @@ def test_langchao_live_assesses_then_commits_only_langchao_once():
     assert [item[0] for item in calls] == ["assess", "langchao"]
 
 
+def test_langchao_shadow_assesses_then_runs_shadow_with_routed_authority_revision():
+    calls = []
+    assessment = SimpleNamespace(decision_id="d")
+    v2 = SimpleNamespace(
+        decide_endogenous=lambda **kw: calls.append(("decide", kw)),
+        assess_endogenous=lambda **kw: calls.append(("assess", kw)) or assessment,
+    )
+    shadow = SimpleNamespace(
+        run=lambda value, **kw: calls.append(("shadow", value, kw)) or "shadow-result"
+    )
+    router = AuthorityRoutedEndogenousRound(
+        scope_key="scope", v2_coordinator=v2,
+        authority_reader=Authority(AuthorityEngine.LANGCHAO, AuthorityMode.SHADOW, False),
+        langchao_shadow_runner=shadow,
+    )
+
+    assert router.run(decision_id="d", now=NOW, elapsed_allowed_seconds=1) == "shadow-result"
+    assert [item[0] for item in calls] == ["assess", "shadow"]
+    assert calls[1][1] is assessment
+    assert calls[1][2] == {"now": NOW, "authority_revision": 1}
+
+
+def test_none_or_disabled_authority_only_assesses_without_shadow_writes():
+    for engine, mode, may_dispatch in (
+        (AuthorityEngine.NONE, AuthorityMode.DISABLED, False),
+        (AuthorityEngine.LANGCHAO, AuthorityMode.DISABLED, False),
+        (AuthorityEngine.LANGCHAO, AuthorityMode.SHADOW, True),
+    ):
+        calls = []
+        v2 = SimpleNamespace(
+            decide_endogenous=lambda **kw: calls.append("decide"),
+            assess_endogenous=lambda **kw: calls.append("assess") or "assessment",
+        )
+        shadow = SimpleNamespace(run=lambda *a, **kw: calls.append("shadow"))
+        router = AuthorityRoutedEndogenousRound(
+            scope_key="scope", v2_coordinator=v2,
+            authority_reader=Authority(engine, mode, may_dispatch),
+            langchao_shadow_runner=shadow,
+        )
+
+        assert router.run(decision_id="d", now=NOW, elapsed_allowed_seconds=1) == "assessment"
+        assert calls == ["assess"]
+
+
+def test_langchao_shadow_requires_configured_runner_after_pure_assessment():
+    calls = []
+    router = AuthorityRoutedEndogenousRound(
+        scope_key="scope",
+        v2_coordinator=SimpleNamespace(
+            decide_endogenous=lambda **kw: calls.append("decide"),
+            assess_endogenous=lambda **kw: calls.append("assess") or "assessment",
+        ),
+        authority_reader=Authority(AuthorityEngine.LANGCHAO, AuthorityMode.SHADOW, False),
+    )
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="no configured shadow runner"):
+        router.run(decision_id="d", now=NOW, elapsed_allowed_seconds=1)
+    assert calls == ["assess"]
+
+
 def test_disabled_or_unallowlisted_never_calls_live_runner():
     calls = []
     v2 = SimpleNamespace(

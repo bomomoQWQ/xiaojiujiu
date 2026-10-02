@@ -14,20 +14,35 @@ from .langchao_repository import LangchaoRepository
 from .langchao_shadow_wiring import build_langchao_shadow_runner
 
 
-def active_authority_coordinates(value: Any) -> tuple[str, str, bool]:
+def _active_authority(value: Any) -> tuple[str, str, bool, int | None]:
     if value is None:
-        return AuthorityEngine.NONE.value, AuthorityMode.DISABLED.value, False
+        return AuthorityEngine.NONE.value, AuthorityMode.DISABLED.value, False, None
     nested = getattr(value, "revision", None)
     if nested is not None and not isinstance(nested, int):
         value = nested
-    def field(name: str) -> Any:
-        return value[name] if isinstance(value, Mapping) else getattr(value, name)
+
+    def field(name: str, default: Any = ...) -> Any:
+        if isinstance(value, Mapping):
+            if default is ...:
+                return value[name]
+            return value.get(name, default)
+        if default is ...:
+            return getattr(value, name)
+        return getattr(value, name, default)
+
     engine, mode = field("engine_key"), field("mode")
+    revision = field("revision", None)
     return (
         engine.value if isinstance(engine, AuthorityEngine) else str(engine),
         mode.value if isinstance(mode, AuthorityMode) else str(mode),
         bool(field("may_dispatch")),
+        int(revision) if revision is not None else None,
     )
+
+
+def active_authority_coordinates(value: Any) -> tuple[str, str, bool]:
+    engine, mode, may_dispatch, _revision = _active_authority(value)
+    return engine, mode, may_dispatch
 
 
 @dataclass(slots=True)
@@ -37,6 +52,9 @@ class LangchaoLiveRunner:
     evaluator: Any
     service: LangchaoLiveService
     repository: LangchaoLiveRepository
+    exposure_repository: Any | None = None
+    user_model: Any | None = None
+    horizons: Any | None = None
 
     def run(self, assessment: Any, *, now: datetime) -> Any:
         sources = {
@@ -65,14 +83,34 @@ class LangchaoLiveRunner:
         del decision_id, outbox_id, now
 
     def after_legacy_send_ack(self, ack: Any, *, confirmed: bool = True) -> tuple[Any, ...]:
-        """Settle one terminal send result, recovering the snapshot after restart."""
-        return self.repository.settle_terminal(
+        """Settle delivery and create the same exposure/labels as Runtime-v2."""
+        sent = bool(ack.sent and confirmed)
+        settled = self.repository.settle_terminal(
             round_id=ack.decision_id,
             attempt_id=ack.attempt_id,
             ack_id=ack.send_outbox_id,
-            sent=bool(ack.sent and confirmed),
+            sent=sent,
             acknowledged_at=ack.acknowledged_at,
         )
+        if sent and self.exposure_repository is not None and self.user_model is not None:
+            commit = self.repository.get(ack.decision_id)
+            if commit is None:
+                raise RuntimeError("sent Langchao acknowledgement has no durable commit")
+            self.exposure_repository.prepare_exposure_and_expectation(
+                user_model=self.user_model,
+                scope_key=commit.scope_key,
+                exposure_id=ack.attempt_id,
+                idempotency_key=f"send-ack:{ack.send_outbox_id}",
+                occurred_at=ack.acknowledged_at,
+                action=ack.action,
+                context_provider=ack.context_provider,
+                horizons=self.horizons,
+                delivery_basis=getattr(ack, "delivery_basis", None) or __import__(
+                    "companion_runtime.user_model_v2_types", fromlist=["DeliveryBasis"]
+                ).DeliveryBasis.DELIVERED,
+                source_event_ids=tuple(getattr(ack, "source_event_ids", ())),
+            )
+        return settled
 
     def recover_pending(self) -> tuple[Any, ...]:
         """Expose durable pending commits for startup/recovery diagnostics."""
@@ -112,9 +150,8 @@ class AuthorityRoutedEndogenousRound:
     live_scope_allowlist: tuple[str, ...] = ()
 
     def run(self, *, decision_id: str, now: datetime, elapsed_allowed_seconds: float) -> Any:
-        engine, mode, may_dispatch = active_authority_coordinates(
-            self.authority_reader.get_active()
-        )
+        active = self.authority_reader.get_active()
+        engine, mode, may_dispatch, authority_revision = _active_authority(active)
         if (engine, mode, may_dispatch) == (
             AuthorityEngine.RUNTIME_V2.value, AuthorityMode.LIVE.value, True,
         ):
@@ -123,7 +160,9 @@ class AuthorityRoutedEndogenousRound:
                 elapsed_allowed_seconds=elapsed_allowed_seconds,
             )
             if self.langchao_shadow_runner is not None:
-                self.langchao_shadow_runner.run(decision, now=now)
+                self.langchao_shadow_runner.run(
+                    decision, now=now, authority_revision=authority_revision,
+                )
             return decision
         if (engine, mode, may_dispatch) == (
             AuthorityEngine.LANGCHAO.value, AuthorityMode.LIVE.value, True,
@@ -138,8 +177,23 @@ class AuthorityRoutedEndogenousRound:
             if self.langchao_live_runner is None:
                 raise RuntimeError("langchao/live authority has no configured live runner")
             return self.langchao_live_runner.run(assessment, now=now)
-        # shadow, none, and disabled authorities cannot commit.  Do not run a baseline
-        # v2 decision merely for comparison because that path owns hazard and commit.
+        # Shadow authority evaluates the same pure v2 assessment, then persists only
+        # Langchao contracts/state/audit.  It must never enter v2 decide/commit.
+        if (engine, mode, may_dispatch) == (
+            AuthorityEngine.LANGCHAO.value, AuthorityMode.SHADOW.value, False,
+        ):
+            assessment = self.v2_coordinator.assess_endogenous(
+                decision_id=decision_id, now=now,
+                elapsed_allowed_seconds=elapsed_allowed_seconds,
+            )
+            if self.langchao_shadow_runner is None:
+                raise RuntimeError("langchao/shadow authority has no configured shadow runner")
+            return self.langchao_shadow_runner.run(
+                assessment, now=now, authority_revision=authority_revision,
+            )
+        # none, disabled, malformed, and dispatch-ineligible live authorities only
+        # assess. Do not run an engine merely for comparison because decide owns
+        # hazard/commit and shadow owns durable audit writes.
         return self.v2_coordinator.assess_endogenous(
             decision_id=decision_id, now=now,
             elapsed_allowed_seconds=elapsed_allowed_seconds,

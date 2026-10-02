@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
+from .capability_witness import WitnessValidator, candidate_witness_requirement
 from .langchao_authority import AuthorityEngine, AuthorityMode
 from .langchao_runtime_adapter import BuiltCandidateContracts, BuiltShadowRound
 from .langchao_live_repository import LangchaoLiveCommit
@@ -64,6 +65,7 @@ class LangchaoLiveService:
     def __init__(
         self, *, scope_key: str, authority_reader: Any, legacy_bridge: Any,
         contract_repository: Any | None = None,
+        witness_reader: Any | None = None,
     ) -> None:
         if not scope_key.strip():
             raise ValueError("scope_key is required")
@@ -71,6 +73,7 @@ class LangchaoLiveService:
         self.authority_reader = authority_reader
         self.legacy = legacy_bridge
         self.contracts = contract_repository
+        self.witnesses = WitnessValidator(witness_reader) if witness_reader is not None else None
 
     def execute_in_transaction(
         self,
@@ -105,6 +108,12 @@ class LangchaoLiveService:
         if item.candidate.kind is CandidateKind.DEFER_OR_REST:
             return LangchaoLiveResult(
                 round_id, decision_candidate_id, item.source_candidate_id, False, "internal_rest"
+            )
+        if item.candidate.kind is CandidateKind.INTERNAL_PROCESS:
+            # Initial live support is deliberately assessment-only.  The work segment
+            # remains an internal candidate; it never crosses the legacy send boundary.
+            return LangchaoLiveResult(
+                round_id, decision_candidate_id, item.source_candidate_id, False, "internal_candidate"
             )
         source = assessed_candidates.get(item.source_candidate_id)
         if source is None or source.candidate_id != item.provenance.candidate_id:
@@ -198,6 +207,14 @@ class LangchaoLiveService:
             # persisted contracts without it are assessment-only and cannot go live.
             if "external_message" not in candidate.capability_refs:
                 raise LangchaoLiveValidationError("external-message capability is absent")
+        requirement = candidate_witness_requirement(candidate, scope_key=self.scope_key)
+        if requirement is not None:
+            if self.witnesses is None:
+                raise LangchaoLiveValidationError("operation candidate has no witness validator")
+            try:
+                self.witnesses.validate(requirement)
+            except RuntimeError as exc:
+                raise LangchaoLiveValidationError(str(exc)) from exc
 
 
 __all__ = [

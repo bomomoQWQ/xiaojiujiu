@@ -22,7 +22,7 @@
       "algorithm": "sha256",
       "canonicalization": "raw_bytes",
       "artifact": "runtime/audit/langchao_acceptance_manifest_v1.schema.json",
-      "value": "7974c79cf862ed072a5d12566d34980ae4241e4b5cae49d6b5197d40a03594b1"
+      "value": "07d75f54319c44b278318ee25e3295176b609e7e288cf6a349c6a0b31163b241"
     },
     "database_schema": {
       "algorithm": "sha256",
@@ -257,7 +257,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-MAT-01",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T01"
+        }
+      ]
     },
     {
       "id": "T02",
@@ -382,7 +389,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-MAT-02",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T02"
+        }
+      ]
     },
     {
       "id": "T03",
@@ -507,7 +521,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-MAT-03",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T03"
+        }
+      ]
     },
     {
       "id": "T04",
@@ -645,7 +666,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-MAT-04",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T04"
+        }
+      ]
     },
     {
       "id": "T05",
@@ -772,7 +800,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-MAT-05",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T05"
+        }
+      ]
     },
     {
       "id": "T06",
@@ -909,7 +944,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-PRA-01",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T06"
+        }
+      ]
     },
     {
       "id": "T07",
@@ -1047,7 +1089,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-PRA-02",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T07"
+        }
+      ]
     },
     {
       "id": "T08",
@@ -1174,7 +1223,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-PRA-03",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T08"
+        }
+      ]
     },
     {
       "id": "T09",
@@ -1311,7 +1367,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-PRA-04",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T09"
+        }
+      ]
     },
     {
       "id": "T10",
@@ -1438,7 +1501,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-PRA-05",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T10"
+        }
+      ]
     },
     {
       "id": "T11",
@@ -1565,7 +1635,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-AGY-01",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T11"
+        }
+      ]
     },
     {
       "id": "T12",
@@ -1690,7 +1767,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-PRA-06",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T12"
+        }
+      ]
     },
     {
       "id": "T13",
@@ -1831,7 +1915,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-CON-01",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T13"
+        }
+      ]
     },
     {
       "id": "T14",
@@ -1955,7 +2046,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-HIS-01",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T14"
+        }
+      ]
     },
     {
       "id": "T15",
@@ -2080,7 +2178,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-HIS-02",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T15"
+        }
+      ]
     },
     {
       "id": "T16",
@@ -2207,7 +2312,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-HIS-03",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T16"
+        }
+      ]
     },
     {
       "id": "T17",
@@ -2344,7 +2456,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-HIS-04",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T17"
+        }
+      ]
     },
     {
       "id": "T18",
@@ -2480,7 +2599,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-PUR-01",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T18"
+        }
+      ]
     },
     {
       "id": "T19",
@@ -2606,7 +2732,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-PUR-02",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T19"
+        }
+      ]
     },
     {
       "id": "T20",
@@ -2733,7 +2866,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-PUR-03",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T20"
+        }
+      ]
     },
     {
       "id": "T21",
@@ -2871,7 +3011,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-PUR-04",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T21"
+        }
+      ]
     },
     {
       "id": "T22",
@@ -3008,7 +3155,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-AGY-02",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T22"
+        }
+      ]
     },
     {
       "id": "T23",
@@ -3150,7 +3304,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-AGY-03",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T23"
+        }
+      ]
     },
     {
       "id": "T24",
@@ -3290,7 +3451,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-AGY-04",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T24"
+        }
+      ]
     },
     {
       "id": "T25",
@@ -3427,7 +3595,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-MAT-06",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T25"
+        }
+      ]
     },
     {
       "id": "T26",
@@ -3565,7 +3740,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-CON-02",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T26"
+        }
+      ]
     },
     {
       "id": "T27",
@@ -3703,7 +3885,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-PRA-07",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T27"
+        }
+      ]
     },
     {
       "id": "T28",
@@ -3842,7 +4031,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-MAT-07",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T28"
+        }
+      ]
     },
     {
       "id": "T29",
@@ -3974,7 +4170,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-CON-03",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T29"
+        }
+      ]
     },
     {
       "id": "T30",
@@ -4110,7 +4313,14 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-VER-01",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T30"
+        }
+      ]
     },
     {
       "id": "T31",
@@ -4251,7 +4461,14 @@
         "storage": "not_created_without_separate_authorization",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-VER-02",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T31"
+        }
+      ]
     },
     {
       "id": "T32",
@@ -4395,7 +4612,18 @@
         "storage": "encrypted_local_review_artifacts",
         "redaction": "replace all user, channel, message and external account identifiers before preservation",
         "deletion_propagation": "delete dependent fixture, review packet and derived evidence when a source deletion applies"
-      }
+      },
+      "canonical_requirement_id": "LC-PRA-08",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T32"
+        }
+      ]
     }
-  ]
+  ],
+  "requirement_registry": {
+    "path": "runtime/audit/langchao_requirement_crosswalk_v1.json",
+    "sha256": "cb3b7f93cb3acb3ccdb0d6ee90b233c0c6969226f8a0e1e691910ba142fef7f3"
+  }
 }

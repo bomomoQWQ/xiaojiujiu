@@ -261,6 +261,7 @@ class GoalContract:
     updated_at: datetime
     wait_for_refs: tuple[str, ...] = ()
     resume_condition_refs: tuple[str, ...] = ()
+    completion_evidence_refs: tuple[str, ...] = ()
     matter_id: str | None = None
     parent_goal_id: str | None = None
     reward_contract_id: str | None = None
@@ -282,6 +283,7 @@ class GoalContract:
         _require_enum_tuple("allowed_candidate_kinds", self.allowed_candidate_kinds, CandidateKind, nonempty=True)
         _require_strings("wait_for_refs", self.wait_for_refs)
         _require_strings("resume_condition_refs", self.resume_condition_refs)
+        _require_strings("completion_evidence_refs", self.completion_evidence_refs)
         for name in ("matter_id", "parent_goal_id", "reward_contract_id"):
             _require_optional_text(name, getattr(self, name))
         if self.parent_goal_id == self.goal_id:
@@ -294,6 +296,13 @@ class GoalContract:
             raise ValueError("paused goals require resume_condition_refs")
         if self.status is not GoalStatus.PAUSED and self.resume_condition_refs:
             raise ValueError("only paused goals may carry resume_condition_refs")
+        if self.status is GoalStatus.COMPLETED:
+            if self.kind is not GoalKind.FINITE:
+                raise ValueError("only finite goals may transition to completed")
+            if not self.completion_evidence_refs:
+                raise ValueError("completed finite goals require actual completion evidence")
+        elif self.completion_evidence_refs:
+            raise ValueError("only completed goals may carry completion_evidence_refs")
         _require_time_order(self.created_at, self.updated_at)
         _require_int("revision", self.revision, minimum=1)
         _require_version("contract_version", self.contract_version, LANGCHAO_GOAL_CONTRACT_VERSION)
@@ -307,6 +316,7 @@ class GoalContract:
             "completion_outcome_keys": list(self.completion_outcome_keys),
             "allowed_candidate_kinds": [item.value for item in self.allowed_candidate_kinds],
             "wait_for_refs": list(self.wait_for_refs), "resume_condition_refs": list(self.resume_condition_refs),
+            "completion_evidence_refs": list(self.completion_evidence_refs),
             "matter_id": self.matter_id, "parent_goal_id": self.parent_goal_id,
             "reward_contract_id": self.reward_contract_id, "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(), "revision": self.revision,

@@ -16,6 +16,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from .decision_v2_audit import CandidateAssessment
+from .langchao_exploration import (
+    EXPLORATION_PROCESS_CAP,
+    EXPLORATION_PROCESS_VALUE,
+    ExplorationWorkSegment,
+)
 from .langchao_reward import AttentionProfile, CandidateCostTerm, OutcomeForecast, ValueProfile
 from .langchao_shadow import ShadowCandidateInput
 from .langchao_types import (
@@ -52,10 +57,13 @@ TEMPLATE_V1_REWARD_AMOUNTS = {
     # terminal send hook can settle explicitly.
     "delivery": 0.0,
     "local": 0.25,
+    "exploration_process": EXPLORATION_PROCESS_VALUE,
 }
 FIXED_VALUE_TOTAL = 8.0
 _ID_NAMESPACE = uuid.UUID("da6d1426-18e6-58e1-a7bc-cfa0bb59a54f")
-_TEMPLATE_KEYS = frozenset({"contact.v1", "expression.v1", "followup.v1", "internal_rest.v1"})
+_TEMPLATE_KEYS = frozenset({
+    "contact.v1", "expression.v1", "followup.v1", "internal_rest.v1", "exploration.v1",
+})
 
 
 def _text(name: str, value: str) -> str:
@@ -110,6 +118,7 @@ class RuntimeCandidateFacts:
     block_reasons: tuple[str, ...] = ()
     expression_delivered_policy: bool = False
     rest_realized_policy: bool = False
+    exploration_segment: ExplorationWorkSegment | None = None
     initial_goal_revision: int = 1
     reward_revision: int = 1
     bound_goal_revision: int = 2
@@ -142,6 +151,10 @@ class RuntimeCandidateFacts:
             raise ValueError("followup.v1 requires unfinished_id")
         if self.template_key == "internal_rest.v1" and not self.self_regulation_ref:
             raise ValueError("internal_rest.v1 requires self_regulation_ref")
+        if self.template_key == "exploration.v1" and self.exploration_segment is None:
+            raise ValueError("exploration.v1 requires exploration_segment")
+        if self.template_key != "exploration.v1" and self.exploration_segment is not None:
+            raise ValueError("exploration_segment is only valid for exploration.v1")
 
     @property
     def semantic_subject(self) -> str:
@@ -151,7 +164,9 @@ class RuntimeCandidateFacts:
             return self.memory_ref or self.social_ref or ""  # validated above
         if self.template_key == "followup.v1":
             return self.unfinished_id or ""
-        return self.self_regulation_ref or ""
+        if self.template_key == "internal_rest.v1":
+            return self.self_regulation_ref or ""
+        return self.exploration_segment.problem_ref if self.exploration_segment is not None else ""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -297,7 +312,9 @@ def _template_spec(facts: RuntimeCandidateFacts) -> tuple[CandidateKind, GoalKin
         return CandidateKind.EXTERNAL_MESSAGE, GoalKind.FINITE, MotivationDirection.EXPRESSION, "expression_delivered"
     if facts.template_key == "followup.v1":
         return CandidateKind.EXTERNAL_MESSAGE, GoalKind.FINITE, MotivationDirection.CARE, "unfinished_progress"
-    return CandidateKind.DEFER_OR_REST, GoalKind.CONTINUOUS_NEED, MotivationDirection.REST, "rest_realized"
+    if facts.template_key == "internal_rest.v1":
+        return CandidateKind.DEFER_OR_REST, GoalKind.CONTINUOUS_NEED, MotivationDirection.REST, "rest_realized"
+    return CandidateKind.INTERNAL_PROCESS, GoalKind.OPEN_ACTIVITY, MotivationDirection.EXPLORATION, "work_segment_completed"
 
 
 def _build_one(snapshot: RuntimeFactSnapshot, facts: RuntimeCandidateFacts, source: RuntimeCandidateInput,
@@ -313,7 +330,7 @@ def _build_one(snapshot: RuntimeFactSnapshot, facts: RuntimeCandidateFacts, sour
 
     tokens: list[OutcomeToken] = []
     forecasts: list[OutcomeForecast] = []
-    if facts.template_key != "internal_rest.v1":
+    if facts.template_key in {"contact.v1", "expression.v1", "followup.v1"}:
         if source.predictions is None:
             raise ValueError(f"{facts.template_key} requires PredictionSetV2")
         predicted = (
@@ -353,15 +370,22 @@ def _build_one(snapshot: RuntimeFactSnapshot, facts: RuntimeCandidateFacts, sour
 
     template_policy: tuple[tuple[str, float], ...] = ()
     local_policy = ((facts.template_key == "expression.v1" and facts.expression_delivered_policy) or
-                    (facts.template_key == "internal_rest.v1" and facts.rest_realized_policy))
+                    (facts.template_key == "internal_rest.v1" and facts.rest_realized_policy) or
+                    facts.template_key == "exploration.v1")
     has_local_outcome = local_policy or facts.template_key == "internal_rest.v1"
     if has_local_outcome:
         token_id = _stable_id("token", *identity, local_outcome)
+        local_amount = (TEMPLATE_V1_REWARD_AMOUNTS["exploration_process"]
+                        if facts.template_key == "exploration.v1"
+                        else TEMPLATE_V1_REWARD_AMOUNTS["local"])
+        local_evidence = ((facts.template_key,) if facts.exploration_segment is None else
+                          tuple(dict.fromkeys((facts.template_key, facts.exploration_segment.result_ref)
+                                              + facts.exploration_segment.evidence_refs)))
         tokens.append(OutcomeToken(token_id=token_id, scope_key=snapshot.scope_key, goal_id=goal_id,
             episode_id=episode_id, outcome_key=local_outcome, settlement_type=SettlementType.EXPECTED,
-            status=OutcomeStatus.UNEXECUTED, base_amount=TEMPLATE_V1_REWARD_AMOUNTS["local"], direction_weights=((direction, 1.0),),
+            status=OutcomeStatus.UNEXECUTED, base_amount=local_amount, direction_weights=((direction, 1.0),),
             evidence_version=TEMPLATE_REWARD_POLICY_VERSION,
-            idempotency_key=_stable_id("token-idempotency", *identity, local_outcome), evidence_refs=(facts.template_key,)))
+            idempotency_key=_stable_id("token-idempotency", *identity, local_outcome), evidence_refs=local_evidence))
         forecasts.append(OutcomeForecast(token_id=token_id, probability=None,
             support="template_policy" if local_policy else "unavailable",
             status="unknown", source_version=TEMPLATE_REWARD_POLICY_VERSION))
@@ -378,9 +402,11 @@ def _build_one(snapshot: RuntimeFactSnapshot, facts: RuntimeCandidateFacts, sour
         excluded_outcomes=("user_intent_inference",), completion_outcome_keys=completion,
         allowed_candidate_kinds=(kind,), matter_id=facts.unfinished_id, created_at=contract_at, updated_at=contract_at,
         revision=facts.initial_goal_revision)
+    reward_cap = (EXPLORATION_PROCESS_CAP if facts.template_key == "exploration.v1" else
+                  math.fsum(abs(token.base_amount) for token in tokens))
     reward = RewardContract(reward_contract_id=reward_id, scope_key=snapshot.scope_key, goal_id=goal_id,
         episode_id=episode_id, template_key=facts.template_key, unit="utility",
-        outcome_tokens=tuple(tokens), total_cap=math.fsum(abs(token.base_amount) for token in tokens),
+        outcome_tokens=tuple(tokens), total_cap=reward_cap,
         overlap_group=f"{facts.template_key}:{subject}", created_at=contract_at, updated_at=contract_at,
         revision=facts.reward_revision)
     # Goal1 -> reward -> goal2 uses distinct revisions allocated upstream.
@@ -393,7 +419,13 @@ def _build_one(snapshot: RuntimeFactSnapshot, facts: RuntimeCandidateFacts, sour
         precondition_refs=facts.precondition_refs, invalidation_refs=facts.invalidation_refs,
         # Legacy runtime candidate ids are provenance, not semantic contract data.
         # Keeping them out of the envelope makes identity and payload agree.
-        envelope=(("subject_ref", subject),),
+        envelope=(("subject_ref", subject),) if facts.exploration_segment is None else (
+            ("subject_ref", subject),
+            ("work_segment_id", facts.exploration_segment.segment_id),
+            ("result_kind", facts.exploration_segment.result_kind.value),
+            ("result_ref", facts.exploration_segment.result_ref),
+            ("records_progress", facts.exploration_segment.records_progress),
+        ),
         state=CandidateState.COMPETITIVE, available_from=advanced_at, expires_at=None, resource_budget=0.0,
         based_on_state_version=based_on_state_version, created_at=advanced_at, updated_at=advanced_at,
         # State version is an optimistic reference, not a semantic contract revision.

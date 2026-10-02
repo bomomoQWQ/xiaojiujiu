@@ -47,7 +47,12 @@
         }
       ],
       "blocker": "No candidate-level registry jointly validates an actual retrieval capability and a resolvable hash-bound artifact before claim/attempt. Capability leases and source refs are not an artifact witness.",
-      "claim_limit": "No T evidence is claimed until the artifact-witness contract exists."
+      "claim_limit": "No T evidence is claimed until the artifact-witness contract exists.",
+      "canonical_requirement_id": "LC-PRA-09",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T02"
+      }
     },
     {
       "id": "T03",
@@ -75,7 +80,12 @@
         }
       ],
       "blocker": null,
-      "claim_limit": "Proves the current shadow coordinator write surface and counters only; it does not prove every future prediction store is isolated."
+      "claim_limit": "Proves the current shadow coordinator write surface and counters only; it does not prove every future prediction store is isolated.",
+      "canonical_requirement_id": "LC-PRA-10",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T03"
+      }
     },
     {
       "id": "T05",
@@ -103,7 +113,12 @@
         }
       ],
       "blocker": null,
-      "claim_limit": "Proves DTO/build scope isolation at the named entrypoint, not every future retrieval query."
+      "claim_limit": "Proves DTO/build scope isolation at the named entrypoint, not every future retrieval query.",
+      "canonical_requirement_id": "LC-MAT-09",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T05"
+      }
     },
     {
       "id": "T08",
@@ -131,7 +146,12 @@
         }
       ],
       "blocker": null,
-      "claim_limit": "Proves internal live-commit settlement idempotency, not external platform exactly-once delivery."
+      "claim_limit": "Proves internal live-commit settlement idempotency, not external platform exactly-once delivery.",
+      "canonical_requirement_id": "LC-PRA-14",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T08"
+      }
     },
     {
       "id": "T10",
@@ -159,7 +179,12 @@
         }
       ],
       "blocker": null,
-      "claim_limit": "Proves the pure label settlement contract; no training repository integration is inferred."
+      "claim_limit": "Proves the pure label settlement contract; no training repository integration is inferred.",
+      "canonical_requirement_id": "LC-PRA-15",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T10"
+      }
     },
     {
       "id": "T12",
@@ -180,7 +205,12 @@
         }
       ],
       "blocker": "No single Langchao lifecycle API currently connects readiness, permission_version, claim/outbox creation, revocation, re-enable, and stale-decision invalidation. Legacy pre-send boundary tests cannot prove the no-backlog contract.",
-      "claim_limit": "No T evidence is claimed for the requested full lifecycle."
+      "claim_limit": "No T evidence is claimed for the requested full lifecycle.",
+      "canonical_requirement_id": "LC-AGY-06",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T12"
+      }
     },
     {
       "id": "T14",
@@ -209,7 +239,12 @@
         }
       ],
       "blocker": null,
-      "claim_limit": "Failure is terminally covered; unknown is evidenced only as a durable pending commit with no duplicate commit, not as a complete reconciliation policy."
+      "claim_limit": "Failure is terminally covered; unknown is evidenced only as a durable pending commit with no duplicate commit, not as a complete reconciliation policy.",
+      "canonical_requirement_id": "LC-PRA-16",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T14"
+      }
     },
     {
       "id": "T15",
@@ -230,7 +265,12 @@
         }
       ],
       "blocker": "The four reasons are emitted by different layers and representations; no first-class unified audit taxonomy/result object exists. Running four unrelated tests would be proxy evidence and is intentionally refused.",
-      "claim_limit": "No unified-taxonomy T evidence is claimed."
+      "claim_limit": "No unified-taxonomy T evidence is claimed.",
+      "canonical_requirement_id": "LC-CON-05",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T15"
+      }
     },
     {
       "id": "T16",
@@ -251,7 +291,12 @@
         }
       ],
       "blocker": "Existing revoke/reactivate primitives do not expose a single same-scope allow/deny event projection with occurred_at ordering bound to Langchao permission_version. Upsert-order tests cannot substitute for this contract.",
-      "claim_limit": "No T evidence is claimed for temporal successor semantics."
+      "claim_limit": "No T evidence is claimed for temporal successor semantics.",
+      "canonical_requirement_id": "LC-AGY-07",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T16"
+      }
     },
     {
       "id": "T20",
@@ -280,7 +325,12 @@
         }
       ],
       "blocker": null,
-      "claim_limit": "Proves the isolated repository contract with a deterministic connection double; real PostgreSQL evidence remains separate."
+      "claim_limit": "Proves the isolated repository contract with a deterministic connection double; real PostgreSQL evidence remains separate.",
+      "canonical_requirement_id": "LC-HIS-09",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T20"
+      }
     }
   ],
   "claim_limits": [

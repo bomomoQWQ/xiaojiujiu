@@ -2,7 +2,18 @@
   "schema_version": "langchao.prelaunch-structural-scenarios.v1",
   "result_schema": "runtime/audit/prelaunch_structural_result_v1.schema.json",
   "test_module": "runtime/tests/test_prelaunch_structural_scenarios.py",
-  "scenario_ids": ["T02", "T03", "T05", "T08", "T10", "T12", "T14", "T15", "T16", "T20"],
+  "scenario_ids": [
+    "LC-PRA-09",
+    "LC-PRA-10",
+    "LC-MAT-09",
+    "LC-PRA-14",
+    "LC-PRA-15",
+    "LC-AGY-06",
+    "LC-PRA-16",
+    "LC-CON-05",
+    "LC-AGY-07",
+    "LC-HIS-09"
+  ],
   "status_policy": {
     "passed_limited": "All registered pytest nodes executed successfully; claims remain limited to the named structural component.",
     "failed": "At least one registered executable assertion failed or the runner itself could not execute it.",
@@ -16,7 +27,12 @@
       "fault_injection": "Remove the hash-bound artifact while retaining the declared capability.",
       "pytest_nodes": [],
       "blocked_reason": "No candidate-level registry jointly validates an actual retrieval capability and a resolvable hash-bound artifact before claim/attempt. Capability leases and source refs are not an artifact witness.",
-      "claim_limit": "No T evidence is claimed until the artifact-witness contract exists."
+      "claim_limit": "No T evidence is claimed until the artifact-witness contract exists.",
+      "canonical_requirement_id": "LC-PRA-09",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T02"
+      }
     },
     {
       "id": "T03",
@@ -27,7 +43,12 @@
         "tests/test_prelaunch_structural_scenarios.py::test_t03_shadow_positive_rehearsal_has_zero_protected_writes"
       ],
       "blocked_reason": null,
-      "claim_limit": "Proves the current shadow coordinator write surface and counters only; it does not prove every future prediction store is isolated."
+      "claim_limit": "Proves the current shadow coordinator write surface and counters only; it does not prove every future prediction store is isolated.",
+      "canonical_requirement_id": "LC-PRA-10",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T03"
+      }
     },
     {
       "id": "T05",
@@ -38,7 +59,12 @@
         "tests/test_prelaunch_structural_scenarios.py::test_t05_scope_isolation_rejects_cross_user_source"
       ],
       "blocked_reason": null,
-      "claim_limit": "Proves DTO/build scope isolation at the named entrypoint, not every future retrieval query."
+      "claim_limit": "Proves DTO/build scope isolation at the named entrypoint, not every future retrieval query.",
+      "canonical_requirement_id": "LC-MAT-09",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T05"
+      }
     },
     {
       "id": "T08",
@@ -49,7 +75,12 @@
         "tests/test_prelaunch_structural_scenarios.py::test_t08_duplicate_ack_settles_delivery_once_only"
       ],
       "blocked_reason": null,
-      "claim_limit": "Proves internal live-commit settlement idempotency, not external platform exactly-once delivery."
+      "claim_limit": "Proves internal live-commit settlement idempotency, not external platform exactly-once delivery.",
+      "canonical_requirement_id": "LC-PRA-14",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T08"
+      }
     },
     {
       "id": "T10",
@@ -60,7 +91,12 @@
         "tests/test_prelaunch_structural_scenarios.py::test_t10_censored_window_never_becomes_negative"
       ],
       "blocked_reason": null,
-      "claim_limit": "Proves the pure label settlement contract; no training repository integration is inferred."
+      "claim_limit": "Proves the pure label settlement contract; no training repository integration is inferred.",
+      "canonical_requirement_id": "LC-PRA-15",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T10"
+      }
     },
     {
       "id": "T12",
@@ -69,7 +105,12 @@
       "fault_injection": "Revoke permission after high readiness, then re-allow and check no old decision is dispatched.",
       "pytest_nodes": [],
       "blocked_reason": "No single Langchao lifecycle API currently connects readiness, permission_version, claim/outbox creation, revocation, re-enable, and stale-decision invalidation. Legacy pre-send boundary tests cannot prove the no-backlog contract.",
-      "claim_limit": "No T evidence is claimed for the requested full lifecycle."
+      "claim_limit": "No T evidence is claimed for the requested full lifecycle.",
+      "canonical_requirement_id": "LC-AGY-06",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T12"
+      }
     },
     {
       "id": "T14",
@@ -81,7 +122,12 @@
         "tests/test_prelaunch_structural_scenarios.py::test_t14_unknown_ack_remains_pending_without_second_commit"
       ],
       "blocked_reason": null,
-      "claim_limit": "Failure is terminally covered; unknown is evidenced only as a durable pending commit with no duplicate commit, not as a complete reconciliation policy."
+      "claim_limit": "Failure is terminally covered; unknown is evidenced only as a durable pending commit with no duplicate commit, not as a complete reconciliation policy.",
+      "canonical_requirement_id": "LC-PRA-16",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T14"
+      }
     },
     {
       "id": "T15",
@@ -90,7 +136,12 @@
       "fault_injection": "Hold other inputs fixed while selecting no-candidate, competition defer, permission denial, or delivery failure.",
       "pytest_nodes": [],
       "blocked_reason": "The four reasons are emitted by different layers and representations; no first-class unified audit taxonomy/result object exists. Running four unrelated tests would be proxy evidence and is intentionally refused.",
-      "claim_limit": "No unified-taxonomy T evidence is claimed."
+      "claim_limit": "No unified-taxonomy T evidence is claimed.",
+      "canonical_requirement_id": "LC-CON-05",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T15"
+      }
     },
     {
       "id": "T16",
@@ -99,7 +150,12 @@
       "fault_injection": "Deliver allow and deny histories in opposite order, including reverse ingestion order.",
       "pytest_nodes": [],
       "blocked_reason": "Existing revoke/reactivate primitives do not expose a single same-scope allow/deny event projection with occurred_at ordering bound to Langchao permission_version. Upsert-order tests cannot substitute for this contract.",
-      "claim_limit": "No T evidence is claimed for temporal successor semantics."
+      "claim_limit": "No T evidence is claimed for temporal successor semantics.",
+      "canonical_requirement_id": "LC-AGY-07",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T16"
+      }
     },
     {
       "id": "T20",
@@ -111,7 +167,12 @@
         "tests/test_prelaunch_structural_scenarios.py::test_t20_deleted_source_discards_stale_proposal"
       ],
       "blocked_reason": null,
-      "claim_limit": "Proves the isolated repository contract with a deterministic connection double; real PostgreSQL evidence remains separate."
+      "claim_limit": "Proves the isolated repository contract with a deterministic connection double; real PostgreSQL evidence remains separate.",
+      "canonical_requirement_id": "LC-HIS-09",
+      "legacy_alias": {
+        "namespace": "attachment-review-v1",
+        "id": "T20"
+      }
     }
   ]
 }

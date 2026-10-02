@@ -86,6 +86,8 @@
       "additionalProperties": false,
       "required": [
         "id",
+        "canonical_requirement_id",
+        "legacy_alias",
         "title",
         "status",
         "component",
@@ -101,6 +103,15 @@
       ],
       "properties": {
         "id": {"enum": ["T02", "T03", "T05", "T08", "T10", "T12", "T14", "T15", "T16", "T20"]},
+        "canonical_requirement_id": {"type": "string", "pattern": "^LC-(?:MAT|PRA|CON|HIS|PUR|VER|AGY)-[0-9]{2}$"},
+        "legacy_alias": {
+          "type": "object", "additionalProperties": false,
+          "required": ["namespace", "id"],
+          "properties": {
+            "namespace": {"type": "string", "minLength": 1},
+            "id": {"pattern": "^T(?:0[1-9]|[12][0-9]|3[0-2])$"}
+          }
+        },
         "title": {"type": "string", "minLength": 1},
         "status": {"enum": ["passed_limited", "failed", "blocked"]},
         "component": {"type": "string", "minLength": 1},

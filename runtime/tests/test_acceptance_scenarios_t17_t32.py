@@ -82,7 +82,10 @@ def test_manifest_has_exact_contiguous_scenarios_and_review_facets() -> None:
     manifest = _manifest()
     scenarios = manifest["scenarios"]
     assert [item["id"] for item in scenarios] == [f"T{number}" for number in range(17, 33)]
+    assert len({item["canonical_requirement_id"] for item in scenarios}) == 16
     for item in scenarios:
+        assert item["canonical_requirement_id"].startswith("LC-")
+        assert item["legacy_aliases"]
         assert item["phase"]
         assert item["fixture"]["status"] in {"executable", "partial", "planned"}
         assert item["mechanical"]["status"] in {"executable", "partial", "planned"}

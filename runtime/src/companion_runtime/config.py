@@ -485,6 +485,9 @@ class LangchaoConfig:
 
     shadow_enabled: bool = False
     live_enabled: bool = False
+    # Mechanical legacy-projection -> social projection refresh. Disabled by default;
+    # it never requires or invokes a semantic/generative model.
+    social_enabled: bool = False
     live_scope_allowlist: list[str] = field(default_factory=list)
 
     def live_allowed(self, scope_key: str) -> bool:

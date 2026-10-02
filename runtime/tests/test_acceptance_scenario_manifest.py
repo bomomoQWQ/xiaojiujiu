@@ -120,7 +120,11 @@ def test_t01_t16_manifest_has_reviewable_nonempty_contracts() -> None:
     scenarios = payload["scenarios"]
     assert isinstance(scenarios, list)
     assert [item["id"] for item in scenarios] == [f"T{index:02d}" for index in range(1, 17)]
+    assert len({item["canonical_requirement_id"] for item in scenarios}) == 16
+    assert all(item["legacy_aliases"] for item in scenarios)
     required = {
+        "canonical_requirement_id",
+        "legacy_aliases",
         "fixture_data",
         "entrypoints",
         "mechanical_assertions",

@@ -742,6 +742,26 @@ class LangchaoSocialRepository:
             (next_revision, event_id, self.scope_key, item_key, revision),
         )
 
+    def is_active_item_ref(self, *, item_key: str, revision: int, digest: str) -> bool:
+        """Revalidate an exact social item against the current active head."""
+        row = self.connection.execute(
+            """SELECT i.payload_sha256, i.status FROM langchao_social_projection_heads AS h
+               JOIN langchao_social_items AS i ON i.scope_key = h.scope_key
+                AND i.item_key = h.item_key AND i.revision = h.item_revision
+               WHERE h.scope_key = %s AND h.item_key = %s AND h.item_revision = %s""",
+            (self.scope_key, item_key, revision),
+        ).fetchone()
+        return bool(row is not None and str(_value(row, "payload_sha256")) == digest
+                    and str(_value(row, "status")) == SocialItemStatus.ACTIVE.value)
+
+    def get_projection_pointer_version(self) -> int:
+        """Return the current scope pointer without creating projection state."""
+        row = self.connection.execute(
+            """SELECT pointer_version FROM langchao_social_projection_state
+               WHERE scope_key = %s""", (self.scope_key,),
+        ).fetchone()
+        return 0 if row is None else int(_value(row, "pointer_version"))
+
     def get_active_projection(self, *, limit: int = 100) -> tuple[Any, ...]:
         """Return a bounded active projection; invalidated/tombstoned rows are excluded."""
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
