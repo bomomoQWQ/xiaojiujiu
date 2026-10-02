@@ -195,7 +195,7 @@ class PostgresUserModelV2ServiceRepository:
         ):
             raise ValueError("prepared exposure components must share one scope")
         legacy_exposure_id = prepared.exposure.exposure_id
-        from .user_model_v2_service import canonical_exposure_id
+        from .exposure_identity import canonical_exposure_id
 
         storage_exposure_id = canonical_exposure_id(scope_key, legacy_exposure_id)
         if storage_exposure_id != legacy_exposure_id:
