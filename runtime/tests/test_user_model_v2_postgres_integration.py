@@ -434,7 +434,7 @@ def _langchao_committed_snapshot(*, scope: str, candidate: CandidateV2, receipt,
             negative=prediction(Target.NEGATIVE),
         ),
         cold_start_exploration=False,
-        audit={"audit_contract_version": "integration-test", "name": "濞搭亝鐤?},
+        audit={"audit_contract_version": "integration-test", "name": "langchao"},
         attempt_id=receipt.attempt_id,
         render_outbox_id=receipt.render_outbox_id,
         committed_at=now,
@@ -490,7 +490,7 @@ def test_shared_runtime_database_commit_is_atomic_on_real_postgres(outcome: str)
             callback_statuses.append(raw.info.transaction_status)
             composition.audit_repository.save_decision_audit(
                 decision_id=decision_id,
-                audit={"audit_contract_version": "integration-test", "name": "濞搭亝鐤?},
+                audit={"audit_contract_version": "integration-test", "name": "langchao"},
             )
             if outcome == "snapshot_sql_failure":
                 raw.execute(
