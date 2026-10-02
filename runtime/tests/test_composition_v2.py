@@ -123,7 +123,10 @@ def test_factory_builds_v2_graph_from_injected_protocols_and_reports_health() ->
     assert composition.coordinator.legacy is legacy
     assert composition.coordinator.repository is runtime_repository
     assert composition.coordinator.user_model is composition.user_model_service
+    assert composition.witness_repository.connection is database.connection
+    assert composition.witness_repository.scope_key == "user:42/channel:direct"
     assert composition.goal_lifecycle_service is not None
+    assert composition.coordinator.goal_lifecycle_service is composition.goal_lifecycle_service
     assert not hasattr(composition.goal_lifecycle_service, "outbox")
     assert not hasattr(composition.goal_lifecycle_service, "create_dispatch_claim")
     config_defaults = RuntimeConfig()
@@ -176,6 +179,33 @@ def test_active_shadow_authority_composes_shadow_runner_without_feature_switch(m
     assert composition.langchao_shadow_runner is runner
     assert composition.authority_round_router.langchao_shadow_runner is runner
     assert len(calls) == 1 and calls[0]["scope_key"] == "scope"
+
+
+def test_factory_wires_same_witness_reader_to_reducer_and_live(monkeypatch) -> None:
+    readers = []
+    reducer = SimpleNamespace(set_witness_reader=lambda value: readers.append(value))
+    legacy = DummyLegacyBridge()
+    legacy.runtime = SimpleNamespace(reducer=reducer)
+    config = configured()
+    config.langchao.live_enabled = True
+    config.langchao.live_scope_allowlist = ["scope"]
+    runner = SimpleNamespace(repository=object())
+    calls = []
+
+    import companion_runtime.langchao_live_wiring as wiring
+    monkeypatch.setattr(
+        wiring, "build_langchao_live_runner",
+        lambda **kwargs: calls.append(kwargs) or runner,
+    )
+    composition = build_v2_composition(
+        config, scope_key="scope", legacy_bridge=legacy,  # type: ignore[arg-type]
+        runtime_repository=DummyRuntimeRepository(),  # type: ignore[arg-type]
+        database=FakeDatabase(), service_repository_factory=FakeServiceRepository,
+        prediction_repository_factory=FakePredictionRepository,
+        authority_repository_factory=FakeAuthorityRepository,
+    )
+    assert readers == [composition.witness_repository]
+    assert calls[0]["witness_reader"] is composition.witness_repository
 
 
 def test_factory_rejects_non_postgres_before_constructing_any_dependency() -> None:

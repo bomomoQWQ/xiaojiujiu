@@ -76,7 +76,12 @@ class LangchaoUserOutcomeSettler:
                     status=OutcomeStatus.CORRECTED,
                     corrects_token_id=corrects_token_id,
                 )
-            self.live_repository.outcomes.put_outcome_revision(
+            put_revision = getattr(
+                self.live_repository.outcomes,
+                "put_outcome_revision_in_transaction",
+                self.live_repository.outcomes.put_outcome_revision,
+            )
+            put_revision(
                 token,
                 revision=1,
                 reward_contract_id=commit.reward_contract_id,

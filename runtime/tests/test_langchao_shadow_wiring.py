@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from companion_runtime.capability_witness import (
+    ArtifactStatus,
+    ArtifactWitness,
+    InMemoryWitnessRegistry,
+    TaskStatus,
+    WitnessValidationError,
+)
 from companion_runtime.config import RuntimeConfig
 from companion_runtime.langchao_shadow_wiring import (
     LangchaoShadowRunner,
@@ -33,27 +44,97 @@ def test_attention_recipe_b3_requires_exact_scope_allowlist_and_invalid_fails_cl
         config.langchao.attention_recipe_for_scope("scope")
 
 
-def test_runtime_fact_builder_emits_only_explicit_completed_internal_exploration():
-    from dataclasses import replace
+HASH = "a" * 64
+SCOPE = "scope"
 
+
+def _exploration_action(*, result_kind="artifact", artifact_type="exploration_artifact"):
+    refs = ("issue:parser", f"artifact:sha256:{HASH}")
     action = {
         "type": "internal_exploration", "internal": True, "segment_completed": True,
         "segment_id": "segment:parser", "problem_ref": "issue:parser",
         "question": "Which parser preserves offsets?",
         "executable_steps": ["run A", "run B", "compare"],
-        "result_kind": "artifact", "result_ref": "artifact:comparison.json",
-        "evidence_refs": ["issue:parser", "artifact:comparison.json"],
-        "elapsed_seconds": 999999,
+        "result_kind": result_kind, "result_ref": f"artifact:sha256:{HASH}",
+        "evidence_refs": list(refs), "elapsed_seconds": 999999,
+        "exploration_witness": {
+            "capability": "bounded_exploration", "operation": "internal_exploration",
+            "task_run_id": "task:parser", "artifact_sha256": HASH,
+            "artifact_type": artifact_type, "source_refs": list(refs),
+        },
     }
+    return action
+
+
+def _exploration_registry(*, artifact_type="exploration_artifact", scope=SCOPE):
+    refs = ("issue:parser", f"artifact:sha256:{HASH}")
+    return InMemoryWitnessRegistry(ArtifactWitness(
+        witness_id="witness:parser", scope_key=scope,
+        capability="bounded_exploration", operation="internal_exploration",
+        task_run_id="task:parser", task_status=TaskStatus.SUCCEEDED,
+        artifact_sha256=HASH, artifact_type=artifact_type,
+        artifact_status=ArtifactStatus.ACTIVE,
+        created_at=datetime(2026, 10, 2, tzinfo=timezone.utc), source_refs=refs,
+    ))
+
+
+def _exploration_decision(action):
     decision = _decision("explore", "internal_exploration")
-    decision = replace(decision, candidate=replace(decision.candidate, action=action))
-    built = _facts_for(decision)
+    return replace(decision, candidate=replace(decision.candidate, action=action))
+
+
+def test_runtime_fact_builder_emits_only_registry_verified_internal_exploration():
+    decision = _exploration_decision(_exploration_action())
+    built = _facts_for(
+        decision, scope_key=SCOPE, witness_reader=_exploration_registry(),
+    )
     assert built is not None and built.template_key == "exploration.v1"
     assert built.capability_refs == ()
     assert built.exploration_segment.segment_id == "segment:parser"
     assert not hasattr(built.exploration_segment, "elapsed_seconds")
     assert _facts_for(decision, internal_exploration_enabled=False) is None
     assert _facts_for(_decision("vague", "exploration_work_segment")) is None
+
+
+def test_forged_exploration_action_fields_are_rejected_without_local_reward():
+    decision = _exploration_decision(_exploration_action())
+    with pytest.raises(WitnessValidationError, match="trusted witness reader"):
+        _facts_for(decision, scope_key=SCOPE)
+
+    forged = _exploration_action()
+    forged["result_ref"] = "artifact:sha256:" + "b" * 64
+    with pytest.raises(WitnessValidationError, match="result reference"):
+        _facts_for(
+            _exploration_decision(forged), scope_key=SCOPE,
+            witness_reader=_exploration_registry(),
+        )
+
+    forged = _exploration_action()
+    forged["evidence_refs"] = ["issue:parser", forged["result_ref"], "invented:evidence"]
+    with pytest.raises(WitnessValidationError, match="evidence"):
+        _facts_for(
+            _exploration_decision(forged), scope_key=SCOPE,
+            witness_reader=_exploration_registry(),
+        )
+
+
+def test_no_conclusion_requires_real_work_segment_record_witness():
+    action = _exploration_action(
+        result_kind="no_conclusion", artifact_type="exploration_work_segment",
+    )
+    decision = _exploration_decision(action)
+    built = _facts_for(
+        decision, scope_key=SCOPE,
+        witness_reader=_exploration_registry(artifact_type="exploration_work_segment"),
+    )
+    assert built is not None
+    assert built.exploration_segment.records_progress is False
+
+    with pytest.raises(WitnessValidationError, match="artifact type|result kind"):
+        _facts_for(
+            decision, scope_key=SCOPE,
+            witness_reader=_exploration_registry(artifact_type="exploration_artifact"),
+        )
 
 
 def test_fixed_template_mapping_drops_unreferenced_expression_and_followup():

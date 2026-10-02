@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime
 from typing import Any, Mapping, Sequence
 from uuid import NAMESPACE_URL, uuid5
@@ -30,6 +31,9 @@ from .user_model_v2_labels import TargetObservationV2
 from .exposure_identity import canonical_exposure_id
 from .user_model_v2_types import Target
 from .utility import ensure_aware, utcnow
+
+
+LOGGER = logging.getLogger("companion_runtime.legacy_bridge_v2")
 
 
 class ConcreteLegacyRuntimeV2Bridge:
@@ -126,14 +130,36 @@ class ConcreteLegacyRuntimeV2Bridge:
         )
 
     def candidates(self, *, scope_key: str, now: datetime) -> Sequence[CandidateV2]:
+        """Supply candidates after refreshing optional social facts for this round.
+
+        This adapter is the common candidate-supply boundary used by direct coordinator
+        calls, the authority router, HTTP simulation, and the CLI scheduler.  Keeping
+        refresh here prevents any entry point from observing social refs left over from
+        a previous round.  A failed optional refresh disables social enrichment for the
+        current supply only; ordinary candidates remain available.
+        """
+
         del scope_key
+        social_service = self.social_service
+        social_available = social_service is not None
+        if social_service is not None:
+            try:
+                social_service.refresh(now=now)
+            except Exception:  # noqa: BLE001 - optional enrichment fails closed
+                LOGGER.exception(
+                    "Social snapshot refresh failed; supplying candidates without social refs"
+                )
+                social_available = False
         legacy = self.runtime.projections.candidates.list_active(
             limit=self.runtime.config.candidate.max_active
         )
         if not legacy:
             legacy = self.runtime.refresh_candidates_for_v2(now=now)
         self._legacy_candidates = {item.candidate_id: item for item in legacy}
-        return tuple(self._candidate(item) for item in legacy)
+        return tuple(
+            self._candidate(item, include_social=social_available)
+            for item in legacy
+        )
 
     def boundary_verdict(
         self, *, candidate: CandidateV2, scope_key: str, now: datetime
@@ -386,7 +412,12 @@ class ConcreteLegacyRuntimeV2Bridge:
             raise KeyError(f"unknown legacy candidate: {candidate_id}")
         return item
 
-    def _candidate(self, item: CandidateIntent) -> CandidateV2:
+    def _candidate(
+        self,
+        item: CandidateIntent,
+        *,
+        include_social: bool = True,
+    ) -> CandidateV2:
         action = {
             "type": item.type,
             "intent": item.intent,
@@ -398,7 +429,7 @@ class ConcreteLegacyRuntimeV2Bridge:
             "emotional_expression": item.type in {"share", "emotional_expression"},
             "topic_shift": item.type == "curious_question",
         }
-        if self.social_service is not None:
+        if include_social and self.social_service is not None:
             action.update(self.social_service.candidate_refs(item.sources))
         concern = next(
             (

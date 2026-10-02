@@ -8,9 +8,10 @@ this protocol directly or translate its existing SQL operations to these records
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Any, Callable, Iterable, Mapping, Protocol
+from typing import Any, Callable, ContextManager, Iterable, Mapping, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
 import numpy as np
@@ -109,6 +110,8 @@ class UserModelV2ServiceRepository(Protocol):
         expected_revision: int,
         idempotency_key: str,
     ) -> bool: ...
+
+    def settlement_transaction(self) -> ContextManager[Any]: ...
 
     def list_active_training_records(
         self, *, scope_key: str, target: Target
@@ -213,69 +216,78 @@ class UserModelV2Service:
         context: SettlementContextV2,
         target: Target | None = None,
     ) -> tuple[TargetLabelV2, ...]:
-        """Generate label revisions with pure settlement and activate them by repository CAS."""
+        """Atomically activate labels and publish their observed outcome revisions.
 
-        materialized = tuple(observations)
-        targets = (target,) if target is not None else tuple(Target)
-        results: list[TargetLabelV2] = []
-        pending_by_target = {label.target: label for label in prepared.labels}
-        for current_target in targets:
-            active = self.repository.get_active_label(
-                scope_key=prepared.exposure.scope_key,
-                exposure_id=prepared.exposure.exposure_id,
-                target=current_target,
-            )
-            current, current_revision = (
-                active if active is not None else (pending_by_target[current_target], 1)
-            )
-            target_exposure = replace(
-                prepared.exposure,
-                window_ends_at=current.window_ends_at,
-                horizon_seconds=current.horizon_seconds,
-            )
-            candidate = settle_target_label(
-                target_exposure,
-                current_target,
-                materialized,
-                context,
-                label_id=current.label_id,
-            )
-            revision = next_label_revision(
-                current, candidate, current_revision=current_revision
-            )
-            if revision == current_revision:
-                results.append(current)
-                continue
-            candidate = replace(
-                candidate,
-                label_id=_stable_label_id(
-                    candidate.scope_key, candidate.exposure_id, candidate.target, revision
-                ),
-            )
-            activated = self.repository.compare_and_swap_active_label(
-                label=candidate,
-                revision=revision,
-                expected_revision=current_revision,
-                idempotency_key=settlement_key(
-                    candidate.scope_key, candidate.exposure_id, candidate.target, revision
-                ),
-            )
-            if not activated:
-                winner = self.repository.get_active_label(
-                    scope_key=candidate.scope_key,
-                    exposure_id=candidate.exposure_id,
-                    target=candidate.target,
+        The service repository owns the transaction boundary.  Outcome observers wired to
+        the same PostgreSQL connection therefore participate in that one transaction: an
+        observer failure rolls back both the label revision/active pointer and every
+        OutcomeToken revision/active pointer it attempted to write.
+        """
+
+        transaction = getattr(self.repository, "settlement_transaction", None)
+        owner = transaction() if transaction is not None else nullcontext()
+        with owner:
+            materialized = tuple(observations)
+            targets = (target,) if target is not None else tuple(Target)
+            results: list[TargetLabelV2] = []
+            pending_by_target = {label.target: label for label in prepared.labels}
+            for current_target in targets:
+                active = self.repository.get_active_label(
+                    scope_key=prepared.exposure.scope_key,
+                    exposure_id=prepared.exposure.exposure_id,
+                    target=current_target,
                 )
-                if winner is None or next_label_revision(
-                    winner[0], candidate, current_revision=winner[1]
-                ) != winner[1]:
-                    raise RuntimeError("active-label CAS lost to a different revision")
-                candidate = winner[0]
-            results.append(candidate)
-        settled = tuple(results)
-        if self.outcome_observer is not None:
-            self.outcome_observer.settle_labels(settled)
-        return settled
+                current, current_revision = (
+                    active if active is not None else (pending_by_target[current_target], 1)
+                )
+                target_exposure = replace(
+                    prepared.exposure,
+                    window_ends_at=current.window_ends_at,
+                    horizon_seconds=current.horizon_seconds,
+                )
+                candidate = settle_target_label(
+                    target_exposure,
+                    current_target,
+                    materialized,
+                    context,
+                    label_id=current.label_id,
+                )
+                revision = next_label_revision(
+                    current, candidate, current_revision=current_revision
+                )
+                if revision == current_revision:
+                    results.append(current)
+                    continue
+                candidate = replace(
+                    candidate,
+                    label_id=_stable_label_id(
+                        candidate.scope_key, candidate.exposure_id, candidate.target, revision
+                    ),
+                )
+                activated = self.repository.compare_and_swap_active_label(
+                    label=candidate,
+                    revision=revision,
+                    expected_revision=current_revision,
+                    idempotency_key=settlement_key(
+                        candidate.scope_key, candidate.exposure_id, candidate.target, revision
+                    ),
+                )
+                if not activated:
+                    winner = self.repository.get_active_label(
+                        scope_key=candidate.scope_key,
+                        exposure_id=candidate.exposure_id,
+                        target=candidate.target,
+                    )
+                    if winner is None or next_label_revision(
+                        winner[0], candidate, current_revision=winner[1]
+                    ) != winner[1]:
+                        raise RuntimeError("active-label CAS lost to a different revision")
+                    candidate = winner[0]
+                results.append(candidate)
+            settled = tuple(results)
+            if self.outcome_observer is not None:
+                self.outcome_observer.settle_labels(settled)
+            return settled
 
     def build_fit_dataset(
         self,

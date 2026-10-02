@@ -99,7 +99,7 @@ class LangchaoLiveRepository:
                WHERE a.scope_key=%s AND a.exposure_id=%s AND a.target_name=%s""",
             (self.scope_key, exposure_id, target_name),
         ).fetchone()
-        return None if row is None else int(row["revision"] if isinstance(row, Mapping) else row[0])
+        return None if row is None else int(row["pointer_version"] if isinstance(row, Mapping) else row[0])
 
     def pending(self) -> tuple[LangchaoLiveCommit, ...]:
         rows = self.connection.execute(

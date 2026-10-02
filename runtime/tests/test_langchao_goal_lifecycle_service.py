@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from copy import deepcopy
 from datetime import timedelta
 
 import pytest
@@ -10,6 +12,7 @@ from companion_runtime.langchao_goal_lifecycle_service import (
     LangchaoGoalLifecycleService,
 )
 from companion_runtime.langchao_types import GoalStatus
+from companion_runtime.runtime_v2 import V2RuntimeCoordinator
 from test_pf011_goal_lifecycle import LATER, candidate, goal, outcome
 
 
@@ -36,6 +39,28 @@ class Contracts:
         self.active_candidates[candidate_id] = (revision, expected_pointer_version + 1); return True
 
 
+class TransactionalContracts(Contracts):
+    def __init__(self, *, fail_candidate=False):
+        super().__init__()
+        self.fail_candidate = fail_candidate
+        self.transaction_entries = 0
+
+    @contextmanager
+    def transaction(self):
+        self.transaction_entries += 1
+        before = deepcopy((self.goals, self.candidates, self.active_goals, self.active_candidates))
+        try:
+            yield
+        except BaseException:
+            self.goals, self.candidates, self.active_goals, self.active_candidates = before
+            raise
+
+    def put_candidate_revision(self, dto):
+        if self.fail_candidate:
+            raise RuntimeError("candidate insert failed")
+        super().put_candidate_revision(dto)
+
+
 def test_explicit_completion_and_cancellation_events_call_lifecycle_without_outbox_or_claim():
     contracts = Contracts()
     matter_events = []
@@ -58,6 +83,77 @@ def test_explicit_completion_and_cancellation_events_call_lifecycle_without_outb
     assert cancelled.completion_tokens == ()
     assert matter_events[-1][1] == "cancelled"
     assert contracts.outbox == [] and contracts.claims == []
+
+
+def test_terminal_transition_failure_rolls_back_goal_candidate_pointers_and_matter():
+    contracts = TransactionalContracts(fail_candidate=True)
+    matter_events = []
+    service = LangchaoGoalLifecycleService(
+        contract_repository=contracts,
+        matter_transition=lambda matter_id, status, at: matter_events.append((matter_id, status, at)),
+    )
+
+    with pytest.raises(RuntimeError, match="candidate insert failed"):
+        service.apply_terminal_event(
+            GoalLifecycleEvent(kind="completed", occurred_at=LATER, actual_outcomes=(outcome(),)),
+            goal=goal(), candidates=(candidate(),),
+        )
+
+    assert contracts.transaction_entries == 1
+    assert contracts.goals == {}
+    assert contracts.candidates == {}
+    assert contracts.active_goals == {}
+    assert contracts.active_candidates == {}
+    assert matter_events == []
+
+
+def test_matter_transition_failure_rolls_back_all_contract_writes():
+    contracts = TransactionalContracts()
+    service = LangchaoGoalLifecycleService(
+        contract_repository=contracts,
+        matter_transition=lambda *_args: (_ for _ in ()).throw(RuntimeError("matter update failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="matter update failed"):
+        service.apply_terminal_event(
+            GoalLifecycleEvent(kind="completed", occurred_at=LATER, actual_outcomes=(outcome(),)),
+            goal=goal(), candidates=(candidate(),),
+        )
+
+    assert contracts.goals == {}
+    assert contracts.candidates == {}
+    assert contracts.active_goals == {}
+    assert contracts.active_candidates == {}
+
+
+def test_runtime_producer_calls_service_only_for_explicit_terminal_evidence():
+    calls = []
+
+    class Service:
+        def apply_terminal_event(self, event, *, goal, candidates):
+            calls.append((event, goal, candidates))
+            return "transition"
+
+    coordinator = object.__new__(V2RuntimeCoordinator)
+    coordinator.goal_lifecycle_service = Service()
+    current_goal = goal()
+    current_candidates = (candidate(),)
+
+    assert coordinator.produce_goal_terminal_event(
+        evidence={"kind": "summary", "occurred_at": LATER, "summary": "all done"},
+        goal=current_goal, candidates=current_candidates,
+    ) is None
+    assert calls == []
+    assert coordinator.produce_goal_terminal_event(
+        evidence={
+            "kind": "completed", "occurred_at": LATER,
+            "actual_outcomes": (outcome(),), "summary": "ignored",
+        },
+        goal=current_goal, candidates=current_candidates,
+    ) == "transition"
+    assert calls[0][0].kind == "completed"
+    assert calls[0][0].actual_outcomes == (outcome(),)
+    assert calls[0][1:] == (current_goal, current_candidates)
 
 
 def test_old_summary_cannot_reopen_through_service_and_elapsed_time_has_no_completion_gain():

@@ -131,50 +131,65 @@ class UserModelV2Repository:
         expected_pointer_version: int | None, idempotency_key: str | None = None,
     ) -> bool:
         """Atomically append the next label revision and CAS its active pointer."""
-        scope_key = _require_scope(scope_key)
         with self._transaction():
-            # Row locks cannot lock an absent pointer.  The scoped advisory lock
-            # serialises first activation too, while keeping the lock key bound.
-            self.connection.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                (f"label:{scope_key}:{exposure_id}:{target_name}",),
-            )
-            current = self.connection.execute(
-                """SELECT target_label_id, pointer_version
-                   FROM user_model_active_labels_v2
-                   WHERE scope_key = %s AND exposure_id = %s AND target_name = %s
-                   FOR UPDATE""",
-                (scope_key, exposure_id, target_name),
-            ).fetchone()
-            actual = None if current is None else int(_row_value(current, "pointer_version", 1))
-            if actual != expected_pointer_version:
-                return False
-            label_version = 1 if actual is None else actual + 1
-            self.insert_label(
+            return self.insert_label_revision_and_activate_in_transaction(
                 scope_key=scope_key, target_label_id=target_label_id, exposure_id=exposure_id,
                 labelled_at=labelled_at, target_name=target_name, target_value=target_value,
-                evidence=evidence, confidence=confidence, label_version=label_version,
+                evidence=evidence, confidence=confidence,
+                expected_pointer_version=expected_pointer_version,
                 idempotency_key=idempotency_key,
             )
-            pointer_key = stable_idempotency_key(
-                "active-label", scope_key,
-                {"exposure_id": str(exposure_id), "target_name": target_name,
-                 "target_label_id": str(target_label_id), "pointer_version": label_version},
-            )
-            self.connection.execute(
-                """INSERT INTO user_model_active_labels_v2
-                   (scope_key, exposure_id, target_name, target_label_id, pointer_version, idempotency_key)
-                   VALUES (%s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (scope_key, exposure_id, target_name) DO UPDATE
-                   SET target_label_id = EXCLUDED.target_label_id,
-                       pointer_version = EXCLUDED.pointer_version,
-                       idempotency_key = EXCLUDED.idempotency_key,
-                       updated_at = CURRENT_TIMESTAMP
-                   WHERE user_model_active_labels_v2.pointer_version = %s""",
-                (scope_key, exposure_id, target_name, target_label_id, label_version,
-                 pointer_key, expected_pointer_version),
-            )
-            return True
+
+    def insert_label_revision_and_activate_in_transaction(
+        self, *, scope_key: str, target_label_id: UUID | str, exposure_id: UUID | str,
+        labelled_at: datetime, target_name: str, target_value: Any,
+        evidence: Mapping[str, Any], confidence: float = 1.0,
+        expected_pointer_version: int | None, idempotency_key: str | None = None,
+    ) -> bool:
+        """Transaction-neutral variant; the application service owns commit/rollback."""
+        scope_key = _require_scope(scope_key)
+        # Row locks cannot lock an absent pointer.  The scoped advisory lock serialises
+        # first activation too and is held until the caller-owned transaction completes.
+        self.connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"label:{scope_key}:{exposure_id}:{target_name}",),
+        )
+        current = self.connection.execute(
+            """SELECT target_label_id, pointer_version
+               FROM user_model_active_labels_v2
+               WHERE scope_key = %s AND exposure_id = %s AND target_name = %s
+               FOR UPDATE""",
+            (scope_key, exposure_id, target_name),
+        ).fetchone()
+        actual = None if current is None else int(_row_value(current, "pointer_version", 1))
+        if actual != expected_pointer_version:
+            return False
+        label_version = 1 if actual is None else actual + 1
+        self.insert_label(
+            scope_key=scope_key, target_label_id=target_label_id, exposure_id=exposure_id,
+            labelled_at=labelled_at, target_name=target_name, target_value=target_value,
+            evidence=evidence, confidence=confidence, label_version=label_version,
+            idempotency_key=idempotency_key,
+        )
+        pointer_key = stable_idempotency_key(
+            "active-label", scope_key,
+            {"exposure_id": str(exposure_id), "target_name": target_name,
+             "target_label_id": str(target_label_id), "pointer_version": label_version},
+        )
+        cursor = self.connection.execute(
+            """INSERT INTO user_model_active_labels_v2
+               (scope_key, exposure_id, target_name, target_label_id, pointer_version, idempotency_key)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT (scope_key, exposure_id, target_name) DO UPDATE
+               SET target_label_id = EXCLUDED.target_label_id,
+                   pointer_version = EXCLUDED.pointer_version,
+                   idempotency_key = EXCLUDED.idempotency_key,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE user_model_active_labels_v2.pointer_version = %s""",
+            (scope_key, exposure_id, target_name, target_label_id, label_version,
+             pointer_key, expected_pointer_version),
+        )
+        return getattr(cursor, "rowcount", 1) == 1
 
     def insert_parameter_snapshot(
         self, *, scope_key: str, parameter_snapshot_id: UUID | str,

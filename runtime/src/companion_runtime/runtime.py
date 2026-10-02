@@ -396,6 +396,7 @@ class Runtime:
         seed: int | None = None,
         database: Database | None = None,
         created_at: datetime | None = None,
+        witness_reader: Any | None = None,
     ) -> None:
         """Wire up storage, projections and the cognitive components.
 
@@ -408,6 +409,8 @@ class Runtime:
                 current UTC time. Callers that drive a simulated or replayed
                 timeline should pass their own reference time here so the absence
                 term does not start from a wall-clock instant in the future.
+            witness_reader: Optional exact capability/artifact witness reader used
+                by the render-time completion-claim gate.
         """
         self.config = config or RuntimeConfig()
         storage: StorageConfig = self.config.storage
@@ -468,6 +471,7 @@ class Runtime:
             events=self.events,
             projections=self.projections,
             config=self.config,
+            witness_reader=witness_reader,
         )
 
     # ------------------------------------------------------------------ plumbing

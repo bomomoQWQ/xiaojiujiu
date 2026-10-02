@@ -119,6 +119,7 @@ class LangchaoLiveRunner:
 
 def build_langchao_live_runner(
     *, connection: Any, scope_key: str, runtime: Any, legacy_bridge: Any,
+    witness_reader: Any | None = None,
     attention_recipe: str = "off", internal_exploration_enabled: bool = True,
 ) -> LangchaoLiveRunner:
     evaluator = build_langchao_shadow_runner(
@@ -133,6 +134,7 @@ def build_langchao_live_runner(
     service = LangchaoLiveService(
         scope_key=scope_key, authority_reader=authority,
         legacy_bridge=legacy_bridge, contract_repository=contracts,
+        witness_reader=witness_reader,
     )
     live_repository = LangchaoLiveRepository(connection, scope_key=scope_key)
     return LangchaoLiveRunner(

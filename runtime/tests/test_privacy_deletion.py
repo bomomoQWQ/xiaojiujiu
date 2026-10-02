@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+import hashlib
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from companion_runtime.privacy_deletion_api import create_privacy_deletion_router
+from companion_runtime.privacy_deletion_api import (
+    bearer_digest_authorizer,
+    create_privacy_deletion_router,
+)
 from companion_runtime.privacy_deletion_repository import (
     ClaimedWork,
     DeletionRequest,
@@ -127,6 +131,49 @@ def test_coordinator_invalidates_dependencies_stops_unsent_and_keeps_sent_audit(
     assert not any("DELETE FROM" in sql for sql, _ in conn.calls)
 
 
+def test_selector_like_patterns_escape_percent_underscore_and_backslash_as_literals():
+    dangerous_id = r"event:%_\\secret"
+    work = ClaimedWork(scope_key="scope:a", request_id="delete:wildcards",
+                       work_kind="goal_candidate_invalidation", selector_kind="source",
+                       selector={"source_id": dangerous_id}, strategy=DeletionStrategy.TOMBSTONE)
+    conn = Connection([Cursor(rowcount=1), Cursor(rowcount=1)])
+    coordinator = PrivacyDeletionCoordinator(
+        PrivacyDeletionRepository(conn, scope_key="scope:a"), worker_id="worker", clock=lambda: NOW
+    )
+
+    coordinator._execute(work, now=NOW)
+
+    assert all("LIKE %s ESCAPE '\\'" in sql for sql, _ in conn.calls)
+    assert all(params[-1] == r"%event:\%\_\\\\secret%" for _, params in conn.calls)
+    assert all(params[-1] != f"%{dangerous_id}%" for _, params in conn.calls)
+
+
+def test_all_text_selector_stages_declare_escape_and_receive_literal_pattern():
+    work = ClaimedWork(scope_key="scope:a", request_id="delete:wildcards",
+                       work_kind="live_outbox_stop", selector_kind="source",
+                       selector={"source_id": r"id%_\\x"}, strategy=DeletionStrategy.TOMBSTONE)
+    coordinator = PrivacyDeletionCoordinator(
+        PrivacyDeletionRepository(Connection(), scope_key="scope:a"),
+        worker_id="worker", clock=lambda: NOW,
+    )
+    for kind, responses in (
+        ("memory_interpretation_invalidation", [Cursor(), Cursor()]),
+        ("live_outbox_stop", [Cursor(), Cursor()]),
+        ("learning_artifact_invalidation", [Cursor(), Cursor(), Cursor()]),
+        ("outcome_evidence_minimization", [Cursor()]),
+    ):
+        conn = Connection(responses)
+        coordinator.connection = conn
+        coordinator._execute(ClaimedWork(
+            scope_key=work.scope_key, request_id=work.request_id, work_kind=kind,
+            selector_kind=work.selector_kind, selector=work.selector, strategy=work.strategy,
+        ), now=NOW)
+        like_calls = [(sql, params) for sql, params in conn.calls if "LIKE %s" in sql]
+        assert like_calls
+        assert all("ESCAPE '\\'" in sql for sql, _ in like_calls)
+        assert all(r"%id\%\_\\\\x%" in params for _, params in like_calls)
+
+
 def test_memory_interpretation_and_outcome_use_invalidation_overlay_not_fk_breaking_delete():
     coordinator = PrivacyDeletionCoordinator(
         PrivacyDeletionRepository(Connection([Cursor(rowcount=1), Cursor(rowcount=2)]), scope_key="scope:a"),
@@ -176,6 +223,16 @@ class ApiCoordinator:
         return {"request_id": request_id, "completed": True}
 
 
+def test_bearer_digest_authorizer_requires_explicit_valid_digest_and_exact_bearer_token():
+    with pytest.raises(ValueError, match="64 hex"):
+        bearer_digest_authorizer("")
+    authorize = bearer_digest_authorizer(hashlib.sha256(b"allowed").hexdigest())
+    assert authorize("scope:a", "Bearer allowed") is True
+    assert authorize("scope:a", "bearer allowed") is True
+    assert authorize("scope:a", "allowed") is False
+    assert authorize("scope:a", "Bearer denied") is False
+
+
 def test_api_is_fail_closed_cross_scope_safe_and_does_not_run_without_explicit_call():
     repository = ApiRepository()
     coordinator = ApiCoordinator(repository)
@@ -199,3 +256,37 @@ def test_api_is_fail_closed_cross_scope_safe_and_does_not_run_without_explicit_c
     assert accepted.json()["status"] == "pending"
     assert client.post("/v1/privacy/deletions/delete:1/run",
                        headers={"Authorization": "Bearer allowed"}).json()["completed"] is True
+
+
+def test_api_duplicate_request_is_idempotent_and_run_failure_is_reported():
+    class DuplicateCoordinator(ApiCoordinator):
+        def request(self, value):
+            if self.requests:
+                return False
+            return super().request(value)
+
+        def run(self, *, request_id):
+            raise RuntimeError("simulated crash")
+
+    repository = ApiRepository()
+    coordinator = DuplicateCoordinator(repository)
+    app = FastAPI()
+    app.include_router(create_privacy_deletion_router(
+        scope_key="scope:a", repository=repository, coordinator=coordinator,
+        authorize=lambda scope, token: token == "Bearer allowed",
+    ))
+    client = TestClient(app, raise_server_exceptions=False)
+    payload = {"scope": "scope:a", "request_id": "delete:1", "selector_kind": "source",
+               "selector": {"source_id": "event:secret"}, "strategy": "tombstone"}
+
+    first = client.post("/v1/privacy/deletions", json=payload,
+                        headers={"Authorization": "Bearer allowed"})
+    duplicate = client.post("/v1/privacy/deletions", json=payload,
+                            headers={"Authorization": "Bearer allowed"})
+    crashed = client.post("/v1/privacy/deletions/delete:1/run",
+                          headers={"Authorization": "Bearer allowed"})
+
+    assert first.json()["created"] is True
+    assert duplicate.status_code == 202 and duplicate.json()["created"] is False
+    assert crashed.status_code == 500
+    assert repository.value == {"request_id": "delete:1", "status": "pending"}

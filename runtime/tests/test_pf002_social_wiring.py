@@ -64,9 +64,13 @@ def test_candidate_supply_carries_exact_memory_and_social_refs_and_expression_is
                                   digest=DIGEST)
     social_ref = encode_exact_ref("social", scope_key="scope", object_id="s1", revision=2,
                                   digest="b" * 64)
-    social = SimpleNamespace(candidate_refs=lambda sources: {
-        "memory_ref": memory_ref, "social_ref": social_ref
-    })
+    refreshes = []
+    social = SimpleNamespace(
+        refresh=lambda *, now: refreshes.append(now),
+        candidate_refs=lambda sources: {
+            "memory_ref": memory_ref, "social_ref": social_ref
+        },
+    )
     runtime = SimpleNamespace(
         projections=SimpleNamespace(candidates=Candidates(item)),
         config=SimpleNamespace(candidate=SimpleNamespace(max_active=4)),
@@ -74,6 +78,7 @@ def test_candidate_supply_carries_exact_memory_and_social_refs_and_expression_is
     )
     candidate = ConcreteLegacyRuntimeV2Bridge(runtime, social_service=social).candidates(
         scope_key="scope", now=NOW)[0]
+    assert refreshes == [NOW]
     assert candidate.action["memory_ref"] == memory_ref
     assert candidate.action["social_ref"] == social_ref
     from companion_runtime.langchao_shadow_wiring import _facts_for
@@ -85,12 +90,67 @@ def test_candidate_supply_carries_exact_memory_and_social_refs_and_expression_is
     assert facts.memory_ref == memory_ref and facts.social_ref == social_ref
 
 
+def test_non_cli_candidate_supply_refreshes_each_round_and_replaces_stale_refs():
+    item = CandidateIntent(candidate_id="c1", type="share", intent="分享", goal="表达",
+                           sources=["memory:m1"], internal_need=.4)
+    stale = encode_exact_ref("memory", scope_key="scope", object_id="m1", revision=1,
+                             digest="1" * 64)
+    fresh = encode_exact_ref("memory", scope_key="scope", object_id="m1", revision=2,
+                             digest="2" * 64)
+
+    class Social:
+        def __init__(self):
+            self.ref = stale
+            self.refreshes = []
+
+        def refresh(self, *, now):
+            self.refreshes.append(now)
+            self.ref = fresh
+
+        def candidate_refs(self, sources):
+            return {"memory_ref": self.ref}
+
+    social = Social()
+    runtime = SimpleNamespace(
+        projections=SimpleNamespace(candidates=Candidates(item)),
+        config=SimpleNamespace(candidate=SimpleNamespace(max_active=4)),
+        _event_ids_behind=lambda source: [],
+    )
+    bridge = ConcreteLegacyRuntimeV2Bridge(runtime, social_service=social)
+    candidate = bridge.candidates(scope_key="scope", now=NOW)[0]
+    assert social.refreshes == [NOW]
+    assert candidate.action["memory_ref"] == fresh
+    assert candidate.action["memory_ref"] != stale
+
+
+def test_failed_refresh_disables_social_refs_without_disabling_other_candidates():
+    item = CandidateIntent(candidate_id="c1", type="share", intent="分享", goal="表达",
+                           sources=["memory:m1"], internal_need=.4)
+    stale = encode_exact_ref("memory", scope_key="scope", object_id="m1", revision=1,
+                             digest="1" * 64)
+    social = SimpleNamespace(
+        refresh=lambda *, now: (_ for _ in ()).throw(RuntimeError("refresh failed")),
+        candidate_refs=lambda sources: {"memory_ref": stale},
+    )
+    runtime = SimpleNamespace(
+        projections=SimpleNamespace(candidates=Candidates(item)),
+        config=SimpleNamespace(candidate=SimpleNamespace(max_active=4)),
+        _event_ids_behind=lambda source: [],
+    )
+    candidate = ConcreteLegacyRuntimeV2Bridge(runtime, social_service=social).candidates(
+        scope_key="scope", now=NOW)[0]
+    assert candidate.candidate_id == "c1"
+    assert "memory_ref" not in candidate.action
+    assert "social_ref" not in candidate.action
+
+
 def test_invalid_exact_source_is_rejected_before_claim_or_outbox():
     item = CandidateIntent(candidate_id="c1", type="share", intent="分享", goal="表达",
                            sources=["memory:m1"], internal_need=.4)
     refs = {"memory_ref": encode_exact_ref("memory", scope_key="other", object_id="m1",
                                            revision=1, digest=DIGEST)}
-    social = SimpleNamespace(candidate_refs=lambda sources: refs,
+    social = SimpleNamespace(refresh=lambda *, now: None,
+                             candidate_refs=lambda sources: refs,
                              validate_candidate_action=lambda action: False)
     calls = []
     runtime = SimpleNamespace(projections=SimpleNamespace(candidates=Candidates(item)),

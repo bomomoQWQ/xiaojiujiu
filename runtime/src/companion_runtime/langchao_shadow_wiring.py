@@ -14,6 +14,12 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Mapping
 
+from .capability_witness import (
+    PostgresWitnessRepository,
+    WitnessValidationError,
+    WitnessValidator,
+    requirement_from_mapping,
+)
 from .decision_v2_audit import CandidateAssessment
 from .langchao_authority_repository import LangchaoAuthorityRepository
 from .langchao_attention_recipe import (
@@ -158,11 +164,22 @@ def _string_tuple(action: Mapping[str, Any], name: str, *, nonempty: bool = Fals
     return result
 
 
-def _exploration_segment(action: Mapping[str, Any]) -> ExplorationWorkSegment | None:
-    """Parse only an explicitly marked, completed internal work segment.
+_EXPLORATION_ARTIFACT_TYPES = {
+    ExplorationResultKind.CAPABILITY: "exploration_capability",
+    ExplorationResultKind.ARTIFACT: "exploration_artifact",
+    ExplorationResultKind.NO_CONCLUSION: "exploration_work_segment",
+}
 
-    Generic thinking/research actions and elapsed work time are intentionally
-    insufficient.  A producer must provide the full finite segment witness.
+
+def _exploration_segment(
+    action: Mapping[str, Any], *, scope_key: str, witness_reader: Any | None,
+) -> ExplorationWorkSegment | None:
+    """Build a segment only after re-reading its exact durable witness.
+
+    The action is an untrusted claim envelope.  Its scope/result/evidence become facts
+    only when the capability/artifact ledger has the exact successful active row.  A
+    no-conclusion additionally requires an ``exploration_work_segment`` artifact: prose
+    saying "nothing found" is not a completed work segment.
     """
 
     kind = str(action.get("type") or "").strip().lower()
@@ -170,30 +187,51 @@ def _exploration_segment(action: Mapping[str, Any]) -> ExplorationWorkSegment | 
         return None
     if action.get("internal") is not True or action.get("segment_completed") is not True:
         return None
+    if witness_reader is None:
+        raise WitnessValidationError("completed exploration has no trusted witness reader")
+    raw_witness = action.get("exploration_witness")
+    if not isinstance(raw_witness, Mapping):
+        raise WitnessValidationError("completed exploration has no witness requirement")
+    requirement = requirement_from_mapping(raw_witness, scope_key=scope_key)
+    witness = WitnessValidator(witness_reader).validate(requirement)
+    if witness.operation != "internal_exploration":
+        raise WitnessValidationError("exploration operation witness mismatch")
+
     result = _explicit_ref(action, "result_kind")
     try:
         result_kind = ExplorationResultKind(result or "")
     except ValueError:
         raise ValueError("action.result_kind must be an exploration terminal result") from None
+    if witness.artifact_type != _EXPLORATION_ARTIFACT_TYPES[result_kind]:
+        raise WitnessValidationError("exploration result kind witness mismatch")
+
+    evidence_refs = _string_tuple(action, "evidence_refs", nonempty=True)
+    if evidence_refs != witness.source_refs:
+        raise WitnessValidationError("exploration evidence witness mismatch")
+    result_ref = f"artifact:sha256:{witness.artifact_sha256}"
+    if _explicit_ref(action, "result_ref") != result_ref:
+        raise WitnessValidationError("exploration result reference witness mismatch")
     return ExplorationWorkSegment(
         segment_id=_explicit_ref(action, "segment_id") or "",
         problem_ref=_explicit_ref(action, "problem_ref") or "",
         question=_explicit_ref(action, "question") or "",
         executable_steps=_string_tuple(action, "executable_steps", nonempty=True),
         result_kind=result_kind,
-        result_ref=_explicit_ref(action, "result_ref") or "",
-        evidence_refs=_string_tuple(action, "evidence_refs", nonempty=True),
+        result_ref=result_ref,
+        evidence_refs=evidence_refs,
     )
 
 
 def _facts_for(
     item: CandidateDecisionV2, *, internal_exploration_enabled: bool = True,
+    scope_key: str = "", witness_reader: Any | None = None,
 ) -> RuntimeCandidateFacts | None:
     candidate = item.candidate
     action = candidate.action
     kind = str(action.get("type") or "").strip().lower()
     evidence = tuple(dict.fromkeys(candidate.source_event_ids)) or (f"candidate:{candidate.candidate_id}",)
-    segment = _exploration_segment(action) if internal_exploration_enabled else None
+    segment = (_exploration_segment(action, scope_key=scope_key, witness_reader=witness_reader)
+               if internal_exploration_enabled else None)
     common = dict(
         candidate_id=candidate.candidate_id,
         ownership=GoalOwnership.SELF_WISH,
@@ -259,9 +297,11 @@ def _explicit_attention_signal(action: Mapping[str, Any], name: str) -> float:
     return value
 
 
-def _attention_candidate(item: Any) -> AttentionRecipeCandidate:
+def _attention_candidate(
+    item: Any, *, admitted_facts: RuntimeCandidateFacts | None = None,
+) -> AttentionRecipeCandidate:
     candidate = item.candidate
-    facts = _facts_for(item)
+    facts = admitted_facts if admitted_facts is not None else _facts_for(item)
     if facts is None:
         raise ValueError("attention candidate requires admitted runtime facts")
     direction = {
@@ -311,6 +351,7 @@ class LangchaoShadowRunner:
     parameters: LangchaoParameters = DEFAULT_LANGCHAO_PARAMETERS
     attention_recipe: str = BASELINE_RECIPE
     internal_exploration_enabled: bool = True
+    exploration_witness_reader: Any | None = None
     last_built: BuiltShadowRound | None = None
 
     def run(
@@ -319,7 +360,12 @@ class LangchaoShadowRunner:
         authority_revision: int | None = None,
     ) -> Any | None:
         pairs = tuple(
-            (item, _facts_for(item, internal_exploration_enabled=self.internal_exploration_enabled))
+            (item, _facts_for(
+                item,
+                internal_exploration_enabled=self.internal_exploration_enabled,
+                scope_key=self.scope_key,
+                witness_reader=self.exploration_witness_reader,
+            ))
             for item in decision.assessments
         )
         pairs = tuple((item, facts) for item, facts in pairs if facts is not None)
@@ -399,10 +445,10 @@ class LangchaoShadowRunner:
         recipe_candidates = tuple(
             AttentionRecipeCandidate(
                 candidate_id=contract.candidate.candidate_id,
-                direction=_attention_candidate(source).direction,
-                signals=_attention_candidate(source).signals,
+                direction=_attention_candidate(source, admitted_facts=facts).direction,
+                signals=_attention_candidate(source, admitted_facts=facts).signals,
             )
-            for source, _facts in pairs
+            for source, facts in pairs
             for contract in probe.contracts
             if contract.source_candidate_id == source.candidate.candidate_id
         )
@@ -471,7 +517,10 @@ def build_langchao_shadow_runner(
                                 state_repository=states,
                                 revisions=LangchaoRevisionResolver(connection, scope_key=scope_key),
                                 attention_recipe=normalize_recipe(attention_recipe),
-                                internal_exploration_enabled=bool(internal_exploration_enabled))
+                                internal_exploration_enabled=bool(internal_exploration_enabled),
+                                exploration_witness_reader=PostgresWitnessRepository(
+                                    connection, scope_key=scope_key,
+                                ))
 
 
 __all__ = [

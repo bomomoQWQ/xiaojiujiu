@@ -79,7 +79,24 @@ class LangchaoOutcomeRepository:
         reward_contract_revision: int,
         corrects_revision: int | None = None,
     ) -> Any:
-        """Append one immutable revision, idempotent by the scoped idempotency key."""
+        """Append one immutable revision in a repository-owned transaction."""
+        with self._transaction():
+            return self.put_outcome_revision_in_transaction(
+                outcome, revision=revision, reward_contract_id=reward_contract_id,
+                reward_contract_revision=reward_contract_revision,
+                corrects_revision=corrects_revision,
+            )
+
+    def put_outcome_revision_in_transaction(
+        self,
+        outcome: OutcomeToken,
+        *,
+        revision: int,
+        reward_contract_id: str,
+        reward_contract_revision: int,
+        corrects_revision: int | None = None,
+    ) -> Any:
+        """Transaction-neutral append for a caller-owned settlement transaction."""
 
         if not isinstance(outcome, OutcomeToken):
             raise TypeError("outcome must be OutcomeToken")
@@ -97,7 +114,7 @@ class LangchaoOutcomeRepository:
 
         _payload, encoded, digest = _canonical_payload(outcome)
         weights_json = self._normalized_weights(outcome)
-        with self._transaction():
+        with nullcontext():
             # Idempotency precedes identity insertion so a conflicting replay leaves no
             # orphan identity when a real transaction rolls back.
             idem = self.connection.execute(
