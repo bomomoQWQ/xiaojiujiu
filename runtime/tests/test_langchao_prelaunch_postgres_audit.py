@@ -64,7 +64,7 @@ def pg_schema():
         with connection.transaction():
             first = migrate(connection, schema=schema, runner_version="langchao-prelaunch-audit/1")
         assert first.applied == tuple(range(1, USER_MODEL_SCHEMA_VERSION + 1))
-        assert first.current_version == 20
+        assert first.current_version == USER_MODEL_SCHEMA_VERSION
         yield schema
     finally:
         connection.rollback()
@@ -205,7 +205,7 @@ def test_v20_migration_second_pass_is_strictly_idempotent(pg_schema) -> None:
     try:
         with connection.transaction():
             result = migrate(connection, schema=pg_schema, runner_version="langchao-prelaunch-audit/1")
-        assert result.current_version == 20
+        assert result.current_version == USER_MODEL_SCHEMA_VERSION
         assert result.applied == ()
         assert result.already_present == tuple(range(1, USER_MODEL_SCHEMA_VERSION + 1))
         v20 = connection.execute(
