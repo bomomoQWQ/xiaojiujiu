@@ -345,7 +345,7 @@ def _seed_atomic_user_settlement(connection, *, scope: str, attempt: str):
     outbox_id = _id("outbox")
     claim_id = _id("claim")
     from companion_runtime.langchao_authority_repository import LangchaoAuthorityRepository
-    from companion_runtime.langchao_types import AuthorityEngine, AuthorityMode
+    from companion_runtime.langchao_authority import AuthorityEngine, AuthorityMode
     authority = LangchaoAuthorityRepository(connection, scope_key=scope)
     authority.initialize(
         engine_key=AuthorityEngine.LANGCHAO, mode=AuthorityMode.LIVE,
