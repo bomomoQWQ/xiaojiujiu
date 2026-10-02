@@ -81,8 +81,7 @@ def test_native_transaction_defers_to_the_template_owner(store) -> None:
                 raise RuntimeError("boom")
 
     rows = {
-        row["event_id"]
-        for row in store.query("SELECT event_id FROM raw_events").fetchall()
+        row["event_id"] for row in store.query("SELECT event_id FROM raw_events")
     }
     assert rows == {"outer", "inner"}
 
@@ -95,7 +94,6 @@ def test_nested_savepoint_rolls_back_only_its_own_level(store) -> None:
                 _event(connection, "dropped")
                 raise RuntimeError("boom")
     rows = {
-        row["event_id"]
-        for row in store.query("SELECT event_id FROM raw_events").fetchall()
+        row["event_id"] for row in store.query("SELECT event_id FROM raw_events")
     }
     assert rows == {"kept"}
