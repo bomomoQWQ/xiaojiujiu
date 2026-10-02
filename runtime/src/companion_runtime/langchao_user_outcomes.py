@@ -34,6 +34,7 @@ class LangchaoUserOutcomeSettler:
     """Persist one Langchao result per active v2 label revision, exactly once."""
 
     live_repository: Any
+    terminal_producer: Any | None = None
 
     def settle_labels(self, labels: tuple[TargetLabelV2, ...]) -> tuple[OutcomeToken, ...]:
         written: list[OutcomeToken] = []
@@ -107,7 +108,14 @@ class LangchaoUserOutcomeSettler:
                     raise RuntimeError("Langchao user-outcome CAS lost to an older observation")
                 continue
             written.append(token)
-        return tuple(written)
+        result = tuple(written)
+        if result and self.terminal_producer is not None:
+            occurred_at = max(
+                label.updated_at for label in labels
+                if label.status is not LabelStatus.PENDING
+            )
+            self.terminal_producer.from_actual_outcomes(result, occurred_at=occurred_at)
+        return result
 
     @staticmethod
     def _token(expected: OutcomeToken, *, label: TargetLabelV2, label_revision: int) -> OutcomeToken:

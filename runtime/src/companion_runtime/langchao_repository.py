@@ -10,9 +10,20 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import nullcontext
+from datetime import datetime
 from typing import Any, Mapping
 
-from .langchao_types import ActionCandidateContract, GoalContract, RewardContract
+from .langchao_types import (
+    ActionCandidateContract,
+    CandidateKind,
+    CandidateState,
+    GoalContract,
+    GoalKind,
+    GoalOwnership,
+    GoalStatus,
+    RetirementReason,
+    RewardContract,
+)
 
 
 class LangchaoRevisionConflictError(RuntimeError):
@@ -38,6 +49,76 @@ def _value(row: Any, key: str, index: int = 0) -> Any:
     if row is None:
         return None
     return row[key] if isinstance(row, Mapping) else row[index]
+
+
+def _payload_object(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, Mapping):
+        raise ValueError("stored contract payload must be a JSON object")
+    return value
+
+
+def _datetime(value: Any, *, field: str) -> datetime:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"stored {field} must be an ISO datetime") from exc
+    if not isinstance(value, datetime):
+        raise ValueError(f"stored {field} must be a datetime")
+    return value
+
+
+def _goal_from_payload(value: Any) -> GoalContract:
+    payload = _payload_object(value)
+    return GoalContract(
+        goal_id=payload["goal_id"], scope_key=payload["scope_key"],
+        episode_id=payload["episode_id"], semantic_key=payload["semantic_key"],
+        kind=GoalKind(payload["kind"]), ownership=GoalOwnership(payload["ownership"]),
+        desired_change=payload["desired_change"], status=GoalStatus(payload["status"]),
+        evidence_refs=tuple(payload["evidence_refs"]),
+        excluded_outcomes=tuple(payload["excluded_outcomes"]),
+        completion_outcome_keys=tuple(payload["completion_outcome_keys"]),
+        allowed_candidate_kinds=tuple(CandidateKind(item) for item in payload["allowed_candidate_kinds"]),
+        wait_for_refs=tuple(payload.get("wait_for_refs", ())),
+        resume_condition_refs=tuple(payload.get("resume_condition_refs", ())),
+        completion_evidence_refs=tuple(payload.get("completion_evidence_refs", ())),
+        matter_id=payload.get("matter_id"), parent_goal_id=payload.get("parent_goal_id"),
+        reward_contract_id=payload.get("reward_contract_id"),
+        created_at=_datetime(payload["created_at"], field="created_at"),
+        updated_at=_datetime(payload["updated_at"], field="updated_at"),
+        revision=payload["revision"], contract_version=payload["contract_version"],
+    )
+
+
+def _candidate_from_payload(value: Any) -> ActionCandidateContract:
+    payload = _payload_object(value)
+    envelope = payload["envelope"]
+    if not isinstance(envelope, Mapping):
+        raise ValueError("stored candidate envelope must be a JSON object")
+    retirement_reason = payload.get("retirement_reason")
+    return ActionCandidateContract(
+        candidate_id=payload["candidate_id"], scope_key=payload["scope_key"],
+        semantic_key=payload["semantic_key"], goal_refs=tuple(payload["goal_refs"]),
+        kind=CandidateKind(payload["kind"]), action_template=payload["action_template"],
+        input_refs=tuple(payload["input_refs"]), reward_contract_ref=payload["reward_contract_ref"],
+        expected_outcome_token_ids=tuple(payload["expected_outcome_token_ids"]),
+        capability_refs=tuple(payload["capability_refs"]), permission_ref=payload["permission_ref"],
+        precondition_refs=tuple(payload["precondition_refs"]),
+        invalidation_refs=tuple(payload["invalidation_refs"]), envelope=tuple(envelope.items()),
+        state=CandidateState(payload["state"]),
+        available_from=_datetime(payload["available_from"], field="available_from"),
+        expires_at=(None if payload.get("expires_at") is None
+                    else _datetime(payload["expires_at"], field="expires_at")),
+        resource_budget=payload["resource_budget"], attempt_budget=payload.get("attempt_budget", 1),
+        retirement_reason=(None if retirement_reason is None else RetirementReason(retirement_reason)),
+        based_on_state_version=payload["based_on_state_version"],
+        semantic_revision=payload["semantic_revision"],
+        created_at=_datetime(payload["created_at"], field="created_at"),
+        updated_at=_datetime(payload["updated_at"], field="updated_at"),
+        contract_version=payload["contract_version"],
+    )
 
 
 class LangchaoRepository:
@@ -273,6 +354,80 @@ class LangchaoRepository:
 
     def get_active_candidate(self, *, candidate_id: str) -> Any:
         return self._get_active("candidate", candidate_id)
+
+    def load_active_goal(
+        self, scope_key: str, goal_id: str, episode_id: str
+    ) -> GoalContract | None:
+        """Load and strictly decode one exact active goal episode."""
+        if scope_key != self.scope_key:
+            raise ValueError("scope_key does not match repository scope_key")
+        row = self.connection.execute(
+            """SELECT r.payload, r.revision AS stored_revision,
+                      a.revision AS active_revision, a.pointer_version
+                 FROM langchao_goal_active AS a
+                 JOIN langchao_goal_revisions AS r
+                   ON r.scope_key = a.scope_key AND r.goal_id = a.goal_id
+                  AND r.revision = a.revision
+                WHERE a.scope_key = %s AND a.goal_id = %s""",
+            (self.scope_key, goal_id),
+        ).fetchone()
+        if row is None:
+            return None
+        goal = _goal_from_payload(_value(row, "payload", 0))
+        stored_revision = int(_value(row, "stored_revision", 1))
+        active_revision = int(_value(row, "active_revision", 2))
+        if (
+            goal.scope_key != self.scope_key
+            or goal.goal_id != goal_id
+            or goal.episode_id != episode_id
+            or goal.revision != stored_revision
+            or stored_revision != active_revision
+        ):
+            raise LangchaoReferenceError(
+                "active goal payload does not match scope/id/episode/revision pointer"
+            )
+        return goal
+
+    def load_active_candidates_for_goal(
+        self, goal: GoalContract
+    ) -> tuple[ActionCandidateContract, ...]:
+        """Load active candidates whose frozen exact goal ref targets ``goal``."""
+        if not isinstance(goal, GoalContract):
+            raise TypeError("goal must be GoalContract")
+        self._require_scope(goal)
+        rows = self.connection.execute(
+            """SELECT r.payload, r.revision AS stored_revision,
+                      a.revision AS active_revision, ref.goal_revision
+                 FROM langchao_candidate_goal_refs AS ref
+                 JOIN langchao_candidate_active AS a
+                   ON a.scope_key = ref.scope_key AND a.candidate_id = ref.candidate_id
+                  AND a.revision = ref.candidate_revision
+                 JOIN langchao_candidate_revisions AS r
+                   ON r.scope_key = a.scope_key AND r.candidate_id = a.candidate_id
+                  AND r.revision = a.revision
+                WHERE ref.scope_key = %s AND ref.goal_id = %s
+                  AND ref.goal_revision = %s
+                ORDER BY ref.candidate_id""",
+            (self.scope_key, goal.goal_id, goal.revision),
+        ).fetchall()
+        candidates: list[ActionCandidateContract] = []
+        for row in rows:
+            candidate = _candidate_from_payload(_value(row, "payload", 0))
+            stored_revision = int(_value(row, "stored_revision", 1))
+            active_revision = int(_value(row, "active_revision", 2))
+            goal_revision = int(_value(row, "goal_revision", 3))
+            if (
+                candidate.scope_key != self.scope_key
+                or goal.goal_id not in candidate.goal_refs
+                or candidate.semantic_revision != stored_revision
+                or stored_revision != active_revision
+                or goal_revision != goal.revision
+            ):
+                raise LangchaoReferenceError(
+                    "active candidate payload does not match scope/goal/revision pointer"
+                )
+            candidates.append(candidate)
+        return tuple(candidates)
 
 
 __all__ = [
