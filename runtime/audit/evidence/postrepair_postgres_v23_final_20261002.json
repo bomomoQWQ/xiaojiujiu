@@ -1,0 +1,11 @@
+{
+  "evidence_version":"langchao.postrepair-postgres-v23.final.v1",
+  "git_commit":"d5f217f",
+  "postgres":"18",
+  "result":{"passed":66,"failed":0,"skipped":0,"exit_code":0},
+  "coverage":["schema_v23","privacy_leases_and_scope","artifact_exact_witness","authority_fk","transaction_rollback","concurrent_ack","restart_pending","user_outcome_atomic_observer_failure","user_outcome_concurrent_duplicate","user_outcome_restart_replay","social_exact_refs"],
+  "environment":"disposable isolated Docker PostgreSQL",
+  "real_send":false,
+  "evidence_class":"T",
+  "release_authorization":false
+}
