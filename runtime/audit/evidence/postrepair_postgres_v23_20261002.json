@@ -1,0 +1,19 @@
+{
+  "evidence_version": "langchao.postrepair-postgres-v23.v1",
+  "git_commit": "485e867",
+  "postgres_version": "18",
+  "environment": "disposable isolated Docker PostgreSQL; no sender or platform client",
+  "command_suite": [
+    "tests/test_user_model_v2_postgres_integration.py",
+    "tests/test_privacy_deletion.py",
+    "tests/test_capability_witness.py",
+    "tests/test_langchao_prelaunch_postgres_audit.py",
+    "tests/test_langchao_user_outcomes.py",
+    "tests/test_langchao_repairs_postgres.py"
+  ],
+  "result": {"passed": 43, "failed": 0, "skipped": 0, "exit_code": 0},
+  "schema_version": 23,
+  "real_send": false,
+  "evidence_class": "T",
+  "release_authorization": false
+}
