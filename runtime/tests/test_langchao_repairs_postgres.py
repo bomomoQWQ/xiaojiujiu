@@ -447,6 +447,9 @@ def test_v23_concurrent_duplicate_user_settlement_commits_one_revision(pg_schema
                 scope_key=scope, idempotency_key=f"delivery:{attempt}",
             )
             assert persisted is not None
+            # End the read-only implicit transaction so settlement_transaction owns
+            # the outer transaction and commits atomically before this worker closes.
+            worker.commit()
             service = UserModelV2Service(
                 adapter,
                 outcome_observer=LangchaoUserOutcomeSettler(
@@ -508,6 +511,7 @@ def test_v23_restart_replay_keeps_atomic_user_settlement_exactly_once(pg_schema)
             scope_key=scope, idempotency_key=f"delivery:{attempt}",
         )
         assert persisted is not None
+        restarted.commit()
         UserModelV2Service(
             adapter,
             outcome_observer=LangchaoUserOutcomeSettler(
