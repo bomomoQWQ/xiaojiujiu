@@ -8,6 +8,7 @@ new active revisions in the caller's transaction.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Iterable
@@ -50,6 +51,10 @@ class LangchaoGoalLifecycleService:
         self.contracts = contract_repository
         self._matter_transition = matter_transition
 
+    def _transaction(self) -> Any:
+        transaction = getattr(self.contracts, "transaction", None)
+        return transaction() if callable(transaction) else nullcontext()
+
     @staticmethod
     def _activate(get_active: Any, activate: Any, identity_name: str, identity: str, revision: int) -> None:
         row = get_active(**{identity_name: identity})
@@ -75,23 +80,28 @@ class LangchaoGoalLifecycleService:
             if event.kind == "completed"
             else drop_finite_goal(goal, candidates=candidate_tuple, at=event.occurred_at)
         )
-        self.contracts.put_goal_revision(transition.goal)
-        self._activate(
-            self.contracts.get_active_goal, self.contracts.activate_goal,
-            "goal_id", transition.goal.goal_id, transition.goal.revision,
-        )
-        for candidate in transition.candidates:
-            self.contracts.put_candidate_revision(candidate)
+        if transition.matter_id is not None and self._matter_transition is None:
+            raise RuntimeError("terminal goal owns a matter but no matter transition is configured")
+
+        # This is one semantic transition.  A failed candidate write, pointer CAS, or
+        # unfinished-matter update must not leave the goal half closed.
+        with self._transaction():
+            self.contracts.put_goal_revision(transition.goal)
             self._activate(
-                self.contracts.get_active_candidate, self.contracts.activate_candidate,
-                "candidate_id", candidate.candidate_id, candidate.semantic_revision,
+                self.contracts.get_active_goal, self.contracts.activate_goal,
+                "goal_id", transition.goal.goal_id, transition.goal.revision,
             )
-        if transition.matter_id is not None and transition.matter_status is not None:
-            if self._matter_transition is None:
-                raise RuntimeError("terminal goal owns a matter but no matter transition is configured")
-            self._matter_transition(
-                transition.matter_id, transition.matter_status.value, event.occurred_at,
-            )
+            for candidate in transition.candidates:
+                self.contracts.put_candidate_revision(candidate)
+                self._activate(
+                    self.contracts.get_active_candidate, self.contracts.activate_candidate,
+                    "candidate_id", candidate.candidate_id, candidate.semantic_revision,
+                )
+            if transition.matter_id is not None and transition.matter_status is not None:
+                assert self._matter_transition is not None
+                self._matter_transition(
+                    transition.matter_id, transition.matter_status.value, event.occurred_at,
+                )
         return transition
 
     def reopen(
@@ -111,11 +121,12 @@ class LangchaoGoalLifecycleService:
             episode_source_refs=episode_source_refs,
             episode_basis_refs=episode_basis_refs, at=at,
         )
-        self.contracts.put_goal_revision(reopened)
-        self._activate(
-            self.contracts.get_active_goal, self.contracts.activate_goal,
-            "goal_id", reopened.goal_id, reopened.revision,
-        )
+        with self._transaction():
+            self.contracts.put_goal_revision(reopened)
+            self._activate(
+                self.contracts.get_active_goal, self.contracts.activate_goal,
+                "goal_id", reopened.goal_id, reopened.revision,
+            )
         return reopened
 
 

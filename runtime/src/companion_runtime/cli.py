@@ -351,11 +351,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             0.0, (now - last_allowed_at).total_seconds()
         )
         last_allowed_at = now
-        # Snapshot social facts before candidate supply. The feature is mechanical,
-        # bounded and opt-in; providers can only return proposals, while the repository
-        # revalidates and commits the projection.
-        if v2_composition.social_service is not None:
-            v2_composition.social_service.refresh(now=now)
+        # Candidate supply owns the optional social snapshot refresh, so scheduler,
+        # direct coordinator and HTTP simulation entry points all use the same exact refs.
         # Authority is read before either engine runs.  In particular, langchao/live
         # invokes v2 assessment-only and cannot accidentally commit the old baseline.
         result = v2_composition.authority_round_router.run(

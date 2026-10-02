@@ -18,7 +18,9 @@ import pytest
 
 psycopg = pytest.importorskip("psycopg")
 
+from companion_runtime.langchao_live_repository import LangchaoLiveCommit, LangchaoLiveRepository
 from companion_runtime.langchao_outcome_repository import LangchaoOutcomeRepository
+from companion_runtime.langchao_user_outcomes import LangchaoUserOutcomeSettler
 from companion_runtime.langchao_social_wiring import (
     LangchaoSocialSnapshotService,
     build_langchao_social_service,
@@ -37,8 +39,12 @@ from companion_runtime.privacy_deletion_repository import (
     PrivacyDeletionRepository,
     WORK_KINDS,
 )
+from companion_runtime.user_model_v2_labels import SettlementContextV2, TargetObservationV2
 from companion_runtime.user_model_v2_migrations import migrate
 from companion_runtime.user_model_v2_schema import USER_MODEL_SCHEMA_VERSION
+from companion_runtime.user_model_v2_service import UserModelV2Service
+from companion_runtime.user_model_v2_service_repository import PostgresUserModelV2ServiceRepository
+from companion_runtime.user_model_v2_types import LabelStatus, Target
 
 _DSN = (
     os.environ.get("CR_TEST_PG_DSN", "").strip()
@@ -308,6 +314,192 @@ def _actual(*, scope: str, goal: str, episode: str, token_id: str, idem: str,
         observation_ends_at=NOW + timedelta(hours=1),
         corrects_token_id=corrects,
     )
+
+
+def _seed_atomic_user_settlement(connection, *, scope: str, attempt: str):
+    reward, goal, episode = _id("reward"), _id("goal"), _id("episode")
+    adapter = PostgresUserModelV2ServiceRepository(connection)
+    prepared = UserModelV2Service(adapter).prepare_exposure(
+        scope_key=scope,
+        exposure_id=attempt,
+        idempotency_key=f"delivery:{attempt}",
+        occurred_at=NOW,
+        action={"type": "reply"},
+        context_provider=lambda: {},
+        delivery_confirmed=True,
+        horizons={target: 3600 for target in Target},
+    )
+    assert prepared is not None
+    _seed_reward_and_exposure(
+        connection, scope=scope, reward=reward, goal=goal, episode=episode,
+        exposure_id=_id("unrelated-exposure"),
+    )
+    expected = OutcomeToken(
+        token_id=_id("expected"), scope_key=scope, goal_id=goal, episode_id=episode,
+        outcome_key="reply", settlement_type=SettlementType.EXPECTED,
+        status=OutcomeStatus.UNEXECUTED, base_amount=1.0, direction_weights=WEIGHTS,
+        evidence_version="atomic-user-settlement.v1", idempotency_key=_id("expected-idem"),
+    )
+    live = LangchaoLiveRepository(connection, scope_key=scope)
+    live.save_commit(LangchaoLiveCommit(
+        scope_key=scope, round_id=_id("round"), langchao_candidate_id=_id("candidate"),
+        candidate_revision=1, source_candidate_id=_id("source"),
+        reward_contract_id=reward, reward_revision=1, expected_tokens=(expected,),
+        attempt_id=attempt, render_outbox_id=_id("outbox"), claim_id=_id("claim"),
+        committed_at=NOW,
+    ))
+    connection.execute(
+        """UPDATE langchao_live_commits
+           SET terminal_ack_id=%s, terminal_ack_kind='sent', terminal_acknowledged_at=%s
+           WHERE scope_key=%s AND attempt_id=%s""",
+        (_id("ack"), NOW, scope, attempt),
+    )
+    connection.commit()
+    return prepared, reward
+
+
+def _reply_observation(prepared):
+    return TargetObservationV2(
+        event_id=_id("reply-event"), target=Target.REPLY,
+        occurred_at=NOW + timedelta(minutes=1), value=True,
+        candidate_exposure_ids=(prepared.exposure.exposure_id,),
+    )
+
+
+def test_v23_observer_failure_rolls_back_label_and_outcome_together(connection) -> None:
+    scope, attempt = _id("atomic-rollback"), _id("attempt")
+    prepared, _reward = _seed_atomic_user_settlement(connection, scope=scope, attempt=attempt)
+    adapter = PostgresUserModelV2ServiceRepository(connection)
+    real = LangchaoUserOutcomeSettler(LangchaoLiveRepository(connection, scope_key=scope))
+
+    class FailingObserver:
+        def settle_labels(self, labels):
+            real.settle_labels(labels)
+            raise RuntimeError("injected observer failure")
+
+    service = UserModelV2Service(adapter, outcome_observer=FailingObserver())
+    with pytest.raises(RuntimeError, match="injected observer failure"):
+        service.settle_observation(
+            prepared=prepared, observations=(_reply_observation(prepared),),
+            context=SettlementContextV2(as_of=NOW + timedelta(minutes=2)),
+            target=Target.REPLY,
+        )
+    active = adapter.get_active_label(
+        scope_key=scope, exposure_id=prepared.exposure.exposure_id, target=Target.REPLY,
+    )
+    assert active is not None and active[1] == 1 and active[0].status is LabelStatus.PENDING
+    assert connection.execute(
+        "SELECT count(*) AS n FROM langchao_outcome_revisions WHERE scope_key=%s", (scope,),
+    ).fetchone()["n"] == 0
+    assert connection.execute(
+        "SELECT count(*) AS n FROM langchao_user_outcome_active WHERE scope_key=%s", (scope,),
+    ).fetchone()["n"] == 0
+
+
+def test_v23_concurrent_duplicate_user_settlement_commits_one_revision(pg_schema) -> None:
+    scope, attempt = _id("atomic-concurrent"), _id("attempt")
+    setup = _connect(pg_schema)
+    try:
+        prepared, _reward = _seed_atomic_user_settlement(
+            setup, scope=scope, attempt=attempt,
+        )
+    finally:
+        setup.close()
+    gate = Barrier(2)
+
+    def settle(_worker_number: int):
+        worker = _connect(pg_schema)
+        try:
+            adapter = PostgresUserModelV2ServiceRepository(worker)
+            persisted = adapter.get_prepared_exposure(
+                scope_key=scope, idempotency_key=f"delivery:{attempt}",
+            )
+            assert persisted is not None
+            service = UserModelV2Service(
+                adapter,
+                outcome_observer=LangchaoUserOutcomeSettler(
+                    LangchaoLiveRepository(worker, scope_key=scope)
+                ),
+            )
+            gate.wait(timeout=10)
+            return service.settle_observation(
+                prepared=persisted, observations=(_reply_observation(persisted),),
+                context=SettlementContextV2(as_of=NOW + timedelta(minutes=2)),
+                target=Target.REPLY,
+            )[0].status
+        finally:
+            worker.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(settle, range(2))) == [
+            LabelStatus.OBSERVED_POSITIVE, LabelStatus.OBSERVED_POSITIVE,
+        ]
+    observer = _connect(pg_schema, autocommit=True)
+    try:
+        assert observer.execute(
+            "SELECT count(*) AS n FROM interaction_target_labels_v2 "
+            "WHERE scope_key=%s AND exposure_id=%s AND target_name='reply'",
+            (scope, prepared.exposure.exposure_id),
+        ).fetchone()["n"] == 2
+        assert observer.execute(
+            "SELECT count(*) AS n FROM langchao_outcome_revisions WHERE scope_key=%s", (scope,),
+        ).fetchone()["n"] == 1
+        assert observer.execute(
+            "SELECT count(*) AS n FROM langchao_user_outcome_active WHERE scope_key=%s", (scope,),
+        ).fetchone()["n"] == 1
+    finally:
+        observer.close()
+
+
+def test_v23_restart_replay_keeps_atomic_user_settlement_exactly_once(pg_schema) -> None:
+    scope, attempt = _id("atomic-restart"), _id("attempt")
+    first = _connect(pg_schema)
+    try:
+        prepared, _reward = _seed_atomic_user_settlement(first, scope=scope, attempt=attempt)
+        UserModelV2Service(
+            PostgresUserModelV2ServiceRepository(first),
+            outcome_observer=LangchaoUserOutcomeSettler(
+                LangchaoLiveRepository(first, scope_key=scope)
+            ),
+        ).settle_observation(
+            prepared=prepared, observations=(_reply_observation(prepared),),
+            context=SettlementContextV2(as_of=NOW + timedelta(minutes=2)),
+            target=Target.REPLY,
+        )
+    finally:
+        first.close()
+
+    restarted = _connect(pg_schema)
+    try:
+        adapter = PostgresUserModelV2ServiceRepository(restarted)
+        persisted = adapter.get_prepared_exposure(
+            scope_key=scope, idempotency_key=f"delivery:{attempt}",
+        )
+        assert persisted is not None
+        UserModelV2Service(
+            adapter,
+            outcome_observer=LangchaoUserOutcomeSettler(
+                LangchaoLiveRepository(restarted, scope_key=scope)
+            ),
+        ).settle_observation(
+            prepared=persisted, observations=(_reply_observation(persisted),),
+            context=SettlementContextV2(as_of=NOW + timedelta(minutes=2)),
+            target=Target.REPLY,
+        )
+        assert restarted.execute(
+            "SELECT count(*) AS n FROM interaction_target_labels_v2 "
+            "WHERE scope_key=%s AND exposure_id=%s AND target_name='reply'",
+            (scope, persisted.exposure.exposure_id),
+        ).fetchone()["n"] == 2
+        assert restarted.execute(
+            "SELECT count(*) AS n FROM langchao_outcome_revisions WHERE scope_key=%s", (scope,),
+        ).fetchone()["n"] == 1
+        assert restarted.execute(
+            "SELECT source_label_revision,pointer_version FROM langchao_user_outcome_active "
+            "WHERE scope_key=%s", (scope,),
+        ).fetchone() == {"source_label_revision": 2, "pointer_version": 1}
+    finally:
+        restarted.close()
 
 
 def test_v23_active_pointer_and_correction_lineage_are_durable(connection) -> None:

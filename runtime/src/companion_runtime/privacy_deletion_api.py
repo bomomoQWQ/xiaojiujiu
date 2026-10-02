@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
@@ -11,6 +14,23 @@ from .privacy_deletion_repository import DeletionRequest, DeletionStrategy, Priv
 from .privacy_deletion_service import PrivacyDeletionCoordinator
 
 AuthorizationCheck = Callable[[str, str], bool]
+_SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def bearer_digest_authorizer(expected_sha256: str) -> AuthorizationCheck:
+    """Return a constant-time bearer authorizer from an explicitly configured digest."""
+    expected = str(expected_sha256 or "").strip().lower()
+    if not _SHA256_HEX.fullmatch(expected):
+        raise ValueError("privacy deletion bearer_token_sha256 must be 64 hex characters")
+
+    def authorize(_scope_key: str, authorization: str) -> bool:
+        scheme, separator, credential = authorization.partition(" ")
+        if not separator or scheme.lower() != "bearer" or not credential:
+            return False
+        actual = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(actual, expected)
+
+    return authorize
 
 
 def create_privacy_deletion_router(*, scope_key: str, repository: PrivacyDeletionRepository,
@@ -68,4 +88,6 @@ def create_privacy_deletion_router(*, scope_key: str, repository: PrivacyDeletio
     return router
 
 
-__all__ = ["AuthorizationCheck", "create_privacy_deletion_router"]
+__all__ = [
+    "AuthorizationCheck", "bearer_digest_authorizer", "create_privacy_deletion_router",
+]

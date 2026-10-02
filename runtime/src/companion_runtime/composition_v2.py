@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 from . import RUNTIME_API_VERSION, __version__
+from .capability_witness import PostgresWitnessRepository
 from .config import RuntimeConfig
 from .db import open_database
 from .db_postgres import PostgresDatabase
@@ -109,6 +110,7 @@ class V2Composition:
     semantic_judge: DisabledSemanticJudgeV2
     coordinator: V2RuntimeCoordinator
     audit_repository: Any
+    witness_repository: PostgresWitnessRepository
     health: V2Health
     enable_decision_run: bool = False
     decision_simulation_runner: Any | None = None
@@ -188,6 +190,11 @@ def build_v2_composition(
         if hasattr(legacy_bridge, "scope_key"):
             legacy_bridge.scope_key = scope_key
         repository = UserModelV2Repository(connection)
+        witness_repository = PostgresWitnessRepository(connection, scope_key=scope_key)
+        runtime = getattr(legacy_bridge, "runtime", None)
+        reducer = getattr(runtime, "reducer", None)
+        if reducer is not None:
+            reducer.set_witness_reader(witness_repository)
         service_repository = service_repository_factory(connection, repository)
         prediction_repository = prediction_repository_factory(repository)
         user_model_service = UserModelV2Service(service_repository)
@@ -266,6 +273,7 @@ def build_v2_composition(
             langchao_live_runner = build_langchao_live_runner(
                 connection=connection, scope_key=scope_key,
                 runtime=legacy_bridge.runtime, legacy_bridge=legacy_bridge,
+                witness_reader=witness_repository,
                 attention_recipe=attention_recipe,
                 internal_exploration_enabled=config.langchao.internal_exploration_enabled,
             )
@@ -280,11 +288,24 @@ def build_v2_composition(
         from .langchao_goal_lifecycle_service import LangchaoGoalLifecycleService
         from .langchao_repository import LangchaoRepository
 
-        # Terminal goal events use an application service with contract persistence
-        # only; it has no outbox or dispatch-claim collaborator.
+        def transition_unfinished_matter(matter_id: str, status: str, at: Any) -> None:
+            cursor = connection.execute(
+                """UPDATE unfinished_matters
+                   SET status = %s, updated_at = %s,
+                       resolution_note = COALESCE(resolution_note, %s)
+                   WHERE unfinished_id = %s""",
+                (status, at, f"langchao_goal_{status}", matter_id),
+            )
+            if getattr(cursor, "rowcount", 1) != 1:
+                raise RuntimeError("terminal goal references a missing unfinished matter")
+
+        # The production coordinator emits explicit terminal evidence into this
+        # service. All collaborators share one connection and outer transaction.
         goal_lifecycle_service = LangchaoGoalLifecycleService(
             contract_repository=LangchaoRepository(connection, scope_key=scope_key),
+            matter_transition=transition_unfinished_matter,
         )
+        coordinator.goal_lifecycle_service = goal_lifecycle_service
         from .langchao_live_wiring import AuthorityRoutedEndogenousRound
         authority_round_router = AuthorityRoutedEndogenousRound(
             scope_key=scope_key, v2_coordinator=coordinator,
@@ -327,6 +348,7 @@ def build_v2_composition(
             semantic_judge=semantic_judge,
             coordinator=coordinator,
             audit_repository=runtime_repository,
+            witness_repository=witness_repository,
             health=health,
             langchao_shadow_runner=langchao_shadow_runner,
             langchao_live_runner=langchao_live_runner,

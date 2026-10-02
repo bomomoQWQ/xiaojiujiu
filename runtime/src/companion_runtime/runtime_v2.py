@@ -387,6 +387,7 @@ class V2RuntimeCoordinator:
         repository: V2RuntimeRepository,
         config: DecisionConfigV2 | None = None,
         rng: random.Random | None = None,
+        goal_lifecycle_service: Any | None = None,
     ) -> None:
         if not scope_key.strip():
             raise ValueError("scope_key is required")
@@ -396,6 +397,7 @@ class V2RuntimeCoordinator:
         self.repository = repository
         self.config = config or DecisionConfigV2()
         self.rng = rng or random.Random()
+        self.goal_lifecycle_service = goal_lifecycle_service
         self._audits: dict[str, DecisionAuditRecorder] = {}
         self._chosen: dict[str, CandidateV2] = {}
         self._explored: dict[str, bool] = {}
@@ -438,6 +440,45 @@ class V2RuntimeCoordinator:
                     ):
                         return False
         return True
+
+    def produce_goal_terminal_event(
+        self,
+        *,
+        evidence: Mapping[str, Any],
+        goal: Any,
+        candidates: Sequence[Any] = (),
+    ) -> Any | None:
+        """Route explicit terminal evidence to the production lifecycle service.
+
+        The coordinator is the common runtime event boundary.  It intentionally
+        ignores summaries, elapsed-time hints, and every unrecognised event kind;
+        only a producer that supplies explicit ``completed`` or ``cancelled``
+        evidence can close a goal.
+        """
+
+        kind = evidence.get("kind")
+        if kind not in {"completed", "cancelled"}:
+            return None
+        if self.goal_lifecycle_service is None:
+            raise RuntimeError("goal lifecycle service is not configured")
+        occurred_at = evidence.get("occurred_at")
+        if not isinstance(occurred_at, datetime):
+            raise ValueError("terminal evidence occurred_at must be a datetime")
+        actual_outcomes = evidence.get("actual_outcomes", ())
+        if actual_outcomes is None:
+            actual_outcomes = ()
+        if not isinstance(actual_outcomes, (tuple, list)):
+            raise TypeError("actual_outcomes must be a sequence")
+        from .langchao_goal_lifecycle_service import GoalLifecycleEvent
+
+        return self.goal_lifecycle_service.apply_terminal_event(
+            GoalLifecycleEvent(
+                kind=str(kind), occurred_at=occurred_at,
+                actual_outcomes=tuple(actual_outcomes),
+            ),
+            goal=goal,
+            candidates=tuple(candidates),
+        )
 
     def process_user_event(self, event: Mapping[str, Any]) -> LegacyUserEventResult:
         """Run legacy ingest once, then settle the resulting v2 observations."""

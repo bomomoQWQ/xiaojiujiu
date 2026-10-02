@@ -244,6 +244,12 @@ class Reducer:
         self._config = config
         self._witnesses = WitnessValidator(witness_reader) if witness_reader is not None else None
 
+    def set_witness_reader(self, witness_reader: Any) -> None:
+        """Install the production reader after the shared database is composed."""
+        if witness_reader is None:
+            raise TypeError("witness_reader is required")
+        self._witnesses = WitnessValidator(witness_reader)
+
     @property
     def projections(self) -> Projections:
         """Return the projection bundle (read access for services and APIs)."""
@@ -1667,6 +1673,8 @@ class Reducer:
                     text,
                     action=planned_action,
                     scope_key=str(planned_action.get("scope_key") or self._config.conversation_id),
+                    render_metadata=render_metadata,
+                    semantic_review=semantic_review,
                 )
                 if requirement is not None:
                     if self._witnesses is None:

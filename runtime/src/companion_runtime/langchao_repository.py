@@ -49,9 +49,21 @@ class LangchaoRepository:
         self.connection = connection
         self.scope_key = scope_key
 
-    def _transaction(self) -> Any:
+    def transaction(self) -> Any:
+        """Open one repository transaction for a multi-write application operation.
+
+        Individual repository methods still protect themselves, but lifecycle services
+        use this public boundary to place every revision, active-pointer CAS and related
+        projection transition under one outer transaction.  Psycopg nests the method
+        transactions as savepoints, so an exception from any participant rolls the
+        whole application operation back.
+        """
+
         transaction = getattr(self.connection, "transaction", None)
         return transaction() if transaction is not None else nullcontext()
+
+    def _transaction(self) -> Any:
+        return self.transaction()
 
     def _require_scope(self, dto: Any) -> None:
         if getattr(dto, "scope_key", None) != self.scope_key:

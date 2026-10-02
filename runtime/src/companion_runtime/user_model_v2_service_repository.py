@@ -146,6 +146,10 @@ class PostgresUserModelV2ServiceRepository:
         transaction = getattr(self.connection, "transaction", None)
         return transaction() if transaction is not None else nullcontext()
 
+    def settlement_transaction(self) -> Any:
+        """Own the complete label-and-outcome settlement transaction."""
+        return self._transaction()
+
     def get_prepared_exposure(
         self, *, scope_key: str, idempotency_key: str
     ) -> PreparedExposureV2 | None:
@@ -285,7 +289,12 @@ class PostgresUserModelV2ServiceRepository:
         _require_scope(label.scope_key)
         if revision != expected_revision + 1:
             raise ValueError("revision must be exactly expected_revision + 1")
-        return self.repository.insert_label_revision_and_activate(
+        activate = getattr(
+            self.repository,
+            "insert_label_revision_and_activate_in_transaction",
+            self.repository.insert_label_revision_and_activate,
+        )
+        return activate(
             scope_key=label.scope_key,
             target_label_id=label.label_id,
             exposure_id=label.exposure_id,

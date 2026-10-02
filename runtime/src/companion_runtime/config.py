@@ -519,6 +519,19 @@ class LangchaoConfig:
 
 
 @dataclass(slots=True)
+class PrivacyDeletionConfig:
+    """Deny-by-default production privacy-deletion control surface.
+
+    Enabling the surface requires an explicitly configured SHA-256 digest of the
+    complete bearer credential.  The clear-text credential therefore remains in the
+    caller's secret store and is never persisted in Runtime configuration.
+    """
+
+    enabled: bool = False
+    bearer_token_sha256: str = ""
+
+
+@dataclass(slots=True)
 class RuntimeConfig:
     """Aggregate configuration for the whole Runtime.
 
@@ -563,6 +576,7 @@ class RuntimeConfig:
     task: TaskConfig = field(default_factory=TaskConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     langchao: LangchaoConfig = field(default_factory=LangchaoConfig)
+    privacy_deletion: PrivacyDeletionConfig = field(default_factory=PrivacyDeletionConfig)
     #: Free-form extras; useful for experiments without touching the schema.
     extras: dict[str, Any] = field(default_factory=dict)
 
