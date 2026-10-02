@@ -129,7 +129,8 @@ def test_summary_payload_cannot_enter_producer_or_coordinator_terminal_boundary(
 
 
 class FakeConnection:
-    pass
+    def execute(self, _sql, _params=()):
+        return SimpleNamespace(rowcount=1)
 
 
 class FakeDatabase:
@@ -248,9 +249,13 @@ class ActualOutcomeSettler:
 
     def __init__(self, repository) -> None:
         self.repository = repository
+        self.terminal_producer = None
 
     def settle_labels(self, labels):
-        return (outcome(),)
+        result = (outcome(),)
+        if self.terminal_producer is not None:
+            self.terminal_producer.from_actual_outcomes(result, occurred_at=LATER)
+        return result
 
 
 def _live_composition(monkeypatch):
@@ -286,7 +291,9 @@ def test_live_composition_feeds_settled_actual_outcomes_to_terminal_producer(mon
     contracts = TransactionalContracts.instance
     assert contracts is not None
 
-    returned = composition.user_model_service.outcome_observer.settle_labels((object(),))
+    returned = composition.user_model_service.outcome_observer.settle_labels(
+        (SimpleNamespace(updated_at=LATER),)
+    )
 
     assert returned == (outcome(),)
     assert contracts.active_goal.status is GoalStatus.COMPLETED
@@ -305,7 +312,9 @@ def test_terminal_producer_failure_propagates_so_outer_settlement_can_roll_back(
     )
     before = deepcopy(contracts.__dict__)
     with pytest.raises(RuntimeError, match="injected producer failure"):
-        composition.user_model_service.outcome_observer.settle_labels((object(),))
+        composition.user_model_service.outcome_observer.settle_labels(
+            (SimpleNamespace(updated_at=LATER),)
+        )
     # The producer must not swallow failures.  In the real path the user-model
     # settlement_transaction is the outer owner and rolls label/outcome/goal back.
     assert contracts.__dict__ == before
