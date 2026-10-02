@@ -5,6 +5,37 @@
 
 ---
 
+## 0.4.1 — 2026-10-02（设计与审查材料移出公开仓库）
+
+按作者判断，仓库里的设计文档与审查材料属于核心技术内容，**从当前分支移除**（共 90 个文件）：
+
+| 类别 | 内容 |
+|---|---|
+| 核心设计 | `我即浪潮_决策模块完整设计与三份核心契约_v1.0.md`、`内源主动型长期陪伴AI_Runtime_完整架构设计.md`、`用户模型与动机决策_v2更新施工要求_20260930.md`、`架构全景_20260930.md`、`PATCH_v0.2_…md` |
+| 表 / 代码对照 | `DESIGN_TABLE_MAPPING.md`、`PATCH_V0.2_MAPPING.md`、`HOST_KB_REUSE.md`、`REDELIVERY.md` |
+| 提示词与角色卡 | `PROMPTS_TO_THE_MAIN_LLM.md`、`docs/PROMPT_REVIEW.md`、`docs/prompt_samples/`、`人格设定*.md`、`病娇化改造_设计对齐.md` |
+| 审计与验收材料 | `runtime/audit/`（49 项：验收清单、指标登记卡、场景映射、语义双评包、逐项结果）、`runtime/docs/浪潮决策引擎_*` 各报告、`BUSINESS_LOGIC_AUDIT.md`、`user_model_v2_source_audit.md`、`docs/SIMULATION_INTEGRATION.md`、`docs/ONBOARDING_new_tester.md` |
+
+随之删掉的还有 4 个只服务于这些材料的文件：验收清单校验模块
+`langchao_acceptance_manifest.py` 与三个读取对应 JSON 的测试。
+
+**保留**：`runtime/docs/浪潮决策引擎_上线记录与回滚手册_20261002.md`（运维文档，
+不含核心机制，丢了会影响回滚能力）。
+
+**范围与代价（写清楚）**：
+
+- 只从**当前分支**移除，历史提交仍可查到；`git log`、已 clone/fork 的副本不受影响。
+  真要彻底抹除需要重写历史并 force push，这一步没有做。
+- 设计推理没了，机制仍在代码里：方程在 `langchao_engine.py`、契约字段在 `langchao_types.py`、
+  提示词在代码中拼装。所以这次移除删的是"解释与依据"，不是机制本身。
+- T01–T32 验收清单与逐项证据不再随仓库分发，公开仓库里可复核的证据只剩代码、测试与文档；
+  `CHANGELOG.md`、`HANDOFF.md` 的历史条目仍会引用这些文件名（未回改，点了会 404）。
+- 作者本地另存了一份逐文件哈希校验过的私有副本。
+
+门禁复跑：聚焦套件 `207 passed / 1 skipped`。
+
+---
+
 ## 0.4.0 — 2026-10-02（已上线）
 
 这一版把「浪潮」决策引擎、社会关系模块与交叉记忆搬进生产，并**真实上线**：

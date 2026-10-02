@@ -1,7 +1,0 @@
-{
-  "audit_version": "offline-ablation-audit.v1",
-  "fixture_sha256": "0d39c28e4adfda41f1892d1a8b0cb89a4b6850b0cf2df420325a95ed8548e4da",
-  "issues": [],
-  "status": "pass",
-  "user_effects_evaluated": false
-}
