@@ -1128,6 +1128,29 @@ def create_app(
                 ),
             )
         )
+        privacy_repository = getattr(
+            v2_composition, "privacy_deletion_repository", None
+        )
+        privacy_coordinator = getattr(
+            v2_composition, "privacy_deletion_coordinator", None
+        )
+        privacy_authorize = getattr(
+            v2_composition, "privacy_deletion_authorize", None
+        )
+        privacy_components = (
+            privacy_repository, privacy_coordinator, privacy_authorize
+        )
+        if any(component is not None for component in privacy_components):
+            if not all(component is not None for component in privacy_components):
+                raise ValueError("privacy deletion composition must be complete")
+            from .privacy_deletion_api import create_privacy_deletion_router
+
+            app.include_router(create_privacy_deletion_router(
+                scope_key=v2_composition.coordinator.scope_key,
+                repository=privacy_repository,
+                coordinator=privacy_coordinator,
+                authorize=privacy_authorize,
+            ))
 
     @app.exception_handler(ValueError)
     async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
