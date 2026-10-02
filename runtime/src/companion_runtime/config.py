@@ -637,6 +637,50 @@ def _coerce_scalar(text: str) -> Any:
     return text
 
 
+def _coerce_for(current: Any, text: str, *, key: str) -> Any:
+    """Coerce an environment value according to the *existing* field's type.
+
+    Guessing the type from the text alone is wrong often enough to be dangerous:
+    ``"off"`` is a legitimate value for a string setting such as the attention recipe,
+    but a scalar guess turns it into ``False``.  The declared default therefore decides
+    how the override is parsed, and a value that cannot satisfy the declared type is an
+    error rather than a silent type change.
+    """
+    if isinstance(current, bool):
+        lowered = text.strip().lower()
+        if lowered in {"true", "yes", "on"}:
+            return True
+        if lowered in {"false", "no", "off"}:
+            return False
+        raise ValueError(f"{key} must be a boolean")
+    if isinstance(current, list):
+        # List-valued settings (for example the 浪潮 live scope allowlist) must never be
+        # silently downgraded to a bare string: a string would turn the exact-scope gate
+        # into a substring match.
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{key} must be a JSON array of strings") from exc
+        if not isinstance(parsed, list) or any(
+            not isinstance(item, str) or not item.strip() for item in parsed
+        ):
+            raise ValueError(f"{key} must be a JSON array of strings")
+        return parsed
+    if isinstance(current, str):
+        return text
+    if isinstance(current, int):
+        try:
+            return int(text)
+        except ValueError as exc:
+            raise ValueError(f"{key} must be an integer") from exc
+    if isinstance(current, float):
+        try:
+            return float(text)
+        except ValueError as exc:
+            raise ValueError(f"{key} must be a number") from exc
+    return _coerce_scalar(text)
+
+
 def load_config(
     path: str | os.PathLike[str] | None = None,
     env: Mapping[str, str] | None = None,
@@ -692,22 +736,7 @@ def load_config(
             LOGGER.warning("Ignoring unknown environment override: %s", key)
             continue
         current = getattr(cursor, segments[-1])
-        if isinstance(current, list):
-            # List-valued settings (for example the 浪潮 live scope allowlist) must
-            # never be silently downgraded to a bare string: a string would turn the
-            # exact-scope gate into a substring match.  Require an explicit JSON array
-            # of strings and fail closed on anything else.
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{key} must be a JSON array of strings") from exc
-            if not isinstance(parsed, list) or any(
-                not isinstance(item, str) or not item.strip() for item in parsed
-            ):
-                raise ValueError(f"{key} must be a JSON array of strings")
-            setattr(cursor, segments[-1], parsed)
-        else:
-            setattr(cursor, segments[-1], _coerce_scalar(raw))
+        setattr(cursor, segments[-1], _coerce_for(current, raw, key=key))
 
     return config
 
