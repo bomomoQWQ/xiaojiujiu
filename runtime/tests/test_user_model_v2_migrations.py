@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from companion_runtime.user_model_v2_schema import USER_MODEL_SCHEMA_VERSION
 from companion_runtime.user_model_v2_migrations import (
     migrate,
     migration_bootstrap_statements,
@@ -45,7 +46,7 @@ def test_records_have_stable_nonempty_checksums() -> None:
     first = migration_records()
     second = migration_records()
     assert first == second
-    assert tuple(record.version for record in first) == tuple(range(1, 21))
+    assert tuple(record.version for record in first) == tuple(range(1, USER_MODEL_SCHEMA_VERSION + 1))
     assert all(len(record.checksum) == 64 for record in first)
 
 
