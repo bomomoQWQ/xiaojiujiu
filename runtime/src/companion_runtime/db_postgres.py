@@ -72,6 +72,7 @@ backend - see :attr:`ConflictError.dialect`.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from typing import Any, Sequence
@@ -135,6 +136,30 @@ CONFLICT_ERRORS: tuple[type[BaseException], ...] = (
 #:     WHERE locktype = 'advisory' AND objsubid = 1
 #:       AND classid::bigint = 5395790 AND objid::bigint = 1414090053;
 WRITER_LOCK_KEY: int = 0x52554E54494D45
+
+
+def writer_lock_key_for(schema: str) -> int:
+    """Return the single-writer advisory key for one schema.
+
+    A deployment runs one Runtime per user, each with its own schema inside one shared
+    database. A single database-wide key therefore serialises every scope against every
+    other, and a busy neighbour turns into a lock timeout for an unrelated user -- which
+    is how a Langchao round loses its commit. The key is derived from the schema name so
+    the invariant stays "one writer per scope" while unrelated scopes never wait.
+
+    Args:
+        schema: The configured schema name; an empty value falls back to the base key.
+
+    Returns:
+        A stable non-zero 64-bit advisory-lock key.
+    """
+    text = str(schema or "").strip()
+    if not text:
+        return WRITER_LOCK_KEY
+    digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
+    # ``pg_advisory_xact_lock`` takes a signed bigint, and zero is a valid key we would
+    # rather not collide with an unconfigured store.
+    return int.from_bytes(digest, "big", signed=True) or WRITER_LOCK_KEY
 
 #: Matches the two SQLite-only spellings this backend rewrites. Both are matched
 #: only in ordinary SQL - never inside a literal, an identifier or a comment.
@@ -722,7 +747,7 @@ class PostgresDatabase(DatabaseBase):
             "dialect": self.dialect,
             "server_version": None,
             "database": None,
-            "writer_lock_key": WRITER_LOCK_KEY,
+            "writer_lock_key": self._writer_lock_key(),
             # A static fact, so it is reported even when the server is down: an
             # operator asking "why did my backup refuse?" reads it from here.
             "durability_commands": self.supports_durability_commands,
@@ -766,7 +791,9 @@ class PostgresDatabase(DatabaseBase):
         try:
             connection.execute("BEGIN")
             if immediate:
-                connection.execute("SELECT pg_advisory_xact_lock(?)", (WRITER_LOCK_KEY,))
+                connection.execute(
+                    "SELECT pg_advisory_xact_lock(?)", (self._writer_lock_key(),)
+                )
         except BaseException:
             # A failed BEGIN or a lock timeout leaves an aborted transaction on a
             # connection that is shared by every later call, which would then fail
@@ -782,6 +809,10 @@ class PostgresDatabase(DatabaseBase):
             connection.execute("ROLLBACK")
         except Exception:
             LOGGER.debug("ROLLBACK after a failed BEGIN was refused", exc_info=True)
+
+    def _writer_lock_key(self) -> int:
+        """Return this store's writer-lock key, scoped to its schema."""
+        return writer_lock_key_for(str(getattr(self, "schema_name", "") or ""))
 
     def _in_transaction(self) -> bool:
         """Ask PostgreSQL whether a transaction block is actually open.

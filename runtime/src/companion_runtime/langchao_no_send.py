@@ -28,6 +28,9 @@ class NoSendReason(str, Enum):
     INVALIDATED = "invalidated"
     DISPATCH_FAILED = "dispatch_failed"
     DELIVERY_UNKNOWN = "delivery_unknown"
+    #: A cold-start outreach was selected but the bounded budget for it is spent. The
+    #: candidate stays legitimate; only this round's use of the allowance is refused.
+    COLD_START_BUDGET_EXHAUSTED = "cold_start_budget_exhausted"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

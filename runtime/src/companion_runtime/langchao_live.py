@@ -17,7 +17,11 @@ from .capability_witness import WitnessValidator, candidate_witness_requirement
 from .langchao_authority import AuthorityEngine, AuthorityMode
 from .langchao_no_send import NoSendReason, NoSendResult
 from .langchao_permission import PermissionProjection, read_runtime_permission
-from .langchao_runtime_adapter import BuiltCandidateContracts, BuiltShadowRound
+from .langchao_runtime_adapter import (
+    COLD_START_DRIVE_OUTCOME,
+    BuiltCandidateContracts,
+    BuiltShadowRound,
+)
 from .langchao_live_repository import LangchaoLiveCommit
 from .langchao_types import CandidateKind, CandidateState
 from .runtime_v2 import CandidateV2, CommitReceiptV2
@@ -77,6 +81,15 @@ def _digest(candidate: Any) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _carries_cold_start_drive(item: Any) -> bool:
+    """Return whether a built contract spends the bounded cold-start allowance."""
+    reward = getattr(item, "reward", None)
+    return any(
+        getattr(token, "outcome_key", None) == COLD_START_DRIVE_OUTCOME
+        for token in getattr(reward, "outcome_tokens", ()) or ()
+    )
+
+
 class LangchaoLiveService:
     """Validate one numerical decision and cross the legacy transaction boundary."""
 
@@ -85,6 +98,7 @@ class LangchaoLiveService:
         contract_repository: Any | None = None,
         witness_reader: Any | None = None,
         permission_reader: Any | None = None,
+        cold_start_budget: Any | None = None,
     ) -> None:
         if not scope_key.strip():
             raise ValueError("scope_key is required")
@@ -94,6 +108,30 @@ class LangchaoLiveService:
         self.contracts = contract_repository
         self.witnesses = WitnessValidator(witness_reader) if witness_reader is not None else None
         self.permission_reader = permission_reader
+        self.cold_start_budget = cold_start_budget
+
+    def _budget_refusal(self, *, contract: Any, round_id: str, now: Any) -> NoSendResult | None:
+        """Return the refusal for a spent cold-start allowance, or ``None`` to proceed.
+
+        Args:
+            contract: The built contract about to cross the send boundary.
+            round_id: Decision round identity, carried into the refusal.
+            now: Decision time.
+
+        Returns:
+            A ``budget``-stage :class:`NoSendResult` when this dispatch would spend an
+            allowance the durable budget has already used up.
+        """
+        if self.cold_start_budget is None or not _carries_cold_start_drive(contract):
+            return None
+        if self.cold_start_budget.available(now=now):
+            return None
+        return NoSendResult(
+            reason=NoSendReason.COLD_START_BUDGET_EXHAUSTED, stage="budget",
+            round_id=round_id,
+            candidate_id=getattr(getattr(contract, "candidate", None), "candidate_id", None),
+            details=(("allowance", COLD_START_DRIVE_OUTCOME),),
+        )
 
     def execute_in_transaction(
         self,
@@ -146,6 +184,12 @@ class LangchaoLiveService:
             return NoSendResult(reason=NoSendReason.PERMISSION_REVOKED, stage="permission",
                 round_id=round_id, candidate_id=decision_candidate_id,
                 permission_version=permission.permission_version)
+        # The cold-start allowance is a declared part of the contract, so a spent budget
+        # must refuse *this dispatch* rather than change the contract and churn its
+        # immutable revision.
+        refusal = self._budget_refusal(contract=item, round_id=round_id, now=now)
+        if refusal is not None:
+            return refusal
         if permission is not None and (
                 permission.permission_version != built.state.permission_version
                 or item.candidate.permission_ref != permission.permission_version):

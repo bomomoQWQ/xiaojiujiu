@@ -15,6 +15,7 @@ from companion_runtime.capability_witness import (
     WitnessValidationError,
 )
 from companion_runtime.config import RuntimeConfig
+from companion_runtime.langchao_engine import LangchaoParameters
 from companion_runtime.langchao_shadow_wiring import (
     DEFAULT_LANGCHAO_PARAMETERS,
     CandidateAdmission,
@@ -264,6 +265,54 @@ def test_default_parameters_are_reachable_and_threshold_one_is_dead_for_bounded_
     assert medium / (medium + impossible.leak) < impossible.decision_threshold
 
 
+def test_runner_uses_the_configured_kernel_parameters_not_the_module_default():
+    """Configuration owns the numbers, so a rollout can be recalibrated without a rebuild.
+
+    Verified through the runner rather than the config object alone: a validated setting
+    that never reaches the kernel is exactly how the earlier placeholder values stayed in
+    force while looking adjustable.
+    """
+    captured = {}
+
+    class Service:
+        def run(self, built, **kwargs):
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(sent_count=0, reward_count=0, training_count=0,
+                                   quota_count=0, outbox_id=None)
+
+    class Revisions:
+        def resolve(self, kind, identity, dto):
+            return (1 if kind != "goal" or dto.reward_contract_id is None else 2), None
+
+    tuned = LangchaoParameters(
+        leak=0.04, competition_gain=0.25, decision_threshold=0.68,
+        time_scale_seconds=2400.0, max_step_seconds=2400.0,
+        crossing_tolerance=1e-7, tie_tolerance=1e-6,
+    )
+    state = SimpleNamespace(version=7, values=RuntimeConfig().values)
+    runtime = SimpleNamespace(
+        state=lambda: state,
+        projections=SimpleNamespace(boundaries=SimpleNamespace(list_all=lambda **_kwargs: [])),
+    )
+    runner = LangchaoShadowRunner(
+        scope_key="scope", runtime=runtime, service=Service(),
+        state_repository=SimpleNamespace(load_active_state=lambda: None), revisions=Revisions(),
+        parameters=tuned,
+    )
+    item = _decision("contact", "contact")
+    runner.run(EndogenousDecisionV2(decision_id="d1", acted=False, reason="defer",
+                                    assessments=(item,)),
+               now=item.predictions.reply.predicted_at)
+    # The attention recipe owns the competition gain (the baseline recipe pins it to zero),
+    # so the recipe-planned parameters are what the service receives.
+    sent = captured["kwargs"]["parameters"]
+    assert (sent.leak, sent.decision_threshold, sent.time_scale_seconds,
+            sent.max_step_seconds) == (0.04, 0.68, 2400.0, 2400.0)
+    # Everything else the configured parameters carry is the configured value.
+    assert sent.competition_gain == 0.0
+    assert sent.parameter_version == tuned.parameter_version
+
+
 def test_enabled_runner_builds_contact_plus_synthetic_rest_and_state_cursor():
     captured = {}
 
@@ -416,29 +465,28 @@ def test_cold_start_drive_is_refused_for_templates_that_already_own_a_local_rewa
         assert facts.cold_start_drive == 0.0, action["type"]
 
 
-def test_round_drive_is_withheld_when_the_durable_budget_is_spent():
-    """A budget that says no must zero the round's drive before any candidate is admitted."""
-    now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+def test_the_drive_is_a_stable_contract_property_not_a_per_round_quantity():
+    """A spent budget must not change the contract, only refuse the dispatch.
 
-    class SpentBudget:
-        def available(self, *, now):
-            return False
+    The reward revision is immutable and outcome tokens replay by idempotency key, so a
+    drive that appeared and disappeared with the budget would change those coordinates
+    and make the next round refuse. The allowance is therefore declared once and spent at
+    the dispatch boundary.
+    """
+    def question(candidate_id: str):
+        return _decision_with_action(candidate_id, {
+            "type": "curious_question", "question": True, "topic_shift": True,
+            "memory_ref": "memory:m1",
+        })
 
-    runner = LangchaoShadowRunner(
-        scope_key="scope", runtime=None, service=None, state_repository=None,
-        revisions=None, cold_start_drive=2.0, cold_start_budget=SpentBudget(),
-    )
-    assert runner._cold_start_drive_for_round(now) == 0.0
+    from companion_runtime.langchao_shadow_wiring import COLD_START_EXPLORATION_REASON
 
-    class OpenBudget:
-        def available(self, *, now):
-            return True
-
-    runner.cold_start_budget = OpenBudget()
-    assert runner._cold_start_drive_for_round(now) == 2.0
-
-    runner.cold_start_drive = 0.0
-    assert runner._cold_start_drive_for_round(now) == 0.0
+    item = replace(question("c1"), reasons=(COLD_START_EXPLORATION_REASON,))
+    first = _admit_candidate(item, cold_start_drive=2.0).facts
+    second = _admit_candidate(item, cold_start_drive=2.0).facts
+    assert first.cold_start_drive == second.cold_start_drive == 2.0
+    # And the runner carries no budget of its own; that gate is the live service's.
+    assert not hasattr(LangchaoShadowRunner, "cold_start_budget")
 
 
 def _decision(candidate_id: str, action_type: str):

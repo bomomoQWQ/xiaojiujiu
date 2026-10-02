@@ -24,6 +24,68 @@ class Authority:
         return self.value
 
 
+def test_a_spent_cold_start_budget_refuses_the_dispatch_not_the_contract():
+    """The allowance is spent at the dispatch boundary, so the contract stays immutable."""
+    from companion_runtime.langchao_live import LangchaoLiveService
+    from companion_runtime.langchao_runtime_adapter import COLD_START_DRIVE_OUTCOME
+    from companion_runtime.langchao_types import (
+        CandidateKind,
+        OutcomeStatus,
+        OutcomeToken,
+        SettlementType,
+    )
+
+    token = OutcomeToken(
+        token_id="token:drive", scope_key="scope", goal_id="goal", episode_id="episode",
+        outcome_key=COLD_START_DRIVE_OUTCOME, settlement_type=SettlementType.EXPECTED,
+        status=OutcomeStatus.UNEXECUTED, base_amount=2.0,
+        direction_weights=(), evidence_version="v1", idempotency_key="idem:drive",
+    )
+    contract = SimpleNamespace(
+        reward=SimpleNamespace(outcome_tokens=(token,)),
+        candidate=SimpleNamespace(candidate_id="candidate", kind=CandidateKind.EXTERNAL_MESSAGE),
+    )
+
+    class Spent:
+        def available(self, *, now):
+            return False
+
+    class Open:
+        def available(self, *, now):
+            return True
+
+    def service_with(budget):
+        return LangchaoLiveService(
+            scope_key="scope", authority_reader=Authority(
+                AuthorityEngine.LANGCHAO, AuthorityMode.LIVE, True
+            ),
+            legacy_bridge=SimpleNamespace(), cold_start_budget=budget,
+        )
+
+    for budget, expected_reason in ((Spent(), NoSendReason.COLD_START_BUDGET_EXHAUSTED),
+                                    (Open(), None)):
+        refusal = service_with(budget)._budget_refusal(contract=contract, round_id="round:1", now=NOW)
+        if expected_reason is None:
+            assert refusal is None
+        else:
+            assert isinstance(refusal, NoSendResult)
+            assert refusal.reason is expected_reason
+            assert refusal.stage == "budget"
+            assert refusal.round_id == "round:1"
+
+    # A contract that never spends the allowance is unaffected by the budget.
+    plain = SimpleNamespace(
+        reward=SimpleNamespace(outcome_tokens=()), candidate=SimpleNamespace(candidate_id="c")
+    )
+    assert service_with(Spent())._budget_refusal(contract=plain, round_id="r", now=NOW) is None
+    # And a service with no budget at all never refuses on this ground.
+    assert LangchaoLiveService(
+        scope_key="scope",
+        authority_reader=Authority(AuthorityEngine.LANGCHAO, AuthorityMode.LIVE, True),
+        legacy_bridge=SimpleNamespace(),
+    )._budget_refusal(contract=contract, round_id="r", now=NOW) is None
+
+
 def test_live_config_is_default_off_and_scope_allowlisted():
     config = RuntimeConfig()
     assert config.langchao.live_enabled is False

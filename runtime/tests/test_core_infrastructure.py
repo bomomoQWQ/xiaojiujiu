@@ -275,6 +275,43 @@ def test_load_config_exposes_strict_langchao_numeric_parameters() -> None:
             load_config(env=env)
 
 
+def test_writer_lock_is_scoped_so_neighbours_do_not_block_each_other() -> None:
+    """One database-wide key would serialise every user against every other.
+
+    Each Runtime keeps its own schema in one shared database, so the single-writer
+    invariant has to hold per scope. A shared key turns a busy neighbour into a lock
+    timeout, which is how a round loses its commit.
+    """
+    from companion_runtime.db_postgres import WRITER_LOCK_KEY, writer_lock_key_for
+
+    first = writer_lock_key_for("cr_default_friendmessage_1000000003")
+    second = writer_lock_key_for("cr_default_friendmessage_1000000002")
+    assert first != second
+    assert first == writer_lock_key_for("cr_default_friendmessage_1000000003")
+    assert first != 0 and second != 0
+    # An unconfigured store still has a real key rather than colliding with zero.
+    assert writer_lock_key_for("") == WRITER_LOCK_KEY
+    assert writer_lock_key_for("   ") == WRITER_LOCK_KEY
+
+
+def test_open_database_scopes_the_writer_lock_to_the_configured_schema() -> None:
+    from companion_runtime.db import open_database
+    from companion_runtime.db_postgres import PostgresDatabase, writer_lock_key_for
+
+    class Storage:
+        schema = "cr_scope_a"
+        busy_timeout_ms = 5000
+
+        @staticmethod
+        def require_postgres_dsn() -> str:
+            return "postgresql://runtime:secret@db/runtime"
+
+    store = open_database(Storage())
+    assert isinstance(store, PostgresDatabase)
+    assert store._writer_lock_key() == writer_lock_key_for("cr_scope_a")
+    assert store.describe()["writer_lock_key"] == store._writer_lock_key()
+
+
 def test_cold_start_drive_is_configurable_and_can_be_switched_off() -> None:
     """The bounded outreach allowance is an operator dial, including turning it off."""
     default = load_config(env={})

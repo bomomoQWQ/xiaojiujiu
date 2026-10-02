@@ -320,6 +320,7 @@ def build_v2_composition(
                 attention_recipe=attention_recipe,
                 internal_exploration_enabled=config.langchao.internal_exploration_enabled,
                 cold_start_drive=config.langchao.cold_start_drive,
+                parameters=config.langchao.parameters(),
             )
         live_enabled = bool(config.langchao.live_allowed(scope_key))
         langchao_live_runner = None
@@ -333,6 +334,7 @@ def build_v2_composition(
                 attention_recipe=attention_recipe,
                 internal_exploration_enabled=config.langchao.internal_exploration_enabled,
                 cold_start_drive=config.langchao.cold_start_drive,
+                parameters=config.langchao.parameters(),
             )
             from .langchao_user_outcomes import LangchaoUserOutcomeSettler
 

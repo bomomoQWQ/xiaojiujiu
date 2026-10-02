@@ -466,35 +466,26 @@ class LangchaoShadowRunner:
     exploration_witness_reader: Any | None = None
     #: Bounded cold-start outreach allowance carried into admitted candidates.
     cold_start_drive: float = 0.0
-    #: Durable budget limiting how often that allowance may be spent.
-    cold_start_budget: Any | None = None
     outcome_repository: Any | None = None
     last_built: BuiltShadowRound | None = None
-
-    def _cold_start_drive_for_round(self, now: datetime) -> float:
-        """Return the drive this round may spend, honouring the durable budget."""
-        if self.cold_start_drive <= 0:
-            return 0.0
-        budget = self.cold_start_budget
-        if budget is None:
-            # Every production builder injects a budget whenever the drive is enabled; a
-            # missing one means an offline caller that cannot dispatch.
-            return float(self.cold_start_drive)
-        return float(self.cold_start_drive) if budget.available(now=now) else 0.0
 
     def run(
         self, decision: EndogenousDecisionV2, *, now: datetime,
         before_commit: Any | None = None,
         authority_revision: int | None = None,
     ) -> Any | None:
-        round_drive = self._cold_start_drive_for_round(now)
+        # The allowance is a declared property of the contract, not a per-round quantity:
+        # its immutable revision must not change just because the budget is momentarily
+        # spent, or the outcome-token replay would see changed coordinates and refuse.
+        # How often the allowance may actually be *spent* is enforced at the live
+        # dispatch boundary, where the durable budget lives.
         admissions = tuple(
             _admit_candidate(
                 item,
                 internal_exploration_enabled=self.internal_exploration_enabled,
                 scope_key=self.scope_key,
                 witness_reader=self.exploration_witness_reader,
-                cold_start_drive=round_drive,
+                cold_start_drive=self.cold_start_drive,
             )
             for item in decision.assessments
         )
@@ -654,7 +645,7 @@ def build_langchao_shadow_runner(
     *, connection: Any, scope_key: str, runtime: Any, allow_live_evaluation: bool = False,
     transaction_factory: Any | None = None, attention_recipe: str = BASELINE_RECIPE,
     internal_exploration_enabled: bool = True, cold_start_drive: float = 0.0,
-    cold_start_budget: Any | None = None,
+    parameters: LangchaoParameters | None = None,
 ) -> LangchaoShadowRunner:
     """Build safe repositories on the same migrated PostgreSQL connection."""
     borrowed = _BorrowedConnection(connection)
@@ -667,12 +658,6 @@ def build_langchao_shadow_runner(
     if authority.get_active() is None:
         authority.bootstrap()  # runtime_v2/live only; bootstrap itself rechecks under lock.
     shadow = LangchaoShadowPostgresRepository(borrowed, state_repository=states)
-    if cold_start_drive > 0 and cold_start_budget is None:
-        # Enabling the drive without its bound would let it fire every few hours; the
-        # builder therefore always attaches the durable counter.
-        from .langchao_live_repository import LangchaoColdStartBudget
-
-        cold_start_budget = LangchaoColdStartBudget(connection, scope_key=scope_key)
     service = LangchaoShadowService(
         contract_repository=contracts,
         outcome_repository=outcomes,
@@ -685,10 +670,12 @@ def build_langchao_shadow_runner(
     return LangchaoShadowRunner(scope_key=scope_key, runtime=runtime, service=service,
                                 state_repository=states, outcome_repository=outcomes,
                                 revisions=LangchaoRevisionResolver(connection, scope_key=scope_key),
+                                # Configuration owns the kernel numbers so a rollout can be
+                                # recalibrated without rebuilding the image.
+                                parameters=parameters or DEFAULT_LANGCHAO_PARAMETERS,
                                 attention_recipe=normalize_recipe(attention_recipe),
                                 internal_exploration_enabled=bool(internal_exploration_enabled),
                                 cold_start_drive=float(cold_start_drive),
-                                cold_start_budget=cold_start_budget,
                                 exploration_witness_reader=PostgresWitnessRepository(
                                     connection, scope_key=scope_key,
                                 ))

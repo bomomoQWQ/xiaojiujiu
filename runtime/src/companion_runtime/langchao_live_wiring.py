@@ -10,7 +10,7 @@ from .actual_action_v21 import actual_action_for_exposure
 from .langchao_authority import AuthorityEngine, AuthorityMode
 from .langchao_authority_repository import LangchaoAuthorityRepository
 from .langchao_live import LangchaoLiveResult, LangchaoLiveService
-from .langchao_live_repository import LangchaoLiveRepository
+from .langchao_live_repository import LangchaoColdStartBudget, LangchaoLiveRepository
 from .langchao_no_send import DELIVERY_STAGE, NoSendReason, NoSendResult
 from .langchao_repository import LangchaoRepository
 from .langchao_shadow_wiring import build_langchao_shadow_runner
@@ -187,7 +187,7 @@ def build_langchao_live_runner(
     *, connection: Any, scope_key: str, runtime: Any, legacy_bridge: Any,
     witness_reader: Any | None = None,
     attention_recipe: str = "off", internal_exploration_enabled: bool = True,
-    cold_start_drive: float = 0.0,
+    cold_start_drive: float = 0.0, parameters: Any | None = None,
 ) -> LangchaoLiveRunner:
     evaluator = build_langchao_shadow_runner(
         connection=connection, scope_key=scope_key, runtime=runtime,
@@ -196,6 +196,7 @@ def build_langchao_live_runner(
         attention_recipe=attention_recipe,
         internal_exploration_enabled=internal_exploration_enabled,
         cold_start_drive=cold_start_drive,
+        parameters=parameters,
     )
     authority = LangchaoAuthorityRepository(connection, scope_key=scope_key)
     contracts = LangchaoRepository(connection, scope_key=scope_key)
@@ -203,6 +204,12 @@ def build_langchao_live_runner(
         scope_key=scope_key, authority_reader=authority,
         legacy_bridge=legacy_bridge, contract_repository=contracts,
         witness_reader=witness_reader,
+        # Enabling the drive without its bound would let it fire every couple of hours;
+        # the dispatch boundary therefore always carries the durable counter.
+        cold_start_budget=(
+            LangchaoColdStartBudget(connection, scope_key=scope_key)
+            if cold_start_drive > 0 else None
+        ),
     )
     live_repository = LangchaoLiveRepository(connection, scope_key=scope_key)
     return LangchaoLiveRunner(
