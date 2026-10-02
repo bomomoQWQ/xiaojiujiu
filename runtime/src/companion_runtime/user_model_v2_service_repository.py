@@ -164,6 +164,9 @@ class PostgresUserModelV2ServiceRepository:
             return None
         exposure_id = str(_row_value(row, "exposure_id", 0))
         exposure = _exposure_from_payload(_row_value(row, "exposure_payload", 3))
+        if exposure.exposure_id != exposure_id:
+            from dataclasses import replace
+            exposure = replace(exposure, exposure_id=exposure_id)
         features = _features_from_payload(
             _row_value(row, "feature_snapshot", 4),
             scope_key=scope_key,
@@ -186,6 +189,9 @@ class PostgresUserModelV2ServiceRepository:
             (scope_key, exposure_id),
         ).fetchall()
         labels = tuple(_label_from_payload(_row_value(item, "target_value", 0)) for item in label_rows)
+        if any(label.exposure_id != exposure_id for label in labels):
+            from dataclasses import replace
+            labels = tuple(replace(label, exposure_id=exposure_id) for label in labels)
         if len(labels) != len(Target) or tuple(label.target for label in labels) != tuple(Target):
             raise ValueError("prepared exposure must have exactly four active target labels")
         return PreparedExposureV2(exposure=exposure, features=features, labels=labels)
