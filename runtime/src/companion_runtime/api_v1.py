@@ -1345,12 +1345,47 @@ def _apply_action_report(
                 reason=f"unsupported_action_type:{action_type or 'missing'}",
             )
 
-        conflict = _lease_owner_conflict(row, adapter_id)
-        if conflict:
-            return _result_response(ok=False, state=_attempt_state(runtime, row), reason=conflict)
-
         result = _mapping(data.get("result"))
         status = _text(data.get("status")).strip().lower() or STATUS_FAILED
+        irreversible_send = (
+            _text(row.kind).strip().lower() == ACTION_SEND
+            and status == STATUS_OK
+            and _flag(result.get("sent"), False)
+        )
+        conflict = _lease_owner_conflict(row, adapter_id)
+        if conflict and not irreversible_send:
+            return _result_response(ok=False, state=_attempt_state(runtime, row), reason=conflict)
+
+        lease_id = _text(data.get("lease_id")).strip()
+        owner = _text(row.lease_owner).strip()
+        expected = _lease_id(
+            adapter_id=owner or adapter_id,
+            outbox_id=row.outbox_id,
+            attempts=row.attempts,
+        )
+        # A report that cannot name the claim it answers is not evidence about the current
+        # lease: an empty fence lets a stale reporter end a newer claim. Only a successful
+        # SEND is exempt, because that is an irreversible platform fact whose arrival must
+        # terminate the queue rather than be refused.
+        missing_claim = bool(expected) and not lease_id
+        stale_claim = bool(lease_id and expected and lease_id != expected)
+        expired_claim = row.status == OutboxStatus.PENDING.value
+        if (missing_claim or stale_claim or expired_claim) and not irreversible_send:
+            extra: dict[str, Any] = {}
+            if _unavailable_marker(result) or _unavailable_marker(data):
+                extra.update(retryable=False, requeued=False)
+            return _result_response(
+                # An unprovable claim is refused outright; a stale or expired one is an
+                # acknowledged duplicate that simply must not touch current state.
+                ok=not missing_claim,
+                state=_attempt_state(runtime, row),
+                duplicate=True,
+                reason=("missing_lease_id" if missing_claim
+                        else "stale_lease" if stale_claim else "lease_expired"),
+                action_id=action_id,
+                action_type=action_type,
+                **extra,
+            )
         outage = _unavailable_marker(result) or _unavailable_marker(data)
         if outage:
             # An outage report is a statement about the *claim*, not about the
@@ -1684,9 +1719,9 @@ def create_v1_router(runtime: Any, config: RuntimeConfig | None = None) -> APIRo
         ``outbox.lease_seconds``, not the requested ``lease_ttl_ms`` -- and a
         ``render`` payload carries a composed ``prompt``.
 
-        Rows whose session is not in ``sessions`` (when given) are not returned;
-        they stay leased until the lease expires, which is deliberate: releasing
-        them would burn their attempt budget on work this adapter never asked for.
+        ``sessions`` is an exact allowlist applied by the claim SQL. A row for
+        another session is never leased, so it cannot burn an attempt budget merely
+        because this adapter cannot route it.
         """
         data = _mapping(payload)
         adapter_id = _text(data.get("adapter_id")).strip() or DEFAULT_ADAPTER_ID
@@ -1699,7 +1734,6 @@ def create_v1_router(runtime: Any, config: RuntimeConfig | None = None) -> APIRo
         sessions = {item for item in _strings(data.get("sessions"))}
         now = utcnow()
         actions: list[dict[str, Any]] = []
-        skipped_sessions: list[str] = []
         failure = ""
         try:
             # A pure render/send deployment has no other time driver, and expired
@@ -1717,15 +1751,19 @@ def create_v1_router(runtime: Any, config: RuntimeConfig | None = None) -> APIRo
             # is given nothing: claiming `kinds=None` would lease it everything.
             items = (
                 runtime.reducer.claim_outbox(
-                    owner=adapter_id, now=now, limit=max_actions, kinds=kinds
+                    owner=adapter_id,
+                    now=now,
+                    limit=max_actions,
+                    kinds=kinds,
+                    conversations=tuple(sorted(sessions)) or None,
+                    include_unscoped=bool(
+                        sessions and settings.conversation_id in sessions
+                    ),
                 )
                 if kinds
                 else []
             )
             for item in items:
-                if sessions and _session_of(item, settings) not in sessions:
-                    skipped_sessions.append(item.outbox_id)
-                    continue
                 actions.append(
                     _leased_action(runtime, settings, item, adapter_id=adapter_id, now=now)
                 )
@@ -1738,8 +1776,6 @@ def create_v1_router(runtime: Any, config: RuntimeConfig | None = None) -> APIRo
             "count": len(actions),
             "protocol_version": PROTOCOL_VERSION,
         }
-        if skipped_sessions:
-            response["skipped_not_in_sessions"] = skipped_sessions
         if failure:
             response["error"] = failure
         return response

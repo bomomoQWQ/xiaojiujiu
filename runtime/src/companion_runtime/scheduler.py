@@ -317,12 +317,12 @@ class Scheduler:
         self._stop = asyncio.Event()
         self._task = asyncio.create_task(self._run(), name="companion-runtime-scheduler")
 
-    async def stop(self) -> None:
-        """Stop the background loop and wait for it to finish.
+    async def stop(self, *, drain_timeout: float | None = None) -> bool:
+        """Stop the loop and report whether its worker thread fully drained.
 
-        A round that is already running is given a bounded moment to complete:
-        it owns the write lock and the database connection, so a caller that
-        closes the Runtime immediately after this returns must not race it.
+        Cancelling ``asyncio.to_thread`` only cancels the awaiting coroutine; the
+        database-owning thread keeps running.  Callers therefore get an explicit
+        boolean and must not close the Runtime/DB when this method times out.
         """
         self._stop.set()
         if self._task is not None:
@@ -332,10 +332,15 @@ class Scheduler:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown path
                 pass
             self._task = None
-        grace = min(5.0, max(1.0, float(self._config.scheduler.busy_poll_seconds)))
+        grace = (
+            min(5.0, max(1.0, float(self._config.scheduler.busy_poll_seconds)))
+            if drain_timeout is None
+            else max(0.0, float(drain_timeout))
+        )
         deadline = time.monotonic() + grace
         while self._round_in_flight and time.monotonic() < deadline:
             await asyncio.sleep(0.02)
+        return not self._round_in_flight
 
     @property
     def running(self) -> bool:

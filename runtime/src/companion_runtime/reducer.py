@@ -1141,6 +1141,8 @@ class Reducer:
         now: datetime | None = None,
         limit: int = 1,
         kinds: Sequence[str] | None = None,
+        conversations: Sequence[str] | None = None,
+        include_unscoped: bool = False,
     ) -> list[OutboxItem]:
         """Lease ready outbox rows for ``owner``.
 
@@ -1149,6 +1151,8 @@ class Reducer:
             now: Reference time.
             limit: Maximum number of rows.
             kinds: Optional restriction to specific kinds.
+            conversations: Optional exact session allowlist, applied by the claim SQL.
+            include_unscoped: Let legacy rows with no stored conversation match.
 
         Returns:
             The leased items.
@@ -1162,6 +1166,8 @@ class Reducer:
                 lease_seconds=self._config.outbox.lease_seconds,
                 limit=limit,
                 kinds=kinds,
+                conversations=conversations,
+                include_unscoped=include_unscoped,
             )
 
     def ack_outbox(
@@ -1334,47 +1340,60 @@ class Reducer:
         """
         stamp = ensure_aware(now) or utcnow()
         closed: list[str] = []
+        live_states = tuple(action_module.PRE_SEND_STATES)
         with self._db.transaction() as conn:
             state = self._p.runtime.ensure()
-            failed_rows = self._p.outbox.list_items(
-                status=OutboxStatus.FAILED.value, limit=limit
-            )
-            for row in failed_rows:
-                attempt_id = str(row.payload.get("attempt_id") or "")
-                if not attempt_id or attempt_id in closed:
-                    continue
-                attempt = self._p.attempts.get(attempt_id)
-                if attempt is None:
-                    continue
-                error = row.last_error or "outbox_failed"
-                if not _terminate_undeliverable_attempt(
-                    self._p.attempts,
+            cursor = ""
+            while True:
+                failed_rows = self._p.outbox.failed_for_live_attempts(
                     conn,
-                    attempt,
-                    reason=f"outbox_failed:{error}",
-                    now=stamp,
-                ):
-                    continue
-                cancelled = self._p.outbox.cancel_for_attempt(
-                    conn, attempt.attempt_id, reason=f"attempt_{attempt.state}"
+                    attempt_states=live_states,
+                    after_attempt_id=cursor,
+                    limit=limit,
                 )
-                self._events.append(
-                    EventType.PROACTIVE_ABORTED,
-                    actor=Actor.RUNTIME,
-                    content=error,
-                    conversation_id=row.conversation_id or self._config.conversation_id,
-                    metadata={
-                        "attempt_id": attempt.attempt_id,
-                        "stage": row.kind,
-                        "outbox_id": row.outbox_id,
-                        "reason": attempt.failure_reason,
-                        "cancelled_outbox_rows": cancelled,
-                    },
-                    timestamp=stamp,
-                    runtime_version=state.version,
-                    connection=conn,
-                )
-                closed.append(attempt.attempt_id)
+                if not failed_rows:
+                    break
+                page_attempt_ids: list[str] = []
+                for row in failed_rows:
+                    attempt_id = str(row.payload.get("attempt_id") or "")
+                    if not attempt_id or attempt_id in closed:
+                        continue
+                    page_attempt_ids.append(attempt_id)
+                    attempt = self._p.attempts.get(attempt_id)
+                    if attempt is None:
+                        continue
+                    error = row.last_error or "outbox_failed"
+                    if not _terminate_undeliverable_attempt(
+                        self._p.attempts,
+                        conn,
+                        attempt,
+                        reason=f"outbox_failed:{error}",
+                        now=stamp,
+                    ):
+                        continue
+                    cancelled = self._p.outbox.cancel_for_attempt(
+                        conn, attempt.attempt_id, reason=f"attempt_{attempt.state}"
+                    )
+                    self._events.append(
+                        EventType.PROACTIVE_ABORTED,
+                        actor=Actor.RUNTIME,
+                        content=error,
+                        conversation_id=row.conversation_id or self._config.conversation_id,
+                        metadata={
+                            "attempt_id": attempt.attempt_id,
+                            "stage": row.kind,
+                            "outbox_id": row.outbox_id,
+                            "reason": attempt.failure_reason,
+                            "cancelled_outbox_rows": cancelled,
+                        },
+                        timestamp=stamp,
+                        runtime_version=state.version,
+                        connection=conn,
+                    )
+                    closed.append(attempt.attempt_id)
+                if len(failed_rows) < limit or not page_attempt_ids:
+                    break
+                cursor = max(page_attempt_ids)
             if closed:
                 self._p.runtime.write(state, conn, expect_version=state.version)
         return closed
@@ -1939,7 +1958,16 @@ class Reducer:
                     "version": version,
                 }
 
-            self._p.outbox.ack(conn, outbox_id, stamp)
+            # SEND success is an irreversible late platform fact. It may arrive
+            # after lease expiry returned the row to ``pending`` or after a newer
+            # claim replaced the reporter's lease, so this is the Runtime-owned
+            # settle primitive rather than lease-bound ``ack``.
+            self._p.outbox.settle(
+                conn,
+                outbox_id,
+                status=OutboxStatus.DELIVERED.value,
+                now=stamp,
+            )
             if attempt is None:
                 self._p.runtime.write(state, conn, expect_version=state.version)
                 return {"delivered": True, "attempt_id": None}

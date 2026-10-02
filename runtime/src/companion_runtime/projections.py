@@ -17,7 +17,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import Any, Sequence
 
-from .db import Database, dumps, row_to_dict
+from .db import Database, dumps, loads, row_to_dict
 from .typing import (
     ActionAttempt,
     ActivatedMemory,
@@ -1358,6 +1358,50 @@ class OutboxProjection:
                 found.append(item)
         return found
 
+    def failed_for_live_attempts(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        attempt_states: Sequence[str],
+        after_attempt_id: str = "",
+        limit: int = 200,
+    ) -> list[OutboxItem]:
+        """Return failed rows whose referenced attempt is still in a live state.
+
+        This is a keyset page over the *join*, not a page of every failed outbox row.
+        Missing-attempt noise and already-terminal history therefore cannot starve a
+        real undeliverable attempt merely by being newer than it.
+        """
+        if not attempt_states:
+            return []
+        placeholders = ",".join("?" for _ in attempt_states)
+        params: list[Any] = [*attempt_states, str(after_attempt_id), max(1, int(limit))]
+        rows = connection.execute(
+            "SELECT o.* FROM outbox AS o JOIN action_attempts AS a "
+            "ON o.payload_json LIKE '%\"attempt_id\":\"' || a.attempt_id || '\"%' "
+            "WHERE o.status = 'failed' AND a.state IN (" + placeholders + ") "
+            "AND a.attempt_id > ? ORDER BY a.attempt_id ASC LIMIT ?",
+            tuple(params),
+        ).fetchall()
+        return [self._to_item(row) for row in rows]
+
+    def has_live_row_for_attempt(
+        self, connection: sqlite3.Connection, attempt_id: str
+    ) -> bool:
+        """Return whether one pending/leased row exactly references ``attempt_id``."""
+        identifier = str(attempt_id or "")
+        if not identifier:
+            return False
+        rows = connection.execute(
+            "SELECT payload_json FROM outbox WHERE status IN ('pending', 'leased') "
+            "AND payload_json LIKE ?",
+            (f'%\"{identifier}\"%',),
+        ).fetchall()
+        return any(
+            str((loads(row["payload_json"]) or {}).get("attempt_id") or "") == identifier
+            for row in rows
+        )
+
     def reclaim_expired(self, connection: sqlite3.Connection, now: datetime) -> int:
         """Return expired leases to the pending pool or fail them.
 
@@ -1394,6 +1438,8 @@ class OutboxProjection:
         lease_seconds: float,
         limit: int = 1,
         kinds: Sequence[str] | None = None,
+        conversations: Sequence[str] | None = None,
+        include_unscoped: bool = False,
     ) -> list[OutboxItem]:
         """Atomically lease up to ``limit`` ready rows for ``owner``.
 
@@ -1407,6 +1453,11 @@ class OutboxProjection:
             lease_seconds: Lease duration.
             limit: Maximum number of rows to lease.
             kinds: Optional restriction to specific outbox kinds.
+            conversations: Optional exact conversation/session allowlist. Filtering is
+                part of the claim query, so rows for another session never consume a
+                lease attempt or disappear behind a worker that cannot deliver them.
+            include_unscoped: Include rows whose ``conversation_id`` is empty when a
+                session allowlist is used (legacy rows resolve to the configured session).
 
         Returns:
             The leased items, highest priority first.
@@ -1419,6 +1470,13 @@ class OutboxProjection:
             placeholders = ",".join("?" for _ in kinds)
             clauses.append(f"kind IN ({placeholders})")
             params.extend(kinds)
+        if conversations:
+            placeholders = ",".join("?" for _ in conversations)
+            clause = f"conversation_id IN ({placeholders})"
+            if include_unscoped:
+                clause = f"({clause} OR conversation_id IS NULL OR conversation_id = '')"
+            clauses.append(clause)
+            params.extend(str(value) for value in conversations)
         params.append(max(1, int(limit)))
         rows = connection.execute(
             "SELECT outbox_id FROM outbox WHERE " + " AND ".join(clauses) +

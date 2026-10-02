@@ -33,6 +33,7 @@ import pytest
 from companion_runtime import action as action_module
 from companion_runtime.api import create_app
 from companion_runtime.authorize import AuthorizeRequest, authorize
+from companion_runtime.db import Database
 from companion_runtime.projections import OutboxProjection
 from companion_runtime.runtime import Runtime
 from companion_runtime.typing import (
@@ -161,6 +162,25 @@ def report_body(action: dict[str, Any], *, status: str, **extra: Any) -> dict[st
     }
     body.update(extra)
     return body
+
+
+@pytest.fixture()
+def file_runtime(tmp_path: Path):
+    """A file-backed SQLite Runtime for persistence-sensitive outbox regressions."""
+    from conftest import build_config
+
+    config = build_config()
+    path = tmp_path / "runtime.sqlite3"
+    instance = Runtime(
+        config,
+        seed=1234,
+        database=Database(str(path)),
+        created_at=BASE_TIME,
+    )
+    try:
+        yield instance
+    finally:
+        instance.close()
 
 
 # --------------------------------------------------------------------------------------
@@ -386,6 +406,70 @@ def test_rendered_after_delivery_is_refused_without_touching_state(
 # --------------------------------------------------------------------------------------
 # complete_render: transactional idempotency
 # --------------------------------------------------------------------------------------
+
+
+def test_failed_outbox_sweep_reaches_rows_beyond_the_first_two_hundred(runtime: Runtime) -> None:
+    """A bounded page must not starve an older failed row forever."""
+    attempt_id, render_row_id = commit_attempt(runtime)
+    with runtime.db.transaction() as conn:
+        conn.execute(
+            "UPDATE outbox SET status='failed', last_error='target_failed' WHERE outbox_id = ?",
+            (render_row_id,),
+        )
+        for index in range(250):
+            runtime.projections.outbox.enqueue(
+                conn,
+                OutboxItem(
+                    outbox_id=f"obx_failed_noise_{index:03d}",
+                    kind=OutboxKind.SEND.value,
+                    payload={"attempt_id": f"att_missing_{index}"},
+                    status=OutboxStatus.FAILED.value,
+                    created_at=BASE_TIME + timedelta(seconds=index + 1),
+                    last_error="noise",
+                ),
+            )
+
+    closed = runtime.reducer.close_settled_outbox_attempts(now=BASE_TIME + timedelta(hours=1))
+    assert attempt_id in closed
+    assert runtime.projections.attempts.get(attempt_id).state == AttemptState.FAILED.value
+
+
+def test_live_row_lookup_does_not_confuse_similar_attempt_ids(runtime: Runtime) -> None:
+    """The exact lookup must distinguish ``att_1`` from ``att_10``."""
+    with runtime.db.transaction() as conn:
+        runtime.projections.outbox.enqueue(
+            conn,
+            OutboxItem(
+                outbox_id="obx_similar_id",
+                kind=OutboxKind.SEND.value,
+                payload={"attempt_id": "att_10"},
+                status=OutboxStatus.PENDING.value,
+                created_at=BASE_TIME,
+            ),
+        )
+        assert runtime.projections.outbox.has_live_row_for_attempt(conn, "att_10") is True
+        assert runtime.projections.outbox.has_live_row_for_attempt(conn, "att_1") is False
+
+
+def test_orphan_sweep_uses_exists_not_a_capped_outbox_page(runtime: Runtime) -> None:
+    """>500 unrelated rows cannot make a live outbox-backed attempt look orphaned."""
+    attempt_id, render_row_id = commit_attempt(runtime)
+    enqueue_noise(runtime, 550)
+    attempt = runtime.projections.attempts.get(attempt_id)
+    assert attempt is not None
+    with runtime.db.transaction() as conn:
+        conn.execute(
+            "UPDATE action_attempts SET created_at=?, updated_at=? WHERE attempt_id=?",
+            (
+                (BASE_TIME - timedelta(days=2)).isoformat(),
+                (BASE_TIME - timedelta(days=2)).isoformat(),
+                attempt_id,
+            ),
+        )
+        runtime._close_stalled_attempts(conn, now=BASE_TIME)
+
+    assert runtime.projections.outbox.get(render_row_id).status == OutboxStatus.PENDING.value
+    assert runtime.projections.attempts.get(attempt_id).state == AttemptState.COMMITTED.value
 
 
 def test_complete_render_replay_does_not_queue_a_second_send(runtime: Runtime) -> None:
@@ -928,6 +1012,45 @@ def ready_to_send(client: TestClient, runtime: Runtime) -> tuple[str, str]:
     return attempt_id, rendered["outbox_id"]
 
 
+def test_session_filter_is_part_of_the_claim_and_does_not_burn_foreign_rows(
+    client: TestClient, runtime: Runtime,
+) -> None:
+    """An adapter must never lease another session's row and discard it afterwards."""
+    attempt_id, render_row_id = commit_attempt(runtime)
+    with runtime.db.transaction() as conn:
+        conn.execute(
+            "UPDATE outbox SET conversation_id = ? WHERE outbox_id = ?",
+            ("default:FriendMessage:other", render_row_id),
+        )
+
+    foreign = client.post(
+        "/v1/outbox/lease",
+        json={
+            "adapter_id": ADAPTER,
+            "capabilities": ["render"],
+            "sessions": ["default:FriendMessage:wanted"],
+            "max_actions": 1,
+        },
+    ).json()
+    assert foreign["items"] == []
+    untouched = runtime.projections.outbox.get(render_row_id)
+    assert untouched.status == OutboxStatus.PENDING.value
+    assert untouched.attempts == 0
+    assert untouched.lease_owner is None
+
+    wanted = client.post(
+        "/v1/outbox/lease",
+        json={
+            "adapter_id": ADAPTER,
+            "capabilities": ["render"],
+            "sessions": ["default:FriendMessage:other"],
+            "max_actions": 1,
+        },
+    ).json()
+    assert [item["action_id"] for item in wanted["items"]] == [render_row_id]
+    assert runtime.projections.attempts.get(attempt_id).state == AttemptState.COMMITTED.value
+
+
 def test_authorize_outage_report_requeues_instead_of_failing(
     client: TestClient, runtime: Runtime
 ) -> None:
@@ -1062,6 +1185,130 @@ def test_outage_reports_stay_retryable_after_the_attempt_budget_is_spent(
     ).json()
     assert sent["delivered"] is True
     assert runtime.projections.attempts.get(attempt_id).state == AttemptState.SENT.value
+
+
+def test_late_successful_send_after_expired_lease_settles_delivered_and_cannot_release_again(
+    file_runtime: Runtime,
+) -> None:
+    """A late platform success is irreversible even after the lease returned pending.
+
+    The first claim expires and is reclaimed to ``pending``.  Its successful SEND
+    result then arrives late: the row and attempt must settle atomically, and the row
+    must never be handed out again.  This is the exact crash window between platform
+    delivery and Runtime acknowledgement.
+    """
+    runtime = file_runtime
+    app = create_app(runtime, runtime.config)
+    with TestClient(app) as client:
+        attempt_id, send_row_id = ready_to_send(client, runtime)
+        first = lease_v1(client, "send")
+    claimed_attempts = runtime.projections.outbox.get(send_row_id).attempts
+
+    # Reclaim the expired claim without creating a newer lease.
+    expiry = runtime.projections.outbox.get(send_row_id).lease_expires_at
+    assert expiry is not None
+    with runtime.db.transaction() as conn:
+        assert runtime.projections.outbox.reclaim_expired(
+            conn, expiry + timedelta(microseconds=1)
+        ) == 1
+    pending = runtime.projections.outbox.get(send_row_id)
+    assert pending.status == OutboxStatus.PENDING.value
+    assert pending.attempts == claimed_attempts
+
+    with TestClient(app) as client:
+        late = client.post(
+            f"/v1/outbox/{send_row_id}/result",
+            json=report_body(first, status="ok", result={"sent": True}),
+        ).json()
+
+    assert late["ok"] is True
+    assert late["delivered"] is True
+    assert runtime.projections.outbox.get(send_row_id).status == OutboxStatus.DELIVERED.value
+    assert runtime.projections.attempts.get(attempt_id).state == AttemptState.SENT.value
+    assert runtime.reducer.claim_outbox(owner="later", now=utcnow(), limit=5) == []
+
+
+def test_missing_lease_id_on_a_live_send_failure_fails_closed(
+    client: TestClient, runtime: Runtime,
+) -> None:
+    """Ordinary results must name their claim; only irreversible SEND success may omit it."""
+    attempt_id, send_row_id = ready_to_send(client, runtime)
+    action = lease_v1(client, "send")
+    body = report_body(
+        action,
+        status="failed",
+        error="missing fence",
+        result={"sent": False},
+    )
+    body["lease_id"] = ""
+
+    response = client.post(f"/v1/outbox/{send_row_id}/result", json=body).json()
+    assert response["ok"] is False
+    assert response["reason"] == "missing_lease_id"
+    assert runtime.projections.outbox.get(send_row_id).status == OutboxStatus.LEASED.value
+    assert runtime.projections.attempts.get(attempt_id).state == AttemptState.READY_TO_SEND.value
+
+
+def test_stale_failure_and_rejection_reports_do_not_end_a_new_send_lease(
+    client: TestClient, runtime: Runtime,
+) -> None:
+    """Only late successful SEND is irreversible; stale verdicts cannot touch a new claim."""
+    attempt_id, send_row_id = ready_to_send(client, runtime)
+    stale = lease_v1(client, "send")
+    assert client.post(
+        f"/v1/outbox/{send_row_id}/result", json=outage_body(stale)
+    ).json()["requeued"] is True
+    current = lease_v1(client, "send")
+    current_row = runtime.projections.outbox.get(send_row_id)
+    assert current["lease_id"] != stale["lease_id"]
+
+    for status in ("failed", "rejected"):
+        response = client.post(
+            f"/v1/outbox/{send_row_id}/result",
+            json=report_body(
+                stale,
+                status=status,
+                error=f"old_{status}",
+                result={"sent": False},
+            ),
+        ).json()
+        assert response["ok"] is True
+        assert response["duplicate"] is True
+        row = runtime.projections.outbox.get(send_row_id)
+        assert row.status == OutboxStatus.LEASED.value
+        assert row.lease_owner == ADAPTER
+        assert row.attempts == current_row.attempts
+        assert runtime.projections.attempts.get(attempt_id).state == AttemptState.READY_TO_SEND.value
+
+    delivered = client.post(
+        f"/v1/outbox/{send_row_id}/result",
+        json=report_body(current, status="ok", result={"sent": True}),
+    ).json()
+    assert delivered["delivered"] is True
+    assert runtime.projections.attempts.get(attempt_id).state == AttemptState.SENT.value
+
+
+def test_old_successful_send_can_end_a_newer_lease_as_late_fact(
+    client: TestClient, runtime: Runtime,
+) -> None:
+    """A stale SEND success wins over a newer claim because the platform fact is irreversible."""
+    attempt_id, send_row_id = ready_to_send(client, runtime)
+    stale = lease_v1(client, "send")
+    assert client.post(
+        f"/v1/outbox/{send_row_id}/result", json=outage_body(stale)
+    ).json()["requeued"] is True
+    current = lease_v1(client, "send")
+    assert current["lease_id"] != stale["lease_id"]
+
+    late = client.post(
+        f"/v1/outbox/{send_row_id}/result",
+        json=report_body(stale, status="ok", result={"sent": True}),
+    ).json()
+
+    assert late["delivered"] is True
+    assert runtime.projections.outbox.get(send_row_id).status == OutboxStatus.DELIVERED.value
+    assert runtime.projections.attempts.get(attempt_id).state == AttemptState.SENT.value
+    assert runtime.reducer.claim_outbox(owner="later", now=utcnow(), limit=1) == []
 
 
 def test_authorize_outage_replay_is_idempotent(client: TestClient, runtime: Runtime) -> None:

@@ -480,13 +480,23 @@ def cmd_serve(args: argparse.Namespace) -> int:
         try:
             await server.serve()
         finally:
-            await scheduler.stop()
+            drained = await scheduler.stop()
             if maintenance is not None:
                 maintenance.cancel()
             # PostgreSQL durability is external (WAL archiving/base backups/pg_dump).
             # Never run SQLite checkpoint machinery on the production service path.
-            v2_composition.close()
-            runtime.close()
+            if drained:
+                v2_composition.close()
+                runtime.close()
+            else:
+                # ``to_thread`` cannot stop a running round. Closing its shared DB
+                # connection here would race the worker and corrupt shutdown into a
+                # random round failure. Leave ownership with the worker; process exit
+                # will reclaim it after the round finishes.
+                LOGGER.error(
+                    "Scheduler shutdown timed out with a round still running; "
+                    "leaving Runtime/database open instead of racing the worker"
+                )
 
     LOGGER.info(
         "Starting companion Runtime sidecar on http://%s:%d (database=%s, "

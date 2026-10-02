@@ -629,6 +629,51 @@ def test_scheduler_does_not_start_a_round_while_an_attempt_is_in_flight(
     assert status["dispatch_reason"] == "attempt_in_flight"
 
 
+def test_stop_timeout_reports_not_drained_while_round_thread_is_still_running(
+    harness: Harness,
+) -> None:
+    """A bounded timeout must never be mistaken for a completed drain."""
+    import threading
+
+    harness.config.scheduler.min_interval_seconds = 0.01
+    harness.config.scheduler.max_interval_seconds = 0.02
+    harness.config.scheduler.busy_poll_seconds = 0.01
+    started = threading.Event()
+    release = threading.Event()
+
+    def round_callback() -> SimpleNamespace:
+        started.set()
+        release.wait(timeout=5.0)
+        return SimpleNamespace(next_wake_at=None)
+
+    scheduler = scheduler_module.Scheduler(
+        config=harness.config, round_callback=round_callback, runtime=harness.runtime
+    )
+
+    async def scenario() -> tuple[bool, bool]:
+        await scheduler.start()
+        for _ in range(200):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert started.is_set()
+        started_at = time.monotonic()
+        drained = await scheduler.stop(drain_timeout=0.02)
+        elapsed = time.monotonic() - started_at
+        still_running = scheduler.round_in_flight
+        release.set()
+        for _ in range(200):
+            if not scheduler.round_in_flight:
+                break
+            await asyncio.sleep(0.005)
+        return drained, still_running, elapsed
+
+    drained, still_running, elapsed = asyncio.run(scenario())
+    assert drained is False
+    assert still_running is True
+    assert elapsed < 0.5, "the explicit drain timeout must stay bounded"
+
+
 def test_stop_waits_for_a_round_that_is_already_running(harness: Harness) -> None:
     """Shutdown must not race the round that owns the database connection."""
     import threading
