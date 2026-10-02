@@ -225,6 +225,28 @@ def test_load_config_environment_override() -> None:
     assert config.drive.cooldown_seconds == 42.0
 
 
+def test_load_config_parses_list_overrides_as_json_and_fails_closed() -> None:
+    """List-valued settings need an explicit JSON array, never a bare string.
+
+    The 浪潮 live scope allowlist is an exact-match gate, so a comma-joined or
+    quoted string would silently degrade it into a substring match.
+    """
+    config = load_config(env={
+        "CR_LANGCHAO__LIVE_ENABLED": "true",
+        "CR_LANGCHAO__LIVE_SCOPE_ALLOWLIST": '["default:FriendMessage:1"]',
+        "CR_LANGCHAO__ATTENTION_B3_SCOPE_ALLOWLIST": '["scope:a", "scope:b"]',
+    })
+    assert config.langchao.live_enabled is True
+    assert config.langchao.live_scope_allowlist == ["default:FriendMessage:1"]
+    assert config.langchao.attention_b3_scope_allowlist == ["scope:a", "scope:b"]
+    assert config.langchao.live_allowed("default:FriendMessage:1") is True
+    assert config.langchao.live_allowed("other") is False
+
+    for bad in ('default:FriendMessage:1', '["ok", 2]', '[""]', '[" "]'):
+        with pytest.raises(ValueError):
+            load_config(env={"CR_LANGCHAO__LIVE_SCOPE_ALLOWLIST": bad})
+
+
 def test_load_config_rejects_unknown_extension(tmp_path) -> None:
     """An unsupported config format fails loudly."""
     path = tmp_path / "config.yaml"

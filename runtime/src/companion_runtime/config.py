@@ -691,7 +691,23 @@ def load_config(
         if cursor is None or not hasattr(cursor, segments[-1]):
             LOGGER.warning("Ignoring unknown environment override: %s", key)
             continue
-        setattr(cursor, segments[-1], _coerce_scalar(raw))
+        current = getattr(cursor, segments[-1])
+        if isinstance(current, list):
+            # List-valued settings (for example the 浪潮 live scope allowlist) must
+            # never be silently downgraded to a bare string: a string would turn the
+            # exact-scope gate into a substring match.  Require an explicit JSON array
+            # of strings and fail closed on anything else.
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{key} must be a JSON array of strings") from exc
+            if not isinstance(parsed, list) or any(
+                not isinstance(item, str) or not item.strip() for item in parsed
+            ):
+                raise ValueError(f"{key} must be a JSON array of strings")
+            setattr(cursor, segments[-1], parsed)
+        else:
+            setattr(cursor, segments[-1], _coerce_scalar(raw))
 
     return config
 
