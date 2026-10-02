@@ -226,6 +226,18 @@ def test_reconcile_same_set_recovers_and_changed_set_intersects_readiness():
     assert changed.state.advanced_at == NOW
 
 
+def test_permission_version_change_forces_fresh_round_without_backlog_readiness():
+    first = build((source("a"),), permission_version="permission:allow:v1")
+    old = replace(first.state, readiness=((first.state.working_set[0], 0.9),))
+    revoked = build(
+        (source("a"),), previous_state=old,
+        permission_version="permission:revoked:v2",
+    )
+    assert revoked.state.decision_round_id != old.decision_round_id
+    assert dict(revoked.state.readiness) == {old.working_set[0]: 0.0}
+    assert revoked.state.advanced_at == NOW
+
+
 def test_round_hashes_are_order_independent_and_cursor_sensitive():
     a = build((source("a"), source("b")), (facts("a"), facts("b", "expression.v1")))
     b = build((source("b"), source("a")), fact_items=(facts("b", "expression.v1"), facts("a")))
