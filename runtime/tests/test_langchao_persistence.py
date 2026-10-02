@@ -190,3 +190,60 @@ def test_get_active_joins_exact_pointer_revision_without_max():
     assert "r.revision = a.revision" in sql
     assert "max(" not in sql.lower()
     assert params == (SCOPE, "goal:1")
+
+
+def test_load_active_goal_returns_strict_contract_and_checks_coordinates_and_pointer():
+    payload = goal(revision=2).to_dict()
+    row = {"payload": payload, "stored_revision": 2, "active_revision": 2, "pointer_version": 7}
+    loaded = LangchaoRepository(Connection(rows=[row]), scope_key=SCOPE).load_active_goal(
+        SCOPE, "goal:1", "episode:1"
+    )
+    assert loaded == goal(revision=2)
+    assert isinstance(loaded.kind, GoalKind)
+    assert isinstance(loaded.allowed_candidate_kinds[0], CandidateKind)
+    assert loaded.created_at == NOW
+
+    mismatch = dict(row, active_revision=3)
+    with pytest.raises(LangchaoReferenceError, match="scope/id/episode/revision"):
+        LangchaoRepository(Connection(rows=[mismatch]), scope_key=SCOPE).load_active_goal(
+            SCOPE, "goal:1", "episode:1"
+        )
+    with pytest.raises(LangchaoReferenceError, match="scope/id/episode/revision"):
+        LangchaoRepository(Connection(rows=[row]), scope_key=SCOPE).load_active_goal(
+            SCOPE, "goal:1", "episode:other"
+        )
+    with pytest.raises(ValueError, match="repository scope"):
+        LangchaoRepository(Connection(), scope_key=SCOPE).load_active_goal(
+            "scope:other", "goal:1", "episode:1"
+        )
+
+
+def test_load_active_candidates_for_goal_decodes_full_payload_and_exact_active_ref():
+    value = candidate(revision=3)
+    payload = value.to_dict()
+    payload["envelope"] = {"mode": "careful", "retries": 2, "enabled": True}
+    row = {"payload": payload, "stored_revision": 3, "active_revision": 3, "goal_revision": 2}
+    target = goal(revision=2)
+    conn = Connection(rows=[row])
+    conn.execute = lambda sql, params=(): (  # type: ignore[method-assign]
+        conn.calls.append((" ".join(sql.split()), params)) or
+        type("Rows", (), {"fetchall": lambda self: [row]})()
+    )
+    loaded = LangchaoRepository(conn, scope_key=SCOPE).load_active_candidates_for_goal(target)
+    assert loaded[0].semantic_revision == 3
+    assert loaded[0].kind is CandidateKind.INTERNAL_PROCESS
+    assert loaded[0].state is CandidateState.PROPOSED
+    assert loaded[0].envelope == (("mode", "careful"), ("retries", 2), ("enabled", True))
+    assert loaded[0].available_from == NOW
+    sql, params = conn.calls[0]
+    assert "a.revision = ref.candidate_revision" in sql
+    assert "r.revision = a.revision" in sql
+    assert params == (SCOPE, "goal:1", 2)
+
+    bad = dict(row, active_revision=4)
+    bad_conn = Connection()
+    bad_conn.execute = lambda sql, params=(): type(  # type: ignore[method-assign]
+        "Rows", (), {"fetchall": lambda self: [bad]}
+    )()
+    with pytest.raises(LangchaoReferenceError, match="candidate payload"):
+        LangchaoRepository(bad_conn, scope_key=SCOPE).load_active_candidates_for_goal(target)

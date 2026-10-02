@@ -404,6 +404,7 @@ class V2RuntimeCoordinator:
         self.config = config or DecisionConfigV2()
         self.rng = rng or random.Random()
         self.goal_lifecycle_service = goal_lifecycle_service
+        self.goal_terminal_producer: Any | None = None
         self._audits: dict[str, DecisionAuditRecorder] = {}
         self._chosen: dict[str, CandidateV2] = {}
         self._explored: dict[str, bool] = {}
@@ -498,6 +499,12 @@ class V2RuntimeCoordinator:
         return self.goal_lifecycle_service.apply_terminal_event(
             event, goal=goal, candidates=tuple(candidates),
         )
+
+    def cancel_goal(self, fact: Any) -> Any | None:
+        """Route one explicit structured cancellation fact to the terminal producer."""
+        if self.goal_terminal_producer is None:
+            raise RuntimeError("goal terminal producer is not configured")
+        return self.goal_terminal_producer.from_cancellation(fact)
 
     def process_user_event(self, event: Mapping[str, Any]) -> LegacyUserEventResult:
         """Run legacy ingest once, then settle the resulting v2 observations."""

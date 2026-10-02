@@ -118,6 +118,7 @@ class V2Composition:
     langchao_live_runner: Any | None = None
     authority_round_router: Any | None = None
     goal_lifecycle_service: Any | None = None
+    goal_terminal_producer: Any | None = None
     social_service: Any | None = None
     privacy_deletion_repository: Any | None = None
     privacy_deletion_coordinator: Any | None = None
@@ -325,11 +326,21 @@ def build_v2_composition(
 
         # The production coordinator emits explicit terminal evidence into this
         # service. All collaborators share one connection and outer transaction.
+        lifecycle_repository = LangchaoRepository(connection, scope_key=scope_key)
         goal_lifecycle_service = LangchaoGoalLifecycleService(
-            contract_repository=LangchaoRepository(connection, scope_key=scope_key),
+            contract_repository=lifecycle_repository,
             matter_transition=transition_unfinished_matter,
         )
         coordinator.goal_lifecycle_service = goal_lifecycle_service
+        from .langchao_goal_terminal_producer import GoalTerminalEventProducer
+        goal_terminal_producer = GoalTerminalEventProducer(
+            coordinator=coordinator,
+            load_goal=lifecycle_repository.load_active_goal,
+            load_candidates=lifecycle_repository.load_active_candidates_for_goal,
+        )
+        coordinator.goal_terminal_producer = goal_terminal_producer
+        if getattr(user_model_service, "outcome_observer", None) is not None:
+            user_model_service.outcome_observer.terminal_producer = goal_terminal_producer
         from .langchao_live_wiring import AuthorityRoutedEndogenousRound
         authority_round_router = AuthorityRoutedEndogenousRound(
             scope_key=scope_key, v2_coordinator=coordinator,
@@ -380,6 +391,7 @@ def build_v2_composition(
             langchao_live_runner=langchao_live_runner,
             authority_round_router=authority_round_router,
             goal_lifecycle_service=goal_lifecycle_service,
+            goal_terminal_producer=goal_terminal_producer,
             social_service=social_service,
             privacy_deletion_repository=privacy_deletion_repository,
             privacy_deletion_coordinator=privacy_deletion_coordinator,
