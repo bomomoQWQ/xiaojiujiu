@@ -18,6 +18,7 @@ from .langchao_shadow_schema import LANGCHAO_SHADOW_SCHEMA_V16_STATEMENTS
 from .langchao_social_schema import LANGCHAO_SOCIAL_SCHEMA_STATEMENTS
 from .langchao_live_schema import LANGCHAO_LIVE_SCHEMA_V19_STATEMENTS
 from .langchao_live_fk_schema import LANGCHAO_LIVE_FK_SCHEMA_V20_STATEMENTS
+from .langchao_no_send_schema import LANGCHAO_NO_SEND_SCHEMA_V24_STATEMENTS
 from .langchao_state_schema import LANGCHAO_STATE_SCHEMA_V14_STATEMENTS
 from .langchao_user_outcome_schema import LANGCHAO_USER_OUTCOME_SCHEMA_V23_STATEMENTS
 from .live_dispatch_schema import LIVE_DISPATCH_SCHEMA_V18_STATEMENTS
@@ -25,7 +26,7 @@ from .runtime_committed_decision_v2_schema import COMMITTED_DECISION_SCHEMA_STAT
 from .runtime_core_v2_schema import CORE_SCHEMA_STATEMENTS, CORE_SCHEMA_VERSION
 from .privacy_deletion_schema import PRIVACY_DELETION_SCHEMA_V21_STATEMENTS
 
-USER_MODEL_SCHEMA_VERSION: Final[int] = 23
+USER_MODEL_SCHEMA_VERSION: Final[int] = 24
 
 _INITIAL_SCHEMA: tuple[str, ...] = (
     """
@@ -562,6 +563,7 @@ MIGRATIONS: Final[tuple[tuple[int, tuple[str, ...]], ...]] = (
     (21, PRIVACY_DELETION_SCHEMA_V21_STATEMENTS),
     (22, CAPABILITY_WITNESS_SCHEMA_V22_STATEMENTS),
     (23, LANGCHAO_USER_OUTCOME_SCHEMA_V23_STATEMENTS),
+    (24, LANGCHAO_NO_SEND_SCHEMA_V24_STATEMENTS),
 )
 
 

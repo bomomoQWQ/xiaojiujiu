@@ -230,7 +230,13 @@ def test_echo_renderer_is_short_and_non_empty() -> None:
     assert renderer.render({"intent": "询问面试结果"})
     assert renderer.render({})
     templated = EchoRenderer(template="{intent}")
-    assert templated.render({"intent": "hi"}) == "hi"
+    result = templated.render({"intent": "hi"})
+    assert result["text"] == "hi"
+    assert result["render_metadata"] == {
+        "claims_completion": False,
+        "task_ref": None,
+        "witness_requirement": None,
+    }
 
 
 def test_sendable_state_helper() -> None:

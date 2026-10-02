@@ -422,7 +422,12 @@ def create_app(
         text = str(_require(payload, "text"))
         try:
             result = runtime.reducer.complete_render(
-                outbox_id=outbox_id, text=text, now=_payload_datetime(payload)
+                outbox_id=outbox_id,
+                text=text,
+                now=_payload_datetime(payload),
+                render_metadata=payload.get("render_metadata"),
+                semantic_review=payload.get("semantic_review"),
+                reauthorized=bool(payload.get("reauthorized", False)),
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -639,13 +644,23 @@ def create_app(
             )
             if render_rows:
                 result = runtime.reducer.complete_render(
-                    outbox_id=render_rows[0].outbox_id, text=text, now=now
+                    outbox_id=render_rows[0].outbox_id,
+                    text=text,
+                    now=now,
+                    render_metadata=payload.get("render_metadata"),
+                    semantic_review=payload.get("semantic_review"),
+                    reauthorized=bool(payload.get("reauthorized", False)),
                 )
             else:
                 # No render row (the attempt was created outside the outbox): go
                 # straight through the state machine and queue the send.
                 result = runtime.reducer.complete_render_for_attempt(
-                    attempt_id=attempt_id, text=text, now=now
+                    attempt_id=attempt_id,
+                    text=text,
+                    now=now,
+                    render_metadata=payload.get("render_metadata"),
+                    semantic_review=payload.get("semantic_review"),
+                    reauthorized=bool(payload.get("reauthorized", False)),
                 )
             path = "outbox" if render_rows else "direct"
             if not result.applied and not result.duplicate:
@@ -1125,6 +1140,10 @@ def create_app(
                 ),
                 decision_simulation_runner=getattr(
                     v2_composition, "decision_simulation_runner", None
+                ),
+                no_send_repository=(
+                    None if getattr(v2_composition, "langchao_live_runner", None) is None
+                    else v2_composition.langchao_live_runner.repository
                 ),
             )
         )

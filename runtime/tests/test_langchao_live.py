@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from companion_runtime.actual_action_v21 import build_actual_action_witness
 from companion_runtime.config import RuntimeConfig
 from companion_runtime.langchao_authority import AuthorityEngine, AuthorityMode
-from companion_runtime.langchao_live_wiring import AuthorityRoutedEndogenousRound
+from companion_runtime.langchao_no_send import NoSendReason, NoSendResult
+from companion_runtime.langchao_live_wiring import (
+    AuthorityRoutedEndogenousRound,
+    LangchaoLiveRunner,
+)
 from companion_runtime.runtime_v2 import V2RuntimeCoordinator
 from test_runtime_v2 import NOW, coordinator
 
@@ -75,6 +80,83 @@ def test_langchao_live_assesses_then_commits_only_langchao_once():
     )
     assert router.run(decision_id="d", now=NOW, elapsed_allowed_seconds=1) == "live"
     assert [item[0] for item in calls] == ["assess", "langchao"]
+
+
+def test_langchao_send_ack_merges_actual_action_witness_for_exposure_like_runtime_v2():
+    witness = build_actual_action_witness(
+        text="最终实际发送文本。",
+        attempt_id="attempt:actual",
+        render_outbox_id="render:actual",
+        send_outbox_id="send:actual",
+        render_metadata={"render_version": "renderer:test"},
+    )
+    captured = []
+    repository = SimpleNamespace(
+        settle_terminal=lambda **_kw: (),
+        get=lambda _round_id: SimpleNamespace(scope_key="scope"),
+    )
+    exposure_repository = SimpleNamespace(
+        prepare_exposure_and_expectation=lambda **kw: captured.append(kw)
+    )
+    runner = LangchaoLiveRunner(
+        evaluator=None,
+        service=None,
+        repository=repository,
+        exposure_repository=exposure_repository,
+        user_model=object(),
+        horizons={},
+    )
+    ack = SimpleNamespace(
+        decision_id="round:actual",
+        attempt_id="attempt:actual",
+        send_outbox_id="send:actual",
+        sent=True,
+        acknowledged_at=NOW,
+        action={"type": "expression", "asks_reply": False},
+        actual_action_witness=witness,
+        context_provider=lambda: {},
+        source_event_ids=("event:actual",),
+    )
+
+    assert runner.after_legacy_send_ack(ack, confirmed=True) == ()
+    assert len(captured) == 1
+    action = captured[0]["action"]
+    assert action["type"] == "expression"
+    assert action["actual_action_witness"] == witness
+    assert action["actual_action_witness"]["rendered_text_sha256"] == witness["rendered_text_sha256"]
+    assert action["actual_action_revision"] == witness["actual_action_revision"]
+    assert action["actual_action_attribution"] == witness["attribution"]
+
+
+def test_langchao_send_ack_without_witness_preserves_planned_action_compatibility():
+    captured = []
+    runner = LangchaoLiveRunner(
+        evaluator=None,
+        service=None,
+        repository=SimpleNamespace(
+            settle_terminal=lambda **_kw: (),
+            get=lambda _round_id: SimpleNamespace(scope_key="scope"),
+        ),
+        exposure_repository=SimpleNamespace(
+            prepare_exposure_and_expectation=lambda **kw: captured.append(kw)
+        ),
+        user_model=object(),
+        horizons={},
+    )
+    action = {"type": "expression", "asks_reply": False}
+    ack = SimpleNamespace(
+        decision_id="round:planned",
+        attempt_id="attempt:planned",
+        send_outbox_id="send:planned",
+        sent=True,
+        acknowledged_at=NOW,
+        action=action,
+        context_provider=lambda: {},
+    )
+
+    runner.after_legacy_send_ack(ack, confirmed=True)
+    assert captured[0]["action"] == action
+    assert captured[0]["action"] is not action
 
 
 def test_langchao_shadow_assesses_then_runs_shadow_with_routed_authority_revision():
@@ -157,5 +239,8 @@ def test_disabled_or_unallowlisted_never_calls_live_runner():
         langchao_live_runner=live, live_enabled=True,
         live_scope_allowlist=("other",),
     )
-    assert router.run(decision_id="d", now=NOW, elapsed_allowed_seconds=1) == "assessment"
+    result = router.run(decision_id="d", now=NOW, elapsed_allowed_seconds=1)
+    assert isinstance(result, NoSendResult)
+    assert result.reason is NoSendReason.PERMISSION_DENIED
+    assert result.stage == "router"
     assert calls == ["assess"]

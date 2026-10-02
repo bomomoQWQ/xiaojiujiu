@@ -34,6 +34,7 @@ from .actual_action_v21 import (
     ScopeDriftError,
     build_actual_action_witness,
     enforce_plan_render_scope,
+    verify_render_plan_v1,
 )
 from .capability_witness import (
     WitnessValidationError,
@@ -1457,6 +1458,9 @@ class Reducer:
         attempt_id: str,
         text: str,
         now: datetime | None = None,
+        render_metadata: Mapping[str, Any] | None = None,
+        semantic_review: Mapping[str, Any] | None = None,
+        reauthorized: bool = False,
     ) -> RenderResult:
         """Attach rendered text for an attempt that has no render outbox row.
 
@@ -1500,6 +1504,9 @@ class Reducer:
                     attempt=attempt,
                     text=text,
                     stamp=stamp,
+                    render_metadata=render_metadata,
+                    semantic_review=semantic_review,
+                    reauthorized=reauthorized,
                 )
                 if result.applied:
                     self._p.runtime.write(state, conn, expect_version=state.version)
@@ -1510,7 +1517,15 @@ class Reducer:
                 return blocked
 
             result = self._apply_rendered_text(
-                conn, state=state, item=None, attempt=attempt, text=text, stamp=stamp
+                conn,
+                state=state,
+                item=None,
+                attempt=attempt,
+                text=text,
+                stamp=stamp,
+                render_metadata=render_metadata,
+                semantic_review=semantic_review,
+                reauthorized=reauthorized,
             )
             if result.applied:
                 self._p.runtime.write(state, conn, expect_version=state.version)
@@ -1659,15 +1674,21 @@ class Reducer:
             if item is not None and isinstance(item.payload.get("action"), Mapping)
             else {}
         )
-        witness = build_actual_action_witness(
-            text=text,
-            attempt_id=attempt.attempt_id,
-            render_outbox_id=item.outbox_id if item is not None else None,
-            send_outbox_id=send_outbox_id,
-            render_metadata=render_metadata,
-            semantic_review=semantic_review,
-        )
+        effective_render_metadata = dict(render_metadata or {})
+        frozen_plan = planned_action.get("render_plan_v1")
+        if isinstance(frozen_plan, Mapping):
+            effective_render_metadata.setdefault("template_version", frozen_plan.get("template_version"))
+            effective_render_metadata.setdefault("style_version", frozen_plan.get("style_version"))
+            effective_render_metadata.setdefault("render_plan_revision", frozen_plan.get("revision"))
         try:
+            witness = build_actual_action_witness(
+                text=text,
+                attempt_id=attempt.attempt_id,
+                render_outbox_id=item.outbox_id if item is not None else None,
+                send_outbox_id=send_outbox_id,
+                render_metadata=effective_render_metadata,
+                semantic_review=semantic_review,
+            )
             try:
                 requirement = rendered_completion_requirement(
                     text,
@@ -1675,6 +1696,7 @@ class Reducer:
                     scope_key=str(planned_action.get("scope_key") or self._config.conversation_id),
                     render_metadata=render_metadata,
                     semantic_review=semantic_review,
+                    allow_legacy_inference=self._config.allow_legacy_render_completion_inference,
                 )
                 if requirement is not None:
                     if self._witnesses is None:
@@ -1691,6 +1713,19 @@ class Reducer:
                 witness=witness,
                 reauthorized=reauthorized,
             )
+            attribution, drift = verify_render_plan_v1(
+                planned_action=planned_action, witness=witness
+            )
+            witness["render_plan_revision"] = (
+                planned_action.get("render_plan_v1", {}).get("revision")
+                if isinstance(planned_action.get("render_plan_v1"), Mapping)
+                else None
+            )
+            witness["plan_verification"] = {
+                "attribution": attribution,
+                "drift": list(drift),
+            }
+            witness["attribution"] = attribution
             if attempt.state == AttemptState.COMMITTED.value:
                 action_module.mark_rendering(self._p.attempts, conn, attempt, now=stamp)
             action_module.mark_ready(self._p.attempts, conn, attempt, text=text, now=stamp)

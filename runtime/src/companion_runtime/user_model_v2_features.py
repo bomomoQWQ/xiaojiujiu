@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, TypeAlias, Union
 
+from .render_plan_v1 import LENGTH_BUCKETS, PRESSURE_TIERS, plan_from_action, stable_version_code
 from .user_model_v2_types import USER_MODEL_V2_FEATURE_VERSION
 
 JsonScalar: TypeAlias = str | int | float | bool | None
@@ -27,7 +28,7 @@ TOPIC_SHIFT_TYPES = frozenset({"curious_question"})
 
 # Changing any encoding semantics requires a new version.  Including this identifier in the
 # fingerprint prevents an accidental rename/reorder-only interpretation of the digest.
-_ENCODER_CONTRACT = "legacy-13-raw-time-and-count-v1"
+_ENCODER_CONTRACT = "legacy-13-plus-render-plan-v1"
 
 V2_FEATURE_NAMES: tuple[str, ...] = (
     "bias",
@@ -43,6 +44,13 @@ V2_FEATURE_NAMES: tuple[str, ...] = (
     "after_boundary",
     "novelty",
     "explicit_permission",
+    "plan_asks_reply",
+    "plan_pressure_tier",
+    "plan_completion_claim_intent",
+    "plan_commitment",
+    "plan_length_bucket",
+    "plan_template_version",
+    "plan_style_version",
 )
 
 
@@ -238,6 +246,9 @@ def encode_features_v2(
     if spec.names != V2_FEATURE_NAMES or spec.version != USER_MODEL_V2_FEATURE_VERSION:
         raise ValueError("encode_features_v2 only supports the declared default v2 feature spec")
 
+    # This is pre-treatment data.  ``plan_from_action`` reads only the frozen plan (or
+    # compatibility action metadata) and deliberately ignores actual-action witnesses.
+    plan = plan_from_action(action)
     encoded: dict[str, tuple[float, bool]] = {
         "bias": (1.0, False),
         "proactive": _boolean(action, "proactive"),
@@ -256,6 +267,16 @@ def encode_features_v2(
         "after_boundary": _boolean(context, "ever_boundary"),
         "novelty": _number(context, "novelty"),
         "explicit_permission": _boolean(context, "explicit_permission"),
+        "plan_asks_reply": (1.0 if plan["asks_reply"] else 0.0, False),
+        "plan_pressure_tier": (float(PRESSURE_TIERS.index(plan["pressure_tier"])), False),
+        "plan_completion_claim_intent": (
+            1.0 if plan["completion_claim_intent"] else 0.0,
+            False,
+        ),
+        "plan_commitment": (1.0 if plan["commitment"] else 0.0, False),
+        "plan_length_bucket": (float(LENGTH_BUCKETS.index(plan["length_bucket"])), False),
+        "plan_template_version": (stable_version_code(plan["template_version"]), False),
+        "plan_style_version": (stable_version_code(plan["style_version"]), False),
     }
     return EncodedFeaturesV2(
         values=tuple(encoded[name][0] for name in spec.names),

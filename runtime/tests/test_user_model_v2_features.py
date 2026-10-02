@@ -41,7 +41,7 @@ def test_spec_has_stable_names_version_and_sha256_fingerprint() -> None:
     second = FeatureSpecV2(names=tuple(V2_FEATURE_NAMES), version=first.version)
 
     assert first.names == V2_FEATURE_NAMES
-    assert first.version == "user-model-v2.0"
+    assert first.version == "user-model-v2.1-render-plan-v1"
     assert first.fingerprint == second.fingerprint
     assert len(first.fingerprint) == 64
     int(first.fingerprint, 16)
@@ -148,6 +148,13 @@ def test_current_action_types_map_to_compatible_v2_features() -> None:
         "after_boundary": 0.0,
         "novelty": 0.5,
         "explicit_permission": 1.0,
+        "plan_asks_reply": 0.0,
+        "plan_pressure_tier": 1.0,
+        "plan_completion_claim_intent": 0.0,
+        "plan_commitment": 0.0,
+        "plan_length_bucket": 1.0,
+        "plan_template_version": by_name["plan_template_version"],
+        "plan_style_version": by_name["plan_style_version"],
     }
     assert not any(item.missing_mask)
     assert by_name["recent_contact_count"] > 1.0  # no legacy tolerance/clamp

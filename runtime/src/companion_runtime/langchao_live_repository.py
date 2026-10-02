@@ -8,6 +8,8 @@ from datetime import datetime
 from typing import Any, Mapping
 from uuid import NAMESPACE_URL, uuid5
 
+from .langchao_no_send import NoSendResult
+from .langchao_no_send_repository import LangchaoNoSendRepository
 from .langchao_outcome_repository import LangchaoOutcomeRepository
 from .langchao_types import MotivationDirection, OutcomeStatus, OutcomeToken, SettlementType
 from .exposure_identity import canonical_exposure_id
@@ -36,6 +38,16 @@ class LangchaoLiveRepository:
         self.connection = connection
         self.scope_key = scope_key
         self.outcomes = LangchaoOutcomeRepository(connection, scope_key=scope_key)
+        self.no_sends = LangchaoNoSendRepository(connection, scope_key=scope_key)
+
+    def save_no_send(self, result: NoSendResult, *, recorded_at: datetime | None = None) -> NoSendResult:
+        return self.no_sends.save(result, recorded_at=recorded_at)
+
+    def get_no_send(self, round_id: str) -> NoSendResult | None:
+        return self.no_sends.get(round_id)
+
+    def list_no_sends(self, *, reason: Any | None = None, limit: int = 100) -> tuple[NoSendResult, ...]:
+        return self.no_sends.list(reason=reason, limit=limit)
 
     def save_commit(self, commit: LangchaoLiveCommit) -> None:
         if commit.scope_key != self.scope_key:

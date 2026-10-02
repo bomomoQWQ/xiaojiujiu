@@ -45,6 +45,8 @@ class Connection:
             return Cursor(row=self.row if self.row and self.row["round_id"] == params[1] else None)
         if "WHERE scope_key=%s AND terminal_ack_kind IS NULL" in normalized:
             return Cursor(rows=() if self.row is None or self.row["terminal_ack_kind"] else (self.row,))
+        if normalized.startswith("INSERT INTO langchao_no_send_results"):
+            return Cursor(row={"round_id": params[1]})
         if normalized.startswith("UPDATE langchao_live_commits"):
             if self.row is None or self.row["terminal_ack_kind"] is not None:
                 return Cursor()

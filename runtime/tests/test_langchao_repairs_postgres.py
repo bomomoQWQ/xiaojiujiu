@@ -81,7 +81,7 @@ def pg_schema():
     try:
         with connection.transaction():
             result = migrate(connection, schema=schema, runner_version="langchao-repairs-pg/1")
-        assert result.current_version == USER_MODEL_SCHEMA_VERSION == 23
+        assert result.current_version == USER_MODEL_SCHEMA_VERSION == 24
         yield schema
     finally:
         connection.rollback()

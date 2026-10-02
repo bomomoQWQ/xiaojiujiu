@@ -555,6 +555,9 @@ class RuntimeConfig:
     #: Acceptance-only escape hatch for exercising repeated delivery/idempotency in
     #: a disposable fake-user scope. Never enable while a real platform is connected.
     v2_simulation_ignore_repeat_limits: bool = False
+    #: Explicit legacy/test compatibility for renderers that return text without the
+    #: authoritative completion metadata contract. Production serve forces this off.
+    allow_legacy_render_completion_inference: bool = False
     values: ValueProfile = field(default_factory=ValueProfile)
     server: ServerConfig = field(default_factory=ServerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)

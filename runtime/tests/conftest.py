@@ -63,6 +63,9 @@ def build_config(**overrides) -> RuntimeConfig:
     config = RuntimeConfig()
     config.storage.mirror_raw_events = False
     config.storage.database_path = ":memory:"
+    # Existing tests exercise legacy text-only renderers deliberately. Production
+    # defaults fail closed; strict-contract tests turn this explicit test switch off.
+    config.allow_legacy_render_completion_inference = True
     for key, value in overrides.items():
         setattr(config, key, value)
     return config

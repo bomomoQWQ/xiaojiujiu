@@ -36,8 +36,8 @@ LOGGER = logging.getLogger("companion_runtime.delivery")
 class Renderer(Protocol):
     """Port for the host main LLM that produces the final wording."""
 
-    def render(self, payload: Mapping[str, Any]) -> str:
-        """Return the visible message text for ``payload``."""
+    def render(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Return text plus authoritative completion metadata."""
         ...
 
 
@@ -83,16 +83,23 @@ class EchoRenderer:
         """Store an optional template with ``{intent}`` and ``{goal}`` placeholders."""
         self._template = template
 
-    def render(self, payload: Mapping[str, Any]) -> str:
-        """Return a short message derived from the intent."""
+    def render(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Return a short non-completion message with the full declaration."""
         if self._template:
-            return self._template.format(
+            text = self._template.format(
                 intent=payload.get("intent", ""), goal=payload.get("goal", "")
             )
-        intent = str(payload.get("intent") or "").strip()
-        if not intent:
-            return "在的，想和你说说话。"
-        return f"（{intent}）"
+        else:
+            intent = str(payload.get("intent") or "").strip()
+            text = "在的，想和你说说话。" if not intent else f"（{intent}）"
+        return {
+            "text": text,
+            "render_metadata": {
+                "claims_completion": False,
+                "task_ref": None,
+                "witness_requirement": None,
+            },
+        }
 
 
 class NullTransport:
@@ -187,18 +194,32 @@ class DeliveryService:
         """Render the intent into message text and queue it for sending."""
         attempt_id = str(item.payload.get("attempt_id") or "")
         try:
-            text = self._renderer.render(item.payload)
+            raw = self._renderer.render(item.payload)
         except Exception as exc:  # noqa: BLE001 - renderer is an external port
             self._reducer.fail_render(outbox_id=item.outbox_id, error=f"renderer_error:{exc}", now=now)
             return {"outbox_id": item.outbox_id, "status": "failed", "error": str(exc)}
-        if not text or not text.strip():
+        if isinstance(raw, Mapping):
+            text = str(raw.get("text") or "")
+            render_metadata = raw.get("render_metadata")
+            semantic_review = raw.get("semantic_review")
+        else:
+            # Kept only for callers that explicitly enable the legacy/test switch;
+            # production validation below rejects the absent metadata.
+            text = str(raw or "")
+            render_metadata = None
+            semantic_review = None
+        if not text.strip():
             self._reducer.fail_render(
                 outbox_id=item.outbox_id, error="renderer_returned_empty_text", now=now
             )
             return {"outbox_id": item.outbox_id, "status": "failed", "error": "empty_text"}
 
         result: RenderResult = self._reducer.complete_render(
-            outbox_id=item.outbox_id, text=text, now=now
+            outbox_id=item.outbox_id,
+            text=text,
+            now=now,
+            render_metadata=render_metadata,
+            semantic_review=semantic_review,
         )
         return {
             "outbox_id": item.outbox_id,

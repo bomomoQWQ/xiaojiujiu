@@ -11,6 +11,9 @@ from enum import Enum
 from typing import Any, Mapping
 
 
+NO_SEND_RESULT_VERSION = "langchao.no-send-result.v1"
+
+
 class NoSendReason(str, Enum):
     NO_ELIGIBLE_CANDIDATE = "no_eligible_candidate"
     DECISION_BUDGET_EXHAUSTED = "decision_budget_exhausted"
@@ -30,6 +33,7 @@ class NoSendResult:
     candidate_id: str | None = None
     permission_version: str | None = None
     details: tuple[tuple[str, str], ...] = ()
+    result_version: str = NO_SEND_RESULT_VERSION
 
     def __post_init__(self) -> None:
         if not isinstance(self.reason, NoSendReason):
@@ -45,6 +49,8 @@ class NoSendResult:
         if any(not isinstance(item, tuple) or len(item) != 2 or not all(isinstance(v, str) for v in item)
                for item in self.details):
             raise TypeError("details must contain string pairs")
+        if self.result_version != NO_SEND_RESULT_VERSION:
+            raise ValueError(f"result_version must be {NO_SEND_RESULT_VERSION!r}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -54,6 +60,7 @@ class NoSendResult:
             "candidate_id": self.candidate_id,
             "permission_version": self.permission_version,
             "details": dict(self.details),
+            "result_version": self.result_version,
         }
 
     @classmethod
@@ -62,4 +69,4 @@ class NoSendResult:
                    stage=stage, **kwargs)
 
 
-__all__ = ["NoSendReason", "NoSendResult"]
+__all__ = ["NO_SEND_RESULT_VERSION", "NoSendReason", "NoSendResult"]

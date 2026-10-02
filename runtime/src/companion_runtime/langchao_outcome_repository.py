@@ -325,6 +325,33 @@ class LangchaoOutcomeRepository:
                 )
             return tuple(rows)
 
+    def list_settled_user_observations(self) -> tuple[Any, ...]:
+        """Return active user outcome facts for future forecast conditioning.
+
+        Only active semantic pointers are read, so corrections replace rather than
+        duplicate earlier evidence.  The consumer still decides which terminal
+        statuses are statistically usable.
+        """
+        cursor = self.connection.execute(
+            """SELECT r.token_id, r.revision, r.settlement_type, r.status,
+                      r.base_amount, i.outcome_key,
+                      rr.payload->>'template_key' AS template_key
+               FROM langchao_user_outcome_active AS a
+               JOIN langchao_outcome_revisions AS r
+                 ON r.scope_key=a.scope_key AND r.token_id=a.token_id
+                AND r.revision=a.revision
+               JOIN langchao_outcome_identities AS i
+                 ON i.scope_key=r.scope_key AND i.token_id=r.token_id
+               JOIN langchao_reward_revisions AS rr
+                 ON rr.scope_key=r.scope_key
+                AND rr.reward_contract_id=r.reward_contract_id
+                AND rr.revision=r.reward_contract_revision
+               WHERE a.scope_key=%s
+               ORDER BY r.token_id, r.revision""",
+            (self.scope_key,),
+        )
+        return tuple(cursor.fetchall())
+
     def get_active_observation(
         self, *, reward_contract_id: str, episode_id: str, outcome_key: str
     ) -> Any:
