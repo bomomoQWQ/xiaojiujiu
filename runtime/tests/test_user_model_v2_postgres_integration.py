@@ -377,7 +377,7 @@ def test_committed_decision_round_trips_and_terminal_ack_is_once(pg_schema) -> N
         with connection.transaction():
             connection.execute(
                 "INSERT INTO outbox (outbox_id,kind,payload_json,status,priority,created_at) "
-                "VALUES (%s,'render',%s::jsonb,'pending',100,%s)",
+                "VALUES (%s,'audit',%s::jsonb,'pending',100,%s)",
                 ("outbox:rollback", '{"attempt_id":"attempt:rollback"}', now),
             )
             runtime.save_committed_decision(committed=committed)
