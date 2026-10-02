@@ -147,6 +147,11 @@ class DatabaseBase:
         self.busy_timeout_ms = int(busy_timeout_ms)
         self._lock = threading.RLock()
         self._depth = 0
+        #: One flag per open level: whether that level owns the transaction (it issued
+        #: BEGIN and must COMMIT) or merely nests inside a parent (it issued SAVEPOINT
+        #: and must RELEASE).  The entry decision is remembered rather than recomputed,
+        #: because the exit must undo exactly what the entry did.
+        self._opened: list[bool] = []
         #: Per-thread transaction depth, readable *without* taking ``self._lock``.
         #:
         #: ``transaction`` holds ``self._lock`` for the whole block (one connection, one
@@ -181,6 +186,16 @@ class DatabaseBase:
     def _rollback(self) -> None:
         """Roll back the outermost transaction."""
         raise NotImplementedError
+
+    def _in_transaction(self) -> bool:
+        """Report whether the connection actually has a transaction open right now.
+
+        The template normally knows this from ``_depth``, but a repository that opens a
+        driver-native ``connection.transaction()`` block on the same shared session can
+        commit ours without touching the counter.  Backends that can ask the driver
+        override this; the default keeps the historical behaviour of trusting the depth.
+        """
+        return True
 
     def _savepoint(self, name: str) -> None:
         """Open a nested level."""
@@ -244,11 +259,21 @@ class DatabaseBase:
         """
         with self._lock:
             outermost = self._depth == 0
-            if outermost:
+            # A second transaction owner can end this connection's transaction without
+            # telling the template: repositories built on the same shared PostgreSQL
+            # session open driver-native ``connection.transaction()`` blocks, and their
+            # COMMIT closes whatever BEGIN we had.  The depth counter still says "nested",
+            # so a SAVEPOINT would be refused ("SAVEPOINT can only be used in transaction
+            # blocks") and every later nested write in that request would fail.
+            # Re-open in that case instead of failing; the level then owns its
+            # transaction, so its exit path commits rather than releasing a savepoint.
+            owns_transaction = outermost or not self._in_transaction()
+            if owns_transaction:
                 self._begin(immediate=immediate)
             else:
                 self._savepoint(f"sp_{self._depth}")
             self._depth += 1
+            self._opened.append(owns_transaction)
             # Mirror the depth for the lock-free query below. Only the thread holding
             # the lock can be inside, so its mirror is the whole truth; every other
             # thread reads zero without touching the lock.
@@ -261,12 +286,18 @@ class DatabaseBase:
             except BaseException:
                 self._depth -= 1
                 self._txn_local.depth = self._depth
+                owned = self._opened.pop()
                 self._txn_frames.pop()
                 rollbacks = self._rollback_frames.pop()
                 self._release_frames.pop()
-                if outermost:
-                    self._rollback()
-                else:
+                if owned:
+                    # The transaction can be gone already: a foreign owner sharing this
+                    # session may have committed it mid-block. PostgreSQL treats a
+                    # COMMIT outside a transaction as a warning, SQLite as an error, so
+                    # only close what is actually still open.
+                    if self._in_transaction():
+                        self._rollback()
+                elif self._in_transaction():
                     self._rollback_to(f"sp_{self._depth}")
                     self._release(f"sp_{self._depth}")
                 self._run_hooks(rollbacks)
@@ -274,13 +305,15 @@ class DatabaseBase:
             else:
                 self._depth -= 1
                 self._txn_local.depth = self._depth
+                owned = self._opened.pop()
                 hooks = self._txn_frames.pop()
                 rollbacks = self._rollback_frames.pop()
                 releases = self._release_frames.pop()
                 try:
-                    if outermost:
-                        self._commit()
-                    else:
+                    if owned:
+                        if self._in_transaction():
+                            self._commit()
+                    elif self._in_transaction():
                         self._release(f"sp_{self._depth}")
                 except BaseException:
                     # The statements did not commit, so every hook registered
@@ -294,7 +327,7 @@ class DatabaseBase:
                     self._rollback_frames.clear()
                     self._release_frames.clear()
                     raise
-                if outermost:
+                if owned:
                     self._run_hooks(hooks)
                 else:
                     # A released savepoint is part of its parent transaction:

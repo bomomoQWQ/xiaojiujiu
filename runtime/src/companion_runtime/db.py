@@ -635,6 +635,10 @@ class Database(DatabaseBase):
     def _rollback(self) -> None:
         self._conn.execute("ROLLBACK")
 
+    def _in_transaction(self) -> bool:
+        """SQLite knows directly whether a transaction is open on this connection."""
+        return bool(getattr(self._conn, "in_transaction", False))
+
     def _savepoint(self, name: str) -> None:
         self._conn.execute(f"SAVEPOINT {name}")
 

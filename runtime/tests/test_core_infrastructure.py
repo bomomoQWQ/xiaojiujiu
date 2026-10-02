@@ -320,6 +320,35 @@ def test_migrate_creates_runtime_row_and_schema() -> None:
         db.close()
 
 
+def test_nested_transaction_recovers_when_the_transaction_was_committed_elsewhere() -> None:
+    """A foreign COMMIT must not turn a nested block into a hard failure.
+
+    Repositories share one PostgreSQL session and some of them open driver-native
+    ``connection.transaction()`` blocks.  Their COMMIT closes the transaction this
+    template had opened, while the depth counter still says "nested" — the next
+    SAVEPOINT is then refused ("SAVEPOINT can only be used in transaction blocks") and
+    the whole request fails.  The template re-opens instead, so the work still happens.
+    """
+    db = Database(":memory:")
+    db.migrate()
+    try:
+        with db.transaction() as outer:
+            outer.execute(
+                "INSERT INTO raw_events(event_id, event_type, timestamp, actor, created_at) "
+                "VALUES('outer', 't', 'now', 'user', 'now')"
+            )
+            # A second transaction owner on the same connection commits our work.
+            db._conn.execute("COMMIT")
+            with db.transaction() as inner:
+                inner.execute(
+                    "INSERT INTO raw_events(event_id, event_type, timestamp, actor, created_at) "
+                    "VALUES('inner', 't', 'now', 'user', 'now')"
+                )
+        assert db.query_one("SELECT 1 FROM raw_events WHERE event_id = 'inner'") is not None
+    finally:
+        db.close()
+
+
 def test_transaction_rolls_back_on_error() -> None:
     """A raised exception inside a transaction leaves no partial write."""
     db = Database(":memory:")

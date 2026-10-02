@@ -727,6 +727,21 @@ class PostgresDatabase(DatabaseBase):
         except Exception:
             LOGGER.debug("ROLLBACK after a failed BEGIN was refused", exc_info=True)
 
+    def _in_transaction(self) -> bool:
+        """Ask PostgreSQL whether a transaction block is actually open.
+
+        ``IDLE`` means someone committed or rolled back outside the template — typically
+        a driver-native ``connection.transaction()`` block opened by a repository that
+        shares this session.  A ``SAVEPOINT`` would then be refused, so the template
+        re-opens instead.
+        """
+        info = getattr(self._conn, "info", None)
+        status = getattr(info, "transaction_status", None)
+        if status is None:
+            return True
+        name = getattr(status, "name", str(status))
+        return str(name).upper() != "IDLE"
+
     def _commit(self) -> None:
         self._conn.execute("COMMIT")
 
