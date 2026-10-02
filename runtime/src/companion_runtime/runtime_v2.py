@@ -46,6 +46,7 @@ from .repeat_v2 import (
 from .user_model_v2_labels import SettlementContextV2, TargetObservationV2
 from .user_model_v2_service import PreparedExposureV2, UserModelV2Service
 from .actual_action_v21 import actual_action_for_exposure
+from .render_plan_v1 import freeze_action_render_plan
 from .user_model_v2_types import DeliveryBasis, Target, TargetPredictionV2
 
 DECISION_POLICY_VERSION = "runtime-v2.0"
@@ -72,7 +73,7 @@ def _softplus(value: float) -> float:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CandidateV2:
-    """Legacy-produced candidate facts consumed by the v2 decision path."""
+    """Legacy-produced candidate with its render design frozen before prediction."""
 
     candidate_id: str
     action: Mapping[str, Any]
@@ -81,6 +82,11 @@ class CandidateV2:
     repeat_subject: RepeatSubjectV2
     policy: CandidatePolicyV2
     source_event_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.action, Mapping):
+            raise TypeError("candidate action must be a mapping")
+        object.__setattr__(self, "action", freeze_action_render_plan(self.action))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -469,15 +475,28 @@ class V2RuntimeCoordinator:
             actual_outcomes = ()
         if not isinstance(actual_outcomes, (tuple, list)):
             raise TypeError("actual_outcomes must be a sequence")
+        evidence_refs = evidence.get("evidence_refs", ())
+        if not isinstance(evidence_refs, (tuple, list)):
+            raise TypeError("evidence_refs must be a sequence")
         from .langchao_goal_lifecycle_service import GoalLifecycleEvent
 
+        event = GoalLifecycleEvent(
+            kind=str(kind), occurred_at=occurred_at,
+            scope_key=str(evidence.get("scope_key") or ""),
+            goal_id=str(evidence.get("goal_id") or ""),
+            episode_id=str(evidence.get("episode_id") or ""),
+            evidence_refs=tuple(evidence_refs),
+            actual_outcomes=tuple(actual_outcomes),
+        )
+        if (
+            event.scope_key != self.scope_key
+            or event.scope_key != getattr(goal, "scope_key", None)
+            or event.goal_id != getattr(goal, "goal_id", None)
+            or event.episode_id != getattr(goal, "episode_id", None)
+        ):
+            raise ValueError("terminal evidence does not match exact scope/goal/episode")
         return self.goal_lifecycle_service.apply_terminal_event(
-            GoalLifecycleEvent(
-                kind=str(kind), occurred_at=occurred_at,
-                actual_outcomes=tuple(actual_outcomes),
-            ),
-            goal=goal,
-            candidates=tuple(candidates),
+            event, goal=goal, candidates=tuple(candidates),
         )
 
     def process_user_event(self, event: Mapping[str, Any]) -> LegacyUserEventResult:

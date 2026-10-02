@@ -43,6 +43,51 @@ _RENDER_COMPLETION_KEYS = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class CompletionMetadata:
+    """Authoritative renderer declaration for task-completion semantics.
+
+    Every render result carries all three fields, including ordinary messages.  A
+    non-completion is represented explicitly as ``False, None, None``; absence is
+    not a negative claim and is accepted only behind the legacy/test switch.
+    """
+
+    claims_completion: bool
+    task_ref: str | None
+    witness_requirement: Mapping[str, Any] | None
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "CompletionMetadata":
+        missing = _RENDER_COMPLETION_KEYS - value.keys()
+        if missing:
+            raise WitnessValidationError(
+                "incomplete completion metadata: " + ",".join(sorted(missing))
+            )
+        claims_completion = value.get("claims_completion")
+        if not isinstance(claims_completion, bool):
+            raise WitnessValidationError("claims_completion must be boolean")
+        task_ref = value.get("task_ref")
+        raw_requirement = value.get("witness_requirement")
+        if not claims_completion:
+            if task_ref is not None or raw_requirement is not None:
+                raise WitnessValidationError("non-completion metadata carries task witness")
+            return cls(False, None, None)
+        if not isinstance(task_ref, str) or not task_ref.strip():
+            raise WitnessValidationError("completion metadata has no task_ref")
+        if not isinstance(raw_requirement, Mapping):
+            raise WitnessValidationError("completion metadata has no witness requirement")
+        return cls(True, task_ref.strip(), raw_requirement)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "claims_completion": self.claims_completion,
+            "task_ref": self.task_ref,
+            "witness_requirement": (
+                None if self.witness_requirement is None else dict(self.witness_requirement)
+            ),
+        }
+
+
 class TaskStatus(str, Enum):
     NOT_STARTED = "not_started"
     RUNNING = "running"
@@ -212,37 +257,29 @@ def rendered_completion_requirement(
     scope_key: str,
     render_metadata: Mapping[str, Any] | None = None,
     semantic_review: Mapping[str, Any] | None = None,
+    allow_legacy_inference: bool = False,
 ) -> WitnessRequirement | None:
     """Return the exact witness requirement for a rendered completion claim.
 
-    A renderer's ``claims_completion``/``task_ref``/``witness_requirement``
-    declaration is authoritative.  Legacy renderers fall back to an approved
-    semantic review and finally to conservative text detection.  An explicitly
-    unknown semantic review is never treated as a negative decision.
+    The structured declaration is authoritative and mandatory by default.  Only
+    callers that explicitly enable legacy/test compatibility may fall back to a
+    semantic review or conservative text detection.
     """
     metadata = render_metadata if isinstance(render_metadata, Mapping) else {}
     declared_keys = _RENDER_COMPLETION_KEYS.intersection(metadata)
     if declared_keys:
-        if declared_keys != _RENDER_COMPLETION_KEYS:
-            missing = ",".join(sorted(_RENDER_COMPLETION_KEYS - declared_keys))
-            raise WitnessValidationError(f"incomplete completion metadata: {missing}")
-        claims_completion = metadata.get("claims_completion")
-        if not isinstance(claims_completion, bool):
-            raise WitnessValidationError("claims_completion must be boolean")
-        task_ref = metadata.get("task_ref")
-        raw = metadata.get("witness_requirement")
-        if not claims_completion:
-            if task_ref not in (None, "") or raw not in (None, {}):
-                raise WitnessValidationError("non-completion metadata carries task witness")
+        declaration = CompletionMetadata.from_mapping(metadata)
+        if not declaration.claims_completion:
             return None
-        if not isinstance(task_ref, str) or not task_ref.strip():
-            raise WitnessValidationError("completion metadata has no task_ref")
-        if not isinstance(raw, Mapping):
-            raise WitnessValidationError("completion metadata has no witness requirement")
-        requirement = requirement_from_mapping(raw, scope_key=scope_key)
-        if requirement.task_run_id != task_ref.strip():
+        requirement = requirement_from_mapping(
+            declaration.witness_requirement or {}, scope_key=scope_key
+        )
+        if requirement.task_run_id != declaration.task_ref:
             raise WitnessValidationError("completion task_ref does not match witness requirement")
         return requirement
+
+    if not allow_legacy_inference:
+        raise WitnessValidationError("completion metadata is required")
 
     review = semantic_review if isinstance(semantic_review, Mapping) else None
     if review is not None:
@@ -364,7 +401,7 @@ class PostgresWitnessRepository:
 
 
 __all__ = [
-    "ArtifactStatus", "ArtifactWitness", "InMemoryWitnessRegistry",
+    "ArtifactStatus", "ArtifactWitness", "CompletionMetadata", "InMemoryWitnessRegistry",
     "PostgresWitnessRepository", "TaskStatus", "WitnessReader", "WitnessRequirement",
     "WitnessValidationError", "WitnessValidator", "candidate_witness_requirement",
     "rendered_completion_requirement", "requirement_from_mapping",

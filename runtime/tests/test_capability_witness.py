@@ -138,6 +138,7 @@ def test_runtime_constructor_wires_reducer_completion_gate_positive_and_missing(
     config.storage.mirror_raw_events = False
     config.storage.database_path = ":memory:"
     config.conversation_id = "scope:a"
+    config.allow_legacy_render_completion_inference = True
     registry = InMemoryWitnessRegistry(witness())
     runtime = Runtime(
         config, database=Database(":memory:"), created_at=NOW, witness_reader=registry
@@ -204,6 +205,19 @@ def test_render_metadata_completion_declaration_is_authoritative_and_requires_wi
         )
 
 
+def test_missing_completion_metadata_fails_closed_without_compatibility():
+    with pytest.raises(WitnessValidationError, match="metadata is required"):
+        rendered_completion_requirement(
+            "我把活儿收尾交差了。", action={}, scope_key="scope:a"
+        )
+    with pytest.raises(WitnessValidationError, match="metadata is required"):
+        rendered_completion_requirement(
+            "The deliverable is buttoned up and ready to ship.",
+            action={},
+            scope_key="scope:a",
+        )
+
+
 def test_render_metadata_negative_declaration_is_authoritative():
     assert rendered_completion_requirement(
         "I've finished the research.", action={}, scope_key="scope:a",
@@ -224,9 +238,14 @@ def test_render_metadata_negative_declaration_is_authoritative():
 )
 def test_legacy_text_fallback_covers_english_chinese_and_paraphrases(text):
     with pytest.raises(WitnessValidationError, match="no witness"):
-        rendered_completion_requirement(text, action={}, scope_key="scope:a")
+        rendered_completion_requirement(
+            text, action={}, scope_key="scope:a", allow_legacy_inference=True
+        )
     assert rendered_completion_requirement(
-        text, action={"completion_witness": completion_witness_mapping()}, scope_key="scope:a"
+        text,
+        action={"completion_witness": completion_witness_mapping()},
+        scope_key="scope:a",
+        allow_legacy_inference=True,
     ) == requirement()
 
 
@@ -241,7 +260,9 @@ def test_legacy_text_fallback_covers_english_chinese_and_paraphrases(text):
     ],
 )
 def test_legacy_text_fallback_does_not_flag_non_completion_statements(text):
-    assert rendered_completion_requirement(text, action={}, scope_key="scope:a") is None
+    assert rendered_completion_requirement(
+        text, action={}, scope_key="scope:a", allow_legacy_inference=True
+    ) is None
 
 
 def test_unknown_semantic_review_fails_closed_without_metadata():
@@ -249,6 +270,7 @@ def test_unknown_semantic_review_fails_closed_without_metadata():
         rendered_completion_requirement(
             "A neutral update.", action={}, scope_key="scope:a",
             semantic_review={"status": "unknown", "claims_task_completion": "unknown"},
+            allow_legacy_inference=True,
         )
 
 
@@ -256,11 +278,12 @@ def test_approved_semantic_completion_review_requires_witness():
     review = {"status": "approved", "claims_task_completion": True}
     with pytest.raises(WitnessValidationError, match="no witness"):
         rendered_completion_requirement(
-            "A neutral update.", action={}, scope_key="scope:a", semantic_review=review
+            "A neutral update.", action={}, scope_key="scope:a", semantic_review=review,
+            allow_legacy_inference=True,
         )
     assert rendered_completion_requirement(
         "A neutral update.", action={"completion_witness": completion_witness_mapping()},
-        scope_key="scope:a", semantic_review=review,
+        scope_key="scope:a", semantic_review=review, allow_legacy_inference=True,
     ) == requirement()
 
 

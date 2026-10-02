@@ -19,7 +19,7 @@ from enum import Enum
 from typing import Any, TypeAlias
 
 USER_MODEL_V2_CONTRACT_VERSION = "2"
-USER_MODEL_V2_FEATURE_VERSION = "user-model-v2.0"
+USER_MODEL_V2_FEATURE_VERSION = "user-model-v2.1-render-plan-v1"
 USER_MODEL_V2_TARGET_CONTRACT_VERSION = "1"
 
 JsonScalar: TypeAlias = str | int | float | bool | None

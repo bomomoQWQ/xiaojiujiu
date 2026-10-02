@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping
 
+from .render_plan_v1 import plan_from_action
+
 ACTUAL_ACTION_WITNESS_SCHEMA_VERSION = "21"
 DEFAULT_RENDER_VERSION = "unknown"
 DEFAULT_TEMPLATE_VERSION = "unknown"
@@ -116,6 +118,8 @@ def build_actual_action_witness(
             normalized,
             str(metadata.get("render_version") or DEFAULT_RENDER_VERSION),
             str(metadata.get("template_version") or DEFAULT_TEMPLATE_VERSION),
+            str(metadata.get("style_version") or DEFAULT_TEMPLATE_VERSION),
+            str(metadata.get("render_plan_revision") or "unbound"),
             str(metadata.get("encoder_version") or DEFAULT_ENCODER_VERSION),
         )
     )
@@ -135,6 +139,8 @@ def build_actual_action_witness(
         },
         "render_version": str(metadata.get("render_version") or DEFAULT_RENDER_VERSION),
         "template_version": str(metadata.get("template_version") or DEFAULT_TEMPLATE_VERSION),
+        "style_version": str(metadata.get("style_version") or DEFAULT_TEMPLATE_VERSION),
+        "render_plan_revision": str(metadata.get("render_plan_revision") or "") or None,
         "encoder_version": str(metadata.get("encoder_version") or DEFAULT_ENCODER_VERSION),
         "semantic_review": review,
         "attribution": (
@@ -143,6 +149,36 @@ def build_actual_action_witness(
             else ActualActionAttribution.UNATTRIBUTABLE.value
         ),
     }
+
+
+def verify_render_plan_v1(
+    *, planned_action: Mapping[str, Any], witness: Mapping[str, Any]
+) -> tuple[str, tuple[str, ...]]:
+    """Compare reviewed actual semantics with the frozen plan.
+
+    The witness is verification evidence only.  Unknown review or any semantic/version
+    mismatch is ``UNATTRIBUTABLE`` and never mutates prediction/training features.
+    """
+
+    plan = plan_from_action(planned_action)
+    review = witness.get("semantic_review")
+    if not isinstance(review, Mapping) or review.get("status") != SemanticReviewStatus.APPROVED.value:
+        return ActualActionAttribution.UNATTRIBUTABLE.value, ("semantic_review_unknown",)
+    drift: list[str] = []
+    if bool(review.get("asks_reply")) != plan["asks_reply"]:
+        drift.append("asks_reply")
+    if review.get("pressure") != plan["pressure_tier"]:
+        drift.append("pressure_tier")
+    if bool(review.get("makes_commitment")) != plan["commitment"]:
+        drift.append("commitment")
+    if bool(review.get("claims_task_completion")) != plan["completion_claim_intent"]:
+        drift.append("completion_claim_intent")
+    if "render_plan_v1" in planned_action and witness.get("template_version") != plan["template_version"]:
+        drift.append("template_version")
+    return (
+        ActualActionAttribution.UNATTRIBUTABLE.value if drift else ActualActionAttribution.ATTRIBUTABLE.value,
+        tuple(drift),
+    )
 
 
 def enforce_plan_render_scope(
@@ -161,20 +197,16 @@ def enforce_plan_render_scope(
     review = witness.get("semantic_review")
     if not isinstance(review, Mapping) or review.get("status") != SemanticReviewStatus.APPROVED.value:
         return
-    drift: list[str] = []
-    if review.get("asks_reply") is True and planned_action.get("asks_reply", planned_action.get("question")) is not True:
-        drift.append("asks_reply")
-    pressure = review.get("pressure")
-    planned_pressure = planned_action.get("pressure", "low")
-    ranks = {"none": 0, "low": 1, "medium": 2, "high": 3, "urgent": 4}
-    if isinstance(pressure, str) and ranks.get(pressure, 99) > ranks.get(str(planned_pressure), 1):
-        drift.append("pressure")
-    if review.get("makes_commitment") is True and planned_action.get("makes_commitment") is not True:
-        drift.append("makes_commitment")
-    if review.get("claims_task_completion") is True and planned_action.get("claims_task_completion") is not True:
-        drift.append("claims_task_completion")
-    if drift and not reauthorized:
-        raise ScopeDriftError("render_scope_drift:" + ",".join(drift))
+    attribution, drift = verify_render_plan_v1(planned_action=planned_action, witness=witness)
+    if (
+        attribution == ActualActionAttribution.UNATTRIBUTABLE.value
+        and drift != ("semantic_review_unknown",)
+        and not reauthorized
+    ):
+        plan = plan_from_action(planned_action)
+        raise ScopeDriftError(
+            "render_scope_drift:" + ",".join(drift) + f":new_render_plan_revision_required:{plan['revision']}"
+        )
 
 
 def actual_action_for_exposure(
@@ -199,4 +231,5 @@ __all__ = [
     "actual_action_for_exposure",
     "build_actual_action_witness",
     "enforce_plan_render_scope",
+    "verify_render_plan_v1",
 ]

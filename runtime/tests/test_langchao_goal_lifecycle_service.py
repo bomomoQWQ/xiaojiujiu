@@ -69,14 +69,14 @@ def test_explicit_completion_and_cancellation_events_call_lifecycle_without_outb
         matter_transition=lambda matter_id, status, at: matter_events.append((matter_id, status, at)),
     )
     completed = service.apply_terminal_event(
-        GoalLifecycleEvent(kind="completed", occurred_at=LATER, actual_outcomes=(outcome(),)),
+        GoalLifecycleEvent(kind="completed", occurred_at=LATER, scope_key=goal().scope_key, goal_id=goal().goal_id, episode_id=goal().episode_id, evidence_refs=(outcome().token_id,), actual_outcomes=(outcome(),)),
         goal=goal(), candidates=(candidate(),),
     )
     assert completed.goal.status is GoalStatus.COMPLETED
     assert matter_events[-1][1] == "resolved"
 
     cancelled = service.apply_terminal_event(
-        GoalLifecycleEvent(kind="cancelled", occurred_at=LATER + timedelta(days=90)),
+        GoalLifecycleEvent(kind="cancelled", occurred_at=LATER + timedelta(days=90), scope_key=goal().scope_key, goal_id=goal().goal_id, episode_id=goal().episode_id, evidence_refs=("event:user-cancel:1",)),
         goal=goal(), candidates=(candidate(),),
     )
     assert cancelled.goal.status is GoalStatus.DROPPED
@@ -95,7 +95,7 @@ def test_terminal_transition_failure_rolls_back_goal_candidate_pointers_and_matt
 
     with pytest.raises(RuntimeError, match="candidate insert failed"):
         service.apply_terminal_event(
-            GoalLifecycleEvent(kind="completed", occurred_at=LATER, actual_outcomes=(outcome(),)),
+            GoalLifecycleEvent(kind="completed", occurred_at=LATER, scope_key=goal().scope_key, goal_id=goal().goal_id, episode_id=goal().episode_id, evidence_refs=(outcome().token_id,), actual_outcomes=(outcome(),)),
             goal=goal(), candidates=(candidate(),),
         )
 
@@ -116,7 +116,7 @@ def test_matter_transition_failure_rolls_back_all_contract_writes():
 
     with pytest.raises(RuntimeError, match="matter update failed"):
         service.apply_terminal_event(
-            GoalLifecycleEvent(kind="completed", occurred_at=LATER, actual_outcomes=(outcome(),)),
+            GoalLifecycleEvent(kind="completed", occurred_at=LATER, scope_key=goal().scope_key, goal_id=goal().goal_id, episode_id=goal().episode_id, evidence_refs=(outcome().token_id,), actual_outcomes=(outcome(),)),
             goal=goal(), candidates=(candidate(),),
         )
 
@@ -137,6 +137,7 @@ def test_runtime_producer_calls_service_only_for_explicit_terminal_evidence():
     coordinator = object.__new__(V2RuntimeCoordinator)
     coordinator.goal_lifecycle_service = Service()
     current_goal = goal()
+    coordinator.scope_key = current_goal.scope_key
     current_candidates = (candidate(),)
 
     assert coordinator.produce_goal_terminal_event(
@@ -147,6 +148,9 @@ def test_runtime_producer_calls_service_only_for_explicit_terminal_evidence():
     assert coordinator.produce_goal_terminal_event(
         evidence={
             "kind": "completed", "occurred_at": LATER,
+            "scope_key": current_goal.scope_key, "goal_id": current_goal.goal_id,
+            "episode_id": current_goal.episode_id,
+            "evidence_refs": (outcome().token_id,),
             "actual_outcomes": (outcome(),), "summary": "ignored",
         },
         goal=current_goal, candidates=current_candidates,
@@ -162,7 +166,7 @@ def test_old_summary_cannot_reopen_through_service_and_elapsed_time_has_no_compl
         contract_repository=contracts, matter_transition=lambda *_args: None,
     )
     closed = service.apply_terminal_event(
-        GoalLifecycleEvent(kind="completed", occurred_at=LATER, actual_outcomes=(outcome(),)),
+        GoalLifecycleEvent(kind="completed", occurred_at=LATER, scope_key=goal().scope_key, goal_id=goal().goal_id, episode_id=goal().episode_id, evidence_refs=(outcome().token_id,), actual_outcomes=(outcome(),)),
         goal=goal(), candidates=(),
     ).goal
     with pytest.raises(GoalLifecycleError, match="old or same-source"):
@@ -172,9 +176,9 @@ def test_old_summary_cannot_reopen_through_service_and_elapsed_time_has_no_compl
             episode_basis_refs=("summary:old",), at=LATER + timedelta(days=365),
         )
     # Merely waiting a year cannot synthesize a completion event or outcome.
-    with pytest.raises(GoalLifecycleError, match="actual confirmed completion evidence"):
+    with pytest.raises(ValueError, match="not backed by actual outcomes"):
         service.apply_terminal_event(
-            GoalLifecycleEvent(kind="completed", occurred_at=LATER + timedelta(days=365)),
+            GoalLifecycleEvent(kind="completed", occurred_at=LATER + timedelta(days=365), scope_key=goal().scope_key, goal_id=goal().goal_id, episode_id=goal().episode_id, evidence_refs=("event:missing-actual",)),
             goal=goal(),
         )
     assert contracts.outbox == [] and contracts.claims == []

@@ -861,10 +861,21 @@ def _render_payload(
         lines.extend("  · " + line for line in already_said)
     lines.extend(RENDER_STYLE_LINES)
     lines.append("- 只回正文本身：别解释、别复述上面的背景、别提这些说明。")
+    action = _mapping(payload.get("action"))
+    completion_metadata = {
+        "claims_completion": bool(action.get("claims_task_completion", False)),
+        "task_ref": None,
+        "witness_requirement": None,
+    }
+    if completion_metadata["claims_completion"]:
+        witness = _mapping(action.get("completion_witness"))
+        completion_metadata["task_ref"] = _text(witness.get("task_run_id")).strip() or None
+        completion_metadata["witness_requirement"] = dict(witness) if witness else None
     return {
         "prompt": "\n".join(lines),
         "system_prompt": "",
         "max_chars": 0,
+        "completion_metadata": completion_metadata,
         "attempt_id": _text(payload.get("attempt_id")).strip(),
         "intent": intent,
         "goal": goal,
@@ -1402,8 +1413,16 @@ def _apply_action_report(
                     outbox_id=action_id,
                     text=text,
                     now=now,
-                    render_metadata=_mapping(result.get("render_metadata")),
-                    semantic_review=_mapping(result.get("semantic_review")),
+                    render_metadata=(
+                        result.get("render_metadata")
+                        if isinstance(result.get("render_metadata"), Mapping)
+                        else None
+                    ),
+                    semantic_review=(
+                        result.get("semantic_review")
+                        if isinstance(result.get("semantic_review"), Mapping)
+                        else None
+                    ),
                     reauthorized=_flag(result.get("reauthorized"), False),
                 )
                 state = render.state

@@ -317,6 +317,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # learning/prediction and proactive decisions are owned by the PostgreSQL v2 graph.
     config.legacy_user_model_enabled = False
     config.legacy_endogenous_enabled = False
+    config.allow_legacy_render_completion_inference = False
     runtime = Runtime(config, seed=args.seed)
     bridge = ConcreteLegacyRuntimeV2Bridge(runtime)
     v2_composition = build_v2_composition(

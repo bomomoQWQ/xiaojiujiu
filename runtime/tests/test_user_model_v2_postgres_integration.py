@@ -9,11 +9,14 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
 psycopg = pytest.importorskip("psycopg")
 
+from companion_runtime.actual_action_v21 import build_actual_action_witness
+from companion_runtime.langchao_live_wiring import LangchaoLiveRunner
 from companion_runtime.user_model_v2_schema import USER_MODEL_SCHEMA_VERSION
 from companion_runtime.user_model_v2_migrations import migrate
 from companion_runtime.user_model_v2_repository import UserModelV2Repository
@@ -211,6 +214,74 @@ def test_service_adapter_round_trip_and_scope_isolation_on_real_postgres(pg_sche
     assert tuple(
         adapter.list_active_training_records(scope_key="scope:service-b", target=Target.REPLY)
     ) == ()
+
+
+def test_langchao_send_ack_actual_action_round_trips_on_real_postgres(pg_schema) -> None:
+    connection, schema = pg_schema
+    _search_path(connection, schema)
+    scope = "scope:langchao-actual-action"
+    adapter = PostgresUserModelV2ServiceRepository(connection)
+    service = UserModelV2Service(adapter)
+    prediction = UserModelV2PredictionService(
+        PostgresUserModelV2PredictionRepository(adapter.repository)
+    )
+    exposure_repository = PostgresV2RuntimeRepository(
+        connection,
+        prediction_service=prediction,
+        service_repository=adapter,
+        scope_key=scope,
+        state_version_provider=lambda: 1,
+    )
+    witness = build_actual_action_witness(
+        text="浪潮实际发送的最终文本。",
+        attempt_id="attempt:langchao:actual",
+        render_outbox_id="render:langchao:actual",
+        send_outbox_id="send:langchao:actual",
+        render_metadata={
+            "render_version": "renderer:pg-test",
+            "template_version": "template:pg-test",
+        },
+    )
+    runner = LangchaoLiveRunner(
+        evaluator=None,
+        service=None,
+        repository=SimpleNamespace(
+            settle_terminal=lambda **_kw: (),
+            get=lambda _round_id: SimpleNamespace(scope_key=scope),
+        ),
+        exposure_repository=exposure_repository,
+        user_model=service,
+        horizons={target: 60 for target in Target},
+    )
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    ack = SimpleNamespace(
+        decision_id="round:langchao:actual",
+        attempt_id="attempt:langchao:actual",
+        send_outbox_id="send:langchao:actual",
+        sent=True,
+        acknowledged_at=now,
+        action={"type": "expression", "asks_reply": False},
+        actual_action_witness=witness,
+        context_provider=lambda: {"busy_probability": 0.1, "recent_contact_count": 0},
+        source_event_ids=("event:langchao:actual",),
+        delivery_basis=first_basis(),
+    )
+
+    runner.after_legacy_send_ack(ack, confirmed=True)
+
+    prepared = adapter.get_prepared_exposure(
+        scope_key=scope, idempotency_key="send-ack:send:langchao:actual"
+    )
+    assert prepared is not None
+    action = prepared.features.action_json
+    assert action["actual_action_witness"]["rendered_text_sha256"] == witness["rendered_text_sha256"]
+    assert action["actual_action_revision"] == witness["actual_action_revision"]
+    assert action["actual_action_attribution"] == witness["attribution"]
+    row = connection.execute(
+        "SELECT action FROM interaction_exposures_v2 WHERE scope_key = %s AND idempotency_key = %s",
+        (scope, "send-ack:send:langchao:actual"),
+    ).fetchone()
+    assert row["action"] == action
 
 
 def test_send_ack_freezes_expectation_once_and_maintenance_settles_real_postgres(pg_schema) -> None:

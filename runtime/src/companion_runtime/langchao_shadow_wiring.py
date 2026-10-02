@@ -32,6 +32,7 @@ from .langchao_attention_recipe import (
 )
 from .langchao_engine import LangchaoParameters
 from .langchao_exploration import ExplorationResultKind, ExplorationWorkSegment
+from .langchao_history import condition_forecasts_from_history, observations_from_rows
 from .langchao_outcome_repository import LangchaoOutcomeRepository
 from .langchao_permission import read_runtime_permission
 from .langchao_repository import LangchaoRepository
@@ -352,6 +353,7 @@ class LangchaoShadowRunner:
     attention_recipe: str = BASELINE_RECIPE
     internal_exploration_enabled: bool = True
     exploration_witness_reader: Any | None = None
+    outcome_repository: Any | None = None
     last_built: BuiltShadowRound | None = None
 
     def run(
@@ -472,6 +474,20 @@ class LangchaoShadowRunner:
             parameter_version=parameter_version_for_recipe(recipe_plan),
             attention_profile=recipe_plan.attention_profile,
         )
+        # Realized user outcomes are never appended as bonus terms.  Active settled
+        # history conditions the next round's expected forecasts before compilation.
+        if self.outcome_repository is not None:
+            history = observations_from_rows(
+                self.outcome_repository.list_settled_user_observations()
+            )
+            conditioned = tuple(
+                condition_forecasts_from_history(item, history) for item in built.inputs
+            )
+            contracts = tuple(
+                replace(contract, shadow_input=conditioned[index])
+                for index, contract in enumerate(built.contracts)
+            )
+            built = replace(built, inputs=conditioned, contracts=contracts)
         # Live wiring consumes this exact immutable build after numerical evaluation;
         # it must never rebuild from a potentially changed legacy candidate pool.
         self.last_built = built
@@ -514,7 +530,7 @@ def build_langchao_shadow_runner(
         allow_live_evaluation=allow_live_evaluation,
     )
     return LangchaoShadowRunner(scope_key=scope_key, runtime=runtime, service=service,
-                                state_repository=states,
+                                state_repository=states, outcome_repository=outcomes,
                                 revisions=LangchaoRevisionResolver(connection, scope_key=scope_key),
                                 attention_recipe=normalize_recipe(attention_recipe),
                                 internal_exploration_enabled=bool(internal_exploration_enabled),

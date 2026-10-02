@@ -24,10 +24,14 @@ from .langchao_types import ActionCandidateContract, GoalContract, OutcomeToken
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GoalLifecycleEvent:
-    """An explicit terminal event; elapsed time and summaries are intentionally absent."""
+    """An exact terminal fact, never an inference from prose or elapsed time."""
 
     kind: str
     occurred_at: datetime
+    scope_key: str
+    goal_id: str
+    episode_id: str
+    evidence_refs: tuple[str, ...]
     actual_outcomes: tuple[OutcomeToken, ...] = ()
 
     def __post_init__(self) -> None:
@@ -35,6 +39,14 @@ class GoalLifecycleEvent:
             raise ValueError("kind must be 'completed' or 'cancelled'")
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
+        for name in ("scope_key", "goal_id", "episode_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        if not self.evidence_refs or any(
+            not isinstance(ref, str) or not ref.strip() for ref in self.evidence_refs
+        ):
+            raise ValueError("terminal events require non-empty evidence_refs")
         if self.kind == "cancelled" and self.actual_outcomes:
             raise ValueError("cancelled events cannot carry completion outcomes")
 
@@ -70,6 +82,23 @@ class LangchaoGoalLifecycleService:
         candidates: Iterable[ActionCandidateContract] = (),
     ) -> GoalTerminalTransition:
         """Apply one explicit event; no event means no lifecycle inference."""
+
+        if (
+            event.scope_key != goal.scope_key
+            or event.goal_id != goal.goal_id
+            or event.episode_id != goal.episode_id
+        ):
+            raise ValueError("terminal event does not match exact scope/goal/episode")
+        if event.occurred_at < goal.updated_at:
+            raise ValueError("terminal event predates the active goal revision")
+        if event.kind == "completed":
+            token_evidence = {
+                ref
+                for token in event.actual_outcomes
+                for ref in (token.token_id, *token.evidence_refs)
+            }
+            if not set(event.evidence_refs).issubset(token_evidence):
+                raise ValueError("completion event evidence is not backed by actual outcomes")
 
         candidate_tuple = tuple(candidates)
         transition = (

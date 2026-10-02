@@ -35,6 +35,22 @@ class LangchaoLiveResult:
     committed: bool
     reason: str
     receipt: CommitReceiptV2 | None = None
+    stage: str = "live"
+    permission_version: str | None = None
+    details: tuple[tuple[str, str], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "stage": self.stage,
+            "round_id": self.round_id,
+            "candidate_id": self.candidate_id,
+            "source_candidate_id": self.source_candidate_id,
+            "permission_version": self.permission_version,
+            "details": dict(self.details),
+            "committed": self.committed,
+            "receipt": self.receipt,
+        }
 
 
 def _authority(value: Any) -> tuple[str, str, bool, int]:

@@ -110,6 +110,7 @@ def create_v2_observability_router(
     health: Any,
     enable_decision_run: bool = False,
     decision_simulation_runner: DecisionSimulationRunner | None = None,
+    no_send_repository: Any | None = None,
 ) -> APIRouter:
     """Create the isolated ``/v2`` public router.
 
@@ -153,6 +154,27 @@ def create_v2_observability_router(
                 "decision_audits": audits,
             }
         )
+
+    if no_send_repository is not None:
+
+        @router.get("/langchao/no-send-results")
+        def no_send_results(
+            scope: str = Query(..., min_length=1),
+            reason: str | None = Query(default=None),
+            limit: int = Query(default=100, ge=1, le=1000),
+        ) -> dict[str, Any]:
+            if scope != scope_key:
+                raise HTTPException(status_code=403, detail="scope is not allowed")
+            reader = getattr(no_send_repository, "list_no_sends", None)
+            if not callable(reader):
+                reader = getattr(no_send_repository, "list", None)
+            if not callable(reader):
+                raise RuntimeError("no-send repository is missing list capability")
+            try:
+                results = reader(reason=reason, limit=limit)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return _safe({"scope": scope_key, "read_only": True, "results": results})
 
     if enable_decision_run:
         assert decision_simulation_runner is not None

@@ -336,6 +336,8 @@ def build_v2_composition(
             authority_reader=authority,
             langchao_live_runner=langchao_live_runner,
             langchao_shadow_runner=langchao_shadow_runner,
+            no_send_repository=(None if langchao_live_runner is None
+                                else langchao_live_runner.repository),
             live_enabled=live_enabled,
             live_scope_allowlist=tuple(config.langchao.live_scope_allowlist),
         )

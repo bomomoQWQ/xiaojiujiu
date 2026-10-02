@@ -535,6 +535,51 @@ def test_render_endpoint_reports_a_replay_instead_of_raising(
     assert runtime.projections.attempts.get(attempt_id).state == AttemptState.SENT.value
 
 
+def test_render_api_requires_authoritative_completion_metadata_in_strict_mode(
+    client: TestClient, runtime: Runtime
+) -> None:
+    runtime.config.allow_legacy_render_completion_inference = False
+    attempt_id, render_row_id = commit_attempt(runtime)
+
+    response = client.post(
+        "/render",
+        json={"outbox_id": render_row_id, "text": "我把活儿收尾交差了。"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["applied"] is True
+    assert body["outbox_id"] is None
+    assert "completion metadata is required" in body["reason"]
+    assert runtime.projections.attempts.get(attempt_id).state == AttemptState.FAILED.value
+    assert rows_for(runtime, attempt_id, OutboxKind.SEND.value) == []
+
+
+def test_render_api_accepts_complete_negative_declaration_without_text_inference(
+    client: TestClient, runtime: Runtime
+) -> None:
+    runtime.config.allow_legacy_render_completion_inference = False
+    attempt_id, render_row_id = commit_attempt(runtime)
+
+    response = client.post(
+        "/render",
+        json={
+            "outbox_id": render_row_id,
+            "text": "The deliverable is buttoned up; 我也把活儿收尾交差了。",
+            "render_metadata": {
+                "claims_completion": False,
+                "task_ref": None,
+                "witness_requirement": None,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["state"] == AttemptState.READY_TO_SEND.value
+    assert runtime.projections.attempts.get(attempt_id).state == AttemptState.READY_TO_SEND.value
+    assert len(rows_for(runtime, attempt_id, OutboxKind.SEND.value)) == 1
+
+
 # --------------------------------------------------------------------------------------
 # concurrency
 # --------------------------------------------------------------------------------------

@@ -1,0 +1,20 @@
+{
+  "version": "langchao.history-fixture.v1",
+  "prior_strength": 2.0,
+  "prior_probability": 0.5,
+  "reply_positive": {
+    "history": [true],
+    "expected_probability": 0.6666666666666666,
+    "expected_attraction_direction": "up"
+  },
+  "negative_positive": {
+    "history": [true],
+    "expected_probability": 0.6666666666666666,
+    "expected_attraction_direction": "down"
+  },
+  "unknown_censored": {
+    "history": [null, null],
+    "expected_probability": 0.5,
+    "expected_attraction_direction": "unchanged"
+  }
+}
