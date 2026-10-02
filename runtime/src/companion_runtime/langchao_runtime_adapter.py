@@ -39,7 +39,7 @@ from .langchao_types import (
     RewardContract,
     SettlementType,
 )
-from .runtime_v2 import CandidateV2, PredictionSetV2
+from .runtime_v2 import CandidateV2, DecisionConfigV2, PredictionSetV2
 from .user_model_v2_types import SupportStatus, TargetPredictionV2
 
 LANGCHAO_RUNTIME_ADAPTER_VERSION = "langchao.runtime-adapter.v1"
@@ -49,6 +49,10 @@ VALUE_PROFILE_VERSION = "langchao.runtime-values.v1"
 ATTENTION_PROFILE_VERSION = "langchao.attention.all-one.v1"
 TEMPLATE_POLICY_VERSION = "langchao.template-policy.v1"
 TEMPLATE_REWARD_POLICY_VERSION = "langchao.template-reward.v1"
+#: Version of the bounded cold-start outreach drive below. It is part of every token's
+#: evidence, so a change in how much the character is willing to reach out to a user it
+#: has no evidence about is visible in the audit trail.
+COLD_START_DRIVE_VERSION = "langchao.cold-start-drive.v1"
 TEMPLATE_V1_REWARD_AMOUNTS = {
     "reply": 1.0,
     "continuation": 0.5,
@@ -63,8 +67,21 @@ TEMPLATE_V1_REWARD_AMOUNTS = {
 FIXED_VALUE_TOTAL = 8.0
 _ID_NAMESPACE = uuid.UUID("da6d1426-18e6-58e1-a7bc-cfa0bb59a54f")
 _TEMPLATE_KEYS = frozenset({
-    "contact.v1", "expression.v1", "followup.v1", "internal_rest.v1", "exploration.v1",
+    "contact.v1", "expression.v1", "question.v1", "followup.v1",
+    "internal_rest.v1", "exploration.v1",
 })
+#: Templates that may carry the bounded cold-start drive. ``expression.v1`` and
+#: ``internal_rest.v1`` already own a local outcome token, so adding a second one there
+#: would double-count the same act.
+_COLD_START_DRIVE_TEMPLATES = frozenset({"contact.v1", "question.v1", "followup.v1"})
+#: Outcome key of the bounded cold-start outreach token.
+COLD_START_DRIVE_OUTCOME = "cold_start_outreach"
+#: Cold-start budget reused verbatim from the v2 decision defaults, so both engines bound
+#: exploratory contact with one policy rather than two drifting ones.
+_COLD_START_CONFIG = DecisionConfigV2()
+COLD_START_EXPLORATION_LIMIT = _COLD_START_CONFIG.cold_start_exploration_limit
+COLD_START_EXPLORATION_WINDOW = _COLD_START_CONFIG.cold_start_exploration_window
+COLD_START_EXPLORATION_MIN_SPACING = _COLD_START_CONFIG.cold_start_exploration_min_spacing
 
 
 def _text(name: str, value: str) -> str:
@@ -117,6 +134,15 @@ class RuntimeCandidateFacts:
     blocked: bool = False
     hard_repeat: bool = False
     block_reasons: tuple[str, ...] = ()
+    diagnostic_reasons: tuple[str, ...] = ()
+    question: bool = False
+    topic_shift: bool = False
+    expires_at: datetime | None = None
+    #: Bounded, declared drive to reach out while the user model is still cold. It is a
+    #: *self* outcome (the character did reach out), never a claim about the user's
+    #: reaction, and it is present only when the safety policy already allows a
+    #: low-pressure exploratory contact.
+    cold_start_drive: float = 0.0
     expression_delivered_policy: bool = False
     rest_realized_policy: bool = False
     exploration_segment: ExplorationWorkSegment | None = None
@@ -144,10 +170,23 @@ class RuntimeCandidateFacts:
                 raise ValueError(f"{name} must be a positive integer supplied by the revision resolver")
         if self.bound_goal_revision <= self.initial_goal_revision:
             raise ValueError("bound_goal_revision must be greater than initial_goal_revision")
+        if isinstance(self.cold_start_drive, bool) or not isinstance(self.cold_start_drive, (int, float)):
+            raise TypeError("cold_start_drive must be numeric")
+        if not math.isfinite(float(self.cold_start_drive)) or self.cold_start_drive < 0:
+            raise ValueError("cold_start_drive must be finite and non-negative")
+        if self.cold_start_drive > 0 and self.template_key not in _COLD_START_DRIVE_TEMPLATES:
+            raise ValueError(
+                "cold_start_drive is only defined for a low-pressure external template; "
+                f"got {self.template_key!r}"
+            )
         if self.template_key == "contact.v1" and self.subject_ref != "relationship-continuity":
             raise ValueError("contact.v1 subject_ref must be 'relationship-continuity'")
-        if self.template_key == "expression.v1" and not (self.memory_ref or self.social_ref):
-            raise ValueError("expression.v1 requires memory_ref or social_ref")
+        if self.template_key in {"expression.v1", "question.v1"} and not (
+            self.memory_ref or self.social_ref
+        ):
+            raise ValueError(f"{self.template_key} requires memory_ref or social_ref")
+        if self.template_key == "question.v1" and (not self.question or not self.topic_shift):
+            raise ValueError("question.v1 requires explicit question and topic_shift semantics")
         if self.template_key == "followup.v1" and not self.unfinished_id:
             raise ValueError("followup.v1 requires unfinished_id")
         if self.template_key == "internal_rest.v1" and not self.self_regulation_ref:
@@ -161,7 +200,7 @@ class RuntimeCandidateFacts:
     def semantic_subject(self) -> str:
         if self.template_key == "contact.v1":
             return "relationship-continuity"
-        if self.template_key == "expression.v1":
+        if self.template_key in {"expression.v1", "question.v1"}:
             return self.memory_ref or self.social_ref or ""  # validated above
         if self.template_key == "followup.v1":
             return self.unfinished_id or ""
@@ -233,6 +272,17 @@ class BuiltCandidateContracts:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class DroppedCandidate:
     source_candidate_id: str
+    source_type: str
+    reason: str
+    stage: str
+    reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CandidateDiagnostic:
+    source_candidate_id: str
+    source_type: str
+    stage: str
     reasons: tuple[str, ...]
 
 
@@ -257,6 +307,9 @@ class BuiltShadowRound:
     reward_snapshot_version: str
     candidate_snapshot_version: str
     prediction_snapshot_version: str
+    # Non-blocking assessment notes (for example cold-support diagnostics). They never
+    # decide admission, so they carry a default and stay optional for older callers.
+    diagnostics: tuple[CandidateDiagnostic, ...] = ()
     adapter_version: str = LANGCHAO_RUNTIME_ADAPTER_VERSION
     built_version: str = BUILT_SHADOW_ROUND_VERSION
 
@@ -317,6 +370,8 @@ def _template_spec(facts: RuntimeCandidateFacts) -> tuple[CandidateKind, GoalKin
         return CandidateKind.EXTERNAL_MESSAGE, GoalKind.CONTINUOUS_NEED, MotivationDirection.APPROACH, "relationship_continuity"
     if facts.template_key == "expression.v1":
         return CandidateKind.EXTERNAL_MESSAGE, GoalKind.FINITE, MotivationDirection.EXPRESSION, "expression_delivered"
+    if facts.template_key == "question.v1":
+        return CandidateKind.EXTERNAL_MESSAGE, GoalKind.FINITE, MotivationDirection.EXPLORATION, "question_answered"
     if facts.template_key == "followup.v1":
         return CandidateKind.EXTERNAL_MESSAGE, GoalKind.FINITE, MotivationDirection.CARE, "unfinished_progress"
     if facts.template_key == "internal_rest.v1":
@@ -337,7 +392,7 @@ def _build_one(snapshot: RuntimeFactSnapshot, facts: RuntimeCandidateFacts, sour
 
     tokens: list[OutcomeToken] = []
     forecasts: list[OutcomeForecast] = []
-    if facts.template_key in {"contact.v1", "expression.v1", "followup.v1"}:
+    if facts.template_key in {"contact.v1", "expression.v1", "question.v1", "followup.v1"}:
         if source.predictions is None:
             raise ValueError(f"{facts.template_key} requires PredictionSetV2")
         predicted = (
@@ -399,6 +454,30 @@ def _build_one(snapshot: RuntimeFactSnapshot, facts: RuntimeCandidateFacts, sour
         if local_policy:
             template_policy = ((token_id, 1.0),)
 
+    if facts.cold_start_drive > 0:
+        # While every head is cold the conservative bounds say a first message is almost
+        # certainly unwelcome, so a purely predictive kernel can never reach out to a new
+        # user. This token represents the character's own bounded willingness to reach out
+        # under the declared cold-start allowance -- a self outcome, like rest or
+        # expression, never a claim about how the user will react. The predicted user
+        # utility keeps applying unchanged and can still outweigh it.
+        drive_id = _stable_id("token", *identity, COLD_START_DRIVE_OUTCOME)
+        tokens.append(OutcomeToken(
+            token_id=drive_id, scope_key=snapshot.scope_key, goal_id=goal_id,
+            episode_id=episode_id, outcome_key=COLD_START_DRIVE_OUTCOME,
+            settlement_type=SettlementType.EXPECTED, status=OutcomeStatus.UNEXECUTED,
+            base_amount=float(facts.cold_start_drive),
+            direction_weights=((direction, 1.0),),
+            evidence_version=COLD_START_DRIVE_VERSION,
+            idempotency_key=_stable_id("token-idempotency", *identity, COLD_START_DRIVE_OUTCOME),
+            evidence_refs=tuple(dict.fromkeys((facts.template_key, COLD_START_DRIVE_VERSION))),
+        ))
+        forecasts.append(OutcomeForecast(
+            token_id=drive_id, probability=1.0, support="cold_start_policy",
+            status="declared", source_version=COLD_START_DRIVE_VERSION,
+        ))
+        template_policy = (*template_policy, (drive_id, 1.0))
+
     completion = (local_outcome,) if has_local_outcome else ("reply", "continuation", "negative")
     # Template contracts are timeless semantic definitions. Round/state time remains
     # on the candidate and state snapshot, allowing goal/reward revisions to be reused.
@@ -418,6 +497,17 @@ def _build_one(snapshot: RuntimeFactSnapshot, facts: RuntimeCandidateFacts, sour
         revision=facts.reward_revision)
     # Goal1 -> reward -> goal2 uses distinct revisions allocated upstream.
     goal = replace(initial_goal, reward_contract_id=reward_id, revision=facts.bound_goal_revision)
+    envelope: tuple[tuple[str, Any], ...] = (("subject_ref", subject),)
+    if facts.template_key == "question.v1":
+        envelope += (("question", True), ("topic_shift", True))
+    if facts.exploration_segment is not None:
+        envelope = (
+            ("subject_ref", subject),
+            ("work_segment_id", facts.exploration_segment.segment_id),
+            ("result_kind", facts.exploration_segment.result_kind.value),
+            ("result_ref", facts.exploration_segment.result_ref),
+            ("records_progress", facts.exploration_segment.records_progress),
+        )
     contract = ActionCandidateContract(candidate_id=candidate_id, scope_key=snapshot.scope_key,
         semantic_key=f"{facts.template_key}:{subject}", goal_refs=(goal_id,), kind=kind,
         action_template=facts.template_key, input_refs=tuple(dict.fromkeys(facts.evidence_refs + source.candidate.source_event_ids)),
@@ -426,14 +516,9 @@ def _build_one(snapshot: RuntimeFactSnapshot, facts: RuntimeCandidateFacts, sour
         precondition_refs=facts.precondition_refs, invalidation_refs=facts.invalidation_refs,
         # Legacy runtime candidate ids are provenance, not semantic contract data.
         # Keeping them out of the envelope makes identity and payload agree.
-        envelope=(("subject_ref", subject),) if facts.exploration_segment is None else (
-            ("subject_ref", subject),
-            ("work_segment_id", facts.exploration_segment.segment_id),
-            ("result_kind", facts.exploration_segment.result_kind.value),
-            ("result_ref", facts.exploration_segment.result_ref),
-            ("records_progress", facts.exploration_segment.records_progress),
-        ),
-        state=CandidateState.COMPETITIVE, available_from=advanced_at, expires_at=None, resource_budget=0.0,
+        envelope=envelope,
+        state=CandidateState.COMPETITIVE, available_from=advanced_at,
+        expires_at=facts.expires_at, resource_budget=0.0,
         based_on_state_version=based_on_state_version, created_at=advanced_at, updated_at=advanced_at,
         # State version is an optimistic reference, not a semantic contract revision.
         # The service/repository resolver supplies candidate_revision explicitly.
@@ -461,7 +546,8 @@ def build_shadow_round(*, snapshot: RuntimeFactSnapshot, inputs: tuple[RuntimeCa
                        parameter_version: str = "langchao.parameters.v1",
                        permission: PermissionProjection | None = None,
                        permission_version: str = "runtime.permission.v2",
-                       attention_profile: AttentionProfile | None = None) -> BuiltShadowRound:
+                       attention_profile: AttentionProfile | None = None,
+                       omitted_candidates: tuple[Mapping[str, str], ...] = ()) -> BuiltShadowRound:
     """Build deterministic contracts and bootstrap/reconcile an initial state.
 
     ``permission_version`` remains a compatibility shim for offline/legacy callers.
@@ -483,28 +569,58 @@ def build_shadow_round(*, snapshot: RuntimeFactSnapshot, inputs: tuple[RuntimeCa
     if set(by_id) != set(facts_by_id):
         raise ValueError("snapshot candidate facts and inputs must cover exactly the same ids")
 
-    dropped: list[DroppedCandidate] = []
+    dropped: list[DroppedCandidate] = [
+        DroppedCandidate(
+            source_candidate_id=_text("source_candidate_id", item["source_candidate_id"]),
+            source_type=_text("source_type", item["source_type"]),
+            reason=_text("reason", item["reason"]),
+            stage=_text("stage", item["stage"]),
+            reasons=(_text("reason", item["reason"]),),
+        )
+        for item in omitted_candidates
+    ]
+    diagnostics: list[CandidateDiagnostic] = []
     built: list[BuiltCandidateContracts] = []
     for source_id in sorted(by_id):
         facts = facts_by_id[source_id]
+        if facts.diagnostic_reasons:
+            diagnostics.append(CandidateDiagnostic(
+                source_candidate_id=source_id,
+                source_type=str(by_id[source_id].candidate.action.get("type") or "unknown"),
+                stage="assessment",
+                reasons=facts.diagnostic_reasons,
+            ))
         reasons = list(facts.block_reasons)
         if (projection is not None and not projection.allowed
-                and facts.template_key in {"contact.v1", "expression.v1", "followup.v1"}):
+                and facts.template_key in {"contact.v1", "expression.v1", "question.v1", "followup.v1"}):
             reasons.append("permission_denied")
         if facts.blocked:
             reasons.append("blocked")
         if facts.hard_repeat:
             reasons.append("hard_repeat")
         if reasons:
-            dropped.append(DroppedCandidate(source_candidate_id=source_id, reasons=tuple(dict.fromkeys(reasons))))
+            unique = tuple(dict.fromkeys(reasons))
+            dropped.append(DroppedCandidate(
+                source_candidate_id=source_id,
+                source_type=str(by_id[source_id].candidate.action.get("type") or "unknown"),
+                reason=unique[0],
+                stage="eligibility",
+                reasons=unique,
+            ))
             continue
         bound_facts = (replace(facts, permission_ref=permission_version)
                        if projection is not None and facts.template_key in {
-                           "contact.v1", "expression.v1", "followup.v1"
+                           "contact.v1", "expression.v1", "question.v1", "followup.v1"
                        } else facts)
         item = _build_one(snapshot, bound_facts, by_id[source_id], advanced_at, based_on_state_version)
         if any(existing.candidate.candidate_id == item.candidate.candidate_id for existing in built):
-            dropped.append(DroppedCandidate(source_candidate_id=source_id, reasons=("duplicate_semantic_candidate",)))
+            dropped.append(DroppedCandidate(
+                source_candidate_id=source_id,
+                source_type=str(by_id[source_id].candidate.action.get("type") or "unknown"),
+                reason="duplicate_semantic_candidate",
+                stage="dedupe",
+                reasons=("duplicate_semantic_candidate",),
+            ))
             continue
         built.append(item)
 
@@ -576,14 +692,16 @@ def build_shadow_round(*, snapshot: RuntimeFactSnapshot, inputs: tuple[RuntimeCa
             attention_version=attention.version, parameter_version=parameter_version,
             permission_version=permission_version)
     return BuiltShadowRound(inputs=tuple(item.shadow_input for item in built), contracts=tuple(built), state=state,
-        value_profile=value_profile, attention_profile=attention, dropped=tuple(dropped), id_mapping=mappings,
+        value_profile=value_profile, attention_profile=attention, dropped=tuple(dropped),
+        diagnostics=tuple(diagnostics), id_mapping=mappings,
         goal_snapshot_version=goal_hash, reward_snapshot_version=reward_hash,
         candidate_snapshot_version=candidate_hash, prediction_snapshot_version=prediction_hash)
 
 
 __all__ = [
     "ATTENTION_PROFILE_VERSION", "BUILT_SHADOW_ROUND_VERSION", "BuiltCandidateContracts",
-    "BuiltShadowRound", "CandidateIdMapping", "DroppedCandidate", "FIXED_VALUE_TOTAL",
+    "BuiltShadowRound", "CandidateDiagnostic", "CandidateIdMapping", "DroppedCandidate",
+    "FIXED_VALUE_TOTAL",
     "LANGCHAO_RUNTIME_ADAPTER_VERSION", "LegacyProvenance", "RUNTIME_FACT_SNAPSHOT_VERSION",
     "RuntimeCandidateFacts", "RuntimeCandidateInput", "RuntimeFactSnapshot", "TEMPLATE_POLICY_VERSION",
     "VALUE_PROFILE_VERSION", "all_one_attention", "build_shadow_round", "value_profile_from_runtime",

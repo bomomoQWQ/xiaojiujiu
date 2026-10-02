@@ -16,8 +16,11 @@ from companion_runtime.capability_witness import (
 )
 from companion_runtime.config import RuntimeConfig
 from companion_runtime.langchao_shadow_wiring import (
+    DEFAULT_LANGCHAO_PARAMETERS,
+    CandidateAdmission,
     LangchaoShadowRunner,
     _BorrowedConnection,
+    _admit_candidate,
     _facts_for,
 )
 from companion_runtime.runtime_v2 import EndogenousDecisionV2
@@ -92,8 +95,15 @@ def test_runtime_fact_builder_emits_only_registry_verified_internal_exploration(
     assert built.capability_refs == ()
     assert built.exploration_segment.segment_id == "segment:parser"
     assert not hasattr(built.exploration_segment, "elapsed_seconds")
-    assert _facts_for(decision, internal_exploration_enabled=False) is None
-    assert _facts_for(_decision("vague", "exploration_work_segment")) is None
+    # A refusal is typed and auditable rather than a silent ``None``: the two cases that
+    # must not become exploration contracts report *why* they were dropped.
+    disabled = _admit_candidate(decision, internal_exploration_enabled=False)
+    assert disabled.facts is None
+    assert disabled.drop_reason == "exploration_disabled_or_incomplete"
+    assert disabled.stage == "admission"
+    vague = _admit_candidate(_decision("vague", "exploration_work_segment"))
+    assert vague.facts is None
+    assert vague.drop_reason == "exploration_disabled_or_incomplete"
 
 
 def test_forged_exploration_action_fields_are_rejected_without_local_reward():
@@ -137,18 +147,121 @@ def test_no_conclusion_requires_real_work_segment_record_witness():
         )
 
 
-def test_fixed_template_mapping_drops_unreferenced_expression_and_followup():
-    expression = source("expression").assessment
-    expression_decision = _decision("expression", "share")
-    assert _facts_for(expression_decision) is None
-    followup_decision = _decision("followup", "follow_up")
-    assert _facts_for(followup_decision) is None
-    contact = _facts_for(_decision("contact", "contact"))
-    assert contact is not None and contact.template_key == "contact.v1"
-    rest = _facts_for(_decision("rest", "internal_rest"))
-    assert rest is not None and rest.template_key == "internal_rest.v1"
-    assert _facts_for(_decision("repair", "repair")) is None
-    assert _facts_for(_decision("apology", "apology")) is None
+def _decision_with_action(candidate_id: str, action: dict):
+    decision = _decision(candidate_id, str(action["type"]))
+    return replace(decision, candidate=replace(decision.candidate, action=action))
+
+
+def test_candidate_admission_is_explicit_for_every_formal_type():
+    memory_question = _admit_candidate(_decision_with_action("q", {
+        "type": "curious_question", "question": True, "topic_shift": True,
+        "memory_ref": "memory:m1",
+    }))
+    assert memory_question.admitted
+    assert memory_question.facts.template_key == "question.v1"
+    assert memory_question.facts.memory_ref == "memory:m1"
+    assert memory_question.facts.question is True
+    assert memory_question.facts.topic_shift is True
+
+    social_question = _admit_candidate(_decision_with_action("qs", {
+        "type": "curious_question", "question": True, "topic_shift": True,
+        "social_ref": "social:s1",
+    }))
+    assert social_question.facts.social_ref == "social:s1"
+
+    assert _admit_candidate(_decision("contact", "contact")).facts.template_key == "contact.v1"
+    assert _admit_candidate(_decision_with_action("share", {
+        "type": "share", "memory_ref": "memory:m2",
+    })).facts.template_key == "expression.v1"
+    assert _admit_candidate(_decision_with_action("follow", {
+        "type": "follow_up", "unfinished_id": "unfinished:u1",
+    })).facts.template_key == "followup.v1"
+
+    check_in_contact = _admit_candidate(_decision("check", "check_in"))
+    assert check_in_contact.facts.template_key == "contact.v1"
+    check_in_followup = _admit_candidate(_decision_with_action("check-u", {
+        "type": "check_in", "unfinished_id": "unfinished:u2",
+    }))
+    assert check_in_followup.facts.template_key == "followup.v1"
+
+    rest = _admit_candidate(_decision("rest", "internal_rest"))
+    assert rest.admitted and rest.facts.template_key == "internal_rest.v1"
+
+    for kind in ("repair", "apology", "confront", "reply"):
+        dropped = _admit_candidate(_decision(kind, kind))
+        assert dropped.facts is None
+        assert dropped.drop_reason == "permission_semantics_unimplemented"
+        assert dropped.stage == "admission"
+
+
+def test_unreferenced_and_unknown_candidates_are_typed_drops_not_silent_none():
+    expression = _admit_candidate(_decision("expression", "share"))
+    assert expression.facts is None
+    assert expression.drop_reason == "missing_memory_or_social_ref"
+    assert expression.source_type == "share"
+
+    followup = _admit_candidate(_decision("followup", "follow_up"))
+    assert followup.facts is None
+    assert followup.drop_reason == "missing_unfinished_ref"
+
+    unknown = _admit_candidate(_decision("mystery", "totally_new_type"))
+    assert unknown.facts is None
+    assert unknown.drop_reason == "unsupported_candidate_type"
+
+    with pytest.raises(ValueError, match="admission"):
+        _facts_for(_decision("mystery", "totally_new_type"))
+
+
+def test_candidate_ttl_is_preserved_by_question_contract():
+    expires = datetime(2026, 10, 2, 6, tzinfo=timezone.utc)
+    item = _decision_with_action("q-ttl", {
+        "type": "curious_question", "question": True, "topic_shift": True,
+        "memory_ref": "memory:m1", "expires_at": expires.isoformat(),
+    })
+    facts = _admit_candidate(item).facts
+    assert facts.expires_at == expires
+
+
+def test_contact_diagnostic_reasons_do_not_become_block_reasons_or_drop():
+    item = _decision("contact", "contact")
+    item = replace(
+        item,
+        reasons=(
+            "limited_support:reply,continue,negative",
+            "limited_support_safe_exploration_allowed",
+        ),
+    )
+    admission = _admit_candidate(item)
+    assert admission.admitted
+    assert admission.facts.blocked is False
+    assert admission.facts.block_reasons == ()
+    assert admission.facts.diagnostic_reasons == item.reasons
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("decision_threshold", 0.70),
+        ("leak", 0.05),
+        ("time_scale_seconds", 3600.0),
+        ("competition_gain", 0.0),
+    ],
+)
+def test_default_langchao_parameters_match_audited_recommendation(name, expected):
+    assert getattr(DEFAULT_LANGCHAO_PARAMETERS, name) == expected
+
+
+def test_default_parameters_are_reachable_and_threshold_one_is_dead_for_bounded_utility():
+    weak = .01639344262295082
+    equilibrium = weak / (weak + DEFAULT_LANGCHAO_PARAMETERS.leak)
+    assert equilibrium < DEFAULT_LANGCHAO_PARAMETERS.decision_threshold
+
+    medium = .2
+    equilibrium = medium / (medium + DEFAULT_LANGCHAO_PARAMETERS.leak)
+    assert equilibrium > DEFAULT_LANGCHAO_PARAMETERS.decision_threshold
+
+    impossible = replace(DEFAULT_LANGCHAO_PARAMETERS, decision_threshold=1.0)
+    assert medium / (medium + impossible.leak) < impossible.decision_threshold
 
 
 def test_enabled_runner_builds_contact_plus_synthetic_rest_and_state_cursor():
@@ -252,6 +365,80 @@ def test_cli_routes_authority_before_any_engine_can_commit():
     assert "authority_round_router.run(" in body
     assert "decide_endogenous(" not in body
     assert "langchao_shadow_runner.run" not in body
+
+
+def test_cold_start_drive_is_granted_only_to_a_safe_low_pressure_candidate():
+    """The drive needs the safety reason, and never overrides a block or a repeat limit."""
+    from companion_runtime.langchao_shadow_wiring import COLD_START_EXPLORATION_REASON
+
+    def question(candidate_id: str):
+        return _decision_with_action(candidate_id, {
+            "type": "curious_question", "question": True, "topic_shift": True,
+            "memory_ref": "memory:m1",
+        })
+
+    allowed = replace(question("c1"), reasons=(COLD_START_EXPLORATION_REASON,))
+    facts = _admit_candidate(allowed, cold_start_drive=2.0).facts
+    assert facts is not None and facts.cold_start_drive == 2.0
+
+    # Without the policy's own allowance the drive is not a licence to reach out.
+    plain = _admit_candidate(question("c2"), cold_start_drive=2.0).facts
+    assert plain is not None and plain.cold_start_drive == 0.0
+
+    # A hard block or a spent repeat budget still wins over the drive.
+    blocked = _admit_candidate(replace(allowed, blocked=True), cold_start_drive=2.0).facts
+    assert blocked is not None and blocked.cold_start_drive == 0.0
+
+    spent_repeat = type("Repeat", (), {
+        "total_cost": 0.0, "policy_version": "repeat-v2.0",
+        "hard_limit_reasons": ("hard_repeat",),
+    })()
+    repeated = _admit_candidate(
+        replace(allowed, repeat=spent_repeat), cold_start_drive=2.0
+    ).facts
+    assert repeated is not None and repeated.cold_start_drive == 0.0
+
+
+def test_cold_start_drive_is_refused_for_templates_that_already_own_a_local_reward():
+    """Expression and rest already carry a local outcome; a second one would double-count."""
+    from companion_runtime.langchao_shadow_wiring import COLD_START_EXPLORATION_REASON
+
+    cases = (
+        {"type": "share", "memory_ref": "memory:m1"},
+        {"type": "internal_rest", "self_regulation_ref": "runtime:self-regulation"},
+    )
+    for action in cases:
+        item = replace(
+            _decision_with_action("c", action), reasons=(COLD_START_EXPLORATION_REASON,)
+        )
+        facts = _admit_candidate(item, cold_start_drive=2.0).facts
+        assert facts is not None, action["type"]
+        assert facts.cold_start_drive == 0.0, action["type"]
+
+
+def test_round_drive_is_withheld_when_the_durable_budget_is_spent():
+    """A budget that says no must zero the round's drive before any candidate is admitted."""
+    now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+
+    class SpentBudget:
+        def available(self, *, now):
+            return False
+
+    runner = LangchaoShadowRunner(
+        scope_key="scope", runtime=None, service=None, state_repository=None,
+        revisions=None, cold_start_drive=2.0, cold_start_budget=SpentBudget(),
+    )
+    assert runner._cold_start_drive_for_round(now) == 0.0
+
+    class OpenBudget:
+        def available(self, *, now):
+            return True
+
+    runner.cold_start_budget = OpenBudget()
+    assert runner._cold_start_drive_for_round(now) == 2.0
+
+    runner.cold_start_drive = 0.0
+    assert runner._cold_start_drive_for_round(now) == 0.0
 
 
 def _decision(candidate_id: str, action_type: str):

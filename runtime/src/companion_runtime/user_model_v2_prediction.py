@@ -50,6 +50,43 @@ class UserModelV2PredictionRepository(Protocol):
     ) -> ActiveParameterSnapshotV2 | None: ...
 
 
+#: Version of the neutral cold-start priors below. It is part of every prediction's
+#: provenance, so a change in the declared prior is visible in the audit trail rather
+#: than silently shifting what the character believes about a new user.
+DEFAULT_PRIOR_VERSION = "user-model-v2-prior.1"
+
+
+def default_registered_priors(spec: Any) -> Mapping[Target, GaussianPrior]:
+    """Return one declared neutral prior per target head.
+
+    A brand-new scope has no fitted parameters, and the service deliberately refuses to
+    invent one. Registering an explicit prior keeps that case honest: the prediction is
+    labelled ``prior_only``, its uncertainty comes from the prior precision alone, and
+    nothing is read out of the legacy user model.
+
+    The prior is neutral (zero mean in logit space, unit precision). That is
+    intentionally *not* an optimistic guess about a stranger: the conservative bounds
+    derived from it stay near the uninformative endpoints, which is what keeps a cold
+    first message from being justified by fabricated user benefit.
+
+    Args:
+        spec: The feature spec the priors must be dimensioned for.
+
+    Returns:
+        A mapping with one :class:`GaussianPrior` per :class:`Target`.
+
+    Raises:
+        ValueError: If the spec exposes no usable feature names.
+    """
+    names = tuple(getattr(spec, "names", ()) or ())
+    if not names:
+        raise ValueError("feature spec must declare feature names")
+    dimension = len(names)
+    mean = np.zeros(dimension, dtype=np.float64)
+    precision = np.eye(dimension, dtype=np.float64)
+    return {target: GaussianPrior(mean=mean, precision=precision) for target in Target}
+
+
 class UserModelV2PredictionService:
     """Build one four-head envelope from independently active target snapshots."""
 

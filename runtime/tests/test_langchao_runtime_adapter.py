@@ -8,6 +8,7 @@ import pytest
 from companion_runtime.decision_v2_audit import CandidateAssessment
 from companion_runtime.langchao_permission import PermissionProjection, PermissionVerdict
 from companion_runtime.langchao_runtime_adapter import (
+    COLD_START_DRIVE_VERSION,
     FIXED_VALUE_TOTAL,
     RuntimeCandidateFacts,
     RuntimeCandidateInput,
@@ -60,6 +61,12 @@ def facts(candidate_id: str, template="contact.v1", **kwargs) -> RuntimeCandidat
                 evidence_refs=("fact",))
     if template == "contact.v1": base["subject_ref"] = "relationship-continuity"
     elif template == "expression.v1": base["memory_ref"] = "memory:m1"
+    elif template == "question.v1":
+        base["memory_ref"] = "memory:m1"
+        # question.v1 asserts the question/topic-shift semantics it claims, so a fixture
+        # that omits them is rejected rather than silently rendered as plain expression.
+        base["question"] = True
+        base["topic_shift"] = True
     elif template == "followup.v1": base["unfinished_id"] = "unfinished:u1"
     else:
         base["self_regulation_ref"] = "self:fatigue"
@@ -69,13 +76,16 @@ def facts(candidate_id: str, template="contact.v1", **kwargs) -> RuntimeCandidat
 
 
 def build(items, fact_items=None, **kwargs):
-    fact_items = fact_items or tuple(facts(item.candidate.candidate_id) for item in items)
+    if fact_items is None:
+        fact_items = tuple(facts(item.candidate.candidate_id) for item in items)
     snapshot = RuntimeFactSnapshot(scope_key="scope", episode_id="episode", source_cursor="cursor",
         values=VALUES, candidates=tuple(fact_items))
     return build_shadow_round(snapshot=snapshot, inputs=tuple(items), advanced_at=NOW, **kwargs)
 
 
-@pytest.mark.parametrize("template", ["contact.v1", "expression.v1", "followup.v1", "internal_rest.v1"])
+@pytest.mark.parametrize("template", [
+    "contact.v1", "expression.v1", "question.v1", "followup.v1", "internal_rest.v1",
+])
 def test_fixed_templates_build_and_enforce_subject_facts(template):
     result = build((source("c"),), (facts("c", template),))
     assert result.contracts[0].candidate.action_template == template
@@ -165,6 +175,24 @@ def test_prediction_mapping_unknown_negative_and_acceptance_unused():
     assert unknown[0].probability is None and unknown[1].probability is None
 
 
+def test_question_contract_preserves_external_question_semantics_and_ttl():
+    expiry = NOW.replace(hour=18)
+    built = build(
+        (source("q"),),
+        (facts(
+            "q", "question.v1", question=True, topic_shift=True,
+            expires_at=expiry,
+        ),),
+    ).contracts[0]
+    assert built.candidate.action_template == "question.v1"
+    assert built.candidate.kind.value == "external_message"
+    assert built.goal.desired_change == "question_answered"
+    assert dict(built.candidate.envelope) == {
+        "subject_ref": "memory:m1", "question": True, "topic_shift": True,
+    }
+    assert built.candidate.expires_at == expiry
+
+
 def test_internal_legacy_fields_only_enter_provenance_and_do_not_change_contracts():
     low = build((source("c", internal=1, coefficients=(1, 2, 3)),),
                 (facts("c", legacy_internal_need=2, legacy_relevance=3),))
@@ -174,6 +202,42 @@ def test_internal_legacy_fields_only_enter_provenance_and_do_not_change_contract
     assert low.contracts[0].shadow_input.forecasts == high.contracts[0].shadow_input.forecasts
     assert low.contracts[0].shadow_input.costs == high.contracts[0].shadow_input.costs
     assert low.contracts[0].provenance != high.contracts[0].provenance
+
+
+def test_nonblocking_diagnostic_reasons_are_not_drop_reasons_but_remain_auditable():
+    built = build((source("contact"),), (
+        facts(
+            "contact",
+            diagnostic_reasons=(
+                "limited_support:reply,continue,negative",
+                "limited_support_safe_exploration_allowed",
+            ),
+        ),
+    ))
+    assert len(built.contracts) == 1
+    assert built.dropped == ()
+    assert built.diagnostics[0].source_candidate_id == "contact"
+    assert built.diagnostics[0].stage == "assessment"
+    assert "limited_support_safe_exploration_allowed" in built.diagnostics[0].reasons
+
+
+def test_typed_drops_are_persistable_with_source_type_reason_and_stage():
+    # A candidate rejected at admission never becomes a snapshot fact or a shadow input,
+    # so its omission travels as a typed record instead of vanishing.
+    built = build((), fact_items=(), omitted_candidates=(
+        {
+            "source_candidate_id": "repair",
+            "source_type": "repair",
+            "reason": "permission_semantics_unimplemented",
+            "stage": "admission",
+        },
+    ))
+    assert built.contracts == ()
+    drop = built.dropped[0]
+    assert drop.source_candidate_id == "repair"
+    assert drop.source_type == "repair"
+    assert drop.reason == "permission_semantics_unimplemented"
+    assert drop.stage == "admission"
 
 
 def test_repeat_soft_cost_explicit_and_blocked_or_hard_repeat_dropped():
@@ -197,6 +261,40 @@ def test_local_deterministic_outcomes_require_explicit_policy():
     yes = build((source("e"),), (facts("e", "expression.v1", expression_delivered_policy=True),)).contracts[0]
     assert "expression_delivered" not in {t.outcome_key for t in no.reward.outcome_tokens}
     assert yes.shadow_input.template_probability_policy
+
+
+def test_cold_start_drive_becomes_a_declared_local_outcome_token():
+    """The bounded drive is an auditable self outcome, not a forecast about the user."""
+    contract = build(
+        (source("c"),), (facts("c", "contact.v1", cold_start_drive=2.0),)
+    ).contracts[0]
+    drive = [t for t in contract.reward.outcome_tokens if t.outcome_key == "cold_start_outreach"]
+    assert len(drive) == 1
+    assert drive[0].base_amount == 2.0
+    assert drive[0].evidence_version == COLD_START_DRIVE_VERSION
+    # It is declared, not inferred: the policy pins its probability so the compiler counts it.
+    assert (drive[0].token_id, 1.0) in contract.shadow_input.template_probability_policy
+    # The predicted user outcomes are untouched and still able to outweigh it.
+    assert {t.outcome_key for t in contract.reward.outcome_tokens} >= {
+        "reply", "continuation", "negative"
+    }
+
+
+def test_cold_start_drive_is_refused_on_a_template_that_owns_a_local_outcome():
+    """A drive on expression/rest would double-count the same act, so it is a hard error."""
+    with pytest.raises(ValueError, match="cold_start_drive is only defined"):
+        facts("e", "expression.v1", cold_start_drive=2.0)
+    with pytest.raises(ValueError):
+        facts("r", "internal_rest.v1", cold_start_drive=2.0)
+
+
+def test_cold_start_drive_is_validated_as_a_finite_non_negative_number():
+    with pytest.raises(ValueError):
+        facts("c", "contact.v1", cold_start_drive=-1.0)
+    with pytest.raises(ValueError):
+        facts("c", "contact.v1", cold_start_drive=float("nan"))
+    with pytest.raises(TypeError):
+        facts("c", "contact.v1", cold_start_drive=True)
 
 
 def test_value_profile_fixed_total_all_one_attention_and_zero_definition():

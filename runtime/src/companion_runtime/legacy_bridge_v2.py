@@ -35,6 +35,76 @@ from .utility import ensure_aware, utcnow
 
 LOGGER = logging.getLogger("companion_runtime.legacy_bridge_v2")
 
+#: Novelty prior reported to the v2 feature encoder. It is a constant because the
+#: mechanical layer has no learned estimate of how new a subject is to the user.
+DEFAULT_NOVELTY = 0.6
+
+#: Elapsed-time thresholds behind the two derived context booleans.
+USER_ACTIVE_WINDOW_SECONDS = 300.0
+REPLIED_RECENTLY_WINDOW_SECONDS = 1800.0
+
+
+def mechanical_prediction_context(runtime: Any, candidate: Any, now: datetime) -> dict[str, Any]:
+    """Return the exposure-time context for one v2 prediction, from projections only.
+
+    This is the single implementation shared by the Runtime and the concrete bridge. It
+    reads no fitted parameter, so it stays correct while the legacy user model is
+    disabled. A scope that has never exchanged a message has no anchor at all: elapsed
+    values then degrade to zero and the boolean facts stay explicitly false, because the
+    v2 feature encoder treats a *missing* value as a masked feature and would then refuse
+    to predict at all.
+
+    Args:
+        runtime: The legacy Runtime supplying projections and foreground rules.
+        candidate: The candidate being scored (reserved for future context terms).
+        now: Exposure time.
+
+    Returns:
+        The fast-variable context mapping expected by the v2 feature encoder.
+    """
+    del candidate
+    state = runtime.projections.runtime.read()
+    # "Active now" and "replied recently" are claims about a user message, so they need
+    # that anchor specifically. Falling back to ``now`` would report a scope that has
+    # never written as if it had written a second ago.
+    last_user_message_at = getattr(state, "last_user_message_at", None)
+    elapsed = (
+        None
+        if last_user_message_at is None
+        else max(
+            0.0, (ensure_aware(now) - ensure_aware(last_user_message_at)).total_seconds()
+        )
+    )
+    hours_since_contact = 0.0
+    for name in ("last_exchange_at", "last_contact_at", "epoch_at", "updated_at"):
+        earlier = getattr(state, name, None)
+        if earlier is not None:
+            hours_since_contact = max(
+                0.0, (ensure_aware(now) - ensure_aware(earlier)).total_seconds()
+            ) / 3600.0
+            break
+    return {
+        "busy_probability": float(
+            runtime._legacy_busy_probability(
+                hours_since_contact=hours_since_contact,
+                replied_recently=(
+                    elapsed is not None and elapsed < REPLIED_RECENTLY_WINDOW_SECONDS
+                ),
+            )
+        ),
+        "recent_contact_count": int(runtime._recent_contact_count(now)),
+        "hours_since_contact": hours_since_contact,
+        "user_active_now": bool(
+            elapsed is not None and elapsed < USER_ACTIVE_WINDOW_SECONDS
+        ),
+        "ever_boundary": bool(
+            runtime.projections.boundaries.list_all(include_revoked=True)
+        ),
+        "novelty": DEFAULT_NOVELTY,
+        # An absent explicit permission is a false permission, not a missing value.
+        "explicit_permission": bool(runtime._recent_user_permission(now)),
+    }
+
 
 class ConcreteLegacyRuntimeV2Bridge:
     """Wrap one existing Runtime without consuming its learned model outputs."""
@@ -160,6 +230,20 @@ class ConcreteLegacyRuntimeV2Bridge:
             self._candidate(item, include_social=social_available)
             for item in legacy
         )
+
+    def prediction_context(self, *, candidate: CandidateV2, now: datetime) -> dict[str, Any]:
+        """Return the mechanical exposure-time context for one v2 prediction.
+
+        The composition injects this as the runtime repository's context provider.
+
+        Args:
+            candidate: The candidate being scored (reserved for future context terms).
+            now: Exposure time.
+
+        Returns:
+            The fast-variable context mapping expected by the v2 feature encoder.
+        """
+        return mechanical_prediction_context(self.runtime, candidate, now)
 
     def boundary_verdict(
         self, *, candidate: CandidateV2, scope_key: str, now: datetime
@@ -439,9 +523,17 @@ class ConcreteLegacyRuntimeV2Bridge:
             ),
             None,
         )
-        low_pressure_types = {"share", "contact", "reminder"}
+        # Pressure/ignorability facts must agree with the plan the candidate already
+        # carries, because that plan is what the v2 feature encoder consumes. A
+        # ``curious_question`` states ``pressure_tier="low"`` and asks about something the
+        # character already remembers; classifying it as high pressure here used to make
+        # the cold-start policy hard-block the most common real candidate while the
+        # encoder was told it was low pressure.
+        low_pressure_types = {"share", "contact", "reminder", "curious_question"}
         continuous_types = {"follow_up", "check_in"}
         sensitive_types = {"repair", "apology", "confront"}
+        # A question can simply be left unanswered, which is what "easy to ignore" means.
+        ignorable_types = low_pressure_types | {"curious_question"}
         internal = float(item.internal_need) + max(
             float(item.unfinished_relevance), float(item.emotion_relevance)
         )
@@ -460,7 +552,7 @@ class ConcreteLegacyRuntimeV2Bridge:
             policy=CandidatePolicyV2(
                 low_pressure=item.type in low_pressure_types,
                 low_frequency=item.type not in continuous_types,
-                easy_to_ignore=item.type in low_pressure_types,
+                easy_to_ignore=item.type in ignorable_types,
                 continuous_follow_up=item.type in continuous_types,
                 sensitive=item.type in sensitive_types,
             ),

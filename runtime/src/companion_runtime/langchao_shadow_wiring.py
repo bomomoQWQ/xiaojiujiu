@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from .capability_witness import (
@@ -37,6 +37,7 @@ from .langchao_outcome_repository import LangchaoOutcomeRepository
 from .langchao_permission import read_runtime_permission
 from .langchao_repository import LangchaoRepository
 from .langchao_runtime_adapter import (
+    _COLD_START_DRIVE_TEMPLATES,
     RuntimeCandidateFacts,
     RuntimeCandidateInput,
     RuntimeFactSnapshot,
@@ -48,15 +49,20 @@ from .langchao_state_repository import LangchaoStateRepository
 from .langchao_types import GoalOwnership, MotivationDirection
 from .motivation_v2 import CandidatePolicyV2, UserUtilityCoefficientsV2
 from .repeat_v2 import RepeatCostBreakdownV2, RepeatSubjectV2
-from .runtime_v2 import CandidateDecisionV2, CandidateV2, EndogenousDecisionV2
+from .runtime_v2 import CandidateDecisionV2, CandidateV2, DecisionConfigV2, EndogenousDecisionV2
 
+
+#: The reason v2's own cold-start policy attaches to a candidate it may safely explore.
+#: Langchao reuses the same predicate, so one policy governs which cold candidates are
+#: allowed to reach out instead of two layers disagreeing about the same candidate.
+COLD_START_EXPLORATION_REASON = DecisionConfigV2().cold_start_exploration_reason
 
 DEFAULT_LANGCHAO_PARAMETERS = LangchaoParameters(
-    leak=0.2,
+    leak=0.05,
     competition_gain=0.0,
-    decision_threshold=0.99,
-    time_scale_seconds=10.0,
-    max_step_seconds=0.5,
+    decision_threshold=0.70,
+    time_scale_seconds=3600.0,
+    max_step_seconds=3600.0,
     crossing_tolerance=1e-7,
     tie_tolerance=1e-6,
 )
@@ -223,16 +229,63 @@ def _exploration_segment(
     )
 
 
-def _facts_for(
+@dataclass(frozen=True, slots=True)
+class CandidateAdmission:
+    source_candidate_id: str
+    source_type: str
+    facts: RuntimeCandidateFacts | None = None
+    drop_reason: str | None = None
+    stage: str = "admission"
+
+    @property
+    def admitted(self) -> bool:
+        return self.facts is not None
+
+
+def _candidate_expiry(action: Mapping[str, Any]) -> datetime | None:
+    raw = action.get("expires_at")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if not isinstance(raw, datetime) or raw.tzinfo is None or raw.utcoffset() is None:
+        raise ValueError("action.expires_at must be a timezone-aware datetime")
+    return raw.astimezone(timezone.utc)
+
+
+def _admit_candidate(
     item: CandidateDecisionV2, *, internal_exploration_enabled: bool = True,
     scope_key: str = "", witness_reader: Any | None = None,
-) -> RuntimeCandidateFacts | None:
+    cold_start_drive: float = 0.0,
+) -> CandidateAdmission:
     candidate = item.candidate
     action = candidate.action
     kind = str(action.get("type") or "").strip().lower()
     evidence = tuple(dict.fromkeys(candidate.source_event_ids)) or (f"candidate:{candidate.candidate_id}",)
     segment = (_exploration_segment(action, scope_key=scope_key, witness_reader=witness_reader)
                if internal_exploration_enabled else None)
+    # The same predicate v2's own commit path uses to authorize a cold-start exploration:
+    # the candidate must be unblocked *and* the safety policy must have granted the
+    # allowance. A hard boundary, a repeat limit or an unsafe shape therefore keeps
+    # blocking, and the drive never becomes a way around them.
+    allowance = (
+        float(cold_start_drive)
+        if cold_start_drive > 0
+        and not item.blocked
+        and not item.repeat.hard_limit_reasons
+        and COLD_START_EXPLORATION_REASON in item.reasons
+        else 0.0
+    )
+
+    def drive_for(template_key: str) -> float:
+        """Return the allowance only for a template that can carry it.
+
+        ``expression.v1`` and ``internal_rest.v1`` already own a local outcome token, and
+        the contract refuses a drive on them, so the decision is made here once instead of
+        raising from every share/rest candidate that happens to be safely explorable.
+        """
+        return allowance if template_key in _COLD_START_DRIVE_TEMPLATES else 0.0
+
     common = dict(
         candidate_id=candidate.candidate_id,
         ownership=GoalOwnership.SELF_WISH,
@@ -243,49 +296,106 @@ def _facts_for(
         repeat_cost_refs=(item.repeat.policy_version,),
         blocked=item.blocked,
         hard_repeat=bool(item.repeat.hard_limit_reasons),
-        block_reasons=item.reasons,
+        block_reasons=(),
+        diagnostic_reasons=item.reasons,
+        expires_at=_candidate_expiry(action),
         legacy_internal_utility=float(candidate.internal_utility),
     )
+    def admitted(facts: RuntimeCandidateFacts) -> CandidateAdmission:
+        return CandidateAdmission(candidate.candidate_id, kind, facts=facts)
+
+    def dropped(reason: str) -> CandidateAdmission:
+        return CandidateAdmission(candidate.candidate_id, kind or "missing", drop_reason=reason)
+
     if segment is not None:
         exploration_common = dict(common)
         exploration_common.update(
             ownership=GoalOwnership.SELF_INTEREST,
             evidence_refs=tuple(dict.fromkeys((*evidence, *segment.evidence_refs))),
         )
-        return RuntimeCandidateFacts(
+        return admitted(RuntimeCandidateFacts(
             **exploration_common, template_key="exploration.v1", exploration_segment=segment,
-        )
+        ))
     if kind in {"internal_exploration", "exploration_work_segment"}:
-        # Disabled or incomplete segments are omitted, never relabelled as contact.
-        return None
+        return dropped("exploration_disabled_or_incomplete")
     if kind in {"rest", "defer", "internal_rest"}:
-        return RuntimeCandidateFacts(
+        return admitted(RuntimeCandidateFacts(
             **common, template_key="internal_rest.v1",
             self_regulation_ref=str(action.get("self_regulation_ref") or "runtime:self-regulation"),
             rest_realized_policy=True,
-        )
+        ))
     if kind in {"share", "emotional_expression", "expression"}:
         memory = _explicit_ref(action, "memory_ref")
         social = _explicit_ref(action, "social_ref")
         if memory is None and social is None:
-            return None
-        return RuntimeCandidateFacts(
+            return dropped("missing_memory_or_social_ref")
+        return admitted(RuntimeCandidateFacts(
             **common, template_key="expression.v1", memory_ref=memory, social_ref=social,
             expression_delivered_policy=True,
-        )
-    if kind in {"follow_up", "check_in", "followup"}:
+        ))
+    if kind in {"curious_question", "question"}:
+        memory = _explicit_ref(action, "memory_ref")
+        social = _explicit_ref(action, "social_ref")
+        if memory is None and social is None:
+            return dropped("missing_memory_or_social_ref")
+        question_common = dict(common)
+        question_common["ownership"] = GoalOwnership.SELF_INTEREST
+        return admitted(RuntimeCandidateFacts(
+            **question_common, template_key="question.v1", memory_ref=memory,
+            social_ref=social, question=True, topic_shift=True,
+            cold_start_drive=drive_for("question.v1"),
+        ))
+    if kind in {"follow_up", "followup"}:
         unfinished = _explicit_ref(action, "unfinished_id")
         unfinished = unfinished or candidate.repeat_subject.concern_id
         if not unfinished:
-            return None
-        return RuntimeCandidateFacts(**common, template_key="followup.v1", unfinished_id=unfinished)
+            return dropped("missing_unfinished_ref")
+        return admitted(RuntimeCandidateFacts(
+            **common, template_key="followup.v1", unfinished_id=unfinished,
+            cold_start_drive=drive_for("followup.v1"),
+        ))
+    if kind == "check_in":
+        unfinished = _explicit_ref(action, "unfinished_id")
+        unfinished = unfinished or candidate.repeat_subject.concern_id
+        if unfinished:
+            return admitted(RuntimeCandidateFacts(
+                **common, template_key="followup.v1", unfinished_id=unfinished,
+                cold_start_drive=drive_for("followup.v1"),
+            ))
+        return admitted(RuntimeCandidateFacts(
+            **common, template_key="contact.v1", subject_ref="relationship-continuity",
+            cold_start_drive=drive_for("contact.v1"),
+        ))
     if kind in {"contact", "reminder"}:
-        return RuntimeCandidateFacts(
-            **common, template_key="contact.v1", subject_ref="relationship-continuity"
+        return admitted(RuntimeCandidateFacts(
+            **common, template_key="contact.v1", subject_ref="relationship-continuity",
+            cold_start_drive=drive_for("contact.v1"),
+        ))
+    if kind in {"reply", "repair", "apology", "confront"}:
+        return dropped("permission_semantics_unimplemented")
+    return dropped("unsupported_candidate_type")
+
+
+def _facts_for(
+    item: CandidateDecisionV2, *, internal_exploration_enabled: bool = True,
+    scope_key: str = "", witness_reader: Any | None = None,
+    cold_start_drive: float = 0.0,
+) -> RuntimeCandidateFacts:
+    """Compatibility helper for callers that require admitted facts.
+
+    New production wiring consumes :func:`_admit_candidate` so every omission remains
+    typed and auditable.  This helper raises rather than reintroducing silent ``None``.
+    """
+    admission = _admit_candidate(
+        item, internal_exploration_enabled=internal_exploration_enabled,
+        scope_key=scope_key, witness_reader=witness_reader,
+        cold_start_drive=cold_start_drive,
+    )
+    if admission.facts is None:
+        raise ValueError(
+            f"candidate admission dropped {admission.source_type}: {admission.drop_reason}"
         )
-    # Unsupported candidate kinds (notably repair/apology/confront) must not be
-    # relabelled as contact. Their omission remains visible in baseline audit facts.
-    return None
+    return admission.facts
 
 
 def _explicit_attention_signal(action: Mapping[str, Any], name: str) -> float:
@@ -308,6 +418,7 @@ def _attention_candidate(
     direction = {
         "contact.v1": MotivationDirection.APPROACH,
         "expression.v1": MotivationDirection.EXPRESSION,
+        "question.v1": MotivationDirection.EXPLORATION,
         "followup.v1": MotivationDirection.CARE,
         "internal_rest.v1": MotivationDirection.REST,
         "exploration.v1": MotivationDirection.EXPLORATION,
@@ -353,24 +464,58 @@ class LangchaoShadowRunner:
     attention_recipe: str = BASELINE_RECIPE
     internal_exploration_enabled: bool = True
     exploration_witness_reader: Any | None = None
+    #: Bounded cold-start outreach allowance carried into admitted candidates.
+    cold_start_drive: float = 0.0
+    #: Durable budget limiting how often that allowance may be spent.
+    cold_start_budget: Any | None = None
     outcome_repository: Any | None = None
     last_built: BuiltShadowRound | None = None
+
+    def _cold_start_drive_for_round(self, now: datetime) -> float:
+        """Return the drive this round may spend, honouring the durable budget."""
+        if self.cold_start_drive <= 0:
+            return 0.0
+        budget = self.cold_start_budget
+        if budget is None:
+            # Every production builder injects a budget whenever the drive is enabled; a
+            # missing one means an offline caller that cannot dispatch.
+            return float(self.cold_start_drive)
+        return float(self.cold_start_drive) if budget.available(now=now) else 0.0
 
     def run(
         self, decision: EndogenousDecisionV2, *, now: datetime,
         before_commit: Any | None = None,
         authority_revision: int | None = None,
     ) -> Any | None:
-        pairs = tuple(
-            (item, _facts_for(
+        round_drive = self._cold_start_drive_for_round(now)
+        admissions = tuple(
+            _admit_candidate(
                 item,
                 internal_exploration_enabled=self.internal_exploration_enabled,
                 scope_key=self.scope_key,
                 witness_reader=self.exploration_witness_reader,
-            ))
+                cold_start_drive=round_drive,
+            )
             for item in decision.assessments
         )
-        pairs = tuple((item, facts) for item, facts in pairs if facts is not None)
+        # A candidate this layer cannot represent is recorded as a typed omission rather
+        # than dropped silently or allowed to abort the round: one unsupported shape must
+        # not cost every other candidate its decision.
+        omitted = tuple(
+            {
+                "source_candidate_id": admission.source_candidate_id,
+                "source_type": admission.source_type,
+                "reason": str(admission.drop_reason or "unsupported_candidate_type"),
+                "stage": admission.stage,
+            }
+            for admission in admissions
+            if not admission.admitted
+        )
+        pairs = tuple(
+            (item, admission.facts)
+            for item, admission in zip(decision.assessments, admissions)
+            if admission.facts is not None
+        )
         inputs = [RuntimeCandidateInput(candidate=item.candidate, predictions=item.predictions,
                                         assessment=_assessment(item)) for item, _facts in pairs]
         facts_list = [facts for _item, facts in pairs]
@@ -473,6 +618,7 @@ class LangchaoShadowRunner:
             previous_state=previous, based_on_state_version=state_version,
             parameter_version=parameter_version_for_recipe(recipe_plan),
             attention_profile=recipe_plan.attention_profile,
+            omitted_candidates=omitted,
         )
         # Realized user outcomes are never appended as bonus terms.  Active settled
         # history conditions the next round's expected forecasts before compilation.
@@ -507,7 +653,8 @@ class LangchaoShadowRunner:
 def build_langchao_shadow_runner(
     *, connection: Any, scope_key: str, runtime: Any, allow_live_evaluation: bool = False,
     transaction_factory: Any | None = None, attention_recipe: str = BASELINE_RECIPE,
-    internal_exploration_enabled: bool = True,
+    internal_exploration_enabled: bool = True, cold_start_drive: float = 0.0,
+    cold_start_budget: Any | None = None,
 ) -> LangchaoShadowRunner:
     """Build safe repositories on the same migrated PostgreSQL connection."""
     borrowed = _BorrowedConnection(connection)
@@ -520,6 +667,12 @@ def build_langchao_shadow_runner(
     if authority.get_active() is None:
         authority.bootstrap()  # runtime_v2/live only; bootstrap itself rechecks under lock.
     shadow = LangchaoShadowPostgresRepository(borrowed, state_repository=states)
+    if cold_start_drive > 0 and cold_start_budget is None:
+        # Enabling the drive without its bound would let it fire every few hours; the
+        # builder therefore always attaches the durable counter.
+        from .langchao_live_repository import LangchaoColdStartBudget
+
+        cold_start_budget = LangchaoColdStartBudget(connection, scope_key=scope_key)
     service = LangchaoShadowService(
         contract_repository=contracts,
         outcome_repository=outcomes,
@@ -534,6 +687,8 @@ def build_langchao_shadow_runner(
                                 revisions=LangchaoRevisionResolver(connection, scope_key=scope_key),
                                 attention_recipe=normalize_recipe(attention_recipe),
                                 internal_exploration_enabled=bool(internal_exploration_enabled),
+                                cold_start_drive=float(cold_start_drive),
+                                cold_start_budget=cold_start_budget,
                                 exploration_witness_reader=PostgresWitnessRepository(
                                     connection, scope_key=scope_key,
                                 ))

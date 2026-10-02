@@ -33,6 +33,7 @@ from .user_model_v2_migrations import migration_records
 from .user_model_v2_prediction import (
     ActiveParameterSnapshotV2,
     UserModelV2PredictionService,
+    default_registered_priors,
 )
 from .user_model_v2_repository import UserModelV2Repository
 from .user_model_v2_service import UserModelV2Service
@@ -44,6 +45,30 @@ ServiceRepositoryFactory = Callable[[Any, UserModelV2Repository], Any]
 PredictionRepositoryFactory = Callable[[UserModelV2Repository], Any]
 RuntimeRepositoryFactory = Callable[..., V2RuntimeRepository]
 AuthorityRepositoryFactory = Callable[..., Any]
+
+
+def _mechanical_context_provider(runtime: Any) -> Callable[[Any, Any], Mapping[str, Any]]:
+    """Return the exposure-time context provider used by v2 predictions.
+
+    Without this the repository would fall back to an empty mapping, every fast-variable
+    feature would be masked as missing, and the prediction service would report every
+    head ``unavailable`` no matter how much evidence had been fitted. A Runtime that
+    cannot supply the mechanical context provider leaves the repository's own default in
+    place rather than being crashed by composition.
+    """
+    provider = getattr(runtime, "v2_prediction_context", None)
+    if not callable(provider):
+        return lambda _candidate, _now: {}
+    return provider
+
+
+def _mechanical_state_version_provider(runtime: Any) -> Callable[[], int]:
+    """Return the optimistic state-version provider used by v2 predictions."""
+    def provide() -> int:
+        state = runtime.state()
+        return int(getattr(state, "version", 0) or 0)
+
+    return provide if callable(getattr(runtime, "state", None)) else (lambda: 0)
 
 
 class PostgresUserModelV2PredictionRepository:
@@ -202,7 +227,10 @@ def build_v2_composition(
         service_repository = service_repository_factory(connection, repository)
         prediction_repository = prediction_repository_factory(repository)
         user_model_service = UserModelV2Service(service_repository)
-        prediction_service = UserModelV2PredictionService(prediction_repository)
+        prediction_service = UserModelV2PredictionService(
+            prediction_repository,
+            registered_priors=default_registered_priors(DEFAULT_FEATURE_SPEC_V2),
+        )
         if runtime_repository is None:
             if runtime_repository_factory is None:
                 from .runtime_repository_v2 import PostgresV2RuntimeRepository
@@ -213,6 +241,8 @@ def build_v2_composition(
                 prediction_service=prediction_service,
                 service_repository=service_repository,
                 scope_key=scope_key,
+                context_provider=_mechanical_context_provider(runtime),
+                state_version_provider=_mechanical_state_version_provider(runtime),
             )
         semantic_judge = DisabledSemanticJudgeV2()
         coordinator = V2RuntimeCoordinator(
@@ -289,6 +319,7 @@ def build_v2_composition(
                 connection=connection, scope_key=scope_key, runtime=legacy_bridge.runtime,
                 attention_recipe=attention_recipe,
                 internal_exploration_enabled=config.langchao.internal_exploration_enabled,
+                cold_start_drive=config.langchao.cold_start_drive,
             )
         live_enabled = bool(config.langchao.live_allowed(scope_key))
         langchao_live_runner = None
@@ -301,6 +332,7 @@ def build_v2_composition(
                 witness_reader=witness_repository,
                 attention_recipe=attention_recipe,
                 internal_exploration_enabled=config.langchao.internal_exploration_enabled,
+                cold_start_drive=config.langchao.cold_start_drive,
             )
             from .langchao_user_outcomes import LangchaoUserOutcomeSettler
 

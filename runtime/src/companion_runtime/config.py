@@ -19,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import tomllib
@@ -26,6 +27,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .langchao_engine import LangchaoParameters
 from .typing import ValueProfile
 
 LOGGER = logging.getLogger("companion_runtime.config")
@@ -497,9 +499,59 @@ class LangchaoConfig:
     # selected globally, while B3 additionally requires the exact scope below.
     attention_recipe: str = "off"
     attention_b3_scope_allowlist: list[str] = field(default_factory=list)
+    # Numerical 浪潮 kernel. These live in configuration so a rollout can be calibrated or
+    # rolled back without rebuilding the image. The defaults are the calibrated production
+    # values: the earlier ``0.2 / 0.99 / 10s`` placeholder was never reachable for any
+    # template's attainable utility, so no candidate could ever cross.
+    leak: float = 0.05
+    competition_gain: float = 0.0
+    decision_threshold: float = 0.70
+    time_scale_seconds: float = 3600.0
+    max_step_seconds: float = 3600.0
+    crossing_tolerance: float = 1e-7
+    tie_tolerance: float = 1e-6
+    # Bounded, declared drive that lets a low-pressure candidate reach out while the user
+    # model is still cold. It never overrides a hard block, and it is the only reason a
+    # brand-new scope can send at all; set it to 0 to keep the kernel purely predictive.
+    cold_start_drive: float = 2.0
 
     def live_allowed(self, scope_key: str) -> bool:
         return bool(self.live_enabled and scope_key in self.live_scope_allowlist)
+
+    def parameters(self) -> LangchaoParameters:
+        """Return the validated kernel parameters for this configuration."""
+        return LangchaoParameters(
+            leak=self.leak,
+            competition_gain=self.competition_gain,
+            decision_threshold=self.decision_threshold,
+            time_scale_seconds=self.time_scale_seconds,
+            max_step_seconds=self.max_step_seconds,
+            crossing_tolerance=self.crossing_tolerance,
+            tie_tolerance=self.tie_tolerance,
+        )
+
+    def validate(self) -> None:
+        """Reject numerically dead 浪潮 settings before a Runtime can start.
+
+        ``decision_threshold = 1`` is the one value the engine itself accepts and which
+        can never be reached in finite time from any readiness below 1, so it is refused
+        here rather than silently freezing every future round.
+
+        Raises:
+            ValueError: If any kernel parameter is unusable.
+        """
+        if not 0.0 < self.decision_threshold < 1.0:
+            raise ValueError(
+                "decision_threshold must be strictly between 0 and 1; a threshold of 1 "
+                "is unreachable in finite time and 0 would fire unconditionally"
+            )
+        if isinstance(self.cold_start_drive, bool) or not isinstance(
+            self.cold_start_drive, (int, float)
+        ):
+            raise TypeError("cold_start_drive must be numeric")
+        if not math.isfinite(float(self.cold_start_drive)) or self.cold_start_drive < 0:
+            raise ValueError("cold_start_drive must be finite and non-negative")
+        self.parameters()
 
     def attention_recipe_for_scope(self, scope_key: str) -> str:
         """Validate the configured recipe and enforce B3's exact-scope gate."""
@@ -738,6 +790,9 @@ def load_config(
         current = getattr(cursor, segments[-1])
         setattr(cursor, segments[-1], _coerce_for(current, raw, key=key))
 
+    # Reject an unusable kernel here, where the operator can still see the mistake,
+    # rather than after a Runtime has started and silently stopped dispatching.
+    config.langchao.validate()
     return config
 
 

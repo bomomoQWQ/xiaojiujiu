@@ -247,6 +247,50 @@ def test_load_config_parses_list_overrides_as_json_and_fails_closed() -> None:
             load_config(env={"CR_LANGCHAO__LIVE_SCOPE_ALLOWLIST": bad})
 
 
+def test_load_config_exposes_strict_langchao_numeric_parameters() -> None:
+    config = load_config(env={
+        "CR_LANGCHAO__LEAK": "0.04",
+        "CR_LANGCHAO__DECISION_THRESHOLD": "0.68",
+        "CR_LANGCHAO__TIME_SCALE_SECONDS": "2400",
+        "CR_LANGCHAO__MAX_STEP_SECONDS": "2400",
+        "CR_LANGCHAO__COMPETITION_GAIN": "0.25",
+    })
+    assert config.langchao.leak == 0.04
+    assert config.langchao.decision_threshold == 0.68
+    assert config.langchao.time_scale_seconds == 2400.0
+    assert config.langchao.max_step_seconds == 2400.0
+    assert config.langchao.competition_gain == 0.25
+    params = config.langchao.parameters()
+    assert params.decision_threshold == 0.68
+    assert params.leak == 0.04
+
+    for env in (
+        {"CR_LANGCHAO__LEAK": "-0.1"},
+        {"CR_LANGCHAO__DECISION_THRESHOLD": "1.0"},
+        {"CR_LANGCHAO__TIME_SCALE_SECONDS": "0"},
+        {"CR_LANGCHAO__MAX_STEP_SECONDS": "0"},
+        {"CR_LANGCHAO__COMPETITION_GAIN": "-1"},
+    ):
+        with pytest.raises(ValueError):
+            load_config(env=env)
+
+
+def test_cold_start_drive_is_configurable_and_can_be_switched_off() -> None:
+    """The bounded outreach allowance is an operator dial, including turning it off."""
+    default = load_config(env={})
+    assert default.langchao.cold_start_drive == 2.0
+
+    tuned = load_config(env={"CR_LANGCHAO__COLD_START_DRIVE": "0"})
+    assert tuned.langchao.cold_start_drive == 0.0
+
+    raised = load_config(env={"CR_LANGCHAO__COLD_START_DRIVE": "1.25"})
+    assert raised.langchao.cold_start_drive == 1.25
+
+    for bad in ("-0.5", "nan"):
+        with pytest.raises(ValueError):
+            load_config(env={"CR_LANGCHAO__COLD_START_DRIVE": bad})
+
+
 def test_load_config_string_fields_keep_their_textual_value() -> None:
     """A string setting must never be re-typed from its text.
 

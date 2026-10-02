@@ -851,18 +851,13 @@ class Runtime:
             Identifiers of the attempts closed by this pass.
         """
         closed = self.reducer.close_settled_outbox_attempts(now=now)
-        live_rows: set[str] = set()
-        for item in self.projections.outbox.list_items(status=None, limit=500):
-            if item.status not in {OutboxStatus.PENDING.value, OutboxStatus.LEASED.value}:
-                continue
-            attempt_id = str(item.payload.get("attempt_id") or "")
-            if attempt_id:
-                live_rows.add(attempt_id)
         window = timedelta(seconds=self.config.action.send_expiry_seconds)
         for attempt in self.projections.attempts.list_by_state(
             list(action_module.PRE_SEND_STATES)
         ):
-            if attempt.attempt_id in live_rows or attempt.attempt_id in closed:
+            if attempt.attempt_id in closed or self.projections.outbox.has_live_row_for_attempt(
+                conn, attempt.attempt_id
+            ):
                 continue
             reference = attempt.updated_at or attempt.created_at
             if reference is None or now - reference <= window:
@@ -2939,6 +2934,24 @@ class Runtime:
             "now": isoformat(now),
             "local_hour": local_now(now).hour,
         }
+
+    def v2_prediction_context(self, candidate: Any, now: datetime) -> dict[str, Any]:
+        """Return the exposure-time predictor context for one v2 prediction.
+
+        Delegates to the single mechanical implementation so the Runtime and the concrete
+        v2 bridge cannot drift apart. Imported lazily because the bridge module imports
+        this module's typing contracts.
+
+        Args:
+            candidate: The candidate being scored.
+            now: Exposure time.
+
+        Returns:
+            The fast-variable context mapping expected by the v2 feature encoder.
+        """
+        from .legacy_bridge_v2 import mechanical_prediction_context
+
+        return mechanical_prediction_context(self, candidate, now)
 
     def _recent_stated_busy(self, now: datetime, *, window_hours: float = 24.0) -> bool:
         """Return whether the user recently *said* they are busy.

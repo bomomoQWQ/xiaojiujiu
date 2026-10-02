@@ -51,6 +51,18 @@ def _value(row: Any, key: str, index: int = 0) -> Any:
     return row[key] if isinstance(row, Mapping) else row[index]
 
 
+def _semantic_key_matches(stored: Any, requested: str) -> bool:
+    """Return whether a stored semantic key still names the requested concept.
+
+    A reward identity used to be keyed by its bare template name, so an existing row may
+    read ``question.v1`` where the current writer asks for ``question.v1:<subject>``.
+    Accepting that narrow widening keeps published contracts readable across the change,
+    while a genuinely different concept still fails the check.
+    """
+    text = "" if stored is None else str(stored)
+    return text == requested or requested.startswith(text + ":")
+
+
 def _payload_object(value: Any) -> Mapping[str, Any]:
     if isinstance(value, str):
         value = json.loads(value)
@@ -161,7 +173,7 @@ class LangchaoRepository:
             f"SELECT semantic_key FROM {table} WHERE scope_key = %s AND {id_column} = %s",
             (self.scope_key, identity),
         ).fetchone()
-        if row is None or _value(row, "semantic_key") != semantic_key:
+        if row is None or not _semantic_key_matches(_value(row, "semantic_key"), semantic_key):
             raise LangchaoRevisionConflictError("scoped identity has a different semantic_key")
 
     def _existing_or_conflict(self, table: str, id_column: str, identity: str, revision: int, digest: str) -> Any | None:
@@ -202,7 +214,12 @@ class LangchaoRepository:
             raise TypeError("reward must be RewardContract")
         self._require_scope(reward)
         _payload, encoded, digest = _canonical_payload(reward)
-        semantic_key = reward.template_key
+        # A template may legitimately own several reward contracts in one scope: four
+        # remembered subjects become four ``question.v1`` candidates. Keying the identity
+        # by the bare template name made the second one a unique-constraint violation, so
+        # the key follows the same (template, subject) identity the goal and candidate
+        # already use.
+        semantic_key = reward.overlap_group or reward.template_key
         with self._transaction():
             self._put_identity("langchao_reward_identities", "reward_contract_id", reward.reward_contract_id, semantic_key)
             existing = self._existing_or_conflict(

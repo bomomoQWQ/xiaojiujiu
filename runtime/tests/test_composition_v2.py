@@ -85,6 +85,14 @@ class FakeServiceRepository:
         self.repository = repository
 
 
+class CapturingRuntimeRepository:
+    def __init__(self, connection, **kwargs):
+        self.connection = connection
+        self.kwargs = kwargs
+        self.context_provider = kwargs["context_provider"]
+        self.state_version_provider = kwargs["state_version_provider"]
+
+
 class FakePredictionRepository:
     def __init__(self, repository):
         self.repository = repository
@@ -120,6 +128,7 @@ def test_factory_builds_v2_graph_from_injected_protocols_and_reports_health() ->
     assert isinstance(composition.user_model_service, UserModelV2Service)
     assert composition.user_model_service.repository is composition.service_repository
     assert composition.prediction_service.repository is composition.prediction_repository
+    assert set(composition.prediction_service.registered_priors) == set(Target)
     assert isinstance(composition.coordinator, V2RuntimeCoordinator)
     assert composition.coordinator.legacy is legacy
     assert composition.coordinator.repository is runtime_repository
@@ -273,6 +282,41 @@ def test_factory_reuses_borrowed_database_without_closing_it() -> None:
     assert composition.owns_database is False
     composition.close()
     assert database.closed is False
+
+
+def test_production_repository_receives_mechanical_context_and_state_version_providers() -> None:
+    class Runtime:
+        def state(self):
+            return SimpleNamespace(version=42)
+
+        def v2_prediction_context(self, candidate, now):
+            assert candidate == "candidate"
+            assert now == "now"
+            return {
+                "busy_probability": 0.25,
+                "recent_contact_count": 2,
+                "hours_since_contact": 5.0,
+                "user_active_now": False,
+                "ever_boundary": True,
+                "novelty": 0.6,
+                "explicit_permission": True,
+            }
+
+    legacy = DummyLegacyBridge()
+    legacy.runtime = Runtime()
+    composition = build_v2_composition(
+        configured(), scope_key="scope", legacy_bridge=legacy,  # type: ignore[arg-type]
+        database=FakeDatabase(), runtime_repository_factory=CapturingRuntimeRepository,
+        service_repository_factory=FakeServiceRepository,
+        prediction_repository_factory=FakePredictionRepository,
+        authority_repository_factory=FakeAuthorityRepository,
+    )
+    repo = composition.coordinator.repository
+    context = repo.context_provider("candidate", "now")
+    assert context["hours_since_contact"] == 5.0
+    assert context["explicit_permission"] is True
+    assert type(context["explicit_permission"]) is bool
+    assert repo.state_version_provider() == 42
 
 
 def test_factory_does_not_close_borrowed_database_when_build_fails() -> None:

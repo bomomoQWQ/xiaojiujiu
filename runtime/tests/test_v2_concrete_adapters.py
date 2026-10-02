@@ -94,6 +94,34 @@ def repository(connection):
     )
 
 
+def test_runtime_prediction_context_handles_empty_time_anchors_and_permission_is_bool():
+    item = CandidateIntent(
+        candidate_id="c1", type="contact", intent="联系", goal="continuity",
+        sources=["internal_approach_drive"], internal_need=.4,
+    )
+    state = SimpleNamespace(
+        version=7, epoch_at=None, updated_at=None, last_exchange_at=None,
+        last_contact_at=None, last_user_message_at=None,
+    )
+    runtime = SimpleNamespace(
+        projections=SimpleNamespace(
+            candidates=Candidates(item), boundaries=SimpleNamespace(list_all=lambda **_kwargs: []),
+            runtime=SimpleNamespace(read=lambda: state),
+        ),
+        config=SimpleNamespace(candidate=SimpleNamespace(max_active=12), conversation_id="default"),
+        _event_ids_behind=lambda source: [],
+        _recent_contact_count=lambda now: 0,
+        _recent_user_permission=lambda now: False,
+        _legacy_busy_probability=lambda **kwargs: 0.0,
+    )
+    bridge = ConcreteLegacyRuntimeV2Bridge(runtime)
+    context = bridge.prediction_context(candidate=bridge._candidate(item), now=NOW)
+    assert context["hours_since_contact"] == 0.0
+    assert context["user_active_now"] is False
+    assert context["explicit_permission"] is False
+    assert type(context["explicit_permission"]) is bool
+
+
 def test_runtime_repository_reads_v2_history_and_writes_idempotently():
     connection = FakeConnection()
     connection.results = [[{

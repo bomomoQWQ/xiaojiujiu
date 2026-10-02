@@ -136,6 +136,25 @@ def test_no_active_snapshot_uses_registered_prior_or_marks_unavailable() -> None
     assert dict(envelope.parameter_snapshot_ids) == {target: None for target in Target}
 
 
+def test_versioned_default_priors_produce_legal_prior_only_predictions_for_all_targets() -> None:
+    from companion_runtime.user_model_v2_prediction import (
+        DEFAULT_PRIOR_VERSION,
+        default_registered_priors,
+    )
+
+    features = complete_features()
+    service = UserModelV2PredictionService(
+        FakeRepository(), registered_priors=default_registered_priors(features.spec)
+    )
+    envelope = service.predict(features=features, predicted_at=NOW, based_on_state_version=0)
+    by_target = {item.target: item for item in envelope.predictions}
+    assert set(by_target) == set(Target)
+    assert all(item.support is SupportStatus.PRIOR_ONLY for item in by_target.values())
+    assert all(item.point is not None for item in by_target.values())
+    assert all(item.lower is not None and item.upper is not None for item in by_target.values())
+    assert DEFAULT_PRIOR_VERSION.startswith("user-model-v2-prior.")
+
+
 def test_missing_features_never_silently_use_encoded_zero() -> None:
     missing = FeatureSnapshotV2(
         scope_key=SCOPE,
