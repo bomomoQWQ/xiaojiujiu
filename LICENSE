@@ -668,5 +668,3 @@ For more information on how to apply and follow the GNU AGPL, see
 （例如闭源集成，或无法承担 AGPL 第 13 节源码提供义务的商业部署），可以另行洽谈商业许可：
 <https://github.com/bomomoQWQ>
 
-`astrbot_plugin_companion_runtime` 是**独立仓库**，有自己的许可证，不在本文件范围内；
-上游 AstrBot 是独立项目（AGPL-3.0，Copyright Soulter），本仓库不对它主张任何权利。
