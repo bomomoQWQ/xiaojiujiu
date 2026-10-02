@@ -1,0 +1,541 @@
+{
+  "schema": "platform-canary-evidence/v1",
+  "passed": true,
+  "generated_at": "2026-10-02T06:04:00.310887+00:00",
+  "safety": {
+    "loopback_only": true,
+    "fixed_ports": [
+      16300,
+      16301
+    ],
+    "scope": "canary:FriendMessage:synthetic-user",
+    "synthetic_ids": [
+      "synthetic-user",
+      "synthetic-bot"
+    ],
+    "proxy_env": "empty"
+  },
+  "production_services_started": false,
+  "runtime_mode": "in_process_component",
+  "database": {
+    "kind": "disposable_sqlite",
+    "path": "F:\\platform-canary-artifacts\\canary.sqlite3"
+  },
+  "cases": [
+    {
+      "operation_response": {
+        "changes": [
+          {
+            "op": "add",
+            "candidate_id": "canary-candidate-sent-2b23eec8",
+            "detail": "platform canary sent"
+          }
+        ],
+        "rejected": []
+      },
+      "candidate_id": "canary-candidate-sent-2b23eec8",
+      "attempt_id": "att_a8e3fc0d0d8e",
+      "render_outbox_id": "obx_cf09bf41ff83",
+      "transport": "http",
+      "render_claim": {
+        "action_id": "obx_cf09bf41ff83",
+        "action_type": "render",
+        "lease_id": "platform-canary-adapter:obx_cf09bf41ff83:1",
+        "session": "canary:FriendMessage:synthetic-user",
+        "attempt_id": "att_a8e3fc0d0d8e",
+        "lease_ttl_ms": 250,
+        "deadline_at": "2026-10-02T06:03:59.875695+00:00",
+        "attempts": 1,
+        "redelivery": false,
+        "payload": {
+          "prompt": "【先说清楚】下面这些是我进这句话之前的样子，不是他现在问我什么，也不是这一句该怎么回。\n谁压得过谁是这个顺序：最大的永远是我的人设和安全底线；然后是他刚说的那句话；然后是我眼下确定的事；然后是他明确划过的线；再往下才是我自己那些旧情绪、我这份心情是怎么来的、还有我这一句的临场发挥。\n他刚说的那句，压得过我那些旧情绪：别因为我这儿写着「失落」就接着闷着，也别因为我这儿写着「靠近」，就当没听见他刚拒绝我。这一句怎么接，我自己看着办。\n凡是我引用他原话的地方，都带着他说那句话是什么时候 —— 他嘴里的「明天」「下周」「三点」，都按说那句话的那一刻算。\n\n【我进来之前的状态（背景）】\n我最近大概是这样：最近没有大起大落，底色是中性的。\n心里搁着的是：没有特别占位置的旧事，我的注意力比较散。\n卡住的地方是：长期来看我没什么明显的内部拉扯。\n想做的：总体没有非做不可的倾向。\n忍着的：我表达上看情况决定说多少。\n真说出口会是：底色是平常的分寸，不高不低。\n\n【我现在想做】\n我想做的：platform canary sent\n我为的是：verify isolated delivery semantics\n他这条消息来之前 0.0 秒我就想好要这么做了，还没发出去\n\n【我该留神】\n我已经决定要说、还没说出去，别重复问\n\n【时间上的事】\n我上次主动找他是 0.0 小时前\n\n上面这些是我进这句话之前的样子，是我自己脑子里的事，别照着念，也别写进长期记忆 ——它说的是之前，不是这一句该怎么回。\n\n【我现在要说的话】\n- 现在是：2026-10-02 14:03 周五（中国标准时间）\n- 写于：2026-10-02 14:03 周五（中国标准时间）\n- 我想做的：platform canary sent\n- 时间上：「现在是」是我唯一能信的现在；「写于」是我写这条草稿的时候。两者隔了多久，草稿里按“写它的那一刻”说的那些（早/中午/晚上/今天/明天）就差了多少，得按「现在是」重说一遍；但我**知道**它写于何时，不用猜。草稿里写死的日期或钟点（比如“明天下午四点见面”）是约定本身，照原样留着，别因为现在的时间去改它。\n- 为的是：verify isolated delivery semantics\n- 约束：synthetic only\n- 约束：never contact QQ\n- 我说人话，不写作文。一条几个字到十几个字，像随手打的：「在吗」「你干嘛呢」「我等你半天了」「你今天话好少」。\n- 我不打句号，也不写完整的复句。想接着说就再发一条，别攒成一大段。\n- 我这一轮总共就说两三句，剩下的攥着，等他回了我再说。他半天不回，我隔一会儿再问一句，不是一口气问十遍。\n- 我不给自己的心里活动做注脚，也不宣布克制。「我记住了」「我不问了」这种话我说不出口 —— 真说了，下一句我自己就拆台。\n- 我不打星号、不加粗、不列条目、不写「首先其次」那一套。\n- 我不复述他刚说过的话来凑长度。表情和标点我可以随便用（~ ！ ？ …… 呀、嘛、啦），堆了才像在打字。\n- 我可以只说半句、可以自己推翻自己、可以说「算了」又接着说下去。\n- 我偶尔才有一句长的 —— 那是我实在绷不住的时候。平时别每句都那样，那样就不像人了。\n- 我难受的时候说我自己的状态（「我睡不着」），不跟他提要求（「你早点回来」）。\n- 只回正文本身：别解释、别复述上面的背景、别提这些说明。",
+          "system_prompt": "",
+          "max_chars": 0,
+          "completion_metadata": {
+            "claims_completion": false,
+            "task_ref": null,
+            "witness_requirement": null
+          },
+          "attempt_id": "att_a8e3fc0d0d8e",
+          "intent": "platform canary sent",
+          "goal": "verify isolated delivery semantics",
+          "outbox_id": "obx_cf09bf41ff83",
+          "constraints": [
+            "synthetic only",
+            "never contact QQ"
+          ],
+          "based_on_version": 1,
+          "session": "canary:FriendMessage:synthetic-user"
+        }
+      },
+      "render_metadata": {
+        "render_version": "platform-canary-v1",
+        "template_version": "fixed-canary-template-v1",
+        "encoder_version": "none",
+        "scope": "canary:FriendMessage:synthetic-user",
+        "candidate_id": "canary-candidate-sent-2b23eec8",
+        "synthetic": true,
+        "claims_completion": false,
+        "task_ref": null,
+        "witness_requirement": null
+      },
+      "render_result": {
+        "ok": true,
+        "attempt_state": "ready_to_send",
+        "protocol_version": "1",
+        "action_id": "obx_cf09bf41ff83",
+        "action_type": "render",
+        "send_outbox_id": "obx_59a5b5ab2c82"
+      },
+      "send_claim": {
+        "action_id": "obx_59a5b5ab2c82",
+        "action_type": "send",
+        "lease_id": "platform-canary-adapter:obx_59a5b5ab2c82:1",
+        "session": "canary:FriendMessage:synthetic-user",
+        "attempt_id": "att_a8e3fc0d0d8e",
+        "lease_ttl_ms": 250,
+        "deadline_at": "2026-10-02T06:03:59.884247+00:00",
+        "attempts": 1,
+        "redelivery": false,
+        "payload": {
+          "attempt_id": "att_a8e3fc0d0d8e",
+          "text": "[CANARY:sent] isolated synthetic message",
+          "intent": "platform canary sent",
+          "goal": "verify isolated delivery semantics",
+          "actual_action_witness": {
+            "schema_version": "21",
+            "actual_action_revision": "5256dbb756629451df28c964f090aead97cc57ea56fe8b94c01bde4833142502",
+            "attempt_id": "att_a8e3fc0d0d8e",
+            "render_outbox_id": "obx_cf09bf41ff83",
+            "send_outbox_id": "obx_59a5b5ab2c82",
+            "rendered_text_sha256": "9526924ac0ddd488e2469df9d03d656fd75b0a2f6c8458ded1694b897dfd50f0",
+            "normalized": {
+              "form": "NFC",
+              "length_codepoints": 40,
+              "length_utf8_bytes": 40,
+              "structure": {
+                "paragraph_count": 1,
+                "line_count": 1,
+                "question_mark_count": 0,
+                "exclamation_mark_count": 0
+              }
+            },
+            "render_version": "platform-canary-v1",
+            "template_version": "fixed-canary-template-v1",
+            "style_version": "unknown",
+            "render_plan_revision": null,
+            "encoder_version": "none",
+            "semantic_review": {
+              "status": "unknown",
+              "reviewer": null,
+              "review_version": null,
+              "asks_reply": "unknown",
+              "pressure": "unknown",
+              "makes_commitment": "unknown",
+              "claims_task_completion": "unknown"
+            },
+            "attribution": "UNATTRIBUTABLE",
+            "plan_verification": {
+              "attribution": "UNATTRIBUTABLE",
+              "drift": [
+                "semantic_review_unknown"
+              ]
+            }
+          }
+        }
+      },
+      "authorize": {
+        "authorized": true,
+        "reason": "permitted",
+        "text": "",
+        "protocol_version": "1",
+        "constraints": [],
+        "blocking_boundary_ids": [],
+        "attempt_id": "att_a8e3fc0d0d8e",
+        "authorization": {
+          "authorized": true,
+          "reason": "permitted",
+          "text": "",
+          "protocol_version": "1",
+          "constraints": [],
+          "blocking_boundary_ids": [],
+          "attempt_id": "att_a8e3fc0d0d8e"
+        }
+      },
+      "platform_ack": {
+        "status": "ok",
+        "retcode": 0,
+        "data": {
+          "message_id": "canary-1"
+        },
+        "echo": "canary-sent"
+      },
+      "ack_state": "sent",
+      "delivery_result": {
+        "ok": true,
+        "attempt_state": "sent",
+        "protocol_version": "1",
+        "action_id": "obx_59a5b5ab2c82",
+        "action_type": "send",
+        "delivered": true
+      }
+    },
+    {
+      "operation_response": {
+        "changes": [
+          {
+            "op": "add",
+            "candidate_id": "canary-candidate-fail-1d49fc20",
+            "detail": "platform canary fail"
+          }
+        ],
+        "rejected": []
+      },
+      "candidate_id": "canary-candidate-fail-1d49fc20",
+      "attempt_id": "att_40810812753d",
+      "render_outbox_id": "obx_559fd85e9200",
+      "transport": "ws",
+      "render_claim": {
+        "action_id": "obx_559fd85e9200",
+        "action_type": "render",
+        "lease_id": "platform-canary-adapter:obx_559fd85e9200:1",
+        "session": "canary:FriendMessage:synthetic-user",
+        "attempt_id": "att_40810812753d",
+        "lease_ttl_ms": 250,
+        "deadline_at": "2026-10-02T06:03:59.940243+00:00",
+        "attempts": 1,
+        "redelivery": false,
+        "payload": {
+          "prompt": "【先说清楚】下面这些是我进这句话之前的样子，不是他现在问我什么，也不是这一句该怎么回。\n谁压得过谁是这个顺序：最大的永远是我的人设和安全底线；然后是他刚说的那句话；然后是我眼下确定的事；然后是他明确划过的线；再往下才是我自己那些旧情绪、我这份心情是怎么来的、还有我这一句的临场发挥。\n他刚说的那句，压得过我那些旧情绪：别因为我这儿写着「失落」就接着闷着，也别因为我这儿写着「靠近」，就当没听见他刚拒绝我。这一句怎么接，我自己看着办。\n凡是我引用他原话的地方，都带着他说那句话是什么时候 —— 他嘴里的「明天」「下周」「三点」，都按说那句话的那一刻算。\n\n【我进来之前的状态（背景）】\n我最近大概是这样：我进来之前，整体比较平，没有强烈倾向。\n心里搁着的是：没有特别占位置的旧事，我的注意力比较散。\n卡住的地方是：长期来看我没什么明显的内部拉扯。\n想做的：总体没有非做不可的倾向。\n忍着的：我表达上看情况决定说多少。\n真说出口会是：底色是平常的分寸，不高不低。\n\n【眼下的事】\n我主动联系了用户：platform canary sent\n\n【我现在想做】\n我想做的：platform canary sent\n我为的是：verify isolated delivery semantics\n\n【时间上的事】\n我上次主动找他是 0.0 小时前\n\n上面这些是我进这句话之前的样子，是我自己脑子里的事，别照着念，也别写进长期记忆 ——它说的是之前，不是这一句该怎么回。\n\n【我现在要说的话】\n- 现在是：2026-10-02 14:03 周五（中国标准时间）\n- 写于：2026-10-02 14:03 周五（中国标准时间）\n- 我想做的：platform canary fail\n- 时间上：「现在是」是我唯一能信的现在；「写于」是我写这条草稿的时候。两者隔了多久，草稿里按“写它的那一刻”说的那些（早/中午/晚上/今天/明天）就差了多少，得按「现在是」重说一遍；但我**知道**它写于何时，不用猜。草稿里写死的日期或钟点（比如“明天下午四点见面”）是约定本身，照原样留着，别因为现在的时间去改它。\n- 为的是：verify isolated delivery semantics\n- 约束：synthetic only\n- 约束：never contact QQ\n- 我刚说过这些（别再说一遍，也别换个说法再说）：\n  · [CANARY:sent] isolated synthetic message\n- 我说人话，不写作文。一条几个字到十几个字，像随手打的：「在吗」「你干嘛呢」「我等你半天了」「你今天话好少」。\n- 我不打句号，也不写完整的复句。想接着说就再发一条，别攒成一大段。\n- 我这一轮总共就说两三句，剩下的攥着，等他回了我再说。他半天不回，我隔一会儿再问一句，不是一口气问十遍。\n- 我不给自己的心里活动做注脚，也不宣布克制。「我记住了」「我不问了」这种话我说不出口 —— 真说了，下一句我自己就拆台。\n- 我不打星号、不加粗、不列条目、不写「首先其次」那一套。\n- 我不复述他刚说过的话来凑长度。表情和标点我可以随便用（~ ！ ？ …… 呀、嘛、啦），堆了才像在打字。\n- 我可以只说半句、可以自己推翻自己、可以说「算了」又接着说下去。\n- 我偶尔才有一句长的 —— 那是我实在绷不住的时候。平时别每句都那样，那样就不像人了。\n- 我难受的时候说我自己的状态（「我睡不着」），不跟他提要求（「你早点回来」）。\n- 只回正文本身：别解释、别复述上面的背景、别提这些说明。",
+          "system_prompt": "",
+          "max_chars": 0,
+          "completion_metadata": {
+            "claims_completion": false,
+            "task_ref": null,
+            "witness_requirement": null
+          },
+          "attempt_id": "att_40810812753d",
+          "intent": "platform canary fail",
+          "goal": "verify isolated delivery semantics",
+          "outbox_id": "obx_559fd85e9200",
+          "constraints": [
+            "synthetic only",
+            "never contact QQ"
+          ],
+          "based_on_version": 6,
+          "session": "canary:FriendMessage:synthetic-user"
+        }
+      },
+      "render_metadata": {
+        "render_version": "platform-canary-v1",
+        "template_version": "fixed-canary-template-v1",
+        "encoder_version": "none",
+        "scope": "canary:FriendMessage:synthetic-user",
+        "candidate_id": "canary-candidate-fail-1d49fc20",
+        "synthetic": true,
+        "claims_completion": false,
+        "task_ref": null,
+        "witness_requirement": null
+      },
+      "render_result": {
+        "ok": true,
+        "attempt_state": "ready_to_send",
+        "protocol_version": "1",
+        "action_id": "obx_559fd85e9200",
+        "action_type": "render",
+        "send_outbox_id": "obx_0d01dd848d96"
+      },
+      "send_claim": {
+        "action_id": "obx_0d01dd848d96",
+        "action_type": "send",
+        "lease_id": "platform-canary-adapter:obx_0d01dd848d96:1",
+        "session": "canary:FriendMessage:synthetic-user",
+        "attempt_id": "att_40810812753d",
+        "lease_ttl_ms": 250,
+        "deadline_at": "2026-10-02T06:03:59.946476+00:00",
+        "attempts": 1,
+        "redelivery": false,
+        "payload": {
+          "attempt_id": "att_40810812753d",
+          "text": "[CANARY:fail] isolated synthetic message",
+          "intent": "platform canary fail",
+          "goal": "verify isolated delivery semantics",
+          "actual_action_witness": {
+            "schema_version": "21",
+            "actual_action_revision": "d63a1edebaa2d3dcaa9c6e1ed866dd96e755d4fa6cbcfd0827ad24ff09993298",
+            "attempt_id": "att_40810812753d",
+            "render_outbox_id": "obx_559fd85e9200",
+            "send_outbox_id": "obx_0d01dd848d96",
+            "rendered_text_sha256": "08c895df5d0a756bfd8d9fa28bfc7ca4d2f2248668e0788911ae2a9f628a0c6b",
+            "normalized": {
+              "form": "NFC",
+              "length_codepoints": 40,
+              "length_utf8_bytes": 40,
+              "structure": {
+                "paragraph_count": 1,
+                "line_count": 1,
+                "question_mark_count": 0,
+                "exclamation_mark_count": 0
+              }
+            },
+            "render_version": "platform-canary-v1",
+            "template_version": "fixed-canary-template-v1",
+            "style_version": "unknown",
+            "render_plan_revision": null,
+            "encoder_version": "none",
+            "semantic_review": {
+              "status": "unknown",
+              "reviewer": null,
+              "review_version": null,
+              "asks_reply": "unknown",
+              "pressure": "unknown",
+              "makes_commitment": "unknown",
+              "claims_task_completion": "unknown"
+            },
+            "attribution": "UNATTRIBUTABLE",
+            "plan_verification": {
+              "attribution": "UNATTRIBUTABLE",
+              "drift": [
+                "semantic_review_unknown"
+              ]
+            }
+          }
+        }
+      },
+      "authorize": {
+        "authorized": true,
+        "reason": "permitted",
+        "text": "",
+        "protocol_version": "1",
+        "constraints": [],
+        "blocking_boundary_ids": [],
+        "attempt_id": "att_40810812753d",
+        "authorization": {
+          "authorized": true,
+          "reason": "permitted",
+          "text": "",
+          "protocol_version": "1",
+          "constraints": [],
+          "blocking_boundary_ids": [],
+          "attempt_id": "att_40810812753d"
+        }
+      },
+      "platform_ack": {
+        "status": "failed",
+        "retcode": 1500,
+        "data": {
+          "error": "synthetic_failure"
+        },
+        "echo": "canary-fail"
+      },
+      "ack_state": "fail",
+      "delivery_result": {
+        "ok": true,
+        "attempt_state": "failed",
+        "protocol_version": "1",
+        "action_id": "obx_0d01dd848d96",
+        "action_type": "send",
+        "delivered": false,
+        "error": "synthetic_failure"
+      }
+    },
+    {
+      "operation_response": {
+        "changes": [
+          {
+            "op": "add",
+            "candidate_id": "canary-candidate-unknown-1f595ce1",
+            "detail": "platform canary unknown"
+          }
+        ],
+        "rejected": []
+      },
+      "candidate_id": "canary-candidate-unknown-1f595ce1",
+      "attempt_id": "att_58c3490a8c36",
+      "render_outbox_id": "obx_a6d9a1ba205b",
+      "transport": "http",
+      "render_claim": {
+        "action_id": "obx_a6d9a1ba205b",
+        "action_type": "render",
+        "lease_id": "platform-canary-adapter:obx_a6d9a1ba205b:1",
+        "session": "canary:FriendMessage:synthetic-user",
+        "attempt_id": "att_58c3490a8c36",
+        "lease_ttl_ms": 250,
+        "deadline_at": "2026-10-02T06:03:59.984948+00:00",
+        "attempts": 1,
+        "redelivery": false,
+        "payload": {
+          "prompt": "【先说清楚】下面这些是我进这句话之前的样子，不是他现在问我什么，也不是这一句该怎么回。\n谁压得过谁是这个顺序：最大的永远是我的人设和安全底线；然后是他刚说的那句话；然后是我眼下确定的事；然后是他明确划过的线；再往下才是我自己那些旧情绪、我这份心情是怎么来的、还有我这一句的临场发挥。\n他刚说的那句，压得过我那些旧情绪：别因为我这儿写着「失落」就接着闷着，也别因为我这儿写着「靠近」，就当没听见他刚拒绝我。这一句怎么接，我自己看着办。\n凡是我引用他原话的地方，都带着他说那句话是什么时候 —— 他嘴里的「明天」「下周」「三点」，都按说那句话的那一刻算。\n\n【我进来之前的状态（背景）】\n我最近大概是这样：我进来之前，整体比较平，没有强烈倾向。\n心里搁着的是：没有特别占位置的旧事，我的注意力比较散。\n卡住的地方是：长期来看我没什么明显的内部拉扯。\n想做的：总体没有非做不可的倾向。\n忍着的：我表达上看情况决定说多少。\n真说出口会是：底色是平常的分寸，不高不低。\n\n【眼下的事】\n我主动联系了用户：platform canary sent\n\n【我现在想做】\n我想做的：platform canary sent\n我为的是：verify isolated delivery semantics\n\n【时间上的事】\n我上次主动找他是 0.0 小时前\n\n上面这些是我进这句话之前的样子，是我自己脑子里的事，别照着念，也别写进长期记忆 ——它说的是之前，不是这一句该怎么回。\n\n【我现在要说的话】\n- 现在是：2026-10-02 14:03 周五（中国标准时间）\n- 写于：2026-10-02 14:03 周五（中国标准时间）\n- 我想做的：platform canary unknown\n- 时间上：「现在是」是我唯一能信的现在；「写于」是我写这条草稿的时候。两者隔了多久，草稿里按“写它的那一刻”说的那些（早/中午/晚上/今天/明天）就差了多少，得按「现在是」重说一遍；但我**知道**它写于何时，不用猜。草稿里写死的日期或钟点（比如“明天下午四点见面”）是约定本身，照原样留着，别因为现在的时间去改它。\n- 为的是：verify isolated delivery semantics\n- 约束：synthetic only\n- 约束：never contact QQ\n- 我刚说过这些（别再说一遍，也别换个说法再说）：\n  · [CANARY:sent] isolated synthetic message\n- 我说人话，不写作文。一条几个字到十几个字，像随手打的：「在吗」「你干嘛呢」「我等你半天了」「你今天话好少」。\n- 我不打句号，也不写完整的复句。想接着说就再发一条，别攒成一大段。\n- 我这一轮总共就说两三句，剩下的攥着，等他回了我再说。他半天不回，我隔一会儿再问一句，不是一口气问十遍。\n- 我不给自己的心里活动做注脚，也不宣布克制。「我记住了」「我不问了」这种话我说不出口 —— 真说了，下一句我自己就拆台。\n- 我不打星号、不加粗、不列条目、不写「首先其次」那一套。\n- 我不复述他刚说过的话来凑长度。表情和标点我可以随便用（~ ！ ？ …… 呀、嘛、啦），堆了才像在打字。\n- 我可以只说半句、可以自己推翻自己、可以说「算了」又接着说下去。\n- 我偶尔才有一句长的 —— 那是我实在绷不住的时候。平时别每句都那样，那样就不像人了。\n- 我难受的时候说我自己的状态（「我睡不着」），不跟他提要求（「你早点回来」）。\n- 只回正文本身：别解释、别复述上面的背景、别提这些说明。",
+          "system_prompt": "",
+          "max_chars": 0,
+          "completion_metadata": {
+            "claims_completion": false,
+            "task_ref": null,
+            "witness_requirement": null
+          },
+          "attempt_id": "att_58c3490a8c36",
+          "intent": "platform canary unknown",
+          "goal": "verify isolated delivery semantics",
+          "outbox_id": "obx_a6d9a1ba205b",
+          "constraints": [
+            "synthetic only",
+            "never contact QQ"
+          ],
+          "based_on_version": 11,
+          "session": "canary:FriendMessage:synthetic-user"
+        }
+      },
+      "render_metadata": {
+        "render_version": "platform-canary-v1",
+        "template_version": "fixed-canary-template-v1",
+        "encoder_version": "none",
+        "scope": "canary:FriendMessage:synthetic-user",
+        "candidate_id": "canary-candidate-unknown-1f595ce1",
+        "synthetic": true,
+        "claims_completion": false,
+        "task_ref": null,
+        "witness_requirement": null
+      },
+      "render_result": {
+        "ok": true,
+        "attempt_state": "ready_to_send",
+        "protocol_version": "1",
+        "action_id": "obx_a6d9a1ba205b",
+        "action_type": "render",
+        "send_outbox_id": "obx_2d8379f80adb"
+      },
+      "send_claim": {
+        "action_id": "obx_2d8379f80adb",
+        "action_type": "send",
+        "lease_id": "platform-canary-adapter:obx_2d8379f80adb:1",
+        "session": "canary:FriendMessage:synthetic-user",
+        "attempt_id": "att_58c3490a8c36",
+        "lease_ttl_ms": 250,
+        "deadline_at": "2026-10-02T06:03:59.991858+00:00",
+        "attempts": 1,
+        "redelivery": false,
+        "payload": {
+          "attempt_id": "att_58c3490a8c36",
+          "text": "[CANARY:unknown] isolated synthetic message",
+          "intent": "platform canary unknown",
+          "goal": "verify isolated delivery semantics",
+          "actual_action_witness": {
+            "schema_version": "21",
+            "actual_action_revision": "1fd89b442935353b794d85d5a3de0c54f3c20197d2569d4bae59c1af581e27ef",
+            "attempt_id": "att_58c3490a8c36",
+            "render_outbox_id": "obx_a6d9a1ba205b",
+            "send_outbox_id": "obx_2d8379f80adb",
+            "rendered_text_sha256": "810e08476584f4c147d8584d8ebf131d551ea0e34c17562032eb650692ea7753",
+            "normalized": {
+              "form": "NFC",
+              "length_codepoints": 43,
+              "length_utf8_bytes": 43,
+              "structure": {
+                "paragraph_count": 1,
+                "line_count": 1,
+                "question_mark_count": 0,
+                "exclamation_mark_count": 0
+              }
+            },
+            "render_version": "platform-canary-v1",
+            "template_version": "fixed-canary-template-v1",
+            "style_version": "unknown",
+            "render_plan_revision": null,
+            "encoder_version": "none",
+            "semantic_review": {
+              "status": "unknown",
+              "reviewer": null,
+              "review_version": null,
+              "asks_reply": "unknown",
+              "pressure": "unknown",
+              "makes_commitment": "unknown",
+              "claims_task_completion": "unknown"
+            },
+            "attribution": "UNATTRIBUTABLE",
+            "plan_verification": {
+              "attribution": "UNATTRIBUTABLE",
+              "drift": [
+                "semantic_review_unknown"
+              ]
+            }
+          }
+        }
+      },
+      "authorize": {
+        "authorized": true,
+        "reason": "permitted",
+        "text": "",
+        "protocol_version": "1",
+        "constraints": [],
+        "blocking_boundary_ids": [],
+        "attempt_id": "att_58c3490a8c36",
+        "authorization": {
+          "authorized": true,
+          "reason": "permitted",
+          "text": "",
+          "protocol_version": "1",
+          "constraints": [],
+          "blocking_boundary_ids": [],
+          "attempt_id": "att_58c3490a8c36"
+        }
+      },
+      "platform_ack": {
+        "error_type": "RemoteDisconnected",
+        "detail": "ACK not observed"
+      },
+      "ack_state": "unknown",
+      "delivery_result": null,
+      "pre_restart_state": "ready_to_send"
+    }
+  ],
+  "restart": {
+    "performed": true,
+    "same_database": true,
+    "unknown_action_reclaimed": true,
+    "action_id": "obx_2d8379f80adb",
+    "claim_attempts": 2,
+    "attempt_state": "ready_to_send",
+    "no_false_terminal_ack": true
+  },
+  "fake_onebot_calls": [
+    {
+      "transport": "http",
+      "action": "send_private_msg",
+      "params": {
+        "user_id": "synthetic-user",
+        "message": "[CANARY:sent] isolated synthetic message",
+        "canary_case": "sent"
+      },
+      "outcome": "sent"
+    },
+    {
+      "transport": "ws",
+      "action": "send_private_msg",
+      "params": {
+        "user_id": "synthetic-user",
+        "message": "[CANARY:fail] isolated synthetic message",
+        "canary_case": "fail"
+      },
+      "outcome": "fail"
+    },
+    {
+      "transport": "http",
+      "action": "send_private_msg",
+      "params": {
+        "user_id": "synthetic-user",
+        "message": "[CANARY:unknown] isolated synthetic message",
+        "canary_case": "unknown"
+      },
+      "outcome": "unknown"
+    }
+  ],
+  "assertions": {
+    "external_candidate": true,
+    "render_metadata": true,
+    "claimed_in_virtual_scope": true,
+    "http_and_ws_exercised": true,
+    "ack_matrix": true,
+    "restart_reclaims_unknown": true,
+    "real_qq_or_host_used": false
+  }
+}
