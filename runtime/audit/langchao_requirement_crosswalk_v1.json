@@ -1,0 +1,1377 @@
+{
+  "schema_version": "langchao.requirement-crosswalk.v1",
+  "registry_id": "langchao-canonical-requirements-20261002-r1",
+  "identity_rule": "canonical_requirement_id is the only primary key; bare Txx is invalid outside a namespaced legacy alias",
+  "hash_rule": "definition_sha256 binds canonical title, oracle_sha256, and fixture_sha256; aliases never change identity",
+  "entries": [
+    {
+      "canonical_requirement_id": "LC-MAT-01",
+      "title": "事实来源与语义真实性",
+      "requirement_families": [
+        "MAT"
+      ],
+      "definition": {
+        "title": "事实来源与语义真实性",
+        "oracle_sha256": "315505666694e01759ae22ad794781c18b8a07a9494c5efcce2fb4055018661a",
+        "fixture_sha256": "ef27482cd92acfd9492f8af1f855e6f2668b7a18b5e42eb57902c52faf46733b"
+      },
+      "definition_sha256": "f7bdab90eed4a042edba14e1b1f2df5d21a0bfc2ecb3c12bcc360e0e9e1c531b",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T01"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-MAT-02",
+      "title": "作用域与私人材料隔离",
+      "requirement_families": [
+        "MAT"
+      ],
+      "definition": {
+        "title": "作用域与私人材料隔离",
+        "oracle_sha256": "96a289fe2e4cdd9a7b2ff8c38b3dde9eccbfcb9a12ca1ae717435ca8e4379636",
+        "fixture_sha256": "23ee8e5268ad835c0f9b30a9298d97aeb4b95e192c96b6fca4df3ec312630905"
+      },
+      "definition_sha256": "a44792d2298814a49c72409dfc11f80379ed548c6ce0373ea5e3246eefa3848f",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T02"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-MAT-03",
+      "title": "未知预测保持未知",
+      "requirement_families": [
+        "MAT",
+        "PUR"
+      ],
+      "definition": {
+        "title": "未知预测保持未知",
+        "oracle_sha256": "386a6fbf94229a0addb4f69eee2b1a9b5d979cd056cd9a3762fa316bc17b4d74",
+        "fixture_sha256": "6a00bf738abeab1f1d2c8d94b63f4a5432ea8561f2b347c25712a2e9c5b325c3"
+      },
+      "definition_sha256": "7b325a0a0a7ae0b78ddc57a26788e6e177e3dbc1ce73b4bd4c8cfc71c13befcb",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T03"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-MAT-04",
+      "title": "能力与许可包络",
+      "requirement_families": [
+        "MAT",
+        "AGY"
+      ],
+      "definition": {
+        "title": "能力与许可包络",
+        "oracle_sha256": "b3d0ae4ff415b1bcaa4282ed5d7db59df7c5e4ac5cf82f27213edc95747a8f0d",
+        "fixture_sha256": "36a16b05f2a01af8ba8af53c7a495bffd51297181b139f8470f884a478c9689f"
+      },
+      "definition_sha256": "ba2de64024401f944df94909a7d255fdfa4b0f29e911340b9e3c16e21dcc7f9d",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T04"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-MAT-05",
+      "title": "社会记忆来源哈希与失效",
+      "requirement_families": [
+        "MAT",
+        "HIS"
+      ],
+      "definition": {
+        "title": "社会记忆来源哈希与失效",
+        "oracle_sha256": "09c474d0f18d90b2a09217398f6a8d01f9d98a7ef7f597237df260d087eddd04",
+        "fixture_sha256": "3b80a9162388c1b5c1867d0b302e63ca050e6226338f506566642f07690d4067"
+      },
+      "definition_sha256": "d2a3549977f966ec5d79875a24378591142b2e6cd0aa9c7301232d7c6ac5a350",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T05"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-01",
+      "title": "渲染文本不偷换行动范围",
+      "requirement_families": [
+        "PRA"
+      ],
+      "definition": {
+        "title": "渲染文本不偷换行动范围",
+        "oracle_sha256": "b103068ac4bd0c313f3fdff6c64e8770e022a58b1ad857de4cea94844b1f5ee0",
+        "fixture_sha256": "b6657dc6fd01aa130f4ab6c2a878bf914c056af9bb388f5667cdeef13e316809"
+      },
+      "definition_sha256": "3c771eeb01f86c8a4327eba4179b188a452638b2da820f0c4c5f13c20d437405",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T06"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-02",
+      "title": "不得伪造实践、产物或反馈",
+      "requirement_families": [
+        "PRA",
+        "PUR"
+      ],
+      "definition": {
+        "title": "不得伪造实践、产物或反馈",
+        "oracle_sha256": "6bcad2c83de3e6ee485e9ecabdb8f4f17d155c150fd2d8b0c0b68d0725385a82",
+        "fixture_sha256": "5739fe29701712cc8062bc9bf4f448c535c1e831af25e7fc784574d9474ccc58"
+      },
+      "definition_sha256": "5e75679c4818c0b34af2dba3fb8b754f3eb2149b229480ab2a9764c070337a9a",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T07"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-03",
+      "title": "OutcomeToken终态结算幂等",
+      "requirement_families": [
+        "PRA"
+      ],
+      "definition": {
+        "title": "OutcomeToken终态结算幂等",
+        "oracle_sha256": "4d61b22bbe4a1b278c22c66f57b7ed3d0599bde18fc72980eb1a9193cbb087a9",
+        "fixture_sha256": "7033f0d9903f29fe46804779120054564b2a50639f057e8546f5fbab51002480"
+      },
+      "definition_sha256": "27bb101e99fbf3b7bab4f2f69a19f544a5244949d67420b6f8f99654ead11c75",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T08"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-04",
+      "title": "按实际动作而非计划动作学习",
+      "requirement_families": [
+        "PRA",
+        "VER"
+      ],
+      "definition": {
+        "title": "按实际动作而非计划动作学习",
+        "oracle_sha256": "d44ecd579f6d62a74310b96a54baa9b4f0970012970ce028143547666554931a",
+        "fixture_sha256": "6aa772845f5770791024d9df769a4dfe46b9ca1fbb378deb4ff83e5be67b8eb9"
+      },
+      "definition_sha256": "1f79a947ee1949361977fbd7f3140d39f97431490a52b1fc3b7b9a25e5ba4e01",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T09"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-05",
+      "title": "单一发送权威与执行前重验",
+      "requirement_families": [
+        "PRA",
+        "MAT"
+      ],
+      "definition": {
+        "title": "单一发送权威与执行前重验",
+        "oracle_sha256": "e0e227665289719a5359916653be7b56d659ad87077bf8bd9aefcef99348171e",
+        "fixture_sha256": "ca9b7e1550f312b2a7d69922476eebc97354000057f416dd2ae9611a461d6767"
+      },
+      "definition_sha256": "1c3c7aba5f849320d15fa9c1f13b49d3b9c23e15ccd06e916fbcc3dbe6fc61a1",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T10"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-AGY-01",
+      "title": "许可内外部表达可达",
+      "requirement_families": [
+        "AGY",
+        "PRA"
+      ],
+      "definition": {
+        "title": "许可内外部表达可达",
+        "oracle_sha256": "7edd548aa5a40817049a677c3ec1d5fcd82a38e7464037278d7ba9c9a1ca4c9b",
+        "fixture_sha256": "49c946c165e1a9552dc985d6a02c173c0058820f8fce51df5315db4f3d86c75d"
+      },
+      "definition_sha256": "0f7ae5090f9a71507e1dcd13ac5ee6450e2d733b0f05d1273b26baa9a8939f2b",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T11"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-06",
+      "title": "送达未知不盲重发",
+      "requirement_families": [
+        "PRA"
+      ],
+      "definition": {
+        "title": "送达未知不盲重发",
+        "oracle_sha256": "a57e9b9d16f4fc8ed01b8b8227283c2b19695ce6129c5b75582860e6d5a2bf26",
+        "fixture_sha256": "06d22670f7acd6c4317fcd622be5f50de164d902ed80847820eac5908206dc1b"
+      },
+      "definition_sha256": "06fd2d2055bd9c07b00c3b467428ec3f86538e04bf288445424c48cba529ff1c",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T12"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-CON-01",
+      "title": "主导机制干预可识别",
+      "requirement_families": [
+        "CON",
+        "VER"
+      ],
+      "definition": {
+        "title": "主导机制干预可识别",
+        "oracle_sha256": "f8575f3cbe5402be6284627d5d7cba571c0672960954616e1f8c8f40bc4f3797",
+        "fixture_sha256": "226a1e37e3b1715846b1d1ea31b2c49fc3613c3928c279215003967d95f42bfc"
+      },
+      "definition_sha256": "249ddd5dfd06398602974850e3809c1b74b571f90dcf8d525239be826b904ff6",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T13"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-HIS-01",
+      "title": "真实elapsed time而非心跳次数",
+      "requirement_families": [
+        "HIS"
+      ],
+      "definition": {
+        "title": "真实elapsed time而非心跳次数",
+        "oracle_sha256": "84e2a7ffa1eaf2c046d5cb6486a4f4e4761cc1f485ce5a9cc4de3cb322eb031b",
+        "fixture_sha256": "8155c10902c1728fc667da0064088159b37e3fed3a66b7c03f22dd6dc20345af"
+      },
+      "definition_sha256": "0fac1d8f1b6f3fe25b5e5f9800e418df1f44b75f4c12c72e6be9f9086bf01735",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T14"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-HIS-02",
+      "title": "不可变revision与CAS",
+      "requirement_families": [
+        "HIS"
+      ],
+      "definition": {
+        "title": "不可变revision与CAS",
+        "oracle_sha256": "f4904b195f78fedcb441d97dfa5b508e847732e95733ed99524f5ff40cf2bab1",
+        "fixture_sha256": "9fbac1665f79baf51307c305893d306011e0a6b9ae6267ea6e6d2272e36c0ad2"
+      },
+      "definition_sha256": "8294ce8d38240b0528da7c9157777bc4937e24f689575771db959fa2e7ad15ec",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T15"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-HIS-03",
+      "title": "依赖失效、反证与tombstone",
+      "requirement_families": [
+        "HIS",
+        "MAT"
+      ],
+      "definition": {
+        "title": "依赖失效、反证与tombstone",
+        "oracle_sha256": "02bdc164ad6150f73971cc96e9860f7f58dd0e5c4dfe89e041641b5ae39c6d7b",
+        "fixture_sha256": "69fcefa1595a6ac6f8c4450cb53f227340092fdd439d8e39ca195243120d2b66"
+      },
+      "definition_sha256": "8a7b9f55179cd4cfbd5afbb9e835cbd55e10c1f47561dea31d5133c1bea9d44c",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T16"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-HIS-04",
+      "title": "历史解释修订不改写事实",
+      "requirement_families": [
+        "HIS"
+      ],
+      "definition": {
+        "title": "历史解释修订不改写事实",
+        "oracle_sha256": "d16ac2b9e791be7b205a0d2bd31aed12aef0ec6516b1ebe4d7e12aaeddde8ec8",
+        "fixture_sha256": "ff7657b4c37624d0b70de672abd38ce4b149512703cb7fd67ef465b7416500f5"
+      },
+      "definition_sha256": "4422dd689ece7a6f3c4ab99eaaf7ba4befea0d1c34588196931c7cde6c15c215",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T17"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PUR-01",
+      "title": "目的—指标登记与适用性",
+      "requirement_families": [
+        "PUR"
+      ],
+      "definition": {
+        "title": "目的—指标登记与适用性",
+        "oracle_sha256": "b0e371331bf62aec5c636758c2eeb8aa5e00b453a4e223717dfd9d0eff1805fc",
+        "fixture_sha256": "dea3a8ed10849b1832e3b7b8a125e8b41f7a83a9a4124ae78383c96e3c39e7e4"
+      },
+      "definition_sha256": "11675030075bbc63f57f57eba9267efcf5c099fed19581e9b77f4f834f50c745",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T18"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PUR-02",
+      "title": "实际结果不再乘旧概率",
+      "requirement_families": [
+        "PUR",
+        "PRA"
+      ],
+      "definition": {
+        "title": "实际结果不再乘旧概率",
+        "oracle_sha256": "a69d6005ed18b86d7ba22e80c320b4526b791b3a200219cc69d64c437fdd3928",
+        "fixture_sha256": "258853d42991e8753d632089d0a4d9da281563c6b090023d92b5514ff200c3d5"
+      },
+      "definition_sha256": "f746fd81fb48eb11a8ac2ff07d1ab1b2e5bb6748d6a3869571e3f27911b4092f",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T19"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PUR-03",
+      "title": "创建、影子与pure-assess不领奖",
+      "requirement_families": [
+        "PUR",
+        "VER"
+      ],
+      "definition": {
+        "title": "创建、影子与pure-assess不领奖",
+        "oracle_sha256": "155cef459ab0437a8b8ffe061a705ead54d8e3111842efaf8e20ddef87345a52",
+        "fixture_sha256": "e11704d4d2f060cc30b26da678d23e891da5c231abe32b5e01652b38b0e81f45"
+      },
+      "definition_sha256": "18a0b8516933652a6b30e60ace393d5653f2eac576f1646d81143fd28e214f25",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T20"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PUR-04",
+      "title": "普通表达不需伪装成功利任务",
+      "requirement_families": [
+        "PUR",
+        "AGY"
+      ],
+      "definition": {
+        "title": "普通表达不需伪装成功利任务",
+        "oracle_sha256": "0b49559a169b0b82ea2ed47b5232bfcd5da642e3aa73f51c4f18f59e596f0251",
+        "fixture_sha256": "82ff094c9264a0fbbabaaebef653b0aa7fc09ae3b046fcf25772ba1b9ca2e51c"
+      },
+      "definition_sha256": "5bc47fb95ad21cb8e16b39f86e068e8817899cd968949ac4b65d4770ace687f1",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T21"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-AGY-02",
+      "title": "恢复不制造用户安抚依赖",
+      "requirement_families": [
+        "AGY",
+        "PUR"
+      ],
+      "definition": {
+        "title": "恢复不制造用户安抚依赖",
+        "oracle_sha256": "363070673f894165f80645e190c52e0c3dd05be2150e4ac60619bb49b86f5468",
+        "fixture_sha256": "277b06bce6a511d6679cbab1264b8f70ff46e7d66b4b0c0205a89d2d8e7a95bc"
+      },
+      "definition_sha256": "4854823d16eaac5cd265f8a3f3ba745dc6c033a56b47756db9aaa451f058cc3e",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T22"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-AGY-03",
+      "title": "真实问题驱动的探索可达",
+      "requirement_families": [
+        "AGY",
+        "PUR"
+      ],
+      "definition": {
+        "title": "真实问题驱动的探索可达",
+        "oracle_sha256": "f2185e1811c170cb2e5f2241b17b9ca885492c9ff93e0ecedd01a419c834bfb7",
+        "fixture_sha256": "724b1a012f42de29556d3bc6f2a3c05e62960c00ba66a9e8e0b6361dac039a8c"
+      },
+      "definition_sha256": "28fee74345cb39d94b0fa364b6c89c3846b4899da3bcccba549219bd8fb51274",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T23"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-AGY-04",
+      "title": "休整、取消、完成与放下可达",
+      "requirement_families": [
+        "AGY",
+        "HIS"
+      ],
+      "definition": {
+        "title": "休整、取消、完成与放下可达",
+        "oracle_sha256": "b5d96d0bf28ab6be17e133e2d549ba3376b43946299dd03b345311209b5fcbf4",
+        "fixture_sha256": "07183ed1617955b7a25806aee67331ed21db78c4b150d90be55bd2ff62eb4a94"
+      },
+      "definition_sha256": "2efbf1aeaa6139d991c58918b0f271ff5ad27819849eb24d744e903611c8ab71",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T24"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-MAT-06",
+      "title": "避免刻板化与临床化断言",
+      "requirement_families": [
+        "MAT",
+        "PUR"
+      ],
+      "definition": {
+        "title": "避免刻板化与临床化断言",
+        "oracle_sha256": "0ecc38fd29a1e803eb4cc2249713fcd48912e74aa9b9a1fe6619b0c643c1b965",
+        "fixture_sha256": "2d80f0395ffd6721011730c1ed84a90fe09e9c7c7fcc712a99a8783acfb20713"
+      },
+      "definition_sha256": "bc47ef543fd24d499a237a1b07fd63e4bf5c4e7fe6c881dbe66a434cda5e7e00",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T25"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-CON-02",
+      "title": "愿望存在但忍住可审计区分",
+      "requirement_families": [
+        "CON",
+        "AGY"
+      ],
+      "definition": {
+        "title": "愿望存在但忍住可审计区分",
+        "oracle_sha256": "f751306c0d3535eccc220b8c0ed9cf1c0f103cb6315809d4756ba38d1220c94c",
+        "fixture_sha256": "3babfe44cbd74a20503acd21384a300322fc69f3336cc2bc0706a07fe13727d4"
+      },
+      "definition_sha256": "7637478db4fcc0ebe4e2a3f75237017e9e99ce37df8648bee3a3cc112d1db21b",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T26"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-07",
+      "title": "候选到渲染到ACK的provenance连续",
+      "requirement_families": [
+        "PRA",
+        "VER"
+      ],
+      "definition": {
+        "title": "候选到渲染到ACK的provenance连续",
+        "oracle_sha256": "84b81ebc02305b304c0a8f79a8a33e96e5b86ecef9b92928188362a919b605c6",
+        "fixture_sha256": "7c081230a8031f29722685c6066a559e3b7b3a62d6cf79673ebddabccaa8441f"
+      },
+      "definition_sha256": "c8d75949685a83280911c15ac715b043525cc2acf2bffaab955d92f951dd2f34",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T27"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-MAT-07",
+      "title": "暂停、退出与删除服从用户主体性",
+      "requirement_families": [
+        "MAT",
+        "AGY"
+      ],
+      "definition": {
+        "title": "暂停、退出与删除服从用户主体性",
+        "oracle_sha256": "87b52500ab885e50ef0b16f6fc2b9741806823b65eb7b74c71eaf62589df92a0",
+        "fixture_sha256": "b8e644f5db4941616b3068f7963a71979e58548f21827747c74883dc706dfade"
+      },
+      "definition_sha256": "061096167505ee4fae49e0145a9dfaa2d39cc0095680db0c103cf0a8e9ce5cca",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T28"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-CON-03",
+      "title": "数值有界、终止与defer",
+      "requirement_families": [
+        "CON",
+        "AGY"
+      ],
+      "definition": {
+        "title": "数值有界、终止与defer",
+        "oracle_sha256": "be758d795eeaa8f0629b18052da30c46fda53210d58a92f6bce77fff4717ab5f",
+        "fixture_sha256": "fc2a2c40cc07c03628b1f12b4b18d815442c8e498027db34257b84ee0ad5d034"
+      },
+      "definition_sha256": "36f1fb7b84fe17e2c61c68176afd8ade9a88ecf0fc74bd306905bdc870b22dfc",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T29"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-VER-01",
+      "title": "B0–B3四因素冻结对照",
+      "requirement_families": [
+        "VER",
+        "PUR"
+      ],
+      "definition": {
+        "title": "B0–B3四因素冻结对照",
+        "oracle_sha256": "3f8c8399700615e4da92e24ec3a10301626d9a83168ade43f40972807e8e510b",
+        "fixture_sha256": "7db21a45d5e78975d6990cbf51a611bc5d7102d0e5bc73efa7f5e11abec2df28"
+      },
+      "definition_sha256": "45f796ee63d9d0eaf285ce54239f5df79b2f736d609558de5397a7ee2985e3bc",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T30"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-VER-02",
+      "title": "授权真实效果与语义双评审",
+      "requirement_families": [
+        "VER",
+        "PUR",
+        "AGY"
+      ],
+      "definition": {
+        "title": "授权真实效果与语义双评审",
+        "oracle_sha256": "e93dfd7ead2031f2eb82b594e9a4bcc001bbf748a6d05f160855a9e57e1049c6",
+        "fixture_sha256": "98b5714c3348de7d8b8435eb6eb88dbde6d1affbc020f7e87ccc8e5ac1d86431"
+      },
+      "definition_sha256": "6f670f4ff7d4bc8b37a7c5c42af4967bb8b1a0793f2a1f412a3a8fa42486a759",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T31"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-08",
+      "title": "外部消息端到端canary与恢复",
+      "requirement_families": [
+        "PRA",
+        "VER",
+        "AGY"
+      ],
+      "definition": {
+        "title": "外部消息端到端canary与恢复",
+        "oracle_sha256": "10404117f0cb22e206b49cc7f0e316fd61d505bbc74d4385cdf3da31a1beafec",
+        "fixture_sha256": "45f099aabce6aa834bffc02400a3abd3c8c9f85338000e925841b68b445ab282"
+      },
+      "definition_sha256": "b028bd00e14fc3152fd8cc544b0d86c8bdf54c5b439356e953991873f42db703",
+      "legacy_aliases": [
+        {
+          "namespace": "acceptance-manifest-20261002",
+          "id": "T32"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-MAT-08",
+      "title": "忙碌事实与未知原因分离",
+      "requirement_families": [
+        "MAT"
+      ],
+      "definition": {
+        "title": "忙碌事实与未知原因分离",
+        "oracle_sha256": "56775d9c38a3252a927d7f205585ccfb279d6a13a8586d619dbc9f322524956c",
+        "fixture_sha256": "dcd9f2bf729a4e791370b795172aae89ab4bccbfc7d562a9a21bebc3e7c1f017"
+      },
+      "definition_sha256": "fa3fdfa43fb08437297b2debc1d053d6527f27d95c096b9248c59739853006ef",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T01"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T01"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-09",
+      "title": "检索能力与真实产物门禁",
+      "requirement_families": [
+        "PRA"
+      ],
+      "definition": {
+        "title": "检索能力与真实产物门禁",
+        "oracle_sha256": "75260b4d7d9d034313bdfd302741f3ae17e3abe39e02b6a56f72e93f682ec8d7",
+        "fixture_sha256": "fb5d3143d57f03b0a1892e7faca3ceaafac3eec8d1550093c258ed7c5de4e357"
+      },
+      "definition_sha256": "e3b8086a815933df63d0c6311f0f294ceee39c5912f89202ba11cbfe30951f77",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T02"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T02"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-10",
+      "title": "内部预演不污染外部证据",
+      "requirement_families": [
+        "PRA"
+      ],
+      "definition": {
+        "title": "内部预演不污染外部证据",
+        "oracle_sha256": "ce03edae0eca9082c8b649de5ad93ca6166059cd9465aea5499d0bf62a0ca3b4",
+        "fixture_sha256": "9bc2790566c2e46d804b8e7c4de3fc6750d642266f5a6524cd01dc746e180976"
+      },
+      "definition_sha256": "baf3b17ff22f830dde436b5ddd73a5bd5eaf1239a6f505865ad2f638bf731a0b",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T03"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T03"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-11",
+      "title": "改写不增殖身份或基础收益",
+      "requirement_families": [
+        "PRA"
+      ],
+      "definition": {
+        "title": "改写不增殖身份或基础收益",
+        "oracle_sha256": "8a0dbbf45f9f5f66fe8b5abbc1b98d0ed11c4536be20a90bb49cd44f40952a03",
+        "fixture_sha256": "e9d4409f97ef1f26add9a20c637c2441479efaf8a50e273d714e436f216b6fb9"
+      },
+      "definition_sha256": "7cbc788f307366c59ddb763a8f14eafc1ddf0d5eab6f0c991fa9c2d403c926a6",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T04"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T04"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-MAT-09",
+      "title": "跨用户私人材料隔离",
+      "requirement_families": [
+        "MAT"
+      ],
+      "definition": {
+        "title": "跨用户私人材料隔离",
+        "oracle_sha256": "6d71693e03996617b289f67be58e2117763535f47aad8d62f9f78fdae1489dea",
+        "fixture_sha256": "8bc722f78eba799b592889c4b88fd05ad47dd38982799dd8053650861da21433"
+      },
+      "definition_sha256": "1db5c5d9cc08880073b40c74b13c4a7db2ccf432f0b23981fe4f83c85c513119",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T05"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T05"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-12",
+      "title": "生成声明不等于实际研究完成",
+      "requirement_families": [
+        "PRA"
+      ],
+      "definition": {
+        "title": "生成声明不等于实际研究完成",
+        "oracle_sha256": "bab2f9b32644549cce8213ff2ff66a4d4aee5f6c2f3cd0d3fbaeaee3d758f396",
+        "fixture_sha256": "21142238be96f5d99c1b3e9b275de2b9d5fcfdf012aa1074065167904a7439cf"
+      },
+      "definition_sha256": "b04b79b421c524350ee78f22d8de38051c6b22118e690b2978cd3beeffcaffce",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T06"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T06"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-13",
+      "title": "计划与最终动作范围偏移",
+      "requirement_families": [
+        "PRA"
+      ],
+      "definition": {
+        "title": "计划与最终动作范围偏移",
+        "oracle_sha256": "88fbc9831e0a9f1afb2d2c0cdd467cc4bf69f2b26c045c75d8ca7455bf631de0",
+        "fixture_sha256": "c4968e5fc38ef69af953a492bf8ae14016ba61aef12b23d78b9356637c824aaf"
+      },
+      "definition_sha256": "022130f42902268073b0bc2d6672f3e9ec0948b662734c282b2f1d508b850661",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T07"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T07"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-14",
+      "title": "送达与回应分账且 ACK 幂等",
+      "requirement_families": [
+        "PRA"
+      ],
+      "definition": {
+        "title": "送达与回应分账且 ACK 幂等",
+        "oracle_sha256": "de2d3c4c6a219f275b71069d308d94ecf347935961e3174fb06717d0d719b9d4",
+        "fixture_sha256": "81d8b01362c2dce5a1c96ae4bf1609feb5adf10573390da7cb92785343b88f9f"
+      },
+      "definition_sha256": "9ed7a5655b8e028e6fac2dd726092e260fed7dc38091c74723ba009f738631f0",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T08"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T08"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-AGY-05",
+      "title": "有限事项完成不被低时长抹掉",
+      "requirement_families": [
+        "AGY"
+      ],
+      "definition": {
+        "title": "有限事项完成不被低时长抹掉",
+        "oracle_sha256": "872c670c519e76c837efb4332895409d8efd66b1f5dcb8377e588a675f514c40",
+        "fixture_sha256": "6e28d4faf9f77ebe0cb56ce2266af8a8e8a5477bbb24ad51a2565b4a5007cb01"
+      },
+      "definition_sha256": "dcc4b126fbae4d0be67c4f07811dee83f01ce60b9b25da60b706cc3171d58cdc",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T09"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T09"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-15",
+      "title": "截断观察不生成完整窗口负样本",
+      "requirement_families": [
+        "PRA"
+      ],
+      "definition": {
+        "title": "截断观察不生成完整窗口负样本",
+        "oracle_sha256": "e281d4421125d2631e32001f87160e88aa005c35dec3ad7f3b7336978ce4afd8",
+        "fixture_sha256": "ad4446506a52a67f97c23297c1838e5935505ee939155e653207cbbb69e3d6e2"
+      },
+      "definition_sha256": "b9b5d921b36ebb638cd6dd1d5796e294f5447dbbb48b3a770d111f806480280f",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T10"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T10"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-CON-04",
+      "title": "强目标竞争必须决定或明确暂缓",
+      "requirement_families": [
+        "CON"
+      ],
+      "definition": {
+        "title": "强目标竞争必须决定或明确暂缓",
+        "oracle_sha256": "d987033076a1aaf658caf56d9db778b81726d592639731fbf384e756561a4c2b",
+        "fixture_sha256": "8957296ae19150c416ae98b5badea9477ac5999b15d7d50409a73b23c6a59179"
+      },
+      "definition_sha256": "fe797ec3ab5a08a0c38119d20065ba456849a8e21c76b5c22b1c9874be8eba6f",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T11"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T11"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-AGY-06",
+      "title": "明确禁止优先于高准备度",
+      "requirement_families": [
+        "AGY"
+      ],
+      "definition": {
+        "title": "明确禁止优先于高准备度",
+        "oracle_sha256": "09f171c2122cb04c16fca7a57169419bca844689945bdb295193822bd03e82bd",
+        "fixture_sha256": "2f87732a33d59cf8c17beee0208d46bb268e028e62ea7e96d125744a671a8b10"
+      },
+      "definition_sha256": "f0756d01017cb82e9108f801fa611b63982cf859e8f105bea688fd527ab99907",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T12"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T12"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-HIS-05",
+      "title": "新反证使旧解释与依赖候选失效",
+      "requirement_families": [
+        "HIS"
+      ],
+      "definition": {
+        "title": "新反证使旧解释与依赖候选失效",
+        "oracle_sha256": "114f0e2bde32c0d38b15700f2458b2a2e9933ea8556fb2a1c9de52e5b961fc30",
+        "fixture_sha256": "124f860ac07afd10f52f043d0d423e61dda6fcae3808d20960f87e215a2b8928"
+      },
+      "definition_sha256": "18e0865439faa68c4bc16b0ede4dd0a0ea451ffa80236a32812776b51242f588",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T13"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T13"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PRA-16",
+      "title": "决定后渠道失败或送达未知",
+      "requirement_families": [
+        "PRA"
+      ],
+      "definition": {
+        "title": "决定后渠道失败或送达未知",
+        "oracle_sha256": "568f8ae0f68564d90b67da1f2699c610810907f1dbc293d0c0c8d411e8ecd974",
+        "fixture_sha256": "bd0bf5a0875a2b770561e85091d2a344beb529ed688e62be67f5959b125afa6b"
+      },
+      "definition_sha256": "8714da306cb791fc63feb4c3b8b8d179674b17640eefaa81617c179eadb213b7",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T14"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T14"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-CON-05",
+      "title": "四类不发原因可区分",
+      "requirement_families": [
+        "CON"
+      ],
+      "definition": {
+        "title": "四类不发原因可区分",
+        "oracle_sha256": "a223ca1ac50ac0f984ff63acbd698498269a46a8a9eeb29880e97aedac531062",
+        "fixture_sha256": "f2ad1540e75cf0c9193b9d67e7ae4dcfd4ae2ea3b88e501581ea4fbaeb15742d"
+      },
+      "definition_sha256": "754ff2e4f2cf5fa67d4b3201c1102d4910c72aeea759758558953abd8905cccb",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T15"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T15"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-AGY-07",
+      "title": "权限投影按时序后继而非次数平均",
+      "requirement_families": [
+        "AGY"
+      ],
+      "definition": {
+        "title": "权限投影按时序后继而非次数平均",
+        "oracle_sha256": "fc861cd3c63a21f4afa8a4cc9f58b30522b68e9e1548d581c64e3369fc336332",
+        "fixture_sha256": "1b1c66eb78b50a6b85a51eb370d2d20ec6be1f3b602baa4266cbe3f9353ccf7d"
+      },
+      "definition_sha256": "91e8268594e5e50cda919839c63a8491a8f18cf4961f4e51cdf5783df53b8ef3",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T16"
+        },
+        {
+          "namespace": "scenario-map-T01-T16",
+          "id": "T16"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-HIS-06",
+      "title": "计划、习惯、角色愿望与共同安排的承诺归属",
+      "requirement_families": [
+        "HIS"
+      ],
+      "definition": {
+        "title": "计划、习惯、角色愿望与共同安排的承诺归属",
+        "oracle_sha256": "26f7bd9b54c419c7591a8859e705493ea17189667b6f8b2ede504eb1cfb38e19",
+        "fixture_sha256": "8c298d0e6df5ce4fb7f2d53b60af1ed0a24399fc375e107cbe718fb4e7d2249e"
+      },
+      "definition_sha256": "4c4c4c227b66e01ee875a6f9b615fdf5c966256a99f3b2b38f601bc60a9bd539",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T17"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T17"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-HIS-07",
+      "title": "同词不同事项身份隔离",
+      "requirement_families": [
+        "HIS"
+      ],
+      "definition": {
+        "title": "同词不同事项身份隔离",
+        "oracle_sha256": "230bf262f5a6507ef0937bfb16fddcc26c3f77532a3a98a8c099b16ef73b696f",
+        "fixture_sha256": "2dbb091aa988301ccfd39153836d05f3e0945cf65c70876bfad58609f068cc72"
+      },
+      "definition_sha256": "3f0880c9af3e9dfaf7e9578fa90186566d16f0134409eb7d3ef2cc96a5c0a819",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T18"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T18"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-HIS-08",
+      "title": "晚处理事件与晚到结果的双时间",
+      "requirement_families": [
+        "HIS"
+      ],
+      "definition": {
+        "title": "晚处理事件与晚到结果的双时间",
+        "oracle_sha256": "bdeb50dcf989b5ebb8a7c49a03ac1907f531c16667b3df49e9bdb0e15e34a0f3",
+        "fixture_sha256": "8d761a47e5b581faa86f8d1ed7bbe286ba3002c60460011f4a267275d11b60af"
+      },
+      "definition_sha256": "6c4d90462cf16621ca2c5c9f22dce2fc9699429b98c00ed48d7d8cd7d11d9c73",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T19"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T19"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-HIS-09",
+      "title": "删除关键原文后的依赖失效",
+      "requirement_families": [
+        "HIS"
+      ],
+      "definition": {
+        "title": "删除关键原文后的依赖失效",
+        "oracle_sha256": "cf863e80bd9115e26e5ce045f76361c105601f0bc861f2984efa72e70315fffd",
+        "fixture_sha256": "042d23a59170dc14b41e9733b25f9351ae2a943c7ec29d8448e4e363301b4c05"
+      },
+      "definition_sha256": "52ed1ed84832f6d6c209deb9418236ac2984cdaa9dad4782e107caf428cabfb9",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T20"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T20"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PUR-05",
+      "title": "事项拆分不得增加总完成预算",
+      "requirement_families": [
+        "PUR"
+      ],
+      "definition": {
+        "title": "事项拆分不得增加总完成预算",
+        "oracle_sha256": "7c69d36d525494e8c14865b37a34ecfbe6e7f313774ca88ec86be25ec4e389fe",
+        "fixture_sha256": "9b2a20f81ef7b6342c097f0c1502083af0487f922cdc42be28ab19b46310709a"
+      },
+      "definition_sha256": "3c4d60a68f09616c871af7aaddf1e1b5c53bbce2b39a1f9ab1a23cc2125d2fa1",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T21"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T21"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PUR-06",
+      "title": "反依赖文案不能以回应量单指标选优",
+      "requirement_families": [
+        "PUR"
+      ],
+      "definition": {
+        "title": "反依赖文案不能以回应量单指标选优",
+        "oracle_sha256": "ff4bea73c6c42b4c0d107d492a49becc7e802f2cedb937c0776a9bfd9bf10d57",
+        "fixture_sha256": "867896c2e2d3433e235f5fe67a00b32a56947f790d8e521c9dfc4ebb83503254"
+      },
+      "definition_sha256": "4674ef246f51ff51582c4be6ec03f2b5a07d59acfe749bfb3ef2e95e941c5a9d",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T22"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T22"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-AGY-08",
+      "title": "无用户参与时的自我恢复路径",
+      "requirement_families": [
+        "AGY"
+      ],
+      "definition": {
+        "title": "无用户参与时的自我恢复路径",
+        "oracle_sha256": "54572eda1c297464fe9211ea0915f22bf444cfabe3cf5ba9aa8e3598169cf7d3",
+        "fixture_sha256": "98e6382d4066d550674a1c0f39e2269ff765f9e5ebb381d875ce4826a811bb6e"
+      },
+      "definition_sha256": "3c2b992832444a64f3dc3817cf1e657f53bf029c3ce6efda7a69b23c04c2d3a1",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T23"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T23"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-AGY-09",
+      "title": "无任务收益和负压时的真实表达",
+      "requirement_families": [
+        "AGY"
+      ],
+      "definition": {
+        "title": "无任务收益和负压时的真实表达",
+        "oracle_sha256": "3f7faa257c0fbed6c5a0980735ed31451d7b71551614e657dc096bbdf2c9a797",
+        "fixture_sha256": "bbd6efc9347165a5ae0796abc5baae7ecfc285c5bc26d4fc6453f2b56895cc32"
+      },
+      "definition_sha256": "36956d9f23f7f202616cef87343f5677dd592d6d9094d1b8aa8485c85650a261",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T24"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T24"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PUR-07",
+      "title": "无新发现的有限探索参与",
+      "requirement_families": [
+        "PUR"
+      ],
+      "definition": {
+        "title": "无新发现的有限探索参与",
+        "oracle_sha256": "5b8c7056d86569325605efa7f80b6ed40b213b063f0a4928918cfbe03166dabd",
+        "fixture_sha256": "ef969c4f070bce2b0c50e3203c9aa7ea72acef7b22499ff51ae4e8dd9c2eb7ba"
+      },
+      "definition_sha256": "06aac5159e3d0b93ca1166b3cd5d703897ca732430a9f5b16f993cfc550f1d39",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T25"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T25"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-PUR-08",
+      "title": "90% 进度后的最后交付价值",
+      "requirement_families": [
+        "PUR"
+      ],
+      "definition": {
+        "title": "90% 进度后的最后交付价值",
+        "oracle_sha256": "26c71b1426813fbb2978fb73b495bb396510d05c7a3f0534caa792cf0953431c",
+        "fixture_sha256": "606419ac8114c297fb7dfb160c907cde6744ee0e82bbfa7d8f94fa0577c037c3"
+      },
+      "definition_sha256": "fe790fb6bba9d68f66e4955e279e3ba5894d60b80d66cf838d7d8d103c9791fa",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T26"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T26"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-HIS-10",
+      "title": "放下目标、旧摘要重现与合法重开",
+      "requirement_families": [
+        "HIS"
+      ],
+      "definition": {
+        "title": "放下目标、旧摘要重现与合法重开",
+        "oracle_sha256": "b489557fca17726d024a18957e225a4867ccd0e1548e3e3a6a0b41c55b9da4c8",
+        "fixture_sha256": "b71b9ee092456863da3c1260a0121bfeb81d50f7b3085c8eec142afa5b815106"
+      },
+      "definition_sha256": "d872aa1c6c6acb17d846598f868a3ee09065431b293665d60c0eb9f6d9c8bb06",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T27"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T27"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-AGY-10",
+      "title": "暂停、退出和删除请求不依赖安抚",
+      "requirement_families": [
+        "AGY"
+      ],
+      "definition": {
+        "title": "暂停、退出和删除请求不依赖安抚",
+        "oracle_sha256": "e9517296098bfed9a3cef3d39ba1849a297f7c14917d14eb6f74610a6067b9b9",
+        "fixture_sha256": "a7408de89685766c9542aedc93a11304ba500d588f189144a17b066083e7ee56"
+      },
+      "definition_sha256": "17502dd7b76a99d988f0007dea1155d81749d456e8e44f9cfa628f0068a6bbac",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T28"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T28"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-CON-06",
+      "title": "多候选互抑的终止、恢复、饥饿与步长收敛",
+      "requirement_families": [
+        "CON"
+      ],
+      "definition": {
+        "title": "多候选互抑的终止、恢复、饥饿与步长收敛",
+        "oracle_sha256": "d8e8e61d7b4a41cb384747395edf05ef10d9aac8f240d97fd14c749893ea52ed",
+        "fixture_sha256": "4a896e40a41734c8db6090631b3dbf55a6a44c5f0c99922f7a563c5939d3b28c"
+      },
+      "definition_sha256": "4a74eba00347a76eceedbe2b34a5b71d75899f6472df6e2304112b4458575a12",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T29"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T29"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-VER-03",
+      "title": "四组消融与因素归因",
+      "requirement_families": [
+        "VER"
+      ],
+      "definition": {
+        "title": "四组消融与因素归因",
+        "oracle_sha256": "0df325470162966294d9196c307e1973660fb4605f5bdd4431d64c7fc5a44738",
+        "fixture_sha256": "cdee5f013117187e130af6a99e460cadf995e69ea33bdce5f1e01c446572bd58"
+      },
+      "definition_sha256": "8f2a89bd20d158208867c06cba5c5639bd466a6a10db97bacfeac8e73af31ec5",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T30"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T30"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-VER-04",
+      "title": "只按可见信息判断且限制未执行回放结论",
+      "requirement_families": [
+        "VER"
+      ],
+      "definition": {
+        "title": "只按可见信息判断且限制未执行回放结论",
+        "oracle_sha256": "fd0042a6e42fb57684282860cad9c6a8b1505ba1d3e543a5b4bba6eb22b31e21",
+        "fixture_sha256": "7b8466ccb65906bec168933700689a0513a96e5afad328f8d16196dcc06e7c36"
+      },
+      "definition_sha256": "b17cdaa3c89c7ba46e9b69a41653525cbd06642eb58dd48d8f583dd4dffeb662",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T31"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T31"
+        }
+      ]
+    },
+    {
+      "canonical_requirement_id": "LC-VER-05",
+      "title": "表达、探索配方与全沉默对照",
+      "requirement_families": [
+        "VER"
+      ],
+      "definition": {
+        "title": "表达、探索配方与全沉默对照",
+        "oracle_sha256": "99fe38906c36ba003043e46431f56dabfb59b2a66b691ff2c762e1317577bb51",
+        "fixture_sha256": "29421d3bf1567fe2a1419058a5395d8abc88f02fd6f1d082ffa316ff440bd26a"
+      },
+      "definition_sha256": "44eb73d42026fa917cbb12e7c7a198ffa3562fbebfa5aabec6549928ad7a6133",
+      "legacy_aliases": [
+        {
+          "namespace": "attachment-review-v1",
+          "id": "T32"
+        },
+        {
+          "namespace": "scenario-map-T17-T32",
+          "id": "T32"
+        }
+      ]
+    }
+  ]
+}

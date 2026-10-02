@@ -216,6 +216,7 @@ class LangchaoShadowService:
         utility_scale: float = 1.0,
         tie_break_order: tuple[str, ...] = (),
         before_commit: Callable[[ShadowRunResult, BuiltShadowRound, Any], Any] | None = None,
+        expected_authority_revision: int | None = None,
     ) -> ShadowRunResult:
         if not isinstance(built, BuiltShadowRound):
             raise TypeError("built must be BuiltShadowRound")
@@ -225,6 +226,13 @@ class LangchaoShadowService:
             raise ValueError("built shadow round has no admitted candidates")
 
         authority = self._validate_authority(self.authority_reader.get_active())
+        if (
+            expected_authority_revision is not None
+            and authority.revision != expected_authority_revision
+        ):
+            raise LangchaoShadowAuthorityError(
+                "active authority revision changed before shadow audit"
+            )
         if before_commit is not None and not self._allow_live_evaluation:
             raise LangchaoShadowAuthorityError(
                 "before_commit requires an explicit live-evaluation capability"

@@ -190,6 +190,7 @@ class V2WireSendAck:
     sent: bool
     action: Mapping[str, Any]
     context_provider: Callable[[], Mapping[str, Any]]
+    actual_action_witness: Mapping[str, Any] | None = None
     source_event_ids: tuple[str, ...] = ()
 
 
@@ -1397,7 +1398,14 @@ def _apply_action_report(
         if action_type == ACTION_RENDER:
             text = _text(result.get("text")).strip() if status == STATUS_OK else ""
             if text:
-                render = runtime.reducer.complete_render(outbox_id=action_id, text=text, now=now)
+                render = runtime.reducer.complete_render(
+                    outbox_id=action_id,
+                    text=text,
+                    now=now,
+                    render_metadata=_mapping(result.get("render_metadata")),
+                    semantic_review=_mapping(result.get("semantic_review")),
+                    reauthorized=_flag(result.get("reauthorized"), False),
+                )
                 state = render.state
                 if render.outbox_id:
                     extra["send_outbox_id"] = render.outbox_id
@@ -1494,6 +1502,9 @@ def _apply_action_report(
                             sent=sent,
                             action=_v2_action(runtime, row),
                             context_provider=_v2_context_provider(runtime),
+                            actual_action_witness=_mapping(
+                                _mapping(getattr(row, "payload", None)).get("actual_action_witness")
+                            ),
                         ),
                         confirmed=True,
                     )

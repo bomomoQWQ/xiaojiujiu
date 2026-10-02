@@ -10,6 +10,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from .langchao_outcome_repository import LangchaoOutcomeRepository
 from .langchao_types import MotivationDirection, OutcomeStatus, OutcomeToken, SettlementType
+from .user_model_v2_service import canonical_exposure_id
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -71,6 +72,34 @@ class LangchaoLiveRepository:
             (self.scope_key, round_id),
         ).fetchone()
         return None if row is None else self._decode(row)
+
+    def get_by_attempt(self, exposure_id: str) -> LangchaoLiveCommit | None:
+        """Resolve a v2 exposure to the exact Langchao attempt in this scope."""
+        rows = self.connection.execute(
+            """SELECT scope_key,round_id,langchao_candidate_id,candidate_revision,
+                      source_candidate_id,reward_contract_id,reward_revision,snapshot,
+                      attempt_id,render_outbox_id,claim_id,committed_at,terminal_ack_id,terminal_ack_kind
+               FROM langchao_live_commits
+               WHERE scope_key=%s AND terminal_ack_kind='sent'""",
+            (self.scope_key,),
+        ).fetchall()
+        matches = tuple(
+            self._decode(row) for row in rows
+            if canonical_exposure_id(self.scope_key, str(row["attempt_id"] if isinstance(row, Mapping) else row[8]))
+            == exposure_id
+        )
+        if len(matches) > 1:
+            raise RuntimeError("multiple Langchao attempts resolve to one exposure")
+        return matches[0] if matches else None
+
+    def label_revision(self, *, exposure_id: str, target_name: str) -> int | None:
+        row = self.connection.execute(
+            """SELECT a.pointer_version
+               FROM user_model_active_labels_v2 AS a
+               WHERE a.scope_key=%s AND a.exposure_id=%s AND a.target_name=%s""",
+            (self.scope_key, exposure_id, target_name),
+        ).fetchone()
+        return None if row is None else int(row["revision"] if isinstance(row, Mapping) else row[0])
 
     def pending(self) -> tuple[LangchaoLiveCommit, ...]:
         rows = self.connection.execute(

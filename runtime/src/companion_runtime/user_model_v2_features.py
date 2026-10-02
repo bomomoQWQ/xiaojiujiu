@@ -230,6 +230,11 @@ def encode_features_v2(
 
     if not isinstance(action, Mapping) or not isinstance(context, Mapping):
         raise TypeError("action and context must be mappings")
+    # v21 actual-action text metadata is post-treatment: it is persisted for audit and
+    # training attribution, but the shared prediction encoder must not consume it.
+    forbidden = {"actual_action_witness", "rendered_text", "rendered_text_sha256"}
+    if any(name in V2_FEATURE_NAMES for name in forbidden):  # defensive future-version guard
+        raise RuntimeError("post-treatment actual-action metadata cannot be prediction features")
     if spec.names != V2_FEATURE_NAMES or spec.version != USER_MODEL_V2_FEATURE_VERSION:
         raise ValueError("encode_features_v2 only supports the declared default v2 feature spec")
 

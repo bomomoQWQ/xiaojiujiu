@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import re
 
+from companion_runtime.capability_witness_schema import CAPABILITY_WITNESS_SCHEMA_V22_STATEMENTS
 from companion_runtime.langchao_social_schema import LANGCHAO_SOCIAL_SCHEMA_STATEMENTS
+from companion_runtime.langchao_user_outcome_schema import LANGCHAO_USER_OUTCOME_SCHEMA_V23_STATEMENTS
+from companion_runtime.privacy_deletion_schema import PRIVACY_DELETION_SCHEMA_V21_STATEMENTS
 from companion_runtime.runtime_core_v2_schema import CORE_SCHEMA_STATEMENTS
 from companion_runtime.user_model_v2_schema import (
     MIGRATIONS,
@@ -91,9 +94,9 @@ def test_idempotency_and_single_active_parameter_constraints_are_explicit() -> N
 
 
 def test_migration_versions_and_statement_order_are_stable() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 20
+    assert USER_MODEL_SCHEMA_VERSION == 23
     assert isinstance(MIGRATIONS, tuple)
-    assert tuple(version for version, _statements in MIGRATIONS) == tuple(range(1, 21))
+    assert tuple(version for version, _statements in MIGRATIONS) == tuple(range(1, 24))
     assert all(isinstance(statements, tuple) for _version, statements in MIGRATIONS)
     assert schema_statements() == tuple(
         statement for _version, statements in MIGRATIONS for statement in statements
@@ -157,6 +160,21 @@ def test_migration_versions_and_statement_order_are_stable() -> None:
             if re.search(r"CREATE TABLE IF NOT EXISTS", statement, re.IGNORECASE)
         )
         + ("live_dispatch_claims", "langchao_live_commits")
+        + tuple(
+            re.search(r"CREATE TABLE IF NOT EXISTS\s+([a-z0-9_]+)", statement, re.IGNORECASE).group(1)
+            for statement in PRIVACY_DELETION_SCHEMA_V21_STATEMENTS
+            if re.search(r"CREATE TABLE IF NOT EXISTS", statement, re.IGNORECASE)
+        )
+        + tuple(
+            re.search(r"CREATE TABLE IF NOT EXISTS\s+([a-z0-9_]+)", statement, re.IGNORECASE).group(1)
+            for statement in CAPABILITY_WITNESS_SCHEMA_V22_STATEMENTS
+            if re.search(r"CREATE TABLE IF NOT EXISTS", statement, re.IGNORECASE)
+        )
+        + tuple(
+            re.search(r"CREATE TABLE IF NOT EXISTS\s+([a-z0-9_]+)", statement, re.IGNORECASE).group(1)
+            for statement in LANGCHAO_USER_OUTCOME_SCHEMA_V23_STATEMENTS
+            if re.search(r"CREATE TABLE IF NOT EXISTS", statement, re.IGNORECASE)
+        )
     )
 
 

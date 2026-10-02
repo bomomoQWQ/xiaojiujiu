@@ -54,11 +54,11 @@ def run(*, plan_path: Path, output_path: Path, timeout_seconds: int, scenario_id
     if not isinstance(registered, list):
         raise ValueError("plan.scenarios must be a list")
     expected_ids = tuple(plan.get("scenario_ids", ()))
-    actual_ids = tuple(item.get("id") for item in registered)
+    actual_ids = tuple(item.get("canonical_requirement_id") for item in registered)
     if actual_ids != expected_ids or len(set(actual_ids)) != len(actual_ids):
-        raise ValueError("plan scenarios must occur exactly once in scenario_ids order")
+        raise ValueError("plan scenarios must occur exactly once in canonical scenario_ids order")
 
-    selected = [item for item in registered if scenario_ids is None or item["id"] in scenario_ids]
+    selected = [item for item in registered if scenario_ids is None or item["canonical_requirement_id"] in scenario_ids]
     unknown = set() if scenario_ids is None else scenario_ids - set(actual_ids)
     if unknown:
         raise ValueError(f"unknown scenario ids: {sorted(unknown)}")
@@ -72,7 +72,8 @@ def run(*, plan_path: Path, output_path: Path, timeout_seconds: int, scenario_id
         started = time.monotonic()
         if blocker:
             result = {
-                "id": scenario["id"], "title": scenario["title"], "status": "blocked",
+                "id": scenario["id"], "canonical_requirement_id": scenario["canonical_requirement_id"],
+                "legacy_alias": scenario["legacy_alias"], "title": scenario["title"], "status": "blocked",
                 "component": scenario["component"], "fault_injection": scenario["fault_injection"],
                 "pytest_nodes": [], "returncode": None, "duration_seconds": 0.0,
                 "stdout": "", "stderr": "", "artifacts": [_artifact(plan_path)],
@@ -99,7 +100,8 @@ def run(*, plan_path: Path, output_path: Path, timeout_seconds: int, scenario_id
                 stderr += f"\nscenario timed out after {timeout_seconds}s"
                 status, run_blocker = "failed", None
             result = {
-                "id": scenario["id"], "title": scenario["title"], "status": status,
+                "id": scenario["id"], "canonical_requirement_id": scenario["canonical_requirement_id"],
+                "legacy_alias": scenario["legacy_alias"], "title": scenario["title"], "status": status,
                 "component": scenario["component"], "fault_injection": scenario["fault_injection"],
                 "pytest_nodes": nodes, "returncode": returncode,
                 "duration_seconds": round(time.monotonic() - started, 6),

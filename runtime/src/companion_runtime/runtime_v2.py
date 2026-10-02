@@ -45,6 +45,7 @@ from .repeat_v2 import (
 )
 from .user_model_v2_labels import SettlementContextV2, TargetObservationV2
 from .user_model_v2_service import PreparedExposureV2, UserModelV2Service
+from .actual_action_v21 import actual_action_for_exposure
 from .user_model_v2_types import DeliveryBasis, Target, TargetPredictionV2
 
 DECISION_POLICY_VERSION = "runtime-v2.0"
@@ -165,6 +166,7 @@ class SendAckV2:
     sent: bool
     action: Mapping[str, Any]
     context_provider: Callable[[], Mapping[str, Any]]
+    actual_action_witness: Mapping[str, Any] | None = None
     source_event_ids: tuple[str, ...] = ()
     delivery_basis: DeliveryBasis = DeliveryBasis.DELIVERED
 
@@ -845,6 +847,11 @@ class V2RuntimeCoordinator:
         if sent and prepared is None:
             chosen = self._chosen[ack.decision_id]
             sources = tuple(dict.fromkeys((*chosen.source_event_ids, *ack.source_event_ids)))
+            exposure_action = (
+                actual_action_for_exposure(chosen.action, ack.actual_action_witness)
+                if isinstance(ack.actual_action_witness, Mapping)
+                else dict(chosen.action)
+            )
             prepare_and_freeze = getattr(
                 self.repository, "prepare_exposure_and_expectation", None
             )
@@ -855,7 +862,7 @@ class V2RuntimeCoordinator:
                     exposure_id=ack.attempt_id,
                     idempotency_key=ack_idempotency_key,
                     occurred_at=ack.acknowledged_at,
-                    action=chosen.action,
+                    action=exposure_action,
                     context_provider=ack.context_provider,
                     horizons=self.config.horizons,
                     delivery_basis=getattr(ack, "delivery_basis", DeliveryBasis.DELIVERED),
@@ -873,7 +880,7 @@ class V2RuntimeCoordinator:
                     exposure_id=ack.attempt_id,
                     idempotency_key=ack_idempotency_key,
                     occurred_at=ack.acknowledged_at,
-                    action=chosen.action,
+                    action=exposure_action,
                     context_provider=ack.context_provider,
                     delivery_confirmed=True,
                     horizons=self.config.horizons,

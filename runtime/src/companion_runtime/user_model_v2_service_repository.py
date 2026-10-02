@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from contextlib import nullcontext
 from datetime import datetime
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, uuid5
 from typing import Any, Iterable, Mapping
 
 from .user_model_v2_features import DEFAULT_FEATURE_SPEC_V2, FeatureSnapshotV2
@@ -195,13 +195,10 @@ class PostgresUserModelV2ServiceRepository:
         ):
             raise ValueError("prepared exposure components must share one scope")
         legacy_exposure_id = prepared.exposure.exposure_id
-        try:
-            UUID(str(legacy_exposure_id))
-            storage_exposure_id = str(legacy_exposure_id)
-        except (ValueError, TypeError, AttributeError):
-            storage_exposure_id = str(
-                uuid5(NAMESPACE_URL, f"prepared-exposure:{scope_key}:{legacy_exposure_id}")
-            )
+        from .user_model_v2_service import canonical_exposure_id
+
+        storage_exposure_id = canonical_exposure_id(scope_key, legacy_exposure_id)
+        if storage_exposure_id != legacy_exposure_id:
             # Keep all domain components aligned with the storage identity; the legacy
             # attempt id remains present in feature/action provenance and the send-ack key.
             from dataclasses import replace

@@ -308,6 +308,50 @@ class LangchaoOutcomeRepository:
                 )
             return tuple(rows)
 
+    def get_active_observation(
+        self, *, reward_contract_id: str, episode_id: str, outcome_key: str
+    ) -> Any:
+        """Return the latest settled user fact for one semantic reward outcome."""
+        return self.connection.execute(
+            """SELECT r.*, a.pointer_version, a.source_exposure_id,
+                      a.source_label_revision
+               FROM langchao_user_outcome_active AS a
+               JOIN langchao_outcome_revisions AS r
+                 ON r.scope_key=a.scope_key AND r.token_id=a.token_id
+                AND r.revision=a.revision
+               WHERE a.scope_key=%s AND a.reward_contract_id=%s
+                 AND a.episode_id=%s AND a.outcome_key=%s""",
+            (self.scope_key, reward_contract_id, episode_id, outcome_key),
+        ).fetchone()
+
+    def activate_observation(
+        self, *, reward_contract_id: str, episode_id: str, outcome_key: str,
+        token_id: str, revision: int, source_exposure_id: str,
+        source_label_revision: int, expected_pointer_version: int,
+    ) -> bool:
+        """CAS the semantic user-outcome pointer, preserving correction lineage."""
+        self._positive_revision("revision", revision)
+        self._positive_revision("source_label_revision", source_label_revision)
+        if expected_pointer_version < 0:
+            raise ValueError("expected_pointer_version must be non-negative")
+        cursor = self.connection.execute(
+            """INSERT INTO langchao_user_outcome_active
+               (scope_key,reward_contract_id,episode_id,outcome_key,token_id,revision,
+                source_exposure_id,source_label_revision,pointer_version)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (scope_key,reward_contract_id,episode_id,outcome_key) DO UPDATE
+               SET token_id=EXCLUDED.token_id, revision=EXCLUDED.revision,
+                   source_exposure_id=EXCLUDED.source_exposure_id,
+                   source_label_revision=EXCLUDED.source_label_revision,
+                   pointer_version=EXCLUDED.pointer_version, updated_at=CURRENT_TIMESTAMP
+               WHERE langchao_user_outcome_active.pointer_version=%s
+                 AND langchao_user_outcome_active.source_label_revision < EXCLUDED.source_label_revision""",
+            (self.scope_key, reward_contract_id, episode_id, outcome_key, token_id,
+             revision, source_exposure_id, source_label_revision,
+             expected_pointer_version + 1, expected_pointer_version),
+        )
+        return getattr(cursor, "rowcount", 1) == 1
+
     def get_active_outcome(self, *, token_id: str) -> Any:
         return self.connection.execute(
             """SELECT r.*, a.pointer_version

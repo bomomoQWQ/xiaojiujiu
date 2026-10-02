@@ -30,6 +30,16 @@ from . import motivation as motivation_module
 from . import pool as pool_module
 from . import protocol as protocol_module
 from . import unfinished as unfinished_module
+from .actual_action_v21 import (
+    ScopeDriftError,
+    build_actual_action_witness,
+    enforce_plan_render_scope,
+)
+from .capability_witness import (
+    WitnessValidationError,
+    WitnessValidator,
+    rendered_completion_requirement,
+)
 from .config import RuntimeConfig
 from .db import Database
 from .eventlog import EventLog, EventQuery
@@ -225,12 +235,14 @@ class Reducer:
         events: EventLog,
         projections: Projections,
         config: RuntimeConfig,
+        witness_reader: Any | None = None,
     ) -> None:
         """Bind the reducer to storage and configuration."""
         self._db = db
         self._events = events
         self._p = projections
         self._config = config
+        self._witnesses = WitnessValidator(witness_reader) if witness_reader is not None else None
 
     @property
     def projections(self) -> Projections:
@@ -1366,6 +1378,9 @@ class Reducer:
         outbox_id: str,
         text: str,
         now: datetime | None = None,
+        render_metadata: Mapping[str, Any] | None = None,
+        semantic_review: Mapping[str, Any] | None = None,
+        reauthorized: bool = False,
     ) -> RenderResult:
         """Handle a render result: attach text and move the attempt to ``ready_to_send``.
 
@@ -1416,7 +1431,15 @@ class Reducer:
                 return replay
 
             result = self._apply_rendered_text(
-                conn, state=state, item=item, attempt=attempt, text=text, stamp=stamp
+                conn,
+                state=state,
+                item=item,
+                attempt=attempt,
+                text=text,
+                stamp=stamp,
+                render_metadata=render_metadata,
+                semantic_review=semantic_review,
+                reauthorized=reauthorized,
             )
             if result.applied:
                 self._p.runtime.write(state, conn, expect_version=state.version)
@@ -1602,6 +1625,9 @@ class Reducer:
         attempt: Any,
         text: str,
         stamp: datetime,
+        render_metadata: Mapping[str, Any] | None = None,
+        semantic_review: Mapping[str, Any] | None = None,
+        reauthorized: bool = False,
     ) -> RenderResult:
         """Move an attempt to ``ready_to_send`` and queue its send row.
 
@@ -1621,11 +1647,46 @@ class Reducer:
             A :class:`RenderResult`; ``applied`` is true in both the success and
             the recorded-failure branch, because both change persistent state.
         """
+        send_outbox_id = new_id("outbox")
+        planned_action = (
+            dict(item.payload.get("action"))
+            if item is not None and isinstance(item.payload.get("action"), Mapping)
+            else {}
+        )
+        witness = build_actual_action_witness(
+            text=text,
+            attempt_id=attempt.attempt_id,
+            render_outbox_id=item.outbox_id if item is not None else None,
+            send_outbox_id=send_outbox_id,
+            render_metadata=render_metadata,
+            semantic_review=semantic_review,
+        )
         try:
+            try:
+                requirement = rendered_completion_requirement(
+                    text,
+                    action=planned_action,
+                    scope_key=str(planned_action.get("scope_key") or self._config.conversation_id),
+                )
+                if requirement is not None:
+                    if self._witnesses is None:
+                        raise WitnessValidationError(
+                            "completion statement has no live witness validator"
+                        )
+                    # Re-read immediately before accepting the render. A witness
+                    # tombstoned after planning is rejected here.
+                    self._witnesses.validate(requirement)
+            except WitnessValidationError as exc:
+                raise ValueError(f"unverified_completion_claim:{exc}") from exc
+            enforce_plan_render_scope(
+                planned_action=planned_action,
+                witness=witness,
+                reauthorized=reauthorized,
+            )
             if attempt.state == AttemptState.COMMITTED.value:
                 action_module.mark_rendering(self._p.attempts, conn, attempt, now=stamp)
             action_module.mark_ready(self._p.attempts, conn, attempt, text=text, now=stamp)
-        except (ValueError, action_module.IllegalTransition) as exc:
+        except (ValueError, ScopeDriftError, action_module.IllegalTransition) as exc:
             # The text cannot be used (empty, or a state the machine forbids).
             # The reported row is failed *first*, so the error stays on it and
             # closing the attempt's other rows cannot swallow this failure: a send
@@ -1672,13 +1733,14 @@ class Reducer:
                 conn, item.outbox_id, status=OutboxStatus.DELIVERED.value, now=stamp
             )
         send_item = OutboxItem(
-            outbox_id=new_id("outbox"),
+            outbox_id=send_outbox_id,
             kind=OutboxKind.SEND.value,
             payload={
                 "attempt_id": attempt.attempt_id,
                 "text": attempt.rendered_text,
                 "intent": attempt.intent,
                 "goal": attempt.goal,
+                "actual_action_witness": witness,
                 **(
                     {"decision_id": item.payload["decision_id"]}
                     if item is not None and item.payload.get("decision_id")

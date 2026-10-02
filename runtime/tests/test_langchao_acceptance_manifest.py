@@ -29,8 +29,15 @@ def manifest() -> dict[str, object]:
 
 
 def test_preregistered_manifest_is_valid_and_covers_t01_through_t32() -> None:
-    payload = load_and_validate_manifest(MANIFEST_PATH)
+    payload = load_and_validate_manifest(MANIFEST_PATH, artifact_root=REPOSITORY_ROOT)
     assert tuple(item["id"] for item in payload["tests"]) == EXPECTED_TEST_IDS
+    canonical_ids = [item["canonical_requirement_id"] for item in payload["tests"]]
+    assert len(canonical_ids) == len(set(canonical_ids)) == 32
+    assert all(identifier.startswith("LC-") for identifier in canonical_ids)
+    assert all(
+        {"namespace": "acceptance-manifest-20261002", "id": item["id"]} in item["legacy_aliases"]
+        for item in payload["tests"]
+    )
     assert {item["status"] for item in payload["tests"]} <= {"planned", "not_applicable"}
     assert payload["release_decision"] == "hold_not_authorized"
     assert payload["baseline"]["database_schema_version"] == 20
@@ -80,6 +87,33 @@ def test_validator_rejects_missing_duplicate_or_out_of_order_test_ids() -> None:
     payload["tests"][4]["id"] = "T04"  # type: ignore[index]
     issues = validate_manifest(payload)
     assert any(issue.path == "$.tests" and "exactly once in ascending order" in issue.message for issue in issues)
+
+
+def test_validator_rejects_bare_alias_and_duplicate_canonical_id() -> None:
+    payload = manifest()
+    payload["tests"][0]["legacy_aliases"] = ["T01"]  # type: ignore[index]
+    payload["tests"][1]["canonical_requirement_id"] = payload["tests"][0]["canonical_requirement_id"]  # type: ignore[index]
+    issues = validate_manifest(payload)
+    messages = "\n".join(map(str, issues))
+    assert "must be an object" in messages
+    assert "canonical requirement ids must be unique" in messages
+
+
+def test_validator_detects_registry_semantic_conflict_and_hash_drift(tmp_path: Path) -> None:
+    payload = manifest()
+    registry_path = REPOSITORY_ROOT / payload["requirement_registry"]["path"]  # type: ignore[index]
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["entries"][0]["definition"]["title"] = "conflicting title"
+    registry["entries"][1]["legacy_aliases"] = registry["entries"][0]["legacy_aliases"]
+    copied = tmp_path / "registry.json"
+    copied.write_text(json.dumps(registry, ensure_ascii=False), encoding="utf-8")
+    payload["requirement_registry"] = {"path": "registry.json", "sha256": "0" * 64}
+    issues = validate_manifest(payload, artifact_root=tmp_path)
+    messages = "\n".join(map(str, issues))
+    assert "requirement registry hash mismatch" in messages
+    assert "canonical definition hash mismatch" in messages
+    assert "semantic conflict: alias" in messages
+    assert "semantic conflict with registered title/oracle/fixture hash" in messages
 
 
 def test_validator_rejects_fixture_and_config_hash_drift() -> None:

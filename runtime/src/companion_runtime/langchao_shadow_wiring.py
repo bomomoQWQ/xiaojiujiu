@@ -215,6 +215,7 @@ class LangchaoShadowRunner:
     def run(
         self, decision: EndogenousDecisionV2, *, now: datetime,
         before_commit: Any | None = None,
+        authority_revision: int | None = None,
     ) -> Any | None:
         pairs = tuple((item, _facts_for(item)) for item in decision.assessments)
         pairs = tuple((item, facts) for item, facts in pairs if facts is not None)
@@ -301,6 +302,7 @@ class LangchaoShadowRunner:
             run_id=f"langchao-shadow:{decision.decision_id}",
             idempotency_key=f"runtime-v2:{decision.decision_id}",
             before_commit=before_commit,
+            expected_authority_revision=authority_revision,
         )
 
 

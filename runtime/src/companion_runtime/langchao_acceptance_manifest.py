@@ -34,6 +34,8 @@ STAGES = frozenset(
 EXPECTED_TEST_IDS = tuple(f"T{number:02d}" for number in range(1, 33))
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_CANONICAL_REQUIREMENT_RE = re.compile(r"^LC-(?:MAT|PRA|CON|HIS|PUR|VER|AGY)-[0-9]{2}$")
+_LEGACY_TEST_RE = re.compile(r"^T(?:0[1-9]|[12][0-9]|3[0-2])$")
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -142,6 +144,59 @@ def _validate_hash_record(
         issues.append(ManifestIssue(f"{path}.value", f"does not match artifact bytes ({actual})"))
 
 
+def _validate_legacy_aliases(value: Any, path: str, issues: list[ManifestIssue]) -> list[tuple[str, str]]:
+    aliases = _sequence(value, path, issues)
+    parsed: list[tuple[str, str]] = []
+    if aliases is None:
+        return parsed
+    if not aliases:
+        issues.append(ManifestIssue(path, "must contain at least one namespaced alias"))
+    for index, raw in enumerate(aliases):
+        alias_path = f"{path}[{index}]"
+        alias = _mapping(raw, alias_path, issues)
+        if alias is None:
+            continue
+        _required(alias, ("namespace", "id"), alias_path, issues)
+        namespace, legacy_id = alias.get("namespace"), alias.get("id")
+        if not isinstance(namespace, str) or not namespace.strip():
+            issues.append(ManifestIssue(f"{alias_path}.namespace", "must be non-empty; bare Txx aliases are forbidden"))
+        if not isinstance(legacy_id, str) or not _LEGACY_TEST_RE.fullmatch(legacy_id):
+            issues.append(ManifestIssue(f"{alias_path}.id", "must be T01 through T32"))
+        if isinstance(namespace, str) and namespace.strip() and isinstance(legacy_id, str):
+            parsed.append((namespace, legacy_id))
+    if len(parsed) != len(set(parsed)):
+        issues.append(ManifestIssue(path, "must not contain duplicate namespaced aliases"))
+    return parsed
+
+
+def _load_requirement_registry(
+    root: Mapping[str, Any], artifact_root: Path | None, issues: list[ManifestIssue]
+) -> Mapping[str, Any] | None:
+    record = _mapping(root.get("requirement_registry"), "$.requirement_registry", issues)
+    if record is None:
+        return None
+    _required(record, ("path", "sha256"), "$.requirement_registry", issues)
+    path, expected = record.get("path"), record.get("sha256")
+    if not _safe_relative_path(path):
+        issues.append(ManifestIssue("$.requirement_registry.path", "must be a safe repository-relative path"))
+        return None
+    if not isinstance(expected, str) or not _SHA256_RE.fullmatch(expected):
+        issues.append(ManifestIssue("$.requirement_registry.sha256", "must be a lowercase SHA-256 digest"))
+        return None
+    if artifact_root is None:
+        return None
+    candidate = artifact_root / str(path)
+    try:
+        raw = candidate.read_bytes()
+        registry = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        issues.append(ManifestIssue("$.requirement_registry.path", f"cannot load registry: {exc}"))
+        return None
+    if sha256_hex(raw) != expected:
+        issues.append(ManifestIssue("$.requirement_registry.sha256", "requirement registry hash mismatch"))
+    return registry if isinstance(registry, Mapping) else None
+
+
 def _validate_fixture(item: Mapping[str, Any], path: str, issues: list[ManifestIssue]) -> None:
     fixture = _mapping(item.get("fixture"), f"{path}.fixture", issues)
     if fixture is None:
@@ -167,7 +222,7 @@ def _validate_test(item: Any, index: int, issues: list[ManifestIssue]) -> str | 
     if test is None:
         return None
     required = (
-        "id", "title", "requirement_families", "verification_kind", "applicable_stage",
+        "id", "canonical_requirement_id", "legacy_aliases", "title", "requirement_families", "verification_kind", "applicable_stage",
         "fixture", "oracle", "evidence", "positive_control", "status", "blocker",
         "denominator", "tolerance", "seed", "timeout", "privacy",
     )
@@ -176,6 +231,12 @@ def _validate_test(item: Any, index: int, issues: list[ManifestIssue]) -> str | 
     if test_id not in EXPECTED_TEST_IDS:
         issues.append(ManifestIssue(f"{path}.id", "must be one of T01 through T32"))
         test_id = None
+    canonical_id = test.get("canonical_requirement_id")
+    if not isinstance(canonical_id, str) or not _CANONICAL_REQUIREMENT_RE.fullmatch(canonical_id):
+        issues.append(ManifestIssue(f"{path}.canonical_requirement_id", "must be a canonical LC-<family>-NN id"))
+    aliases = _validate_legacy_aliases(test.get("legacy_aliases"), f"{path}.legacy_aliases", issues)
+    if test_id is not None and ("acceptance-manifest-20261002", test_id) not in aliases:
+        issues.append(ManifestIssue(f"{path}.legacy_aliases", "must preserve the acceptance manifest id as a namespaced legacy alias"))
     status = test.get("status")
     if status not in INITIAL_STATUSES:
         issues.append(ManifestIssue(f"{path}.status", "initial manifest status must be planned or not_applicable"))
@@ -304,7 +365,7 @@ def validate_manifest(
         return tuple(issues)
     required = (
         "manifest_version", "manifest_id", "generated_at", "purpose", "release_decision",
-        "baseline", "hashes", "stages", "evidence_classes", "status_policy",
+        "baseline", "hashes", "requirement_registry", "stages", "evidence_classes", "status_policy",
         "global_protocol", "tests",
     )
     _required(root, required, "$", issues)
@@ -358,17 +419,66 @@ def validate_manifest(
                 if configuration.get("value") != actual:
                     issues.append(ManifestIssue("$.hashes.configuration.value", f"does not match frozen configuration ({actual})"))
 
+    registry = _load_requirement_registry(root, artifact_root, issues)
+    registry_by_id: dict[str, Mapping[str, Any]] = {}
+    alias_targets: dict[tuple[str, str], str] = {}
+    if registry is not None:
+        entries = _sequence(registry.get("entries"), "$.requirement_registry.entries", issues)
+        if entries is not None:
+            for index, raw in enumerate(entries):
+                entry_path = f"$.requirement_registry.entries[{index}]"
+                entry = _mapping(raw, entry_path, issues)
+                if entry is None:
+                    continue
+                canonical_id = entry.get("canonical_requirement_id")
+                if not isinstance(canonical_id, str) or not _CANONICAL_REQUIREMENT_RE.fullmatch(canonical_id):
+                    issues.append(ManifestIssue(f"{entry_path}.canonical_requirement_id", "is invalid"))
+                    continue
+                if canonical_id in registry_by_id:
+                    issues.append(ManifestIssue(f"{entry_path}.canonical_requirement_id", "is duplicated"))
+                registry_by_id[canonical_id] = entry
+                definition = entry.get("definition")
+                expected_definition_hash = entry.get("definition_sha256")
+                if isinstance(definition, Mapping):
+                    actual_definition_hash = sha256_hex(canonical_json_bytes(definition))
+                    if expected_definition_hash != actual_definition_hash:
+                        issues.append(ManifestIssue(f"{entry_path}.definition_sha256", "canonical definition hash mismatch"))
+                else:
+                    issues.append(ManifestIssue(f"{entry_path}.definition", "must bind title, oracle and fixture hashes"))
+                for alias in _validate_legacy_aliases(entry.get("legacy_aliases"), f"{entry_path}.legacy_aliases", issues):
+                    previous = alias_targets.get(alias)
+                    if previous is not None and previous != canonical_id:
+                        issues.append(ManifestIssue(f"{entry_path}.legacy_aliases", f"semantic conflict: alias {alias[0]}:{alias[1]} maps to both {previous} and {canonical_id}"))
+                    alias_targets[alias] = canonical_id
+
     tests = _sequence(root.get("tests"), "$.tests", issues)
     ids: list[str] = []
+    canonical_ids: list[str] = []
     if tests is not None:
         for index, item in enumerate(tests):
             test_id = _validate_test(item, index, issues)
             if test_id is not None:
                 ids.append(test_id)
+            if isinstance(item, Mapping) and isinstance(item.get("canonical_requirement_id"), str):
+                canonical_id = item["canonical_requirement_id"]
+                canonical_ids.append(canonical_id)
+                entry = registry_by_id.get(canonical_id)
+                if registry is not None and entry is None:
+                    issues.append(ManifestIssue(f"$.tests[{index}].canonical_requirement_id", "is absent from requirement registry"))
+                elif entry is not None:
+                    expected_definition = {
+                        "title": item.get("title"),
+                        "oracle_sha256": sha256_hex(canonical_json_bytes(item.get("oracle"))),
+                        "fixture_sha256": item.get("fixture", {}).get("sha256") if isinstance(item.get("fixture"), Mapping) else None,
+                    }
+                    if entry.get("definition") != expected_definition:
+                        issues.append(ManifestIssue(f"$.tests[{index}].canonical_requirement_id", "semantic conflict with registered title/oracle/fixture hash"))
         if len(tests) != 32:
             issues.append(ManifestIssue("$.tests", "must contain exactly 32 test registrations"))
         if tuple(ids) != EXPECTED_TEST_IDS:
             issues.append(ManifestIssue("$.tests", "must contain T01 through T32 exactly once in ascending order"))
+        if len(canonical_ids) != len(set(canonical_ids)):
+            issues.append(ManifestIssue("$.tests", "canonical requirement ids must be unique"))
     return tuple(sorted(issues))
 
 
@@ -387,7 +497,7 @@ def load_and_validate_manifest(
         raise AcceptanceManifestError((ManifestIssue("$", f"cannot load JSON: {exc}"),)) from exc
     if not isinstance(payload, dict):
         raise AcceptanceManifestError((ManifestIssue("$", "must be an object"),))
-    root_path = Path(artifact_root) if artifact_root is not None else None
+    root_path = Path(artifact_root) if artifact_root is not None else manifest_path.resolve().parents[2]
     issues = validate_manifest(payload, artifact_root=root_path, check_artifacts=check_artifacts)
     if issues:
         raise AcceptanceManifestError(issues)

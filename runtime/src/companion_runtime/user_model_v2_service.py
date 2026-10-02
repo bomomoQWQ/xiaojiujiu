@@ -35,6 +35,19 @@ from .user_model_v2_types import (
 ContextProvider = Callable[[], Mapping[str, Any]]
 
 
+def canonical_exposure_id(scope_key: str, attempt_id: str) -> str:
+    """Return the single durable exposure identity used by every send path.
+
+    PostgreSQL stores exposure ids as UUIDs.  UUID attempt ids remain unchanged; other
+    attempt ids are deterministically scoped so attribution cannot cross conversations.
+    """
+
+    try:
+        return str(UUID(str(attempt_id)))
+    except (ValueError, TypeError, AttributeError):
+        return str(uuid5(NAMESPACE_URL, f"prepared-exposure:{scope_key}:{attempt_id}"))
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PreparedExposureV2:
     """The complete immutable result of a confirmed send."""
@@ -118,8 +131,11 @@ class UserModelV2ServiceRepository(Protocol):
 class UserModelV2Service:
     """Pure-business application service over v2 feature/label/estimator primitives."""
 
-    def __init__(self, repository: UserModelV2ServiceRepository) -> None:
+    def __init__(
+        self, repository: UserModelV2ServiceRepository, *, outcome_observer: Any | None = None
+    ) -> None:
         self.repository = repository
+        self.outcome_observer = outcome_observer
 
     def prepare_exposure(
         self,
@@ -269,7 +285,10 @@ class UserModelV2Service:
                     raise RuntimeError("active-label CAS lost to a different revision")
                 candidate = winner[0]
             results.append(candidate)
-        return tuple(results)
+        settled = tuple(results)
+        if self.outcome_observer is not None:
+            self.outcome_observer.settle_labels(settled)
+        return settled
 
     def build_fit_dataset(
         self,
@@ -366,6 +385,7 @@ __all__ = [
     "FitDatasetV2",
     "FittedTargetSnapshotV2",
     "PreparedExposureV2",
+    "canonical_exposure_id",
     "UserModelV2Service",
     "UserModelV2ServiceRepository",
 ]
