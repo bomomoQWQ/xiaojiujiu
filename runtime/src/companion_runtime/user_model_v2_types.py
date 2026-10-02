@@ -22,6 +22,18 @@ USER_MODEL_V2_CONTRACT_VERSION = "2"
 USER_MODEL_V2_FEATURE_VERSION = "user-model-v2.1-render-plan-v1"
 USER_MODEL_V2_TARGET_CONTRACT_VERSION = "1"
 
+#: Every feature-definition version whose rows still exist in storage.
+#:
+#: Reading history must not require the *latest* definition: a repository that refused to
+#: deserialize yesterday's label would lose the ability to reconcile or retire it, and the
+#: failure surfaces far away from the version bump (a scheduler round, a late ACK).  Rows
+#: keep the version they were written with; consumers that actually learn or predict
+#: compare against :data:`USER_MODEL_V2_FEATURE_VERSION` themselves and skip stale rows.
+USER_MODEL_V2_FEATURE_VERSIONS: tuple[str, ...] = (
+    "user-model-v2.0",
+    "user-model-v2.1-render-plan-v1",
+)
+
 JsonScalar: TypeAlias = str | int | float | bool | None
 FrozenAttributes: TypeAlias = tuple[tuple[str, JsonScalar], ...]
 
@@ -115,8 +127,10 @@ def _validate_base(
     _require_text("scope_key", scope_key)
     if contract_version != USER_MODEL_V2_CONTRACT_VERSION:
         raise ValueError(f"contract_version must be {USER_MODEL_V2_CONTRACT_VERSION!r}")
-    if feature_version != USER_MODEL_V2_FEATURE_VERSION:
-        raise ValueError(f"feature_version must be {USER_MODEL_V2_FEATURE_VERSION!r}")
+    if feature_version not in USER_MODEL_V2_FEATURE_VERSIONS:
+        raise ValueError(
+            f"feature_version must be one of {USER_MODEL_V2_FEATURE_VERSIONS!r}"
+        )
     if target_contract_version != USER_MODEL_V2_TARGET_CONTRACT_VERSION:
         raise ValueError(
             "target_contract_version must be "
@@ -487,5 +501,6 @@ __all__ = [
     "TargetPredictionV2",
     "USER_MODEL_V2_CONTRACT_VERSION",
     "USER_MODEL_V2_FEATURE_VERSION",
+    "USER_MODEL_V2_FEATURE_VERSIONS",
     "USER_MODEL_V2_TARGET_CONTRACT_VERSION",
 ]

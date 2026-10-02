@@ -20,6 +20,7 @@ from companion_runtime.user_model_v2_types import (
     TargetPredictionV2,
     USER_MODEL_V2_CONTRACT_VERSION,
     USER_MODEL_V2_FEATURE_VERSION,
+    USER_MODEL_V2_FEATURE_VERSIONS,
     USER_MODEL_V2_TARGET_CONTRACT_VERSION,
 )
 
@@ -170,6 +171,21 @@ def test_explicit_versions_and_horizon_are_json_safe() -> None:
         exposure(feature_version="latest")
     with pytest.raises(ValueError, match="target_contract_version"):
         exposure(target_contract_version="latest")
+
+
+def test_historical_feature_versions_stay_readable_but_are_not_the_latest() -> None:
+    """Persisted rows must survive a feature-definition bump.
+
+    A repository that refuses yesterday's rows loses the ability to reconcile or retire
+    them, and the failure shows up somewhere unrelated (a scheduler round, a late ACK).
+    Historical versions therefore stay readable while learning keeps comparing against
+    the current definition.
+    """
+    historical = exposure(feature_version="user-model-v2.0")
+    assert historical.feature_version == "user-model-v2.0"
+    assert "user-model-v2.0" in USER_MODEL_V2_FEATURE_VERSIONS
+    assert USER_MODEL_V2_FEATURE_VERSION in USER_MODEL_V2_FEATURE_VERSIONS
+    assert USER_MODEL_V2_FEATURE_VERSION != "user-model-v2.0"
 
 
 def test_prediction_envelope_has_intervals_and_one_row_per_target() -> None:
