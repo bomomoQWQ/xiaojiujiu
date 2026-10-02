@@ -13,7 +13,9 @@ import pytest
 
 from companion_runtime.langchao_authority import AuthorityEngine, AuthorityMode
 from companion_runtime.langchao_engine import LangchaoParameters, advance_langchao
-from companion_runtime.langchao_live import LangchaoLiveService, LangchaoLiveValidationError
+from companion_runtime.langchao_live import LangchaoLiveService
+from companion_runtime.langchao_no_send import NoSendReason, NoSendResult
+from companion_runtime.langchao_permission import PermissionProjection, PermissionVerdict
 from companion_runtime.langchao_live_repository import LangchaoLiveRepository
 from companion_runtime.langchao_live_wiring import AuthorityRoutedEndogenousRound, LangchaoLiveRunner
 from companion_runtime.langchao_runtime_adapter import BuiltCandidateContracts, BuiltShadowRound, LegacyProvenance
@@ -151,7 +153,15 @@ def _built(*, rest: bool = False) -> tuple[BuiltShadowRound, CandidateV2]:
     return built, external
 
 
-def _stack(*, rest: bool = False, revoked: bool = False):
+def _permission(*, allowed: bool, version: str) -> PermissionProjection:
+    return PermissionProjection(scope_key=SCOPE,
+        verdict=PermissionVerdict.ALLOW if allowed else PermissionVerdict.DENY,
+        permission_version=version, event_id=f"event:{version}", occurred_at=NOW,
+        ingested_at=NOW, revision=1)
+
+
+def _stack(*, rest: bool = False, revoked: bool = False,
+           permission: PermissionProjection | None = None):
     built, source = _built(rest=rest)
     connection = AckConnection()
     repository = LangchaoLiveRepository(connection, scope_key=SCOPE)
@@ -164,7 +174,8 @@ def _stack(*, rest: bool = False, revoked: bool = False):
     evaluator = ThresholdEvaluator(built, connection)
     runner = LangchaoLiveRunner(
         evaluator=evaluator,
-        service=LangchaoLiveService(scope_key=SCOPE, authority_reader=Authority(), legacy_bridge=bridge),
+        service=LangchaoLiveService(scope_key=SCOPE, authority_reader=Authority(), legacy_bridge=bridge,
+            permission_reader=(None if permission is None else lambda **_kw: permission)),
         repository=repository,
     )
     coordinator = AssessmentCoordinator(source)
@@ -199,13 +210,40 @@ def test_rest_crosses_threshold_but_never_calls_bridge_or_creates_pending_send()
     assert bridge.commit_calls == [] and bridge.artifacts == [] and repository.pending() == ()
 
 
-def test_revoked_candidate_creates_no_backlog_and_reenable_requires_a_fresh_round():
-    router, _runner, repository, _connection, bridge, evaluator, *_ = _stack(revoked=True)
-    with pytest.raises(LangchaoLiveValidationError, match="boundary blocks"):
-        router.run(decision_id="tick:revoked", now=NOW, elapsed_allowed_seconds=2.0)
+def test_revoked_candidate_creates_no_claim_or_backlog_and_reenable_requires_a_fresh_round():
+    denied = _permission(allowed=False, version="permission:denied:v2")
+    router, _runner, repository, _connection, bridge, evaluator, *_ = _stack(
+        revoked=True, permission=denied,
+    )
+    result = router.run(decision_id="tick:revoked", now=NOW, elapsed_allowed_seconds=2.0)
+    assert isinstance(result, NoSendResult)
+    assert result.reason is NoSendReason.PERMISSION_REVOKED
     assert evaluator.crossed and bridge.commit_calls == [] and repository.pending() == ()
 
-    fresh_router, _fresh_runner, fresh_repository, _c, fresh_bridge, *_ = _stack(revoked=False)
+    # Re-enabling cannot make the old round eligible: its candidate/state remain bound
+    # to the old permission version, so exact-match validation invalidates it.
+    stale_enabled = _permission(allowed=True, version="permission:allow:v3")
+    stale_router, _stale_runner, stale_repository, _c, stale_bridge, *_ = _stack(
+        revoked=False, permission=stale_enabled,
+    )
+    stale = stale_router.run(decision_id="tick:stale", now=NOW + timedelta(seconds=4), elapsed_allowed_seconds=2.0)
+    assert isinstance(stale, NoSendResult) and stale.reason is NoSendReason.INVALIDATED
+    assert stale_bridge.commit_calls == [] and stale_repository.pending() == ()
+
+    # A freshly built round bound to the re-enabled projection may claim exactly once.
+    fresh_router, _fresh_runner, fresh_repository, _c, fresh_bridge, fresh_evaluator, *_ = _stack(
+        revoked=False, permission=stale_enabled,
+    )
+    fresh_evaluator.built = replace(
+        fresh_evaluator.built,
+        state=replace(fresh_evaluator.built.state, permission_version=stale_enabled.permission_version),
+        contracts=tuple(replace(contract,
+            candidate=replace(contract.candidate, permission_ref=stale_enabled.permission_version),
+            shadow_input=replace(contract.shadow_input,
+                candidate=replace(contract.shadow_input.candidate,
+                                  permission_ref=stale_enabled.permission_version)))
+            for contract in fresh_evaluator.built.contracts),
+    )
     result = fresh_router.run(decision_id="tick:fresh", now=NOW + timedelta(seconds=5), elapsed_allowed_seconds=2.0)
     assert result.committed and len(fresh_bridge.commit_calls) == 1
     assert len(fresh_repository.pending()) == 1

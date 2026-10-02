@@ -16,8 +16,18 @@ from typing import Any, Mapping
 
 from .decision_v2_audit import CandidateAssessment
 from .langchao_authority_repository import LangchaoAuthorityRepository
+from .langchao_attention_recipe import (
+    BASELINE_RECIPE,
+    AttentionRecipeCandidate,
+    ExplicitAttentionSignals,
+    compile_attention_recipe,
+    normalize_recipe,
+    parameter_version_for_recipe,
+)
 from .langchao_engine import LangchaoParameters
+from .langchao_exploration import ExplorationResultKind, ExplorationWorkSegment
 from .langchao_outcome_repository import LangchaoOutcomeRepository
+from .langchao_permission import read_runtime_permission
 from .langchao_repository import LangchaoRepository
 from .langchao_runtime_adapter import (
     RuntimeCandidateFacts,
@@ -28,7 +38,7 @@ from .langchao_runtime_adapter import (
 from .langchao_shadow import LangchaoShadowPostgresRepository
 from .langchao_shadow_service import LangchaoShadowService
 from .langchao_state_repository import LangchaoStateRepository
-from .langchao_types import GoalOwnership
+from .langchao_types import GoalOwnership, MotivationDirection
 from .motivation_v2 import CandidatePolicyV2, UserUtilityCoefficientsV2
 from .repeat_v2 import RepeatCostBreakdownV2, RepeatSubjectV2
 from .runtime_v2 import CandidateDecisionV2, CandidateV2, EndogenousDecisionV2
@@ -136,16 +146,59 @@ def _explicit_ref(action: Mapping[str, Any], name: str) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
-def _facts_for(item: CandidateDecisionV2) -> RuntimeCandidateFacts | None:
+def _string_tuple(action: Mapping[str, Any], name: str, *, nonempty: bool = False) -> tuple[str, ...]:
+    value = action.get(name)
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"action.{name} must be an explicit list/tuple")
+    result = tuple(str(item).strip() for item in value)
+    if nonempty and not result:
+        raise ValueError(f"action.{name} must not be empty")
+    if any(not item for item in result):
+        raise ValueError(f"action.{name} items must be non-empty strings")
+    return result
+
+
+def _exploration_segment(action: Mapping[str, Any]) -> ExplorationWorkSegment | None:
+    """Parse only an explicitly marked, completed internal work segment.
+
+    Generic thinking/research actions and elapsed work time are intentionally
+    insufficient.  A producer must provide the full finite segment witness.
+    """
+
+    kind = str(action.get("type") or "").strip().lower()
+    if kind not in {"internal_exploration", "exploration_work_segment"}:
+        return None
+    if action.get("internal") is not True or action.get("segment_completed") is not True:
+        return None
+    result = _explicit_ref(action, "result_kind")
+    try:
+        result_kind = ExplorationResultKind(result or "")
+    except ValueError:
+        raise ValueError("action.result_kind must be an exploration terminal result") from None
+    return ExplorationWorkSegment(
+        segment_id=_explicit_ref(action, "segment_id") or "",
+        problem_ref=_explicit_ref(action, "problem_ref") or "",
+        question=_explicit_ref(action, "question") or "",
+        executable_steps=_string_tuple(action, "executable_steps", nonempty=True),
+        result_kind=result_kind,
+        result_ref=_explicit_ref(action, "result_ref") or "",
+        evidence_refs=_string_tuple(action, "evidence_refs", nonempty=True),
+    )
+
+
+def _facts_for(
+    item: CandidateDecisionV2, *, internal_exploration_enabled: bool = True,
+) -> RuntimeCandidateFacts | None:
     candidate = item.candidate
     action = candidate.action
     kind = str(action.get("type") or "").strip().lower()
     evidence = tuple(dict.fromkeys(candidate.source_event_ids)) or (f"candidate:{candidate.candidate_id}",)
+    segment = _exploration_segment(action) if internal_exploration_enabled else None
     common = dict(
         candidate_id=candidate.candidate_id,
         ownership=GoalOwnership.SELF_WISH,
         evidence_refs=evidence,
-        capability_refs=(() if kind in {"rest", "defer", "internal_rest"}
+        capability_refs=(() if kind in {"rest", "defer", "internal_rest", "internal_exploration", "exploration_work_segment"}
                          else ("external_message",)),
         repeat_soft_cost=float(item.repeat.total_cost),
         repeat_cost_refs=(item.repeat.policy_version,),
@@ -154,6 +207,18 @@ def _facts_for(item: CandidateDecisionV2) -> RuntimeCandidateFacts | None:
         block_reasons=item.reasons,
         legacy_internal_utility=float(candidate.internal_utility),
     )
+    if segment is not None:
+        exploration_common = dict(common)
+        exploration_common.update(
+            ownership=GoalOwnership.SELF_INTEREST,
+            evidence_refs=tuple(dict.fromkeys((*evidence, *segment.evidence_refs))),
+        )
+        return RuntimeCandidateFacts(
+            **exploration_common, template_key="exploration.v1", exploration_segment=segment,
+        )
+    if kind in {"internal_exploration", "exploration_work_segment"}:
+        # Disabled or incomplete segments are omitted, never relabelled as contact.
+        return None
     if kind in {"rest", "defer", "internal_rest"}:
         return RuntimeCandidateFacts(
             **common, template_key="internal_rest.v1",
@@ -184,6 +249,40 @@ def _facts_for(item: CandidateDecisionV2) -> RuntimeCandidateFacts | None:
     return None
 
 
+def _explicit_attention_signal(action: Mapping[str, Any], name: str) -> float:
+    value = action.get(name, 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"action.{name} must be numeric")
+    value = float(value)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"action.{name} must be between 0 and 1")
+    return value
+
+
+def _attention_candidate(item: Any) -> AttentionRecipeCandidate:
+    candidate = item.candidate
+    facts = _facts_for(item)
+    if facts is None:
+        raise ValueError("attention candidate requires admitted runtime facts")
+    direction = {
+        "contact.v1": MotivationDirection.APPROACH,
+        "expression.v1": MotivationDirection.EXPRESSION,
+        "followup.v1": MotivationDirection.CARE,
+        "internal_rest.v1": MotivationDirection.REST,
+        "exploration.v1": MotivationDirection.EXPLORATION,
+    }[facts.template_key]
+    action = candidate.action
+    return AttentionRecipeCandidate(
+        candidate_id=candidate.candidate_id,
+        direction=direction,
+        signals=ExplicitAttentionSignals(
+            goal_urgency=_explicit_attention_signal(action, "goal_urgency"),
+            source_freshness=_explicit_attention_signal(action, "source_freshness"),
+            resource_availability=_explicit_attention_signal(action, "resource_availability"),
+        ),
+    )
+
+
 def _assessment(item: CandidateDecisionV2) -> CandidateAssessment:
     return CandidateAssessment(
         candidate_id=item.candidate.candidate_id,
@@ -210,6 +309,8 @@ class LangchaoShadowRunner:
     state_repository: LangchaoStateRepository
     revisions: LangchaoRevisionResolver
     parameters: LangchaoParameters = DEFAULT_LANGCHAO_PARAMETERS
+    attention_recipe: str = BASELINE_RECIPE
+    internal_exploration_enabled: bool = True
     last_built: BuiltShadowRound | None = None
 
     def run(
@@ -217,7 +318,10 @@ class LangchaoShadowRunner:
         before_commit: Any | None = None,
         authority_revision: int | None = None,
     ) -> Any | None:
-        pairs = tuple((item, _facts_for(item)) for item in decision.assessments)
+        pairs = tuple(
+            (item, _facts_for(item, internal_exploration_enabled=self.internal_exploration_enabled))
+            for item in decision.assessments
+        )
         pairs = tuple((item, facts) for item, facts in pairs if facts is not None)
         inputs = [RuntimeCandidateInput(candidate=item.candidate, predictions=item.predictions,
                                         assessment=_assessment(item)) for item, _facts in pairs]
@@ -246,12 +350,14 @@ class LangchaoShadowRunner:
         ))
         runtime_state = self.runtime.state()
         state_version = int(runtime_state.version)
+        permission = read_runtime_permission(self.runtime, scope_key=self.scope_key, now=now)
         preliminary = RuntimeFactSnapshot(
             scope_key=self.scope_key,
             episode_id=decision.decision_id,
             source_cursor=f"runtime-version:{state_version}",
             values=runtime_state.values.to_dict(),
             candidates=tuple(facts_list),
+            permission=permission,
         )
         inputs = tuple(inputs)
         active = self.state_repository.load_active_state()
@@ -289,15 +395,45 @@ class LangchaoShadowRunner:
                                      bound_goal_revision=goal_bound, reward_revision=reward,
                                      candidate_revision=candidate))
         snapshot = replace(preliminary, candidates=tuple(allocated))
-        built = build_shadow_round(snapshot=snapshot, inputs=inputs, advanced_at=now,
-                                   previous_state=previous, based_on_state_version=state_version)
+        selected_recipe = normalize_recipe(self.attention_recipe)
+        recipe_candidates = tuple(
+            AttentionRecipeCandidate(
+                candidate_id=contract.candidate.candidate_id,
+                direction=_attention_candidate(source).direction,
+                signals=_attention_candidate(source).signals,
+            )
+            for source, _facts in pairs
+            for contract in probe.contracts
+            if contract.source_candidate_id == source.candidate.candidate_id
+        )
+        recipe_candidates += tuple(
+            AttentionRecipeCandidate(
+                candidate_id=contract.candidate.candidate_id,
+                direction=MotivationDirection.REST,
+                signals=ExplicitAttentionSignals(),
+            )
+            for contract in probe.contracts
+            if contract.source_candidate_id == rest_id
+        )
+        recipe_plan = compile_attention_recipe(
+            selection=selected_recipe,
+            candidates=recipe_candidates,
+            baseline_parameters=self.parameters,
+        )
+        built = build_shadow_round(
+            snapshot=snapshot, inputs=inputs, advanced_at=now,
+            previous_state=previous, based_on_state_version=state_version,
+            parameter_version=parameter_version_for_recipe(recipe_plan),
+            attention_profile=recipe_plan.attention_profile,
+        )
         # Live wiring consumes this exact immutable build after numerical evaluation;
         # it must never rebuild from a potentially changed legacy candidate pool.
         self.last_built = built
         baseline = decision.chosen_candidate_id if decision.acted else None
         defer = None if decision.acted else decision.reason
         return self.service.run(
-            built, now=now, parameters=self.parameters,
+            built, now=now, parameters=recipe_plan.parameters,
+            edges=recipe_plan.competition_edges,
             baseline_candidate_id=baseline, baseline_defer_reason=defer,
             run_id=f"langchao-shadow:{decision.decision_id}",
             idempotency_key=f"runtime-v2:{decision.decision_id}",
@@ -308,7 +444,8 @@ class LangchaoShadowRunner:
 
 def build_langchao_shadow_runner(
     *, connection: Any, scope_key: str, runtime: Any, allow_live_evaluation: bool = False,
-    transaction_factory: Any | None = None,
+    transaction_factory: Any | None = None, attention_recipe: str = BASELINE_RECIPE,
+    internal_exploration_enabled: bool = True,
 ) -> LangchaoShadowRunner:
     """Build safe repositories on the same migrated PostgreSQL connection."""
     borrowed = _BorrowedConnection(connection)
@@ -332,7 +469,9 @@ def build_langchao_shadow_runner(
     )
     return LangchaoShadowRunner(scope_key=scope_key, runtime=runtime, service=service,
                                 state_repository=states,
-                                revisions=LangchaoRevisionResolver(connection, scope_key=scope_key))
+                                revisions=LangchaoRevisionResolver(connection, scope_key=scope_key),
+                                attention_recipe=normalize_recipe(attention_recipe),
+                                internal_exploration_enabled=bool(internal_exploration_enabled))
 
 
 __all__ = [

@@ -488,10 +488,34 @@ class LangchaoConfig:
     # Mechanical legacy-projection -> social projection refresh. Disabled by default;
     # it never requires or invokes a semantic/generative model.
     social_enabled: bool = False
+    # Explicit internal work segments are admitted by default, but remain
+    # non-dispatching. There is no corresponding external exploration default.
+    internal_exploration_enabled: bool = True
+    external_exploration_enabled: bool = False
     live_scope_allowlist: list[str] = field(default_factory=list)
+    # Attention competition is a separate, deny-by-default experiment. B2 may be
+    # selected globally, while B3 additionally requires the exact scope below.
+    attention_recipe: str = "off"
+    attention_b3_scope_allowlist: list[str] = field(default_factory=list)
 
     def live_allowed(self, scope_key: str) -> bool:
         return bool(self.live_enabled and scope_key in self.live_scope_allowlist)
+
+    def attention_recipe_for_scope(self, scope_key: str) -> str:
+        """Validate the configured recipe and enforce B3's exact-scope gate."""
+        from .langchao_attention_recipe import B3_RECIPE, BASELINE_RECIPE, normalize_recipe
+
+        if not isinstance(scope_key, str) or not scope_key.strip():
+            raise ValueError("scope_key is required for attention recipe selection")
+        selected = normalize_recipe(self.attention_recipe)
+        if not isinstance(self.attention_b3_scope_allowlist, list) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in self.attention_b3_scope_allowlist
+        ):
+            raise ValueError("attention_b3_scope_allowlist must contain non-empty strings")
+        if selected == B3_RECIPE and scope_key not in self.attention_b3_scope_allowlist:
+            return BASELINE_RECIPE
+        return selected
 
 
 @dataclass(slots=True)

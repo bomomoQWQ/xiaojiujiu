@@ -29,6 +29,15 @@ B2_ATTENTION_VERSION = "langchao.attention.b2-all-one.v1"
 B3_ATTENTION_VERSION = "langchao.attention.b3-explicit-signals.v1"
 
 
+def parameter_version_for_recipe(plan: "LangchaoAttentionRecipePlan") -> str:
+    """Audit version recorded in state without relaxing engine schema validation."""
+    if not isinstance(plan, LangchaoAttentionRecipePlan):
+        raise TypeError("plan must be LangchaoAttentionRecipePlan")
+    if plan.selection == BASELINE_RECIPE:
+        return plan.parameters.parameter_version
+    return f"{plan.parameters.parameter_version}+{plan.audit_version}+{plan.recipe_version}"
+
+
 def _unit_signal(name: str, value: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be numeric")
@@ -204,5 +213,5 @@ __all__ = [
     "BASELINE_ATTENTION_VERSION", "BASELINE_RECIPE", "BASELINE_RECIPE_VERSION",
     "ExplicitAttentionSignals", "LANGCHAO_ATTENTION_RECIPE_AUDIT_VERSION",
     "LangchaoAttentionRecipePlan", "RECIPE_CHOICES", "compile_attention_recipe",
-    "normalize_recipe",
+    "normalize_recipe", "parameter_version_for_recipe",
 ]

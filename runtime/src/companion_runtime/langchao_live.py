@@ -15,6 +15,8 @@ from typing import Any, Mapping
 
 from .capability_witness import WitnessValidator, candidate_witness_requirement
 from .langchao_authority import AuthorityEngine, AuthorityMode
+from .langchao_no_send import NoSendReason, NoSendResult
+from .langchao_permission import PermissionProjection, read_runtime_permission
 from .langchao_runtime_adapter import BuiltCandidateContracts, BuiltShadowRound
 from .langchao_live_repository import LangchaoLiveCommit
 from .langchao_types import CandidateKind, CandidateState
@@ -66,6 +68,7 @@ class LangchaoLiveService:
         self, *, scope_key: str, authority_reader: Any, legacy_bridge: Any,
         contract_repository: Any | None = None,
         witness_reader: Any | None = None,
+        permission_reader: Any | None = None,
     ) -> None:
         if not scope_key.strip():
             raise ValueError("scope_key is required")
@@ -74,6 +77,7 @@ class LangchaoLiveService:
         self.legacy = legacy_bridge
         self.contracts = contract_repository
         self.witnesses = WitnessValidator(witness_reader) if witness_reader is not None else None
+        self.permission_reader = permission_reader
 
     def execute_in_transaction(
         self,
@@ -84,7 +88,7 @@ class LangchaoLiveService:
         assessed_candidates: Mapping[str, CandidateV2],
         now: datetime,
         persist_snapshot: Any | None = None,
-    ) -> LangchaoLiveResult:
+    ) -> LangchaoLiveResult | NoSendResult:
         """Commit at most one exact external candidate; rest/defer never sends."""
 
         engine, mode, may_dispatch, _revision = _authority(self.authority_reader.get_active())
@@ -115,6 +119,18 @@ class LangchaoLiveService:
             return LangchaoLiveResult(
                 round_id, decision_candidate_id, item.source_candidate_id, False, "internal_candidate"
             )
+        permission = self._current_permission(now)
+        if permission is not None and not permission.allowed:
+            return NoSendResult(reason=NoSendReason.PERMISSION_REVOKED, stage="permission",
+                round_id=round_id, candidate_id=decision_candidate_id,
+                permission_version=permission.permission_version)
+        if permission is not None and (
+                permission.permission_version != built.state.permission_version
+                or item.candidate.permission_ref != permission.permission_version):
+            return NoSendResult(reason=NoSendReason.INVALIDATED, stage="permission",
+                round_id=round_id, candidate_id=decision_candidate_id,
+                permission_version=permission.permission_version,
+                details=(("expected_permission_version", built.state.permission_version),))
         source = assessed_candidates.get(item.source_candidate_id)
         if source is None or source.candidate_id != item.provenance.candidate_id:
             raise LangchaoLiveValidationError("legacy candidate provenance mismatch")
@@ -122,7 +138,11 @@ class LangchaoLiveService:
             candidate=source, scope_key=self.scope_key, now=now
         )
         if boundary.blocked:
-            raise LangchaoLiveValidationError("current boundary blocks selected candidate")
+            return NoSendResult(reason=NoSendReason.PERMISSION_REVOKED, stage="permission",
+                round_id=round_id, candidate_id=decision_candidate_id,
+                permission_version=(built.state.permission_version if permission is None
+                                    else permission.permission_version),
+                details=tuple(("boundary", str(reason)) for reason in boundary.reasons))
         if persist_snapshot is None:
             raise LangchaoLiveValidationError("live dispatch requires durable snapshot persistence")
 
@@ -160,6 +180,17 @@ class LangchaoLiveService:
         return LangchaoLiveResult(
             round_id, decision_candidate_id, item.source_candidate_id, True, "committed", receipt
         )
+
+    def _current_permission(self, now: datetime) -> PermissionProjection | None:
+        if self.permission_reader is not None:
+            projection = self.permission_reader(now=now)
+            if projection is not None and not isinstance(projection, PermissionProjection):
+                raise TypeError("permission_reader must return PermissionProjection or None")
+            return projection
+        runtime = getattr(self.legacy, "runtime", None)
+        if runtime is None:
+            return None
+        return read_runtime_permission(runtime, scope_key=self.scope_key, now=now)
 
     def _validate_contract(
         self, item: BuiltCandidateContracts, *, built: BuiltShadowRound, now: datetime
