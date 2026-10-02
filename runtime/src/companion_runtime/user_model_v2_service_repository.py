@@ -13,7 +13,11 @@ from datetime import datetime
 from uuid import NAMESPACE_URL, uuid5
 from typing import Any, Iterable, Mapping
 
-from .user_model_v2_features import DEFAULT_FEATURE_SPEC_V2, FeatureSnapshotV2
+from .user_model_v2_features import (
+    DEFAULT_FEATURE_SPEC_V2,
+    FeatureSnapshotV2,
+    StoredFeatureSnapshotV2,
+)
 from .user_model_v2_repository import UserModelV2Repository, canonical_json
 from .user_model_v2_service import ActiveTrainingRecordV2, PreparedExposureV2
 from .user_model_v2_types import (
@@ -107,14 +111,17 @@ def _features_from_payload(
     exposure_id: str,
     action: Any,
     context: Any,
-) -> FeatureSnapshotV2:
+) -> FeatureSnapshotV2 | StoredFeatureSnapshotV2:
     payload = _json_object(value, name="feature snapshot")
     if str(payload.get("scope_key")) != scope_key or str(payload.get("exposure_id")) != exposure_id:
         raise ValueError("stored feature snapshot identity does not match its exposure")
     if payload.get("feature_version") != DEFAULT_FEATURE_SPEC_V2.version:
-        raise ValueError("stored feature snapshot has an unsupported feature version")
+        # Written under an older definition: hand it back exactly as stored.  The
+        # integrity comparison below re-encodes with the *current* encoder, which cannot
+        # say anything true about an older vector layout.
+        return StoredFeatureSnapshotV2(stored=dict(payload))
     if payload.get("feature_fingerprint") != DEFAULT_FEATURE_SPEC_V2.fingerprint:
-        raise ValueError("stored feature snapshot has an unsupported feature fingerprint")
+        return StoredFeatureSnapshotV2(stored=dict(payload))
     snapshot = FeatureSnapshotV2(
         scope_key=scope_key,
         exposure_id=exposure_id,

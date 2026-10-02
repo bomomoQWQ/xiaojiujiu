@@ -338,3 +338,44 @@ class FeatureSnapshotV2:
             "missing_mask": list(self.missing_mask),
             "created_at": self.created_at.isoformat(),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class StoredFeatureSnapshotV2:
+    """A persisted snapshot written under an older feature definition.
+
+    It is carried verbatim so historical rows stay readable, reconcilable and
+    byte-identical when re-written.  It deliberately exposes ``feature_version`` and
+    ``feature_fingerprint`` from storage rather than re-encoding: a learner that compares
+    against the current spec therefore skips it instead of silently mixing vector layouts.
+    Re-encoding it here would be worse than useless — the vector would look current.
+    """
+
+    stored: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stored, Mapping):
+            raise TypeError("stored feature snapshot must be a mapping")
+        for name in ("scope_key", "exposure_id", "feature_version", "feature_fingerprint"):
+            value = self.stored.get(name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"stored feature snapshot must carry {name}")
+
+    @property
+    def scope_key(self) -> str:
+        return str(self.stored["scope_key"])
+
+    @property
+    def exposure_id(self) -> str:
+        return str(self.stored["exposure_id"])
+
+    @property
+    def feature_version(self) -> str:
+        return str(self.stored["feature_version"])
+
+    @property
+    def feature_fingerprint(self) -> str:
+        return str(self.stored["feature_fingerprint"])
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.stored)
