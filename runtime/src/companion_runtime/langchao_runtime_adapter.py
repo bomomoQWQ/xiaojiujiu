@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from .decision_v2_audit import CandidateAssessment
+from .langchao_permission import PermissionProjection
 from .langchao_exploration import (
     EXPLORATION_PROCESS_CAP,
     EXPLORATION_PROCESS_VALUE,
@@ -176,6 +177,7 @@ class RuntimeFactSnapshot:
     source_cursor: str
     values: Mapping[str, float]
     candidates: tuple[RuntimeCandidateFacts, ...]
+    permission: PermissionProjection | None = None
     snapshot_version: str = RUNTIME_FACT_SNAPSHOT_VERSION
 
     def __post_init__(self) -> None:
@@ -183,6 +185,11 @@ class RuntimeFactSnapshot:
             _text(name, getattr(self, name))
         if self.snapshot_version != RUNTIME_FACT_SNAPSHOT_VERSION:
             raise ValueError(f"snapshot_version must be {RUNTIME_FACT_SNAPSHOT_VERSION!r}")
+        if self.permission is not None:
+            if not isinstance(self.permission, PermissionProjection):
+                raise TypeError("permission must be PermissionProjection or None")
+            if self.permission.scope_key != self.scope_key:
+                raise ValueError("permission projection scope must match snapshot scope")
         if len({item.candidate_id for item in self.candidates}) != len(self.candidates):
             raise ValueError("candidate facts must have unique candidate_id values")
 
@@ -452,9 +459,23 @@ def build_shadow_round(*, snapshot: RuntimeFactSnapshot, inputs: tuple[RuntimeCa
                        advanced_at: datetime, previous_state: LangchaoState | None = None,
                        based_on_state_version: int = 0,
                        parameter_version: str = "langchao.parameters.v1",
-                       permission_version: str = "runtime.permission.v2") -> BuiltShadowRound:
-    """Build deterministic contracts and bootstrap/reconcile an initial state."""
+                       permission: PermissionProjection | None = None,
+                       permission_version: str = "runtime.permission.v2",
+                       attention_profile: AttentionProfile | None = None) -> BuiltShadowRound:
+    """Build deterministic contracts and bootstrap/reconcile an initial state.
+
+    ``permission_version`` remains a compatibility shim for offline/legacy callers.
+    Production supplies ``snapshot.permission`` (or the explicit ``permission`` arg),
+    and the exact projection version is bound to candidates and state.
+    """
     _utc("advanced_at", advanced_at)
+    projection = permission or snapshot.permission
+    if permission is not None and snapshot.permission is not None and permission != snapshot.permission:
+        raise ValueError("explicit permission must equal snapshot permission projection")
+    if projection is not None:
+        if projection.scope_key != snapshot.scope_key:
+            raise ValueError("permission projection scope must match snapshot scope")
+        permission_version = projection.permission_version
     by_id = {item.candidate.candidate_id: item for item in inputs}
     if len(by_id) != len(inputs):
         raise ValueError("inputs must have unique candidate ids")
@@ -467,6 +488,9 @@ def build_shadow_round(*, snapshot: RuntimeFactSnapshot, inputs: tuple[RuntimeCa
     for source_id in sorted(by_id):
         facts = facts_by_id[source_id]
         reasons = list(facts.block_reasons)
+        if (projection is not None and not projection.allowed
+                and facts.template_key in {"contact.v1", "expression.v1", "followup.v1"}):
+            reasons.append("permission_denied")
         if facts.blocked:
             reasons.append("blocked")
         if facts.hard_repeat:
@@ -474,7 +498,11 @@ def build_shadow_round(*, snapshot: RuntimeFactSnapshot, inputs: tuple[RuntimeCa
         if reasons:
             dropped.append(DroppedCandidate(source_candidate_id=source_id, reasons=tuple(dict.fromkeys(reasons))))
             continue
-        item = _build_one(snapshot, facts, by_id[source_id], advanced_at, based_on_state_version)
+        bound_facts = (replace(facts, permission_ref=permission_version)
+                       if projection is not None and facts.template_key in {
+                           "contact.v1", "expression.v1", "followup.v1"
+                       } else facts)
+        item = _build_one(snapshot, bound_facts, by_id[source_id], advanced_at, based_on_state_version)
         if any(existing.candidate.candidate_id == item.candidate.candidate_id for existing in built):
             dropped.append(DroppedCandidate(source_candidate_id=source_id, reasons=("duplicate_semantic_candidate",)))
             continue
@@ -528,7 +556,9 @@ def build_shadow_round(*, snapshot: RuntimeFactSnapshot, inputs: tuple[RuntimeCa
     )
     readiness = tuple((item, previous_readiness.get(item, 0.0)) for item in working_set)
     value_profile = value_profile_from_runtime(snapshot.values)
-    attention = all_one_attention()
+    attention = all_one_attention() if attention_profile is None else attention_profile
+    if not isinstance(attention, AttentionProfile):
+        raise TypeError("attention_profile must be an AttentionProfile or None")
     state = LangchaoState(scope_key=snapshot.scope_key, decision_round_id=round_id,
         working_set=working_set, readiness=readiness, attraction=tuple((item, 0.0) for item in working_set),
         attention=attention.direction_weights, advanced_at=(previous_state.advanced_at if same_working_set else advanced_at),

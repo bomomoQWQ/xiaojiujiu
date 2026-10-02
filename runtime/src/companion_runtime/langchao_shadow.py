@@ -502,6 +502,13 @@ def run_langchao_shadow(
         decision_budget_seconds=decision_budget_seconds,
         tie_break_order=tie_break_order,
     )
+    # The adapter may append an audited recipe/version suffix while the validated
+    # numeric parameter object retains the kernel's fixed schema version.
+    if prepared_state.parameter_version != parameters.parameter_version:
+        advanced = replace(
+            advanced,
+            state=replace(advanced.state, parameter_version=prepared_state.parameter_version),
+        )
     comparison = ShadowComparison(
         baseline_candidate_id=baseline_candidate_id,
         shadow_candidate_id=advanced.decision_candidate_id,

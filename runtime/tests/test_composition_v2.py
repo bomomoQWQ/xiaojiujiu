@@ -123,6 +123,12 @@ def test_factory_builds_v2_graph_from_injected_protocols_and_reports_health() ->
     assert composition.coordinator.legacy is legacy
     assert composition.coordinator.repository is runtime_repository
     assert composition.coordinator.user_model is composition.user_model_service
+    assert composition.goal_lifecycle_service is not None
+    assert not hasattr(composition.goal_lifecycle_service, "outbox")
+    assert not hasattr(composition.goal_lifecycle_service, "create_dispatch_claim")
+    config_defaults = RuntimeConfig()
+    assert config_defaults.langchao.internal_exploration_enabled is True
+    assert config_defaults.langchao.external_exploration_enabled is False
     health = composition.health.to_dict()
     assert health["storage"] == {"dialect": "postgres", "schema": "runtime_v2"}
     assert health["migrations"]["current_version"] == USER_MODEL_SCHEMA_VERSION

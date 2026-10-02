@@ -16,8 +16,44 @@ from test_langchao_runtime_adapter import source
 def test_langchao_shadow_is_default_off_and_requires_explicit_switch():
     config = RuntimeConfig()
     assert config.langchao.shadow_enabled is False
+    assert config.langchao.attention_recipe_for_scope("scope") == "off"
     config.langchao.shadow_enabled = True
     assert config.langchao.shadow_enabled is True
+
+
+def test_attention_recipe_b3_requires_exact_scope_allowlist_and_invalid_fails_closed():
+    config = RuntimeConfig()
+    config.langchao.attention_recipe = "B3"
+    assert config.langchao.attention_recipe_for_scope("scope") == "off"
+    config.langchao.attention_b3_scope_allowlist.append("scope")
+    assert config.langchao.attention_recipe_for_scope("scope") == "B3"
+    config.langchao.attention_recipe = "unknown"
+    import pytest
+    with pytest.raises(ValueError, match="recipe"):
+        config.langchao.attention_recipe_for_scope("scope")
+
+
+def test_runtime_fact_builder_emits_only_explicit_completed_internal_exploration():
+    from dataclasses import replace
+
+    action = {
+        "type": "internal_exploration", "internal": True, "segment_completed": True,
+        "segment_id": "segment:parser", "problem_ref": "issue:parser",
+        "question": "Which parser preserves offsets?",
+        "executable_steps": ["run A", "run B", "compare"],
+        "result_kind": "artifact", "result_ref": "artifact:comparison.json",
+        "evidence_refs": ["issue:parser", "artifact:comparison.json"],
+        "elapsed_seconds": 999999,
+    }
+    decision = _decision("explore", "internal_exploration")
+    decision = replace(decision, candidate=replace(decision.candidate, action=action))
+    built = _facts_for(decision)
+    assert built is not None and built.template_key == "exploration.v1"
+    assert built.capability_refs == ()
+    assert built.exploration_segment.segment_id == "segment:parser"
+    assert not hasattr(built.exploration_segment, "elapsed_seconds")
+    assert _facts_for(decision, internal_exploration_enabled=False) is None
+    assert _facts_for(_decision("vague", "exploration_work_segment")) is None
 
 
 def test_fixed_template_mapping_drops_unreferenced_expression_and_followup():
@@ -49,8 +85,12 @@ def test_enabled_runner_builds_contact_plus_synthetic_rest_and_state_cursor():
             return (1 if kind != "goal" or dto.reward_contract_id is None else 2), None
 
     state = SimpleNamespace(version=7, values=RuntimeConfig().values)
+    runtime = SimpleNamespace(
+        state=lambda: state,
+        projections=SimpleNamespace(boundaries=SimpleNamespace(list_all=lambda **_kwargs: [])),
+    )
     runner = LangchaoShadowRunner(
-        scope_key="scope", runtime=SimpleNamespace(state=lambda: state), service=Service(),
+        scope_key="scope", runtime=runtime, service=Service(),
         state_repository=SimpleNamespace(load_active_state=lambda: None), revisions=Revisions(),
     )
     item = _decision("contact", "contact")
@@ -63,7 +103,49 @@ def test_enabled_runner_builds_contact_plus_synthetic_rest_and_state_cursor():
         "contact.v1", "internal_rest.v1"
     }
     assert built.state.event_cursor == "runtime-version:7"
+    assert built.state.parameter_version == "langchao.parameters.v1"
+    assert set(dict(built.attention_profile.direction_weights).values()) == {1.0}
+    assert captured["kwargs"]["edges"] == ()
     assert captured["kwargs"]["idempotency_key"] == "runtime-v2:d1"
+
+
+def test_b3_runner_passes_explicit_attention_edges_and_audit_versions_to_service():
+    captured = {}
+
+    class Service:
+        def run(self, built, **kwargs):
+            captured["built"] = built
+            captured["kwargs"] = kwargs
+            return SimpleNamespace()
+
+    class Revisions:
+        def resolve(self, kind, identity, dto):
+            return (1 if kind != "goal" or dto.reward_contract_id is None else 2), None
+
+    state = SimpleNamespace(version=7, values=RuntimeConfig().values)
+    runtime = SimpleNamespace(
+        state=lambda: state,
+        projections=SimpleNamespace(boundaries=SimpleNamespace(list_all=lambda **_kwargs: [])),
+    )
+    runner = LangchaoShadowRunner(
+        scope_key="scope", runtime=runtime, service=Service(),
+        state_repository=SimpleNamespace(load_active_state=lambda: None), revisions=Revisions(),
+        attention_recipe="B3",
+    )
+    item = _decision("contact", "contact")
+    from dataclasses import replace
+    item = replace(item, candidate=replace(item.candidate, action={
+        "type": "contact", "goal_urgency": 1.0,
+        "source_freshness": 1.0, "resource_availability": 1.0,
+    }))
+    runner.run(EndogenousDecisionV2(decision_id="d-b3", acted=False, reason="defer",
+               assessments=(item,)), now=item.predictions.reply.predicted_at)
+    built = captured["built"]
+    assert built.attention_profile.version == "langchao.attention.b3-explicit-signals.v1"
+    assert "langchao.attention-recipe-audit.v1" in built.state.parameter_version
+    assert "langchao.recipe.b3-explicit-attention-full-competition.v1" in built.state.parameter_version
+    assert captured["kwargs"]["parameters"].competition_gain == 1.0
+    assert len(captured["kwargs"]["edges"]) == 2
 
 
 def test_borrowed_connection_forwards_sql_but_never_opens_nested_transaction():

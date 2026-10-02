@@ -1,0 +1,84 @@
+{
+  "schema_version": "langchao.postrepair-results-draft.v1",
+  "document_id": "langchao-postrepair-results-draft-head-94ee162",
+  "not_final_report": true,
+  "release_decision": "do_not_launch",
+  "release_authorized": false,
+  "baseline": {
+    "branch": "feat/langchao-decision-engine",
+    "head": "94ee1628b0ba5f3947161432e1fffe8cf7b476d4",
+    "comparison_baseline": "32bd8a2fbad167c3f6c66d99e704268208d5fed5",
+    "tracked_worktree_clean": true,
+    "postgres_postrepair_executed": false,
+    "evidence_class_R_count": 0
+  },
+  "decision_reason": "修复后隔离测试通过，但8个finding仍open，PostgreSQL后修复测试全部skip，无授权真实运行、external live canary或用户效果证据。",
+  "status_policy": {
+    "passed_limited": "仅在实际执行的隔离测试、已有保存证据和明确入口内通过；不外推生产、PG或真实用户。",
+    "evidence_insufficient": "存在代码/局部测试，但没有覆盖该canonical requirement的完整fixture/oracle。",
+    "blocked": "关键门禁仍open或所需授权真实环境未执行。",
+    "open_is_not_pass": true
+  },
+  "executed_evidence": {
+    "focused_postrepair_pytest": {"passed": 99, "skipped": 1, "failed": 0},
+    "postgres_audit_pytest": {"passed": 0, "skipped": 8, "failed": 0},
+    "real_runtime": {"executed": false, "external_live_canary": false}
+  },
+  "findings": {
+    "path": "runtime/audit/findings/postrepair_findings_draft.json",
+    "closed": 4,
+    "open": 8,
+    "closed_ids": ["PF-001", "PF-004", "PF-010", "PF-012"]
+  },
+  "test_results": [
+    {"id":"T01","canonical_requirement_id":"LC-MAT-01","title":"事实来源与语义真实性","overall":"evidence_insufficient","postrepair_note":"修复不补齐同话语事实投影→预测→决定完整fixture与S。"},
+    {"id":"T02","canonical_requirement_id":"LC-MAT-02","title":"作用域与私人材料隔离","overall":"passed_limited","postrepair_note":"维持隔离入口通过；不覆盖未来检索器。"},
+    {"id":"T03","canonical_requirement_id":"LC-MAT-03","title":"未知预测保持未知","overall":"passed_limited","postrepair_note":"纯函数/组件范围通过。"},
+    {"id":"T04","canonical_requirement_id":"LC-MAT-04","title":"能力与许可包络","overall":"blocked","postrepair_note":"artifact witness组件与live validator已实现并实测，但PF-008因无PG registry/live claim全链仍open。"},
+    {"id":"T05","canonical_requirement_id":"LC-MAT-05","title":"社会记忆来源哈希与失效","overall":"passed_limited","postrepair_note":"repository合同维持通过；跨存储删除由PF-007保持open。"},
+    {"id":"T06","canonical_requirement_id":"LC-PRA-01","title":"渲染文本不偷换行动范围","overall":"evidence_insufficient","postrepair_note":"approved review的scope drift gate与正控本轮通过；未覆盖反馈归因完整scenario和PG。"},
+    {"id":"T07","canonical_requirement_id":"LC-PRA-02","title":"不得伪造实践、产物或反馈","overall":"blocked","postrepair_note":"witness parser/validator与live gate存在，但PF-009缺reducer级完整声明测试和PG。"},
+    {"id":"T08","canonical_requirement_id":"LC-PRA-03","title":"OutcomeToken终态结算幂等","overall":"passed_limited","postrepair_note":"维持内部结算与既有PG证据范围，不等于外部平台exactly-once。"},
+    {"id":"T09","canonical_requirement_id":"LC-PRA-04","title":"按实际动作而非计划动作学习","overall":"passed_limited","postrepair_note":"由failed升级：actual-action witness、UNATTRIBUTABLE与exposure provenance代码及本轮测试通过；无PG/真实发送。"},
+    {"id":"T10","canonical_requirement_id":"LC-PRA-05","title":"单一发送权威与执行前重验","overall":"evidence_insufficient","postrepair_note":"permission revision reset与no-send原语有本轮测试；无PG撤权→重开→不补发全链。"},
+    {"id":"T11","canonical_requirement_id":"LC-AGY-01","title":"许可内外部表达可达","overall":"passed_limited","postrepair_note":"仅isolated/synthetic可达，无external live送达。"},
+    {"id":"T12","canonical_requirement_id":"LC-PRA-06","title":"送达未知不盲重发","overall":"passed_limited","postrepair_note":"维持durable pending范围；完整reconciliation policy未证明。"},
+    {"id":"T13","canonical_requirement_id":"LC-CON-01","title":"主导机制干预可识别","overall":"evidence_insufficient","postrepair_note":"消融仍为synthetic selection mechanics。"},
+    {"id":"T14","canonical_requirement_id":"LC-HIS-01","title":"真实elapsed time而非心跳次数","overall":"passed_limited","postrepair_note":"隔离数值核范围通过。"},
+    {"id":"T15","canonical_requirement_id":"LC-HIS-02","title":"不可变revision与CAS","overall":"passed_limited","postrepair_note":"限已测repository/authority路径。"},
+    {"id":"T16","canonical_requirement_id":"LC-HIS-03","title":"依赖失效、反证与tombstone","overall":"passed_limited","postrepair_note":"局部social失效通过；全域删除未通过。"},
+    {"id":"T17","canonical_requirement_id":"LC-HIS-04","title":"历史解释修订不改写事实","overall":"evidence_insufficient","postrepair_note":"结构与语义证据仍不同题/不完整。"},
+    {"id":"T18","canonical_requirement_id":"LC-PUR-01","title":"目的—指标登记与适用性","overall":"passed_limited","postrepair_note":"治理登记存在；生产指标消费者仍有限。"},
+    {"id":"T19","canonical_requirement_id":"LC-PUR-02","title":"实际结果不再乘旧概率","overall":"passed_limited","postrepair_note":"算术及actual/correction分离维持通过；PF-003生产闭环仍open。"},
+    {"id":"T20","canonical_requirement_id":"LC-PUR-03","title":"创建、影子与pure-assess不领奖","overall":"passed_limited","postrepair_note":"standalone shadow route代码与隔离测试改善；无PG持久化计数。"},
+    {"id":"T21","canonical_requirement_id":"LC-PUR-04","title":"普通表达不需伪装成功利任务","overall":"passed_limited","postrepair_note":"synthetic/isolated范围通过。"},
+    {"id":"T22","canonical_requirement_id":"LC-AGY-02","title":"恢复不制造用户安抚依赖","overall":"evidence_insufficient","postrepair_note":"缺生产高负荷→恢复冻结轨迹。"},
+    {"id":"T23","canonical_requirement_id":"LC-AGY-03","title":"真实问题驱动的探索可达","overall":"blocked","postrepair_note":"exploration.v1纯模块已有测试，但未生产接线、无task/artifact process ledger全链。"},
+    {"id":"T24","canonical_requirement_id":"LC-AGY-04","title":"休整、取消、完成与放下可达","overall":"evidence_insufficient","postrepair_note":"finite lifecycle规则与application boundary改善，但无生产event producer/composition接线和PG测试。"},
+    {"id":"T25","canonical_requirement_id":"LC-MAT-06","title":"避免刻板化与临床化断言","overall":"evidence_insufficient","postrepair_note":"没有对应canonical manifest oracle的双评执行。"},
+    {"id":"T26","canonical_requirement_id":"LC-CON-02","title":"愿望存在但忍住可审计区分","overall":"blocked","postrepair_note":"no-send taxonomy有代码/测试，但无统一PG全链审计输出。"},
+    {"id":"T27","canonical_requirement_id":"LC-PRA-07","title":"候选到渲染到ACK的provenance连续","overall":"passed_limited","postrepair_note":"由evidence_insufficient升级：actual-action witness补足render/send/exposure provenance的隔离证据；无PG/外部send。"},
+    {"id":"T28","canonical_requirement_id":"LC-MAT-07","title":"暂停、退出与删除服从用户主体性","overall":"blocked","postrepair_note":"deletion和permission原语存在，但PF-007及PG撤权/删除传播仍open。"},
+    {"id":"T29","canonical_requirement_id":"LC-CON-03","title":"数值有界、终止与defer","overall":"passed_limited","postrepair_note":"冻结数值fixture范围通过。"},
+    {"id":"T30","canonical_requirement_id":"LC-VER-01","title":"B0–B3四因素冻结对照","overall":"passed_limited","postrepair_note":"仅offline synthetic selection mechanics。"},
+    {"id":"T31","canonical_requirement_id":"LC-VER-02","title":"授权真实效果与语义双评审","overall":"blocked","postrepair_note":"无授权真实暴露/R；synthetic双评不能替代。"},
+    {"id":"T32","canonical_requirement_id":"LC-PRA-08","title":"外部消息端到端canary与恢复","overall":"blocked","postrepair_note":"无Langchao external claim→send→ACK→settlement→restart canary，且真实运行未授权。"}
+  ],
+  "overall_counts": {"total":32,"passed_limited":17,"evidence_insufficient":8,"blocked":7,"passed_unqualified":0},
+  "release_gate": {
+    "decision":"do_not_launch",
+    "hard_reasons":[
+      "8个finding仍open，其中包含P0。",
+      "PostgreSQL后修复测试8项全部skip。",
+      "无授权真实运行R证据。",
+      "无external Langchao live canary与恢复证据。",
+      "若干新模块只有纯/隔离测试，未生产接线。"
+    ],
+    "prohibited_claims":[
+      "不得称12 findings全部关闭。",
+      "不得称T01-T32全部通过。",
+      "不得把99 passed外推为PG、生产或真实用户通过。",
+      "不得称已获得上线授权。"
+    ]
+  }
+}

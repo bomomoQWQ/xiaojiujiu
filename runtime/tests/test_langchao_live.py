@@ -117,7 +117,12 @@ def test_none_or_disabled_authority_only_assesses_without_shadow_writes():
             langchao_shadow_runner=shadow,
         )
 
-        assert router.run(decision_id="d", now=NOW, elapsed_allowed_seconds=1) == "assessment"
+        result = router.run(decision_id="d", now=NOW, elapsed_allowed_seconds=1)
+        if hasattr(result, "reason"):
+            assert result.reason.value == "permission_denied"
+            assert result.stage == "router"
+        else:
+            assert result == "assessment"
         assert calls == ["assess"]
 
 

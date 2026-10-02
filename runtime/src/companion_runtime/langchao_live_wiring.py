@@ -119,11 +119,14 @@ class LangchaoLiveRunner:
 
 def build_langchao_live_runner(
     *, connection: Any, scope_key: str, runtime: Any, legacy_bridge: Any,
+    attention_recipe: str = "off", internal_exploration_enabled: bool = True,
 ) -> LangchaoLiveRunner:
     evaluator = build_langchao_shadow_runner(
         connection=connection, scope_key=scope_key, runtime=runtime,
         allow_live_evaluation=True,
         transaction_factory=runtime.db.transaction,
+        attention_recipe=attention_recipe,
+        internal_exploration_enabled=internal_exploration_enabled,
     )
     authority = LangchaoAuthorityRepository(connection, scope_key=scope_key)
     contracts = LangchaoRepository(connection, scope_key=scope_key)
@@ -194,10 +197,11 @@ class AuthorityRoutedEndogenousRound:
         # none, disabled, malformed, and dispatch-ineligible live authorities only
         # assess. Do not run an engine merely for comparison because decide owns
         # hazard/commit and shadow owns durable audit writes.
-        return self.v2_coordinator.assess_endogenous(
+        assessment = self.v2_coordinator.assess_endogenous(
             decision_id=decision_id, now=now,
             elapsed_allowed_seconds=elapsed_allowed_seconds,
         )
+        return assessment
 
 
 __all__ = ["AuthorityRoutedEndogenousRound", "active_authority_coordinates"]

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import pytest
 
 from companion_runtime.decision_v2_audit import CandidateAssessment
+from companion_runtime.langchao_permission import PermissionProjection, PermissionVerdict
 from companion_runtime.langchao_runtime_adapter import (
     FIXED_VALUE_TOTAL,
     RuntimeCandidateFacts,
@@ -236,6 +237,31 @@ def test_permission_version_change_forces_fresh_round_without_backlog_readiness(
     assert revoked.state.decision_round_id != old.decision_round_id
     assert dict(revoked.state.readiness) == {old.working_set[0]: 0.0}
     assert revoked.state.advanced_at == NOW
+
+
+def test_exact_permission_projection_binds_external_candidate_and_denial_keeps_internal_rest():
+    allowed = PermissionProjection(scope_key="scope", verdict=PermissionVerdict.ALLOW,
+        permission_version="permission:allow:exact", event_id="allow", occurred_at=NOW,
+        ingested_at=NOW, revision=1)
+    snapshot = RuntimeFactSnapshot(scope_key="scope", episode_id="episode", source_cursor="cursor",
+        values=VALUES, candidates=(facts("a"), facts("rest", "internal_rest.v1")),
+        permission=allowed)
+    built = build_shadow_round(snapshot=snapshot,
+        inputs=(source("a"), source("rest", with_predictions=False)), advanced_at=NOW)
+    by_source = {item.source_candidate_id: item for item in built.contracts}
+    assert built.state.permission_version == allowed.permission_version
+    assert by_source["a"].candidate.permission_ref == allowed.permission_version
+    assert by_source["rest"].candidate.permission_ref == "runtime.permission.v2"
+
+    denied = replace(allowed, verdict=PermissionVerdict.DENY,
+                     permission_version="permission:deny:exact", event_id="deny")
+    denied_round = build_shadow_round(snapshot=replace(snapshot, permission=denied),
+        inputs=(source("a"), source("rest", with_predictions=False)), advanced_at=NOW,
+        previous_state=built.state)
+    assert [item.source_candidate_id for item in denied_round.contracts] == ["rest"]
+    assert dict(denied_round.state.readiness) == {denied_round.state.working_set[0]: 0.0}
+    assert any(item.source_candidate_id == "a" and "permission_denied" in item.reasons
+               for item in denied_round.dropped)
 
 
 def test_round_hashes_are_order_independent_and_cursor_sensitive():

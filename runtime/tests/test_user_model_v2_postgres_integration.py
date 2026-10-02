@@ -14,6 +14,7 @@ import pytest
 
 psycopg = pytest.importorskip("psycopg")
 
+from companion_runtime.user_model_v2_schema import USER_MODEL_SCHEMA_VERSION
 from companion_runtime.user_model_v2_migrations import migrate
 from companion_runtime.user_model_v2_repository import UserModelV2Repository
 from companion_runtime.user_model_v2_service import UserModelV2Service
@@ -50,7 +51,7 @@ def pg_schema():
     try:
         with connection.transaction():
             result = migrate(connection, schema=schema)
-        assert result.applied == tuple(range(1, 21))
+        assert result.applied == tuple(range(1, USER_MODEL_SCHEMA_VERSION + 1))
         yield connection, schema
     finally:
         connection.rollback()
@@ -69,7 +70,7 @@ def test_native_migrations_are_idempotent_and_create_scoped_tables(pg_schema) ->
     with connection.transaction():
         second = migrate(connection, schema=schema)
     assert second.applied == ()
-    assert second.already_present == tuple(range(1, 21))
+    assert second.already_present == tuple(range(1, USER_MODEL_SCHEMA_VERSION + 1))
 
     rows = connection.execute(
         "SELECT table_name FROM information_schema.tables "
@@ -415,7 +416,7 @@ def _langchao_committed_snapshot(*, scope: str, candidate: CandidateV2, receipt,
             upper=0.75,
             interval_level=0.9,
             interval_kind="integration-test",
-            support=SupportStatus.UNAVAILABLE,
+            support=SupportStatus.INFORMATIVE,
             predicted_at=now,
             created_at=now,
             updated_at=now,
@@ -433,7 +434,7 @@ def _langchao_committed_snapshot(*, scope: str, candidate: CandidateV2, receipt,
             negative=prediction(Target.NEGATIVE),
         ),
         cold_start_exploration=False,
-        audit={"audit_contract_version": "integration-test", "name": "浪潮"},
+        audit={"audit_contract_version": "integration-test", "name": "濞搭亝鐤?},
         attempt_id=receipt.attempt_id,
         render_outbox_id=receipt.render_outbox_id,
         committed_at=now,
@@ -445,7 +446,7 @@ def test_shared_runtime_database_commit_is_atomic_on_real_postgres(outcome: str)
     """The legacy attempt and every v2 witness share one physical PG transaction."""
 
     schema = "langchao_atomic_" + uuid.uuid4().hex[:12]
-    scope = "integration:浪潮"
+    scope = "integration:濞搭亝鐤?
     decision_id = f"langchao:{outcome}:{uuid.uuid4()}"
     config = RuntimeConfig()
     config.storage.dsn = _DSN
@@ -473,8 +474,8 @@ def test_shared_runtime_database_commit_is_atomic_on_real_postgres(outcome: str)
         legacy_candidate = CandidateIntent(
             candidate_id=f"langchao-candidate:{uuid.uuid4()}",
             type="share",
-            intent="浪潮",
-            goal="浪潮",
+            intent="濞搭亝鐤?,
+            goal="濞搭亝鐤?,
             internal_need=1.0,
         )
         with runtime.db.transaction() as connection:
@@ -489,7 +490,7 @@ def test_shared_runtime_database_commit_is_atomic_on_real_postgres(outcome: str)
             callback_statuses.append(raw.info.transaction_status)
             composition.audit_repository.save_decision_audit(
                 decision_id=decision_id,
-                audit={"audit_contract_version": "integration-test", "name": "浪潮"},
+                audit={"audit_contract_version": "integration-test", "name": "濞搭亝鐤?},
             )
             if outcome == "snapshot_sql_failure":
                 raw.execute(

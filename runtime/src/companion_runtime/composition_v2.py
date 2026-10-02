@@ -115,6 +115,7 @@ class V2Composition:
     langchao_shadow_runner: Any | None = None
     langchao_live_runner: Any | None = None
     authority_round_router: Any | None = None
+    goal_lifecycle_service: Any | None = None
     social_service: Any | None = None
     owns_database: bool = True
 
@@ -212,6 +213,9 @@ def build_v2_composition(
             rng=rng,
         )
         expected = tuple(record.version for record in migration_records())
+        # Validate before constructing optional runners. Invalid recipe/allowlist
+        # configuration aborts composition rather than silently enabling a variant.
+        attention_recipe = config.langchao.attention_recipe_for_scope(scope_key)
         social_enabled = bool(
             config.langchao.social_enabled
             or config.extras.get("langchao.social_enabled", False)
@@ -251,6 +255,8 @@ def build_v2_composition(
             # unconditional above, while object construction remains explicitly opt-in.
             langchao_shadow_runner = build_langchao_shadow_runner(
                 connection=connection, scope_key=scope_key, runtime=legacy_bridge.runtime,
+                attention_recipe=attention_recipe,
+                internal_exploration_enabled=config.langchao.internal_exploration_enabled,
             )
         live_enabled = bool(config.langchao.live_allowed(scope_key))
         langchao_live_runner = None
@@ -260,6 +266,8 @@ def build_v2_composition(
             langchao_live_runner = build_langchao_live_runner(
                 connection=connection, scope_key=scope_key,
                 runtime=legacy_bridge.runtime, legacy_bridge=legacy_bridge,
+                attention_recipe=attention_recipe,
+                internal_exploration_enabled=config.langchao.internal_exploration_enabled,
             )
             from .langchao_user_outcomes import LangchaoUserOutcomeSettler
 
@@ -269,6 +277,14 @@ def build_v2_composition(
             langchao_live_runner.exposure_repository = runtime_repository
             langchao_live_runner.user_model = user_model_service
             langchao_live_runner.horizons = coordinator.config.horizons
+        from .langchao_goal_lifecycle_service import LangchaoGoalLifecycleService
+        from .langchao_repository import LangchaoRepository
+
+        # Terminal goal events use an application service with contract persistence
+        # only; it has no outbox or dispatch-claim collaborator.
+        goal_lifecycle_service = LangchaoGoalLifecycleService(
+            contract_repository=LangchaoRepository(connection, scope_key=scope_key),
+        )
         from .langchao_live_wiring import AuthorityRoutedEndogenousRound
         authority_round_router = AuthorityRoutedEndogenousRound(
             scope_key=scope_key, v2_coordinator=coordinator,
@@ -315,6 +331,7 @@ def build_v2_composition(
             langchao_shadow_runner=langchao_shadow_runner,
             langchao_live_runner=langchao_live_runner,
             authority_round_router=authority_round_router,
+            goal_lifecycle_service=goal_lifecycle_service,
             social_service=social_service,
             owns_database=effective_owns_database,
         )

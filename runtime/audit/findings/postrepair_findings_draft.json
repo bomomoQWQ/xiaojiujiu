@@ -1,0 +1,171 @@
+{
+  "schema_version": "langchao.postrepair-findings-draft.v1",
+  "document_id": "postrepair-findings-draft-head-94ee162",
+  "document_kind": "postrepair_review_issue_list_draft",
+  "not_final_report": true,
+  "release_authorization": false,
+  "release_posture": "hold_not_authorized",
+  "baseline": {
+    "branch": "feat/langchao-decision-engine",
+    "head": "94ee1628b0ba5f3947161432e1fffe8cf7b476d4",
+    "comparison_baseline": "32bd8a2fbad167c3f6c66d99e704268208d5fed5",
+    "worktree_tracked_changes": false,
+    "worktree_untracked_items_present": true,
+    "database_schema_version_in_code": 23,
+    "postgres_postrepair_run": false
+  },
+  "status_policy": {
+    "closed": "有实现接线且本轮实际执行了对应正负测试；关闭范围只到所列隔离入口，不外推真实生产或PG。",
+    "open": "仍缺生产接线、完整oracle、或本轮没有PostgreSQL执行证据。",
+    "passed_limited": "仅证明所列代码入口和实际执行测试，不是R证据、上线授权或生产全链通过。"
+  },
+  "test_execution": {
+    "command": "python -m pytest -q runtime/tests/test_actual_action_v21.py runtime/tests/test_capability_witness.py runtime/tests/test_pf002_social_wiring.py runtime/tests/test_langchao_user_outcomes.py runtime/tests/test_composition_v2.py runtime/tests/test_privacy_deletion.py runtime/tests/test_pf011_goal_lifecycle.py runtime/tests/test_langchao_permission_and_no_send.py runtime/tests/test_langchao_attention_recipe.py runtime/tests/test_langchao_exploration.py runtime/tests/test_langchao_live.py runtime/tests/test_langchao_runtime_adapter.py",
+    "result": "99 passed, 1 skipped",
+    "postgres_command": "python -m pytest -q runtime/tests/test_langchao_prelaunch_postgres_audit.py",
+    "postgres_result": "8 skipped",
+    "evidence_class": "T (local isolated execution only)"
+  },
+  "summary": {
+    "finding_count": 12,
+    "closed": 4,
+    "open": 8,
+    "closed_ids": ["PF-001", "PF-004", "PF-010", "PF-012"],
+    "open_ids": ["PF-002", "PF-003", "PF-005", "PF-006", "PF-007", "PF-008", "PF-009", "PF-011"],
+    "decision_note": "代码修复显著，但PG后修复执行为0；生产接线、持久化和完整oracle未验证项保持open。"
+  },
+  "findings": [
+    {
+      "id": "PF-001",
+      "priority": "P0",
+      "title": "最终 rendered/sent text 未进入训练曝光事实",
+      "status": "closed",
+      "verification": "passed_limited",
+      "current_answer": "已实现actual-action witness并在render→send绑定attempt/render outbox/send outbox；ACK exposure使用witness派生的actual action provenance，未知语义标UNATTRIBUTABLE。",
+      "code_evidence": ["runtime/src/companion_runtime/actual_action_v21.py", "runtime/src/companion_runtime/reducer.py:1650-1685", "runtime/src/companion_runtime/runtime_v2.py:845-880"],
+      "test_evidence": ["runtime/tests/test_actual_action_v21.py (本轮实际执行通过)"],
+      "limitations": ["没有PostgreSQL后修复运行", "没有真实发送R证据", "文本语义仍依赖显式review而非自动判定"]
+    },
+    {
+      "id": "PF-002",
+      "priority": "P1",
+      "title": "social 子系统实现但生产接线未获PG证明",
+      "status": "open",
+      "verification": "passed_limited",
+      "current_answer": "composition已有受配置开关控制的social service构造和legacy bridge注入；隔离测试通过，但默认未启用且无PG composition smoke。",
+      "code_evidence": ["runtime/src/companion_runtime/composition_v2.py:215-228", "runtime/src/companion_runtime/langchao_social_wiring.py"],
+      "test_evidence": ["runtime/tests/test_pf002_social_wiring.py (本轮实际执行通过)", "runtime/tests/test_composition_v2.py (本轮实际执行通过)"],
+      "remain_open_reason": "生产PostgreSQL composition、真实source→proposal→candidate→claim链未运行；按审查口径未生产接线/未PG运行保持open。"
+    },
+    {
+      "id": "PF-003",
+      "priority": "P1",
+      "title": "actual user outcome 回灌闭环",
+      "status": "open",
+      "verification": "passed_limited",
+      "current_answer": "langchao/live ACK现可创建v2 exposure；settled reply/continuation/negative label可写actual/correction token并按scope与label revision幂等。",
+      "code_evidence": ["runtime/src/companion_runtime/langchao_live_wiring.py:85-113", "runtime/src/companion_runtime/langchao_user_outcomes.py", "runtime/src/companion_runtime/composition_v2.py:255-271"],
+      "test_evidence": ["runtime/tests/test_langchao_user_outcomes.py (本轮实际执行通过)"],
+      "remain_open_reason": "无PG ACK→exposure→label→outcome→下一轮reward全链；未来reward/state实际消费效果未由生产运行证明。"
+    },
+    {
+      "id": "PF-004",
+      "priority": "P2",
+      "title": "attention 默认all-one的能力口径",
+      "status": "closed",
+      "verification": "passed_limited",
+      "current_answer": "默认仍明确冻结为all-one/non-informative；新增可选、版本化、校验严格的attention recipe，默认不冒充动态生产信号。",
+      "code_evidence": ["runtime/src/companion_runtime/langchao_attention_recipe.py", "runtime/src/companion_runtime/langchao_runtime_adapter.py"],
+      "test_evidence": ["runtime/tests/test_langchao_attention_recipe.py (本轮实际执行通过)", "runtime/tests/test_langchao_runtime_adapter.py (本轮实际执行通过)"],
+      "limitations": ["关闭的是口径/冻结不变量；不声称动态attention已在生产启用"]
+    },
+    {
+      "id": "PF-005",
+      "priority": "P2",
+      "title": "默认competition_gain=0，完整竞争生产语义未启用",
+      "status": "open",
+      "verification": "passed_limited",
+      "current_answer": "隔离recipe与消融支持非零竞争，但生产默认仍为competition-disabled。",
+      "code_evidence": ["runtime/src/companion_runtime/langchao_attention_recipe.py", "runtime/src/companion_runtime/offline_ablation.py", "runtime/src/companion_runtime/langchao_shadow_wiring.py"],
+      "test_evidence": ["runtime/tests/test_langchao_attention_recipe.py (本轮实际执行通过)"],
+      "remain_open_reason": "未生产启用，且无PG/生产多候选运行；只能声称B2-like简化模式。"
+    },
+    {
+      "id": "PF-006",
+      "priority": "P1",
+      "title": "langchao/shadow authority 路由",
+      "status": "open",
+      "verification": "passed_limited",
+      "current_answer": "router现对独立langchao/shadow执行pure assess后调用shadow runner；composition可按active authority自动构造runner。",
+      "code_evidence": ["runtime/src/companion_runtime/langchao_live_wiring.py:180-193", "runtime/src/companion_runtime/composition_v2.py:229-254"],
+      "test_evidence": ["runtime/tests/test_composition_v2.py::test_active_shadow_authority_composes_shadow_runner_without_feature_switch (本轮通过)", "runtime/tests/test_langchao_live.py (本轮通过)"],
+      "remain_open_reason": "没有PG authority truth-table运行和持久化zero-side-effect计数证据。"
+    },
+    {
+      "id": "PF-007",
+      "priority": "P0",
+      "title": "删除策略跨派生物执行闭环",
+      "status": "open",
+      "verification": "passed_limited",
+      "current_answer": "已新增授权API、可恢复work queue、source protection、social/goal/candidate/memory/outbox/learning/outcome evidence处理。",
+      "code_evidence": ["runtime/src/companion_runtime/privacy_deletion_api.py", "runtime/src/companion_runtime/privacy_deletion_repository.py", "runtime/src/companion_runtime/privacy_deletion_service.py", "runtime/src/companion_runtime/privacy_deletion_schema.py"],
+      "test_evidence": ["runtime/tests/test_privacy_deletion.py (本轮实际执行通过)"],
+      "remain_open_reason": "测试使用fake连接；PG迁移、跨表实际删除传播、reader/exporter suppression和重试对账未运行。"
+    },
+    {
+      "id": "PF-008",
+      "priority": "P0",
+      "title": "能力与artifact witness联合门禁",
+      "status": "open",
+      "verification": "passed_limited",
+      "current_answer": "已实现scope/task/capability/operation/hash/source精确witness和live claim前重验。",
+      "code_evidence": ["runtime/src/companion_runtime/capability_witness.py", "runtime/src/companion_runtime/capability_witness_schema.py", "runtime/src/companion_runtime/langchao_live.py:210-217"],
+      "test_evidence": ["runtime/tests/test_capability_witness.py (本轮实际执行通过)"],
+      "remain_open_reason": "无PG registry读写与live claim正负全链；生产builder是否为所有research/retrieval候选填充witness envelope未证明。"
+    },
+    {
+      "id": "PF-009",
+      "priority": "P0",
+      "title": "render完成声明与task/artifact ledger复核",
+      "status": "open",
+      "verification": "passed_limited",
+      "current_answer": "reducer render阶段会识别狭义研究/检索完成声明并要求live witness validator；缺失则fail render。",
+      "code_evidence": ["runtime/src/companion_runtime/capability_witness.py:189-202", "runtime/src/companion_runtime/reducer.py:1665-1680"],
+      "test_evidence": ["runtime/tests/test_capability_witness.py::test_completion_statement_needs_exact_witness_but_ordinary_expression_does_not (本轮通过)"],
+      "remain_open_reason": "没有reducer级完成声明正负集成测试，也没有PG witness重验；正则仅覆盖有限中文措辞，完整完成声明类型oracle未封闭。"
+    },
+    {
+      "id": "PF-010",
+      "priority": "P0",
+      "title": "plan-vs-render动作范围漂移门禁",
+      "status": "closed",
+      "verification": "passed_limited",
+      "current_answer": "approved semantic review若扩大reply obligation、pressure、commitment或completion claim，render在未重新授权时失败；等价低压正控可达。",
+      "code_evidence": ["runtime/src/companion_runtime/actual_action_v21.py:148-191", "runtime/src/companion_runtime/reducer.py:1656-1689"],
+      "test_evidence": ["runtime/tests/test_actual_action_v21.py::test_reducer_binds_witness_to_send_outbox_and_blocks_pressure_drift", "runtime/tests/test_actual_action_v21.py::test_reducer_positive_control_send_contains_frozen_actual_witness", "本轮实际执行通过"],
+      "limitations": ["关闭范围依赖approved semantic review；无review时归因UNATTRIBUTABLE，不声称自动语义检测"]
+    },
+    {
+      "id": "PF-011",
+      "priority": "P2",
+      "title": "有限目标完成→退休→不重开生命周期",
+      "status": "open",
+      "verification": "passed_limited",
+      "current_answer": "已有complete/drop/reopen纯生命周期合同和持久化application boundary；纯规则正负测试通过。",
+      "code_evidence": ["runtime/src/companion_runtime/langchao_goal_lifecycle.py", "runtime/src/companion_runtime/langchao_goal_lifecycle_service.py"],
+      "test_evidence": ["runtime/tests/test_pf011_goal_lifecycle.py (本轮实际执行通过)"],
+      "remain_open_reason": "虽有持久化application boundary，但未见composition/event producer生产调用，也无service/PG测试；原T09完整交付、自然结束、短时长、后续轮次不复活全链未运行。"
+    },
+    {
+      "id": "PF-012",
+      "priority": "P1",
+      "title": "canonical requirement identity与legacy crosswalk",
+      "status": "closed",
+      "verification": "passed_limited",
+      "current_answer": "canonical registry/crosswalk及manifest冲突校验已存在，namespaced legacy aliases保留。",
+      "code_evidence": ["runtime/audit/langchao_requirement_crosswalk_v1.json", "runtime/src/companion_runtime/langchao_acceptance_manifest.py"],
+      "test_evidence": ["既有runtime/tests/test_langchao_acceptance_manifest.py执行证据；本轮未重跑该文件"],
+      "limitations": ["历史artifact不重写；裸Txx仍只可在明确namespace内解释"]
+    }
+  ]
+}
