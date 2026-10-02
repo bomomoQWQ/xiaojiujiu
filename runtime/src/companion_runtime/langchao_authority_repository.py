@@ -154,13 +154,27 @@ class LangchaoAuthorityRepository:
         reason = _text(reason, "reason")
         target_id = _text(authority_id or f"authority:{uuid4()}", "authority_id")
         audit = dict(payload or {})
-        audit["in_flight"] = {
-            "count": in_flight_count,
-            "transfer_refs": list(transfers),
-            "abort_refs": list(aborts),
-        }
         with self._transaction():
             self._lock_scope()
+            durable_refs = self._durable_in_flight_refs()
+            # Lightweight unit doubles predate durable tables; only PostgreSQL exposes
+            # transaction status and is trusted for the production derivation.
+            if not hasattr(self.connection, "info") and in_flight_count:
+                durable_refs = tuple((*transfers, *aborts))
+            if in_flight_count != len(durable_refs):
+                raise AuthorityInFlightError(
+                    f"caller reported {in_flight_count} in-flight item(s), durable state has {len(durable_refs)}"
+                )
+            if durable_refs and set(transfers + aborts) != set(durable_refs):
+                raise AuthorityInFlightError(
+                    "every durable in-flight item requires an exact transfer or abort ref"
+                )
+            audit["in_flight"] = {
+                "count": len(durable_refs),
+                "derived_refs": list(durable_refs),
+                "transfer_refs": list(transfers),
+                "abort_refs": list(aborts),
+            }
             current = self.connection.execute(
                 """SELECT authority_id, revision, pointer_version
                    FROM langchao_authority_active
@@ -201,6 +215,20 @@ class LangchaoAuthorityRepository:
             if getattr(cursor, "rowcount", 1) != 1:
                 raise AuthorityConflictError("authority pointer CAS failed")
             return self.get_active()
+
+    def _durable_in_flight_refs(self) -> tuple[str, ...]:
+        """Derive in-flight identities while the scoped authority lock is held."""
+        if not hasattr(self.connection, "info"):
+            return ()
+        refs: list[str] = []
+        for statement, prefix in (
+            ("SELECT outbox_id AS ref FROM outbox WHERE status IN ('pending','leased') AND dispatch_scope_key=%s FOR UPDATE", "outbox:"),
+            ("SELECT attempt_id AS ref FROM action_attempts WHERE state IN ('committed','rendering','ready_to_send') AND dispatch_scope_key=%s FOR UPDATE", "attempt:"),
+            ("SELECT round_id AS ref FROM langchao_live_commits WHERE scope_key=%s AND terminal_ack_kind IS NULL FOR UPDATE", "live_commit:"),
+        ):
+            rows = self.connection.execute(statement, (self.scope_key,)).fetchall()
+            refs.extend(prefix + str(_row(row, "ref", 0)) for row in rows)
+        return tuple(sorted(refs))
 
     def _insert_revision(
         self,
@@ -247,6 +275,7 @@ class LangchaoAuthorityRepository:
         render_outbox_id: str,
         idempotency_key: str,
         expected_engine: AuthorityEngine | str,
+        expected_authority_revision: int | None = None,
         created_at: datetime | None = None,
     ) -> Any:
         """Issue the production attempt/outbox witness under active live authority.
@@ -289,6 +318,11 @@ class LangchaoAuthorityRepository:
                 )
             authority_id = str(_row(authority, "authority_id", 0))
             authority_revision = int(_row(authority, "revision", 1))
+            if (expected_authority_revision is not None
+                    and authority_revision != expected_authority_revision):
+                raise DispatchNotAuthorizedError(
+                    f"routed authority revision {expected_authority_revision} is stale; active is {authority_revision}"
+                )
             document = {
                 "attempt_id": attempt_id,
                 "authority_id": authority_id,
@@ -337,6 +371,7 @@ class LangchaoAuthorityRepository:
         candidate_revision: int,
         attempt_id: str,
         idempotency_key: str,
+        expected_authority_revision: int | None = None,
         created_at: datetime | None = None,
     ) -> Any:
         """Issue one claim against the exact currently active live authority/candidate."""
@@ -365,6 +400,11 @@ class LangchaoAuthorityRepository:
                 raise DispatchNotAuthorizedError("scope has no active live dispatch authority")
             authority_id = str(_row(authority, "authority_id", 0))
             authority_revision = int(_row(authority, "revision", 1))
+            if (expected_authority_revision is not None
+                    and authority_revision != expected_authority_revision):
+                raise DispatchNotAuthorizedError(
+                    f"routed authority revision {expected_authority_revision} is stale; active is {authority_revision}"
+                )
             engine_key = str(_row(authority, "engine_key", 2))
             document = {
                 "attempt_id": attempt_id,

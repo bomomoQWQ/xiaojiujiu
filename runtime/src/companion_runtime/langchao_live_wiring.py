@@ -11,7 +11,7 @@ from .langchao_authority import AuthorityEngine, AuthorityMode
 from .langchao_authority_repository import LangchaoAuthorityRepository
 from .langchao_live import LangchaoLiveResult, LangchaoLiveService
 from .langchao_live_repository import LangchaoLiveRepository
-from .langchao_no_send import NoSendReason, NoSendResult
+from .langchao_no_send import DELIVERY_STAGE, NoSendReason, NoSendResult
 from .langchao_repository import LangchaoRepository
 from .langchao_shadow_wiring import build_langchao_shadow_runner
 
@@ -47,6 +47,11 @@ def active_authority_coordinates(value: Any) -> tuple[str, str, bool]:
     return engine, mode, may_dispatch
 
 
+def _is_transient_dispatch_error(exc: Exception) -> bool:
+    """Recognize retryable PostgreSQL lock/contention failures without importing psycopg."""
+    return type(exc).__name__ in {"LockNotAvailable", "SerializationFailure", "DeadlockDetected"}
+
+
 @dataclass(slots=True)
 class LangchaoLiveRunner:
     """Reuse fixed-contract evaluation, then dispatch only its decided winner."""
@@ -58,7 +63,8 @@ class LangchaoLiveRunner:
     user_model: Any | None = None
     horizons: Any | None = None
 
-    def run(self, assessment: Any, *, now: datetime) -> Any:
+    def run(self, assessment: Any, *, now: datetime,
+            authority_revision: int | None = None) -> Any:
         round_id = str(getattr(assessment, "decision_id", "") or "").strip()
         sources = {
             item.candidate.candidate_id: item.candidate
@@ -80,16 +86,24 @@ class LangchaoLiveRunner:
                 built=built, decision_candidate_id=candidate_id,
                 assessed_candidates=sources, now=now,
                 persist_snapshot=self.repository.save_commit,
+                expected_authority_revision=authority_revision,
             )
 
         try:
             evaluated = self.evaluator.run(assessment, now=now, before_commit=commit)
         except Exception as exc:
+            durable = self.repository.get(round_id) if round_id else None
+            if durable is not None:
+                return LangchaoLiveResult(
+                    round_id, durable.langchao_candidate_id, durable.source_candidate_id,
+                    True, "committed_recovered",
+                )
             result = NoSendResult(
                 reason=NoSendReason.DISPATCH_FAILED, stage="dispatch",
                 round_id=round_id or None, candidate_id=attempted_candidate_id,
                 permission_version=attempted_permission_version,
-                details=(("error_type", type(exc).__name__),),
+                details=(("error_type", type(exc).__name__),
+                         ("transient", str(_is_transient_dispatch_error(exc)).lower())),
             )
             self.repository.save_no_send(result, recorded_at=now)
             return result
@@ -133,7 +147,7 @@ class LangchaoLiveRunner:
             result = NoSendResult(
                 reason=(NoSendReason.DISPATCH_FAILED if confirmed
                         else NoSendReason.DELIVERY_UNKNOWN),
-                stage="delivery", round_id=ack.decision_id,
+                stage=DELIVERY_STAGE, round_id=ack.decision_id,
                 candidate_id=(None if commit is None else commit.langchao_candidate_id),
                 details=(("ack_id", str(ack.send_outbox_id)),
                          ("confirmed", str(bool(confirmed)).lower())),
@@ -173,6 +187,7 @@ def build_langchao_live_runner(
     *, connection: Any, scope_key: str, runtime: Any, legacy_bridge: Any,
     witness_reader: Any | None = None,
     attention_recipe: str = "off", internal_exploration_enabled: bool = True,
+    cold_start_drive: float = 0.0,
 ) -> LangchaoLiveRunner:
     evaluator = build_langchao_shadow_runner(
         connection=connection, scope_key=scope_key, runtime=runtime,
@@ -180,6 +195,7 @@ def build_langchao_live_runner(
         transaction_factory=runtime.db.transaction,
         attention_recipe=attention_recipe,
         internal_exploration_enabled=internal_exploration_enabled,
+        cold_start_drive=cold_start_drive,
     )
     authority = LangchaoAuthorityRepository(connection, scope_key=scope_key)
     contracts = LangchaoRepository(connection, scope_key=scope_key)
@@ -249,7 +265,9 @@ class AuthorityRoutedEndogenousRound:
                 ), now=now)
             if self.langchao_live_runner is None:
                 raise RuntimeError("langchao/live authority has no configured live runner")
-            return self.langchao_live_runner.run(assessment, now=now)
+            return self.langchao_live_runner.run(
+                assessment, now=now, authority_revision=authority_revision,
+            )
         # Shadow authority evaluates the same pure v2 assessment, then persists only
         # Langchao contracts/state/audit.  It must never enter v2 decide/commit.
         if (engine, mode, may_dispatch) == (

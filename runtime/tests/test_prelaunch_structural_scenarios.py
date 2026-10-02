@@ -149,7 +149,10 @@ class _LiveConnection:
                 "source_candidate_id": params[4], "reward_contract_id": params[5],
                 "reward_revision": params[6], "snapshot": params[8],
                 "attempt_id": params[9], "render_outbox_id": params[10],
-                "claim_id": params[11], "committed_at": params[12],
+                "claim_id": params[11],
+                # v26 dual-writes the semantic-claim witness pair before committed_at.
+                "semantic_dispatch_id": params[12], "authority_revision": params[13],
+                "committed_at": params[14],
                 "terminal_ack_id": None, "terminal_ack_kind": None,
             }
             return _Cursor(row={"round_id": params[1]})

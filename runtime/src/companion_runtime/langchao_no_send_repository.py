@@ -5,11 +5,11 @@ import json
 from datetime import datetime
 from typing import Any, Mapping
 
-from .langchao_no_send import NoSendReason, NoSendResult
+from .langchao_no_send import DELIVERY_STAGE, NoSendReason, NoSendResult
 
 
 class LangchaoNoSendConflictError(RuntimeError):
-    """One round already has a different terminal non-send result."""
+    """One round already has a commit or a different terminal non-send result."""
 
 
 class LangchaoNoSendRepository:
@@ -24,6 +24,20 @@ class LangchaoNoSendRepository:
             raise TypeError("result must be NoSendResult")
         if result.round_id is None:
             raise ValueError("persisted no-send result requires round_id")
+        # A round that already committed may still record one delivery-stage result:
+        # that record *is* the terminal censoring of its own failed acknowledgement
+        # (``LangchaoLiveRunner.after_legacy_send_ack``).  What must never coexist with a
+        # durable commit is a record claiming the round never dispatched at all, because
+        # then two contradictory accounts of one round would both be readable.
+        if result.stage != DELIVERY_STAGE:
+            committed = self.connection.execute(
+                "SELECT 1 FROM langchao_live_commits WHERE scope_key=%s AND round_id=%s",
+                (self.scope_key, result.round_id),
+            ).fetchone()
+            if committed is not None:
+                raise LangchaoNoSendConflictError(
+                    "round already has a durable live commit"
+                )
         cursor = self.connection.execute(
             """INSERT INTO langchao_no_send_results
                (scope_key, round_id, reason, stage, candidate_id, permission_version,

@@ -4,7 +4,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from companion_runtime.langchao_no_send import NoSendReason, NoSendResult
+from companion_runtime.langchao_no_send import DELIVERY_STAGE, NoSendReason, NoSendResult
+from companion_runtime.langchao_no_send_repository import (
+    LangchaoNoSendConflictError,
+    LangchaoNoSendRepository,
+)
 from companion_runtime.langchao_permission import (
     PermissionEvent,
     PermissionVerdict,
@@ -102,3 +106,62 @@ def test_four_structural_no_send_classes_are_machine_distinct():
         "no_eligible_candidate", "decision_budget_exhausted",
         "permission_revoked", "dispatch_failed",
     }
+
+
+class _NoSendConnection:
+    """Minimal store for the commit/no-send mutual exclusion rule."""
+
+    def __init__(self, *, committed: bool):
+        self.committed = committed
+        self.rows: dict[str, str] = {}
+
+    def execute(self, sql, params=()):
+        normalized = " ".join(sql.split())
+        if normalized.startswith("SELECT 1 FROM langchao_live_commits"):
+            return _NoSendCursor(row={"?": 1} if self.committed else None)
+        if normalized.startswith("INSERT INTO langchao_no_send_results"):
+            round_id = params[1]
+            if round_id in self.rows:
+                return _NoSendCursor(row=None)
+            self.rows[round_id] = params[2]
+            return _NoSendCursor(row={"round_id": round_id})
+        if normalized.startswith("SELECT reason,stage,round_id"):
+            return _NoSendCursor(row=None)
+        raise AssertionError(normalized)
+
+
+class _NoSendCursor:
+    def __init__(self, *, row=None):
+        self.row = row
+
+    def fetchone(self):
+        return self.row
+
+
+def test_a_committed_round_may_still_record_its_failed_delivery():
+    """Censoring a failed acknowledgement settles a commit; it is not a rival account.
+
+    Refusing it would leave every failed send permanently unsettled, so the rule keys on
+    the shared delivery stage rather than blocking any no-send for a committed round.
+    """
+    repository = LangchaoNoSendRepository(_NoSendConnection(committed=True), scope_key="scope")
+    settled = NoSendResult(
+        reason=NoSendReason.DISPATCH_FAILED, stage=DELIVERY_STAGE, round_id="round:1"
+    )
+    assert repository.save(settled) is settled
+
+
+def test_a_committed_round_cannot_also_claim_it_never_dispatched():
+    repository = LangchaoNoSendRepository(_NoSendConnection(committed=True), scope_key="scope")
+    with pytest.raises(LangchaoNoSendConflictError):
+        repository.save(NoSendResult(
+            reason=NoSendReason.NO_ELIGIBLE_CANDIDATE, stage="selection", round_id="round:1"
+        ))
+
+
+def test_an_uncommitted_round_records_any_stage_normally():
+    repository = LangchaoNoSendRepository(_NoSendConnection(committed=False), scope_key="scope")
+    result = NoSendResult(
+        reason=NoSendReason.NO_ELIGIBLE_CANDIDATE, stage="selection", round_id="round:2"
+    )
+    assert repository.save(result) is result

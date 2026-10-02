@@ -4,15 +4,89 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
+from contextlib import nullcontext
 from typing import Any, Mapping
 from uuid import NAMESPACE_URL, uuid5
 
 from .langchao_no_send import NoSendResult
 from .langchao_no_send_repository import LangchaoNoSendRepository
 from .langchao_outcome_repository import LangchaoOutcomeRepository
+from .langchao_runtime_adapter import (
+    COLD_START_DRIVE_OUTCOME,
+    COLD_START_EXPLORATION_LIMIT,
+    COLD_START_EXPLORATION_MIN_SPACING,
+    COLD_START_EXPLORATION_WINDOW,
+)
 from .langchao_types import MotivationDirection, OutcomeStatus, OutcomeToken, SettlementType
 from .exposure_identity import canonical_exposure_id
+
+
+class LangchaoColdStartBudget:
+    """Durable budget over cold-start outreach already committed in this scope.
+
+    The v2 engine bounds exploratory contact with a limit per window and a minimum
+    spacing. Langchao reuses those exact numbers so one policy governs both engines, and
+    counts the durable live commits whose reward contract carries the cold-start drive
+    token. Without this the numerical kernel would reach out every couple of hours, which
+    is precisely the uncontrolled volume the bound exists to prevent.
+    """
+
+    def __init__(self, connection: Any, *, scope_key: str) -> None:
+        self.connection = connection
+        self.scope_key = scope_key
+
+    def usage(self, *, since: datetime) -> tuple[int, datetime | None]:
+        """Return how many cold-start sends were committed since ``since``, and when last.
+
+        Args:
+            since: Start of the counting window.
+
+        Returns:
+            ``(count, last_committed_at)``; the timestamp is ``None`` when none exist.
+        """
+        row = self.connection.execute(
+            """SELECT count(*) AS used, max(committed_at) AS last_at
+                 FROM langchao_live_commits
+                WHERE scope_key = %s AND committed_at >= %s
+                  AND EXISTS (
+                        SELECT 1 FROM jsonb_array_elements(snapshot->'tokens') AS token
+                         WHERE token->>'outcome_key' = %s)""",
+            (self.scope_key, since, COLD_START_DRIVE_OUTCOME),
+        ).fetchone()
+        if row is None:
+            return 0, None
+        used = row["used"] if isinstance(row, Mapping) else row[0]
+        last_at = row["last_at"] if isinstance(row, Mapping) else row[1]
+        return int(used or 0), last_at
+
+    def available(
+        self,
+        *,
+        now: datetime,
+        limit: int = COLD_START_EXPLORATION_LIMIT,
+        window: timedelta = COLD_START_EXPLORATION_WINDOW,
+        min_spacing: timedelta = COLD_START_EXPLORATION_MIN_SPACING,
+    ) -> bool:
+        """Return whether another cold-start send may be committed at ``now``.
+
+        Args:
+            now: Decision time.
+            limit: Maximum cold-start sends per window; zero disables the drive.
+            window: Length of the counting window.
+            min_spacing: Minimum gap between two cold-start sends.
+
+        Returns:
+            ``True`` when a cold-start drive may be granted for this round.
+        """
+        if limit <= 0:
+            return False
+        used, last_at = self.usage(since=now - window)
+        if used >= limit:
+            return False
+        if min_spacing > timedelta(0) and last_at is not None and now - last_at < min_spacing:
+            return False
+        return True
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -29,6 +103,8 @@ class LangchaoLiveCommit:
     render_outbox_id: str
     claim_id: str
     committed_at: datetime
+    semantic_dispatch_id: str | None = None
+    authority_revision: int | None = None
     terminal_ack_id: str | None = None
     terminal_ack_kind: str | None = None
 
@@ -53,22 +129,26 @@ class LangchaoLiveRepository:
         if commit.scope_key != self.scope_key:
             raise ValueError("live commit belongs to a different scope")
         snapshot = {
-            "version": "langchao.live-commit.v1",
+            "version": "langchao.live-commit.v2",
             "tokens": [token.to_dict() for token in commit.expected_tokens],
         }
+        # v26 is rolling-compatible: old writers may leave the new witness pair NULL
+        # while upgraded writers dual-write it. The composite FK rejects wrong/partial pairs.
         cursor = self.connection.execute(
             """INSERT INTO langchao_live_commits
                (scope_key, round_id, langchao_candidate_id, candidate_revision,
                 source_candidate_id, reward_contract_id, reward_revision,
-                expected_token_ids, snapshot, attempt_id, render_outbox_id, claim_id, committed_at)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s)
+                expected_token_ids, snapshot, attempt_id, render_outbox_id, claim_id,
+                semantic_dispatch_id, authority_revision, committed_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (scope_key, round_id) DO NOTHING RETURNING round_id""",
             (self.scope_key, commit.round_id, commit.langchao_candidate_id,
              commit.candidate_revision, commit.source_candidate_id,
              commit.reward_contract_id, commit.reward_revision,
              json.dumps([token.token_id for token in commit.expected_tokens]),
              json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-             commit.attempt_id, commit.render_outbox_id, commit.claim_id, commit.committed_at),
+             commit.attempt_id, commit.render_outbox_id, commit.claim_id,
+             commit.semantic_dispatch_id, commit.authority_revision, commit.committed_at),
         )
         if cursor.fetchone() is None:
             existing = self.get(commit.round_id)
@@ -79,7 +159,8 @@ class LangchaoLiveRepository:
         row = self.connection.execute(
             """SELECT scope_key,round_id,langchao_candidate_id,candidate_revision,
                       source_candidate_id,reward_contract_id,reward_revision,snapshot,
-                      attempt_id,render_outbox_id,claim_id,committed_at,terminal_ack_id,terminal_ack_kind
+                      attempt_id,render_outbox_id,claim_id,semantic_dispatch_id,authority_revision,
+                       committed_at,terminal_ack_id,terminal_ack_kind
                FROM langchao_live_commits WHERE scope_key=%s AND round_id=%s""",
             (self.scope_key, round_id),
         ).fetchone()
@@ -90,7 +171,8 @@ class LangchaoLiveRepository:
         rows = self.connection.execute(
             """SELECT scope_key,round_id,langchao_candidate_id,candidate_revision,
                       source_candidate_id,reward_contract_id,reward_revision,snapshot,
-                      attempt_id,render_outbox_id,claim_id,committed_at,terminal_ack_id,terminal_ack_kind
+                      attempt_id,render_outbox_id,claim_id,semantic_dispatch_id,authority_revision,
+                       committed_at,terminal_ack_id,terminal_ack_kind
                FROM langchao_live_commits
                WHERE scope_key=%s AND terminal_ack_kind='sent'""",
             (self.scope_key,),
@@ -117,70 +199,144 @@ class LangchaoLiveRepository:
         rows = self.connection.execute(
             """SELECT scope_key,round_id,langchao_candidate_id,candidate_revision,
                       source_candidate_id,reward_contract_id,reward_revision,snapshot,
-                      attempt_id,render_outbox_id,claim_id,committed_at,terminal_ack_id,terminal_ack_kind
+                      attempt_id,render_outbox_id,claim_id,semantic_dispatch_id,authority_revision,
+                       committed_at,terminal_ack_id,terminal_ack_kind
                FROM langchao_live_commits
                WHERE scope_key=%s AND terminal_ack_kind IS NULL ORDER BY committed_at,round_id""",
             (self.scope_key,),
         ).fetchall()
         return tuple(self._decode(row) for row in rows)
 
-    def settle_terminal(self, *, round_id: str, attempt_id: str, ack_id: str,
-                        sent: bool, acknowledged_at: datetime) -> tuple[OutcomeToken, ...]:
-        """Claim one terminal ack and append only locally observable execution facts."""
-        commit = self.get(round_id)
-        if commit is None:
-            return ()
-        if commit.attempt_id != attempt_id:
-            raise ValueError("send acknowledgement attempt does not match langchao live commit")
-        kind = "sent" if sent else "failed"
-        if commit.terminal_ack_kind is not None:
-            if (commit.terminal_ack_id, commit.terminal_ack_kind) != (ack_id, kind):
-                raise ValueError("langchao live commit already has a different terminal acknowledgement")
-            return ()
+    def _transaction(self) -> Any:
+        transaction = getattr(self.connection, "transaction", None)
+        return transaction() if transaction is not None else nullcontext()
+
+    def mark_exposure_recovered(self, *, round_id: str, recovered_at: datetime) -> bool:
         cursor = self.connection.execute(
             """UPDATE langchao_live_commits
-               SET terminal_ack_id=%s, terminal_ack_kind=%s, terminal_acknowledged_at=%s
-               WHERE scope_key=%s AND round_id=%s AND attempt_id=%s
-                 AND terminal_ack_kind IS NULL RETURNING round_id""",
-            (ack_id, kind, acknowledged_at, self.scope_key, round_id, attempt_id),
+               SET exposure_recovered_at=%s
+               WHERE scope_key=%s AND round_id=%s
+                 AND exposure_recovery_required AND exposure_recovered_at IS NULL""",
+            (recovered_at, self.scope_key, round_id),
         )
-        if cursor.fetchone() is None:
-            winner = self.get(round_id)
-            if winner is None or (winner.terminal_ack_id, winner.terminal_ack_kind) != (ack_id, kind):
-                raise ValueError("langchao live terminal acknowledgement conflicts")
-            return ()
+        return getattr(cursor, "rowcount", 1) == 1
 
-        written: list[OutcomeToken] = []
-        for expected in commit.expected_tokens:
-            # User outcomes remain unobserved. Only explicit local execution tokens settle.
-            if expected.outcome_key not in {"delivery", "expression_delivered", "rest_realized"}:
-                continue
-            status = OutcomeStatus.CONFIRMED if sent else OutcomeStatus.CENSORED
-            actual = replace(
-                expected,
-                token_id=str(uuid5(NAMESPACE_URL, f"langchao-live:{attempt_id}:{expected.token_id}:{kind}")),
-                settlement_type=SettlementType.ACTUAL,
-                status=status,
-                base_amount=expected.base_amount if sent else 0.0,
-                evidence_version="langchao.live-ack.v1",
-                idempotency_key=f"langchao-live:{attempt_id}:{expected.token_id}:{kind}",
-                evidence_refs=tuple(dict.fromkeys((*expected.evidence_refs, ack_id, kind))),
-                observation_started_at=None,
-                observation_ends_at=None,
+    def pending_exposure_recovery(self) -> tuple[LangchaoLiveCommit, ...]:
+        rows = self.connection.execute(
+            """SELECT scope_key,round_id,langchao_candidate_id,candidate_revision,
+                      source_candidate_id,reward_contract_id,reward_revision,snapshot,
+                      attempt_id,render_outbox_id,claim_id,semantic_dispatch_id,authority_revision,
+                      committed_at,terminal_ack_id,terminal_ack_kind
+               FROM langchao_live_commits
+               WHERE scope_key=%s AND exposure_recovery_required AND exposure_recovered_at IS NULL
+               ORDER BY committed_at,round_id""",
+            (self.scope_key,),
+        ).fetchall()
+        return tuple(self._decode(row) for row in rows)
+
+    def settle_terminal(self, *, round_id: str, attempt_id: str, ack_id: str,
+                        sent: bool, acknowledged_at: datetime) -> tuple[OutcomeToken, ...]:
+        """Settle ACK, local outcome tokens and recovery marker in one transaction.
+
+        ``terminal_ack_*`` is not the completion marker.  A retry that finds an exact ACK
+        with ``settlement_status='pending'`` resumes the idempotent token writes and marks
+        settlement complete, so an interrupted old rollout cannot permanently lose reward
+        or exposure recovery.
+        """
+        with self._transaction():
+            row = self.connection.execute(
+                """SELECT scope_key,round_id,langchao_candidate_id,candidate_revision,
+                          source_candidate_id,reward_contract_id,reward_revision,snapshot,
+                          attempt_id,render_outbox_id,claim_id,semantic_dispatch_id,authority_revision,
+                          committed_at,terminal_ack_id,terminal_ack_kind,settlement_status
+                   FROM langchao_live_commits
+                   WHERE scope_key=%s AND round_id=%s FOR UPDATE""",
+                (self.scope_key, round_id),
+            ).fetchone()
+            if row is None:
+                return ()
+            commit = self._decode(row)
+            if commit.attempt_id != attempt_id:
+                raise ValueError("send acknowledgement attempt does not match langchao live commit")
+            kind = "sent" if sent else "failed"
+            if isinstance(row, Mapping):
+                existing_ack = row.get("terminal_ack_id")
+                existing_kind = row.get("terminal_ack_kind")
+                status = row.get("settlement_status", "pending")
+            else:
+                existing_ack = row[14] if len(row) > 14 else row[12]
+                existing_kind = row[15] if len(row) > 15 else row[13]
+                status = row[16] if len(row) > 16 else "pending"
+            if existing_kind is not None and (existing_ack, existing_kind) != (ack_id, kind):
+                raise ValueError("langchao live commit already has a different terminal acknowledgement")
+            if status == "completed":
+                return ()
+            # Pre-v26 rows and lightweight compatibility stores do not expose the
+            # settlement marker. In that shape an exact terminal ACK still means the
+            # old implementation completed its work; v26 PostgreSQL rows explicitly
+            # carry settlement_status='pending' when repair is required.
+            if "settlement_status" not in row and existing_kind is not None:
+                return ()
+            if existing_kind is None:
+                self.connection.execute(
+                    """UPDATE langchao_live_commits
+                       SET terminal_ack_id=%s, terminal_ack_kind=%s, terminal_acknowledged_at=%s
+                       WHERE scope_key=%s AND round_id=%s AND attempt_id=%s""",
+                    (ack_id, kind, acknowledged_at, self.scope_key, round_id, attempt_id),
+                )
+
+            written: list[OutcomeToken] = []
+            for expected in commit.expected_tokens:
+                if expected.outcome_key not in {"delivery", "expression_delivered", "rest_realized"}:
+                    continue
+                actual = replace(
+                    expected,
+                    token_id=str(uuid5(NAMESPACE_URL, f"langchao-live:{attempt_id}:{expected.token_id}:{kind}")),
+                    settlement_type=SettlementType.ACTUAL,
+                    status=(OutcomeStatus.CONFIRMED if sent else OutcomeStatus.CENSORED),
+                    base_amount=expected.base_amount if sent else 0.0,
+                    evidence_version="langchao.live-ack.v1",
+                    idempotency_key=f"langchao-live:{attempt_id}:{expected.token_id}:{kind}",
+                    evidence_refs=tuple(dict.fromkeys((*expected.evidence_refs, ack_id, kind))),
+                    observation_started_at=None,
+                    observation_ends_at=None,
+                )
+                writer = getattr(self.outcomes, "put_outcome_revision_in_transaction", None)
+                if writer is None:  # compatibility for repository fakes and old implementations
+                    writer = self.outcomes.put_outcome_revision
+                writer(
+                    actual, revision=1, reward_contract_id=commit.reward_contract_id,
+                    reward_contract_revision=commit.reward_revision,
+                )
+                activator = getattr(self.outcomes, "activate_outcome", None)
+                if callable(activator):
+                    activated = activator(
+                        token_id=actual.token_id, revision=1, expected_pointer_version=0
+                    )
+                    if not activated:
+                        active = self.connection.execute(
+                            """SELECT revision FROM langchao_outcome_active
+                               WHERE scope_key=%s AND token_id=%s""",
+                            (self.scope_key, actual.token_id),
+                        ).fetchone()
+                        if active is None or int(active["revision"] if isinstance(active, Mapping) else active[0]) != 1:
+                            raise RuntimeError("outcome activation CAS lost to a different revision")
+                written.append(actual)
+
+            self.connection.execute(
+                """UPDATE langchao_live_commits
+                   SET settlement_status='completed', settlement_completed_at=%s,
+                       exposure_recovery_required=%s
+                   WHERE scope_key=%s AND round_id=%s AND settlement_status='pending'""",
+                (acknowledged_at, sent, self.scope_key, round_id),
             )
-            self.outcomes.put_outcome_revision(
-                actual, revision=1, reward_contract_id=commit.reward_contract_id,
-                reward_contract_revision=commit.reward_revision,
-            )
-            self.outcomes.activate_outcome(
-                token_id=actual.token_id, revision=1, expected_pointer_version=0
-            )
-            written.append(actual)
-        return tuple(written)
+            return tuple(written)
 
     def _decode(self, row: Any) -> LangchaoLiveCommit:
-        def value(name: str, index: int) -> Any:
-            return row[name] if isinstance(row, Mapping) else row[index]
+        def value(name: str, index: int, default: Any = None) -> Any:
+            if isinstance(row, Mapping):
+                return row.get(name, default)
+            return row[index] if index < len(row) else default
         raw = value("snapshot", 7)
         snapshot = json.loads(raw) if isinstance(raw, str) else raw
         tokens = tuple(_token_from_dict(item) for item in snapshot["tokens"])
@@ -192,9 +348,13 @@ class LangchaoLiveRepository:
             reward_contract_id=str(value("reward_contract_id", 5)),
             reward_revision=int(value("reward_revision", 6)), expected_tokens=tokens,
             attempt_id=str(value("attempt_id", 8)), render_outbox_id=str(value("render_outbox_id", 9)),
-            claim_id=str(value("claim_id", 10)), committed_at=value("committed_at", 11),
-            terminal_ack_id=value("terminal_ack_id", 12),
-            terminal_ack_kind=value("terminal_ack_kind", 13),
+            claim_id=str(value("claim_id", 10)),
+            semantic_dispatch_id=value("semantic_dispatch_id", 11),
+            authority_revision=(None if value("authority_revision", 12) is None
+                                else int(value("authority_revision", 12))),
+            committed_at=value("committed_at", 13, value("committed_at", 11)),
+            terminal_ack_id=value("terminal_ack_id", 14, value("terminal_ack_id", 12)),
+            terminal_ack_kind=value("terminal_ack_kind", 15, value("terminal_ack_kind", 13)),
         )
 
 

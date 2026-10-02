@@ -94,7 +94,7 @@ def test_idempotency_and_single_active_parameter_constraints_are_explicit() -> N
 
 
 def test_migration_versions_and_statement_order_are_stable() -> None:
-    assert USER_MODEL_SCHEMA_VERSION == 25
+    assert USER_MODEL_SCHEMA_VERSION == 26
     assert isinstance(MIGRATIONS, tuple)
     assert tuple(version for version, _statements in MIGRATIONS) == tuple(
         range(1, USER_MODEL_SCHEMA_VERSION + 1)

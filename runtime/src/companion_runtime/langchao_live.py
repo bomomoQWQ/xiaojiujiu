@@ -104,14 +104,20 @@ class LangchaoLiveService:
         assessed_candidates: Mapping[str, CandidateV2],
         now: datetime,
         persist_snapshot: Any | None = None,
+        expected_authority_revision: int | None = None,
     ) -> LangchaoLiveResult | NoSendResult:
         """Commit at most one exact external candidate; rest/defer never sends."""
 
-        engine, mode, may_dispatch, _revision = _authority(self.authority_reader.get_active())
+        engine, mode, may_dispatch, revision = _authority(self.authority_reader.get_active())
         if (engine, mode, may_dispatch) != (
             AuthorityEngine.LANGCHAO.value, AuthorityMode.LIVE.value, True,
         ):
             raise LangchaoLiveValidationError("active authority is not langchao/live")
+        if (expected_authority_revision is not None
+                and revision != expected_authority_revision):
+            raise LangchaoLiveValidationError(
+                f"routed authority revision {expected_authority_revision} is stale; active is {revision}"
+            )
         if built.state.scope_key != self.scope_key:
             raise LangchaoLiveValidationError("built round scope mismatch")
         round_id = built.state.decision_round_id
@@ -177,6 +183,8 @@ class LangchaoLiveService:
                 attempt_id=receipt.attempt_id,
                 render_outbox_id=receipt.render_outbox_id,
                 claim_id=receipt.dispatch_claim_id,
+                semantic_dispatch_id=f"semantic:{receipt.dispatch_claim_id}",
+                authority_revision=revision,
                 committed_at=now,
             )
             return persist_snapshot(snapshot)

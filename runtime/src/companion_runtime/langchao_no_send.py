@@ -13,6 +13,11 @@ from typing import Any, Mapping
 
 NO_SEND_RESULT_VERSION = "langchao.no-send-result.v1"
 
+#: Stage of the terminal settlement that follows a real acknowledgement. Unlike the
+#: earlier stages it describes a round that *did* commit and dispatch, so it is the one
+#: non-send record allowed to share a round with a durable live commit.
+DELIVERY_STAGE = "delivery"
+
 
 class NoSendReason(str, Enum):
     NO_ELIGIBLE_CANDIDATE = "no_eligible_candidate"
@@ -69,4 +74,4 @@ class NoSendResult:
                    stage=stage, **kwargs)
 
 
-__all__ = ["NO_SEND_RESULT_VERSION", "NoSendReason", "NoSendResult"]
+__all__ = ["DELIVERY_STAGE", "NO_SEND_RESULT_VERSION", "NoSendReason", "NoSendResult"]
