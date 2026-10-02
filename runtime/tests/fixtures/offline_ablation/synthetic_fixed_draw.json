@@ -1,0 +1,19 @@
+{
+  "fixture_version": "offline-ablation-input.v1",
+  "fixture_id": "synthetic-fixed-draw-v1",
+  "versions": {"candidate_supply": "candidates.draw.v1", "forecasts": "forecasts.draw.v1", "values": "values.draw.v1", "time": "time.draw.v1", "permissions": "permissions.draw.v1", "attention": "attention.draw.v1", "competition_edges": "edges.draw.v1", "parameters": "parameters.draw.v1"},
+  "candidates": [{"candidate_id": "only", "internal_utility": 1.0, "runtime_user_utility": 1.0, "repeat_cost": 0.0}],
+  "forecasts": {"only": [{"outcome_id": "only.reply", "probability": 1.0, "amount": 1.0, "directions": {"care": 1.0}}]},
+  "values": {"direction_weights": {"approach": 1.0, "expression": 1.0, "exploration": 1.0, "care": 1.0, "commitment": 1.0, "repair": 1.0, "autonomy": 1.0, "rest": 1.0}},
+  "attention": {"approach": 1.0, "expression": 1.0, "exploration": 1.0, "care": 1.0, "commitment": 1.0, "repair": 1.0, "autonomy": 1.0, "rest": 1.0},
+  "time": {
+    "now": "2026-10-02T12:00:00Z",
+    "runtime_v2_baseline": {"version": "tempo.runtime-baseline.v1", "utility_threshold": 0.0, "hazard_base": 0.1, "hazard_beta": 4.0, "elapsed_allowed_seconds": 10.0},
+    "matched_tempo": {"version": "tempo.matched.v1", "utility_threshold": 0.0, "hazard_base": 0.1, "hazard_beta": 4.0, "elapsed_allowed_seconds": 10.0, "decision_budget_seconds": 20.0},
+    "initial_readiness": {"only": 0.0},
+    "langchao_parameters": {"leak": 0.1, "competition_gain": 1.0, "decision_threshold": 0.5, "time_scale_seconds": 5.0, "max_step_seconds": 0.1, "crossing_tolerance": 0.0000001, "tie_tolerance": 0.000001, "utility_scale": 1.0}
+  },
+  "permissions": {"only": {"allowed": true, "reasons": []}},
+  "competition_edges": [],
+  "hazard": {"mode": "fixed_draw", "draw": 0.25}
+}
