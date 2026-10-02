@@ -151,6 +151,73 @@ def test_simulation_run_requires_both_explicit_enable_and_simulate_flag() -> Non
     assert len(calls) == 1
 
 
+def test_create_app_mounts_privacy_router_only_for_complete_authorized_composition(
+    runtime: Runtime,
+) -> None:
+    class Repository:
+        scope_key = "tenant:allowed"
+
+        def __init__(self):
+            self.value = None
+
+        def status(self, *, request_id):
+            return self.value
+
+    class Coordinator:
+        scope_key = "tenant:allowed"
+
+        def __init__(self, repository):
+            self.repository = repository
+
+        def request(self, value):
+            self.repository.value = {"request_id": value.request_id, "status": "pending"}
+            return True
+
+        def run(self, *, request_id):
+            return {"request_id": request_id, "completed": True}
+
+    repository = Repository()
+    coordinator = Coordinator(repository)
+    composition = SimpleNamespace(
+        coordinator=SimpleNamespace(
+            scope_key="tenant:allowed", repository=SyntheticRuntimeRepository()
+        ),
+        audit_repository=SyntheticAuditRepository(),
+        health=SyntheticHealth({"runtime": "test"}),
+        privacy_deletion_repository=repository,
+        privacy_deletion_coordinator=coordinator,
+        privacy_deletion_authorize=lambda scope, token: (
+            scope == "tenant:allowed" and token == "Bearer allowed"
+        ),
+    )
+    client = TestClient(create_app(runtime, runtime.config, v2_composition=composition))
+    payload = {
+        "scope": "tenant:allowed", "request_id": "delete:1",
+        "selector_kind": "source", "selector": {"source_id": "event:1"},
+        "strategy": "tombstone",
+    }
+
+    assert client.post("/v1/privacy/deletions", json=payload).status_code == 403
+    accepted = client.post(
+        "/v1/privacy/deletions", json=payload,
+        headers={"Authorization": "Bearer allowed"},
+    )
+    assert accepted.status_code == 202
+
+
+def test_create_app_rejects_partial_privacy_composition(runtime: Runtime) -> None:
+    composition = SimpleNamespace(
+        coordinator=SimpleNamespace(
+            scope_key="tenant:allowed", repository=SyntheticRuntimeRepository()
+        ),
+        audit_repository=SyntheticAuditRepository(),
+        health=SyntheticHealth({"runtime": "test"}),
+        privacy_deletion_repository=SimpleNamespace(scope_key="tenant:allowed"),
+    )
+    with pytest.raises(ValueError, match="must be complete"):
+        create_app(runtime, runtime.config, v2_composition=composition)
+
+
 def test_create_app_mounts_v2_only_when_composition_is_injected(runtime: Runtime) -> None:
     runtime_repo = SyntheticRuntimeRepository()
     audit_repo = SyntheticAuditRepository()
@@ -162,9 +229,11 @@ def test_create_app_mounts_v2_only_when_composition_is_injected(runtime: Runtime
 
     legacy_only = TestClient(create_app(runtime, runtime.config))
     assert legacy_only.get("/v2/health").status_code == 404
+    assert legacy_only.post("/v1/privacy/deletions", json={}).status_code == 404
 
     mounted = TestClient(create_app(runtime, runtime.config, v2_composition=composition))
     assert mounted.get("/v2/health").status_code == 200
+    assert mounted.post("/v1/privacy/deletions", json={}).status_code == 404
     evidence = mounted.get(
         "/v2/blackbox/evidence", params={"scope": "tenant:allowed"}
     )

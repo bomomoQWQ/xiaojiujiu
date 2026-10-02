@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -127,6 +128,9 @@ def test_factory_builds_v2_graph_from_injected_protocols_and_reports_health() ->
     assert composition.witness_repository.scope_key == "user:42/channel:direct"
     assert composition.goal_lifecycle_service is not None
     assert composition.coordinator.goal_lifecycle_service is composition.goal_lifecycle_service
+    assert composition.privacy_deletion_repository is None
+    assert composition.privacy_deletion_coordinator is None
+    assert composition.privacy_deletion_authorize is None
     assert not hasattr(composition.goal_lifecycle_service, "outbox")
     assert not hasattr(composition.goal_lifecycle_service, "create_dispatch_claim")
     config_defaults = RuntimeConfig()
@@ -144,6 +148,39 @@ def test_factory_builds_v2_graph_from_injected_protocols_and_reports_health() ->
     }
     composition.close()
     assert database.closed is True
+
+
+def test_privacy_deletion_composition_is_opt_in_scope_bound_and_authorized() -> None:
+    config = configured()
+    config.privacy_deletion.enabled = True
+    config.privacy_deletion.bearer_token_sha256 = hashlib.sha256(b"allowed").hexdigest()
+    composition = build_v2_composition(
+        config, scope_key="scope:private",
+        legacy_bridge=DummyLegacyBridge(),  # type: ignore[arg-type]
+        runtime_repository=DummyRuntimeRepository(),  # type: ignore[arg-type]
+        database=FakeDatabase(), service_repository_factory=FakeServiceRepository,
+        prediction_repository_factory=FakePredictionRepository,
+        authority_repository_factory=FakeAuthorityRepository,
+    )
+
+    assert composition.privacy_deletion_repository.scope_key == "scope:private"
+    assert composition.privacy_deletion_coordinator.repository is composition.privacy_deletion_repository
+    assert composition.privacy_deletion_authorize("scope:private", "Bearer allowed") is True
+    assert composition.privacy_deletion_authorize("scope:private", "Bearer denied") is False
+
+
+def test_enabled_privacy_deletion_rejects_missing_authorization_configuration() -> None:
+    config = configured()
+    config.privacy_deletion.enabled = True
+    with pytest.raises(ValueError, match="bearer_token_sha256"):
+        build_v2_composition(
+            config, scope_key="scope",
+            legacy_bridge=DummyLegacyBridge(),  # type: ignore[arg-type]
+            runtime_repository=DummyRuntimeRepository(),  # type: ignore[arg-type]
+            database=FakeDatabase(), service_repository_factory=FakeServiceRepository,
+            prediction_repository_factory=FakePredictionRepository,
+            authority_repository_factory=FakeAuthorityRepository,
+        )
 
 
 def test_active_shadow_authority_composes_shadow_runner_without_feature_switch(monkeypatch) -> None:
