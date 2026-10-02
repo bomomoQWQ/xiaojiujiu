@@ -12,10 +12,14 @@
 设计目标不是让它更会聊天，而是让它**记得住、沉得下、会自己想开口**，
 并且**不会因此发疯**——不骚扰、不越界、不把沉默误读成恶意、不忘掉发生过的事。
 
-**先说清楚现在是什么状态**：它在作者的机器上长期跑得住，有 1151 项离线测试、
-四套仿真和一个外接测试框架守着；但它**不是一个开箱即用的产品**——
-**目前没有为自部署做优化**，这件事下一节之后会专门讲透。冲着"部署就能用"来的话，
-现在还不是时候。
+**先说清楚现在是什么状态**：它**已经真实上线**——在作者自己的机器上，一台 PostgreSQL、
+一个 AstrBot、一个 NapCat，加上**每人一个 Runtime 进程**（fleet 形态），
+正在服务 **11 位真实用户**；「浪潮」决策引擎、社会关系模块、交叉记忆都已进入生产，
+发送权威已经切到「浪潮」自己。
+
+但它**仍然不是一个开箱即用的产品**：**没有为自部署做优化**，
+`AstrBot/` 是上游零修改代码、插件是独立仓库、部署仍要自己配 DSN 与端口。
+冲着"clone 下来就能给别人用"来的话，现在还不是时候——这一节的最后会专门讲透。
 
 ---
 
@@ -33,9 +37,10 @@
 用户消息 ──► 宿主 Bot（AstrBot + 主 LLM）
                 │  即时演出：看原话 + 上下文 + 人格，当场回应
                 │
-                └──► Runtime sidecar（本仓库核心）
+                └──► Runtime sidecar（本仓库核心，每人一个进程）
                        持久认知：情绪余波 / 记忆 / 未尽之事 /
-                                 用户模型 / 候选意图 / 主动动力
+                                 用户模型 / 候选意图 / 主动动力 /
+                                 社会关系 / 「浪潮」决策引擎
                        │
                        └──► 未来轮次：上下文注入 + 主动发消息
 ```
@@ -190,7 +195,7 @@ Runtime 做的是并发重协调——它发现新消息恰好满足了原意图
 
 如果它只是一个很高的成本，那"压力足够大"就能压过去——而系统里压力确实会慢慢累积变大，
 于是"今天"会被它自己破坏。所以边界在效用比较**之前**剪枝：违反边界的候选根本不进打分环节，
-连"值不值"都不讨论。
+连"值不值"都谈不上。
 
 这条还踩过一个坑，值得写下来：边界必须**按行为类别**判，不能按名字。
 同一个意图换个说法（"道歉"和"修复"是同一类行为），裁决必须相同——
@@ -213,197 +218,377 @@ Runtime 做的是并发重协调——它发现新消息恰好满足了原意图
 
 ---
 
-## 3. 三条不变量
+## 3. 「浪潮」决策引擎
 
-系统的价值压在这三条上，它们各自都有专门的回归测试：
+「浪潮」是现行发送权威所使用的决策引擎。名字与代码标识是分开的：
+面向文档叫**「浪潮」**，代码与 Git 里叫 `langchao`（从不写 `wave`）。
+
+它负责一件事：**在一堆"现在可以做的事"里，决定这一刻到底做不做**。
+
+### 3.1 数值核：连续动力学，不是打分阈值
+
+候选意图之间不是"各自打分再取最大"。它们互相竞争、彼此抑制，状态按真实流逝的时间演化：
+
+```text
+τ_i · dx_i/dt = (1 − x_i)·[u_i]₊ − x_i·( ℓ_i + [−u_i]₊ + γ · Σ_j c_ij · x_j )
+```
+
+读法：`x_i` 是候选 i 的激活度。第一项是它被自身效用抬升（有上界 1），
+第二项同时被三件事拉下去——泄漏 `ℓ_i`、负效用的惩罚、以及**别的候选正在活跃**带来的竞争压力。
+
+这套写法换来四条硬性质，每条都有测试守着：
+
+1. **同步、冻结系数更新**：一轮之内系数不变，结果与迭代顺序无关。
+2. **真实流逝时间**：用实际经过的秒数推进，不是"醒一次算一拍"。
+3. **首次越阈值判定 + 明确的并列顺序**：同一时刻多个候选越线时，排序规则显式写死。
+4. **预算有界 → 暂缓**：一轮内推不完就明确 defer，绝不硬凑一个决定。
+
+而且：**数值核里没有随机数、没有危险率、没有发送权**。
+随机抽样与授权都在核外，核本身是纯函数式的。
+
+### 3.2 三份契约：目标 / 收益 / 候选
+
+「浪潮」不直接操作"想说什么"，它操作三份不可变契约：
+
+| 契约 | 回答什么 |
+|---|---|
+| **Goal** | 这件事为什么值得做？完成条件是什么？哪些结果**不算**完成？ |
+| **Reward** | 做成了、没做成、被明确拒绝，各算多少？ |
+| **Candidate** | 具体能做什么动作、需要哪些前置条件、什么情况下**自动失效**？ |
+
+每份契约都只追加修订版本，通过独立的 CAS 指针发布；改写历史是不可能的。
+候选带着 `invalidate_when`——来源记忆被归档、被取代、边界被解除，候选会自己死掉，
+不需要谁来"记得清理"。
+
+### 3.3 结果账：期望、实际、截断、更正
+
+一次交互的结果被分成四种身份，**绝不混用**：
+
+- **期望**（expected）：决定发之前就冻结，是"我以为会发生什么"。
+- **实际**（actual）：用户后来真的回复了/没回复/明确反感，才落账。
+- **截断**（censored）：观察窗口结束了还没观察到——**"没回复"不等于"拒绝"**。
+- **更正**（correction）：晚到的观察推翻早期账目时，新增一条并声明它更正了谁。
+
+有一条边界是刻意守住的：**送达不等于用户反应**。消息成功发出去只结算"送达"这一件事，
+它永远不会被当作"用户没有反感"的证据。
+
+### 3.4 单一发送权威 + 派发凭证
+
+"谁能发消息"是一个**持久化的 CAS 指针**，不是配置开关：
+
+| 权威 | 含义 |
+|---|---|
+| `runtime_v2/live` | v2 基线引擎负责发送 |
+| `langchao/live` | **「浪潮」负责发送**（需要配置 allowlist 与权威同时同意）|
+| `shadow` / `none` | 谁都不发，只做零副作用推演 |
+
+在「浪潮」负责发送时，任何一次派发都必须先拿到一条 **dispatch claim**；
+尝试与 outbox 行必须与 claim 精确对应（数据库复合外键强制）。
+**没有 claim 的动作行写不进去**，历史遗留行可以继续记账，但永远不能变成可派发状态。
+
+### 3.5 影子模式：先看它怎么想，再让它动手
+
+`shadow` 权威下，「浪潮」对真实数据完整推演并持久化审计，
+但**受保护输出全部为零**（不发送、不发收益、不写训练、不占额度）。
+上线前后都用它观察"如果让它决定，它会怎么做"。
+
+### 3.6 关于"它为什么经常不说话"
+
+上线后实测：`hazard ≈ 2.4e-05`，一轮的行动概率约 `3.3e-05`。
+也就是说「浪潮」**绝大多数轮次选择沉默**。
+
+这是设计目标，不是故障：**沉默是一个正式候选，而且它应该经常赢**。
+一个陪伴者的主动消息本来就该稀疏；真正的失败模式是"话太多"。
+
+---
+
+## 4. 社会关系与交叉记忆
+
+### 4.1 社会关系模块
+
+「浪潮」不重新"理解"关系，它把已有的机械事实投影成**社会关系证据**：
+从历史里的未竟之事、记忆、边界，机械地提炼出「谁在什么场合做了什么」这类
+`participation_fact`，每条都带精确来源引用与哈希。
+
+要点：
+
+- **纯机械**：不调用任何语义模型，可重复、可审计。
+- **精确引用**：每条社会证据绑定 `scope / id / revision / hash`，
+  来源被归档或被取代时，引用即刻失效。
+- **作用域绑定**：跨作用域引用在提交前就被拒绝，不依赖"检索时记得过滤"。
+
+上线后每个真实作用域已生成 3–61 条关系事实，例如从历史里提炼出的：
+「他明确说过我们只是朋友，还强调自己发给谁、和谁聊天是他的自由。」
+「他情绪上来时会用表情符号代替话，不解释，等对方先接。」
+
+### 4.2 交叉记忆
+
+记忆不是"检索出来塞进提示词"，而是**进入决策**：
+
+- 记忆被激活后，可以生成携带**精确记忆引用**的候选意图
+  （`memory:mem_xxx`），候选同时声明"这条记忆归档/被取代时我就失效"。
+- 因此记忆与候选之间是**可追溯、可自动失效**的关系，
+  而不是一句"它可能记得"。
+- 记忆巩固有且只有一个无人值守写入者（规则驱动的巩固轮），
+  避免两处同时写同一份长期记忆。
+
+---
+
+## 5. 四条不变量
+
+系统的价值压在这几条上，它们各自都有专门的回归测试：
 
 1. **原始事件永不改写。** 一切解释都是追加的新版本，历史字节不变。
 2. **只有一个写者。** 所有模型输出都只是**建议**，经 Reducer 判定
    `APPLY / REBASE / DISCARD` 才能落地。没有任何模型有写权限。
 3. **`committed` 不等于 `sent`。** 决定要说、渲染完、真发出去是三件事，
    只有宿主回执才算发出。
+4. **没有派发凭证就没有发送。** 权威指针 + 精确 claim 双重约束；
+   且**发送权的撤销立刻生效**——撤销后旧决定不会"补发"，重新授权必须开新一轮。
 
 还有一条容易被忽略的：**隐藏的心理上下文绝不进入永久对话历史**。
 宿主在无法保证"临时"时会拒绝注入，而不是将就。
 
 ---
 
-## 4. 仓库结构
+## 6. 仓库结构
 
 ```text
 .
 ├── runtime/                       # ★ 持久认知 sidecar（独立进程，Python 3.11+）
-│   ├── src/companion_runtime/     #   32 个模块（含协议 v1 兼容层 api_v1.py）
-│   ├── tests/                     #   1151 项离线测试（17 项按环境跳过）
-│   ├── docs/                      #   设计→代码对照、缺口审计、崩溃窗口、业务逻辑审计
-│   └── README.md                  #   ★ 逐机制说明 + 配置 / API / 恢复 / 降级
-├── astrbot_plugin_companion_runtime/  # ★ 宿主薄插件：独立仓库，本地克隆（不进本仓库 Git）
+│   ├── src/companion_runtime/     #   模块：认知机制 + 「浪潮」+ 社会关系 + v1 兼容层
+│   ├── tests/                      #   离线测试（见 §8：夹具迁移欠账）
+│   ├── audit/                      #   ★ 验收清单、T01–T32 场景、证据、问题单
+│   ├── docs/                       #   设计对照 / 审计报告 / 上线记录与回滚手册
+│   └── README.md                   #   ★ 逐机制说明 + 配置 / API / 恢复 / 降级
 ├── framework/                     # ★ 外接测试框架：可控时钟 + OpenAI 兼容 mock（不修改原程序）
-├── scripts/                       # 验证脚本、运维脚本、封测（fleet）脚本
-├── docs/                          # 跨仓评估（framework 与 scripts 该不该合并等）
-├── Dockerfile / docker-compose.yml
+├── scripts/                       # 验证脚本、仿真脚本、fleet 脚本
+├── Dockerfile
 ├── AstrBot/                       # 上游 AstrBot，**零修改**（不进镜像、不进 Git）
 ├── archive/                       # 已放弃的本地模型路线（留档，不参与构建）
-├── 人格设定.md                     # 当前封测角色的角色卡
 ├── 内源主动型长期陪伴AI_Runtime_完整架构设计.md   # 原始设计（97 节）
 ├── PATCH_v0.2_….md                # 现行架构补丁（两层分离）
 ├── CHANGELOG.md / HANDOFF.md       # 改动记录 / 换机器接手手册
-└── LICENSE (GPL-3.0-or-later) / RECOVERY.md
+└── LICENSE (AGPL-3.0-or-later) / RECOVERY.md
 ```
 
-`scripts/` 里最值得先看的四个：`blackbox_user_simulation.py`（用户可见行为，77 项）、
-`e2e_resilience_simulation.py`（坏天气，335 项）、`mutation_design_conformance.py`
-（把 bug 放回去看测试红不红）、`dead_code_inventory.py`（找没人读的东西）。
+**存储自本分支起是 PostgreSQL-only**：每个人的 Runtime 用一个独立 schema
+（`cr_<会话标识>`），共享一台 PostgreSQL；迁移只追加，已应用的迁移校验和不会被改写。
+
+**本项目由两个仓库组成**：本仓库是主程序；`astrbot_plugin_companion_runtime`
+是宿主侧薄插件，**独立仓库、独立许可证**，因为要单独发到 AstrBot 插件市场。
+它在本地只是克隆副本，不进本仓库 Git。
 
 **`AstrBot/` 是上游代码，任何情况下都不修改。** 所有集成通过公开 API 完成，
 升级 AstrBot 只需替换该目录；它在 `.gitignore` 与 `.dockerignore` 里都被显式排除。
 
-**本项目由两个仓库组成**：本仓库是主程序，插件仓库是宿主侧的薄插件——
-它要单独发到 AstrBot 插件市场，生命周期与主程序无关。
-
 ---
 
-## 5. 快速开始
+## 7. 快速开始（面向"想自己跑一遍"）
 
-### 5.1 Docker（推荐）
+> 这一节只保证"作者能跑起来"，不保证"你照着做就顺利"——欠账在 §9 里逐条列了。
+
+### 7.1 需要什么
+
+- 一台 Linux（作者的封测机是 192.168.1.15，Ubuntu + Docker）
+- **PostgreSQL 18**（Runtime 不再支持 SQLite 作为运行时存储）
+- AstrBot 4.28.x（上游，零修改）
+- 一个 OneBot v11 前端（作者用 NapCat）
+
+### 7.2 起 Runtime
 
 ```bash
 git clone https://github.com/bomomoQWQ/xiaojiujiu.git
 cd xiaojiujiu
-git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git
-docker compose up -d --build
+docker build -t xiaojiujiu-runtime:v2-test .
+
+# 每人的 schema 由 runtime_fleet 自己算，这里给出一个最小单人启动示例
+docker run -d --name runtime-one --network <你的网络> \
+  -e CR_STORAGE__DSN='postgresql://user:pass@<pg 主机>:5432/<库>' \
+  -e CR_STORAGE__SCHEMA='cr_default_friendmessage_10001' \
+  -e CR_CONVERSATION_ID='default:FriendMessage:10001' \
+  -e CR_RUNTIME_ID='companion-default-friendmessage-10001' \
+  xiaojiujiu-runtime:v2-test \
+  companion-runtime --base-dir /data serve --host 0.0.0.0 --port 8787
 curl http://127.0.0.1:8787/health
 ```
 
-起来之后：AstrBot WebUI 在 `127.0.0.1:6185`，Runtime 在 `127.0.0.1:8787`。
-
-**首次启动必须手改两处**（都在 AstrBot WebUI 里）：
-
-1. 插件配置的 `runtime_base_url` → 容器网络内要用服务名 `http://runtime:8787`；
-2. **多会话部署**：把 Runtime 的 `conversation_id` 设成会话的 `unified_msg_origin`
-   （如 `aiocqhttp:FriendMessage:10001`），否则主动消息不知道该投给谁。
-
-两个端口默认只发布到 `127.0.0.1`。**不要把 8787 暴露到公网**：Runtime 没有面向公网的
-鉴权设计，远程访问请在 AstrBot WebUI 前放反代。API key 只从环境变量读，不要写进仓库文件。
-
-### 5.2 装插件
-
-插件在独立仓库里，**尚未提交到 AstrBot 插件市场**（所以市场里搜不到）：
+### 7.3 装插件
 
 ```bash
 git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git \
   AstrBot/data/plugins/astrbot_plugin_companion_runtime
 ```
 
-然后在 WebUI 里确认 `runtime_base_url` 指向 Runtime，重启 AstrBot。
+插件在独立仓库里，**尚未提交到 AstrBot 插件市场**（所以市场里搜不到）。
+装好后在 WebUI 里确认 `runtime_base_url` 指向 Runtime，然后重启 AstrBot。
 
-### 5.3 本地 venv（开发 / 调试）
+**多会话部署**：把 Runtime 的 `conversation_id` 设成会话的 `unified_msg_origin`
+（如 `default:FriendMessage:10001`），否则主动消息不知道该投给谁。
+
+### 7.4 「浪潮」的开关
+
+```bash
+# 允许「浪潮」发送（还需权威指针同意，见 §3.4）
+CR_LANGCHAO__SHADOW_ENABLED=true          # 影子推演（零副作用）
+CR_LANGCHAO__SOCIAL_ENABLED=true          # 社会关系投影
+CR_LANGCHAO__LIVE_ENABLED=true            # 允许「浪潮」发送
+CR_LANGCHAO__LIVE_SCOPE_ALLOWLIST='["default:FriendMessage:10001"]'   # 必须是 JSON 数组
+CR_LANGCHAO__ATTENTION_RECIPE=off         # 注意力配方：off / B2 / B3（B3 还需精确 scope 允许）
+```
+
+列表型配置**必须是 JSON 数组**：写成裸字符串会 fail-closed 拒绝启动——
+因为那些门禁是精确匹配，字符串会退化成子串匹配。
+
+### 7.5 ⚠️ 端口与密钥
+
+两个端口默认只发布到 `127.0.0.1`。**不要把 Runtime 端口暴露到公网**：
+它没有面向公网的鉴权设计，远程访问请在 AstrBot WebUI 前放反代。
+API key 只从环境变量读，不写进仓库文件。
+
+---
+
+## 8. 验证：它凭什么说自己是对的
+
+验证分几层，每层回答不同的问题。
+
+### 8.1 现在能作为门禁跑的
 
 ```bash
 cd runtime
-python -m venv .venv && .venv/bin/pip install -e ".[test]"
-.venv/bin/python -m pytest tests                 # 1151 passed, 17 skipped
-.venv/bin/python -m companion_runtime.cli --base-dir . serve --host 127.0.0.1 --port 8787
+
+# 聚焦套件（决策核 / 契约 / 权威 / 社会 / 隐私 / 结果账 / 渲染计划 / 生命周期）
+python -m pytest -q tests/test_langchao_types.py tests/test_langchao_engine.py \
+  tests/test_langchao_reward.py tests/test_langchao_authority.py \
+  tests/test_langchao_runtime_adapter.py tests/test_langchao_live.py \
+  tests/test_langchao_shadow_wiring.py tests/test_langchao_social_repository.py \
+  tests/test_langchao_exploration.py tests/test_langchao_permission_and_no_send.py \
+  tests/test_langchao_user_outcomes.py tests/test_langchao_history_closed_loop.py \
+  tests/test_actual_action_v21.py tests/test_capability_witness.py \
+  tests/test_render_plan_v1.py tests/test_privacy_deletion.py \
+  tests/test_pf011_goal_lifecycle.py tests/test_goal_terminal_event_producer_wiring.py
+
+# PostgreSQL 专项套件（需要 DSN）：v21–v26 的真实数据库行为
+CR_TEST_PG_DSN='postgresql://...' python -m pytest -q \
+  tests/test_live_dispatch_legacy_postgres.py \
+  tests/test_langchao_prelaunch_postgres_audit.py \
+  tests/test_langchao_repairs_postgres.py \
+  tests/test_transaction_ownership_postgres.py
 ```
 
-`--base-dir` 是**全局参数，必须写在子命令前面**，用来解析相对存储路径。
+PostgreSQL 套件覆盖的是只有真库才能证明的东西：迁移幂等、精确外键、
+权威 CAS 并发只有一位赢家、回调失败整事务回滚、并发 ACK exactly-once、
+重启恢复不派发、跨作用域拒绝、单所有者事务。
 
-### 5.4 ⚠️ 目前没有为自部署做优化
+### 8.2 审计资产（上线前大审查的产物）
 
-这一条必须说清楚，否则你会以为踩到的是 bug，其实只是"还没做"。
+`runtime/audit/` 与 `runtime/docs/` 里存的不是"测试通过"的截图，而是**可复核的审查结构**：
 
-**现在的定位是"作者自己能长期跑得住"，不是"别人能顺利部署"。** 具体表现：
-
-| 现象 | 说明 |
+| 内容 | 位置 |
 |---|---|
-| 文档和脚本仍按作者的环境写 | 里面还有 `F:\理解痞老板\runtime`、`E:\companion_runtime_backup\` 这类本机路径，换机器要自己替换 |
-| 没有安装向导 / 一键部署 | compose 起来后必须手改两处配置，改错的表现是"角色永不主动"或"消息投错会话" |
-| 插件不在市场里 | 只能手动 `git clone`，升级靠 `git pull` |
-| 没有 CI、没有版本化发布 | 镜像要自己 build，没有定期发布的 tag 或镜像仓库 |
-| **不是多租户** | 状态是单租户全局的。多人使用要"一人一个 Runtime"（封测用的 fleet 形态就是这么做的），那是运行期的做法，不是产品化的多租户 |
-| 该懂的开关不少 | 语义端口、时间尺度、价值观轴、心跳间隔……默认值能用，但想调就得先理解它们 |
-| 端口 / 路径 / 密钥都要自己配 | 而且 8787 一律不能暴露公网 |
+| 验收清单（T01–T32，canonical ID + crosswalk） | `runtime/audit/langchao_prelaunch_acceptance_20261002.json`、`runtime/audit/langchao_requirement_crosswalk_v1.json` |
+| 目的—指标登记卡（19 项指标各自服务的目的是什么） | `runtime/audit/langchao_purpose_metric_registry_v1.yaml` |
+| 场景映射（每项的 fixture / oracle / 正控 / 缺口） | `runtime/audit/scenarios/` |
+| 语义双评包（30 条虚构样本 + rubric + 双评表） | `runtime/audit/semantic/` |
+| 逐项审查结果（机械 / 语义 / 运行证据分开计数） | `runtime/audit/langchao_prelaunch_results_20261002.json` |
+| 上线前大审查总报告 | `runtime/docs/浪潮决策引擎_上线前大审查总报告_20261002.md` |
+| 大修复复审报告（P0/P1 关闭情况与仍开放项） | `runtime/docs/浪潮决策引擎_大修复复审报告_20261002.md` |
+| 上线记录与回滚手册 | `runtime/docs/浪潮决策引擎_上线记录与回滚手册_20261002.md` |
 
-**为什么会这样**：这个项目的精力一直在"认知机制对不对"，不在"部署顺不顺"。
-每一条机制都要有测试、仿真和反证，这部分吃掉了绝大部分时间。
-部署的打磨（向导、发布、文档去本机化）是明确的欠账，**不是有意留的坑**。
+审查里刻意守住的纪律：**D / C / T / R / S / I 六种证据等级分开计数**，
+`planned` 不算通过，`blocked` 不算通过，隔离运行不算真实效果，
+"代码里存在测试文件"只算静态证据。上线前那份报告的结论是**不上线**；
+后来按明确授权直接上线，并在真实流量下又抓出 6 个隔离环境抓不到的缺陷（见 CHANGELOG）。
 
-真要自部署：先读运维手册里的弱 VPS 建议与快速自检两节，确认服务真的活着。
-遇到文档里的本机路径，那是欠账，欢迎提 issue 或直接改。
+### 8.3 反证工具：证明"检查会咬人"
+
+```bash
+runtime/.venv/bin/python scripts/mutation_design_conformance.py   # 把 bug 放回去，测试应该变红
+runtime/.venv/bin/python scripts/dead_code_inventory.py           # 无人调用的函数 / 无读者的配置 / 从未发出的事件
+runtime/.venv/bin/python scripts/business_logic_probes.py         # 已修缺陷的改前/改后对照
+```
+
+为什么值得这么麻烦：**这些检查抓到过单元测试完全没覆盖的缺陷，而且都发生在"所有测试都绿"的时候**
+——已了结的义务被同一句话重新打开、群聊里形成的承诺被投递到私聊；
+"长期记忆"实际有效期只有半天，因为记忆形成约 12 小时后掉出工作集、再想不起相关问句。
 
 ---
 
-## 6. 验证：它凭什么说自己是对的
+## 9. 已知边界（欠账）
 
-验证分四层，每层回答不同的问题：
+诚实列出，避免误以为已经完备。
 
-```bash
-cd runtime && .venv/bin/python -m pytest                        # 1151 passed / 17 skipped
-cd ../framework && ../runtime/.venv/bin/python -m pytest tests   # 293 passed
+### 9.1 测试夹具欠账（本分支最实的一条）
 
-cd ..   # 四套仿真：都真的起服务、真的走 HTTP
-runtime/.venv/bin/python scripts/blackbox_user_simulation.py --base-dir ./bb-run     # 77/77
-runtime/.venv/bin/python scripts/e2e_resilience_simulation.py --base-dir ./res-run   # 335/335
-runtime/.venv/bin/python scripts/e2e_memory_simulation.py --base-dir ./mem-run       # 25/25
-runtime/.venv/bin/python scripts/relationship_progression_simulation.py --base-dir ./rel-run  # 105/105
+**离线套件现在不是全绿**：`1998` 个用例里 **194 失败 + 33 错误**。
+
+原因不是逻辑回归，而是**夹具还没跟上存储变更**：v2 生产路径要求 PostgreSQL，
+而一批历史测试仍然用 `config.storage.database_path = "….sqlite3"` 直接构造 Runtime，
+于是必然抛：
+
+```text
+ValueError: PostgreSQL storage is required; set CR_STORAGE__DSN
 ```
 
-| 层 | 回答的问题 | 特点 |
-|---|---|---|
-| 离线测试 | "这条路径对不对" | 快、多，但不证明真机 |
-| 黑盒仿真 | "用户看得见的行为对不对" | 起真 uvicorn + 真 SQLite + **真插件钩子**，只承认聊天记录里的事实 |
-| 韧性仿真 | "坏天气下对不对" | 并发上报、租约过期、断网恢复、重启续跑 |
-| 外接框架 | "改成这样会发生什么" | 运行中拨时间、灌输入、看变量、注错；不改原程序 |
+给一个 DSN 也救不了它们——因为那些测试根本不读环境变量。
+修法只有两条：**把夹具迁到 PostgreSQL schema**，或**显式标成 skip 并说明理由**。
+这件事没做，所以这个分支上的"全套 pytest"目前不能当门禁，
+§8.1 列出的是现在可以当门禁的集合。
 
-**光"全绿"不够，还要证明检查会咬人**，所以另有三件反证工具：
-
-```bash
-runtime/.venv/bin/python scripts/mutation_design_conformance.py   # 把 bug 放回去：48 个变异应全部变红
-runtime/.venv/bin/python scripts/dead_code_inventory.py            # 无调用方函数 / 无读者配置 / 从未发出的事件
-runtime/.venv/bin/python scripts/business_logic_probes.py          # 三个已修缺陷的改前/改后对照
-```
-
-为什么值得这么麻烦：**这些检查抓到过单元测试完全没覆盖的缺陷，而且都发生在"所有测试都绿"
-的时候**——已了结的义务被同一句话重新打开、群聊里形成的承诺被投递到私聊（黑盒仿真）；
-"长期记忆"实际有效期只有半天，因为记忆形成约 12 小时后就掉出工作集、再想不起相关问句
-（记忆质量仿真，那一版十条修复里八条是它先抓到的）。
-
----
-
-## 7. 已知边界
-
-诚实列出，避免误以为已经完备：
+### 9.2 产品与部署欠账
 
 | 边界 | 影响 |
 |---|---|
-| **没有为自部署优化** | 文档带本机路径、无安装向导、无 CI / 发布 |
+| **没有为自部署优化** | 文档带本机路径、无安装向导、无 CI / 版本化发布 |
+| 插件不在市场里 | 只能手动 `git clone`，升级靠 `git pull` |
+| **不是多租户** | 状态是单租户全局的；多人要"一人一个 Runtime"（fleet 形态就是这么做的），那是运行期做法，不是产品化多租户 |
+| 该懂的开关不少 | 语义端口、时间尺度、价值观轴、心跳间隔、注意力配方……默认值能用，想调得先理解 |
+
+### 9.3 机制边界
+
+| 边界 | 影响 |
+|---|---|
+| **最终措辞不作为预测特征** | 发送前冻结的「渲染计划」结构（要不要回复、压力等级、长度档、模板/风格版本）才进模型；**实际文本只做审计溯源**。所以现在学的是"计划类型 + 上下文 → 用户反应"，不是"具体句子 → 用户反应"。这是刻意避免 post-treatment 泄漏的代价，不是遗漏 |
+| **注意力配方默认 off** | 全 1 权重、无竞争。B2/B3 已实现并有隔离正控，但未授权给任何作用域——生产当前跑的是"无竞争简化配方" |
+| 主动消息非常稀疏 | `hazard ≈ 2.4e-05`：这是设计目标（低打扰），不是"它坏了" |
+| 隐私删除默认关闭 | 协调器、租约、跨派生物失效都已实现并有 PG 证据，但 HTTP 路由**未挂载**，等明确授权 |
 | 记忆检索是词法降级，无 embedding | 语义相近但用词不同的记忆检索不到 |
-| 没有常驻的记忆巩固 worker | 巩固由调用方驱动 |
-| 深层刷新的部分触发信号需调用方提供 | "重大事件""历史解释可能错了"这类判断 Runtime 自己下不了，默认按不成立处理 |
-| 单租户全局状态 | 多人要一人一个 Runtime；会话字段已贯穿全表，拆分留给后续 |
-| "平台已发出"与"结果已上报"之间有崩溃窗口 | 恰好在两步之间被杀时，只能靠租约到期重投，理论上会重复一条主动消息。已把"这是重发"暴露给宿主，但真正消除需要平台回执或宿主落盘幂等日志 |
-| 授权环节断网时插件保持沉默 | 靠租约到期回收重投；长时间断网会消耗 attempt 预算，耗尽后按设计终止 |
+| "平台已发出"与"结果已上报"之间有崩溃窗口 | 恰好两步之间被杀时只能靠租约到期重投，理论上会重复一条主动消息 |
 | 逾期未回复的已发送尝试不做过期清理 | 那会凭空捏造历史；它只由用户回复或边界关闭 |
+| 上游回执不可靠 | 渠道失败/回执未知有明确分支与 no-send 原因审计，但真实平台的 exactly-once 仍受前端能力限制 |
 
 ---
 
-## 8. 许可证
+## 10. 许可证
 
-**GPL-3.0-or-later**（全文见 `LICENSE`）。Copyright (C) 2026 bomomoQWQ。
+**AGPL-3.0-or-later**（全文见 `LICENSE`）。Copyright (C) 2026 bomomoQWQ。
 
-自己跑、自己改、自己用随便用——copyleft 只在**分发**时触发，把 Runtime 部署成自己的服务
-（哪怕改了代码）不需要开源你的改动。分发（发镜像、发 fork、随产品交付）则必须按 GPL-3.0
-提供对应源码并保留同样的许可声明。上游 AstrBot 是独立项目、独立许可证，本仓库不对它主张权利。
+自己跑、自己改、自己用随便用。AGPL 与 GPL 的差别只在**对外提供网络服务**这一种情形：
+
+- 只是**原样**自用或原样对外提供服务 → 不产生源码提供义务；
+- **改了代码**再对外提供服务（哪怕只是自己搭一个 bot 给别人聊）→
+  必须让使用者能拿到你这一版的对应源码（AGPL 第 13 节），并保留同样的许可声明；
+- 分发（发镜像、发 fork、随产品交付）→ 按 AGPL 提供对应源码。
+
+**商业许可另议**：如果你需要在此许可之外的条件下使用（例如闭源集成，
+或无法承担 AGPL 第 13 节义务的商业部署），可以按 `LICENSE` 末尾的联系方式单独洽谈。
+
+两点边界：`astrbot_plugin_companion_runtime` 是**独立仓库、独立许可证**，
+不在本仓库授权范围内；上游 AstrBot 是独立项目（AGPL-3.0，Copyright Soulter），
+本仓库不对它主张任何权利。
 
 ---
 
-## 9. 相关文档
+## 11. 相关文档
 
 | 内容 | 文件 |
 |---|---|
 | 每个认知机制怎么工作、怎么配、怎么运维、怎么恢复 | `runtime/README.md` |
-| 设计到代码的对照与缺口清单 | `runtime/docs/PATCH_V0.2_MAPPING.md` |
+| 上线前大审查总报告 / 大修复复审报告 | `runtime/docs/浪潮决策引擎_上线前大审查总报告_20261002.md`、`runtime/docs/浪潮决策引擎_大修复复审报告_20261002.md` |
+| 上线记录、监控清单、一键回滚 | `runtime/docs/浪潮决策引擎_上线记录与回滚手册_20261002.md` |
+| 「浪潮」完整设计与三份核心契约 | `runtime/docs/我即浪潮_决策模块完整设计与三份核心契约_v1.0.md` |
 | 业务逻辑审计 | `runtime/docs/BUSINESS_LOGIC_AUDIT.md` |
+| 设计到代码的对照与缺口清单 | `runtime/docs/PATCH_V0.2_MAPPING.md` |
 | 原始设计与现行架构补丁 | `内源主动型长期陪伴AI_Runtime_完整架构设计.md`、`PATCH_v0.2_….md` |
 | 换机器接手 | `HANDOFF.md` |
 | 为什么不做本地模型 | `archive/README.md` |

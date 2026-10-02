@@ -151,14 +151,18 @@ python scripts/blackbox_user_simulation.py --fault leak             # 注错，�
 
 | 项目 | 结果 |
 |---|---|
-| Runtime 离线测试 | **1124 passed / 17 skipped**（无 DSN；PG 专项恒跳过） |
+| Runtime 离线测试 | **1998 用例：194 失败 + 33 错误**（历史夹具仍按 SQLite 构造 Runtime，而存储已 PostgreSQL-only；见 README §9.1，属夹具欠账） |
+| Runtime 聚焦套件 | 全绿（命令见 README §8.1） |
+| PostgreSQL 专项套件 | 全绿（v21–v26：迁移幂等 / 精确外键 / 权威 CAS / 整事务回滚 / 并发 ACK / 重启恢复 / 单所有者事务） |
 | 插件离线测试 | 143 passed + 13 subtests |
 | 高仿真故障恢复 | 335/335 |
 | 用户黑盒仿真 | **77 / 77**（退出码 0，连跑多次一致） |
 | 记忆质量仿真 | **25 / 25**（`scripts/e2e_memory_simulation.py`，见第 6 节） |
 | framework 测试 | **293 passed**（`framework/tests`，实测约 50s；旧文档写 227/102，已更正） |
-| 版本 | Runtime 0.3.2（进行中）；插件 0.1.0 |
-| 许可证 | GPL-3.0-or-later |
+| 版本 | Runtime 0.4.0（已上线）；插件 0.1.0 |
+| 数据库 schema | v25（每会话一个 schema，只追加） |
+| 发送权威 | 11 个真实作用域均为 `langchao/live`（「浪潮」负责发送） |
+| 许可证 | AGPL-3.0-or-later（商业许可另议） |
 
 > **换机器复现记录**（Linux / Python 3.14.7 / 全新 venv，2026-09-15）：0.2.0 时点上的四行
 > **逐条复现**——`828 passed`、`143 passed, 13 subtests passed`、`335/335`、`70/70`，四条退出码全 0。
