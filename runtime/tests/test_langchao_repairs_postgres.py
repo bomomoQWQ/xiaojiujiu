@@ -340,12 +340,42 @@ def _seed_atomic_user_settlement(connection, *, scope: str, attempt: str):
         status=OutcomeStatus.UNEXECUTED, base_amount=1.0, direction_weights=WEIGHTS,
         evidence_version="atomic-user-settlement.v1", idempotency_key=_id("expected-idem"),
     )
+    round_id = _id("round")
+    candidate_id = _id("candidate")
+    outbox_id = _id("outbox")
+    claim_id = _id("claim")
+    from companion_runtime.langchao_authority_repository import LangchaoAuthorityRepository
+    from companion_runtime.langchao_types import AuthorityEngine, AuthorityMode
+    authority = LangchaoAuthorityRepository(connection, scope_key=scope)
+    authority.initialize(
+        engine_key=AuthorityEngine.LANGCHAO, mode=AuthorityMode.LIVE,
+        reason="atomic outcome test", created_at=NOW,
+    )
+    authority.create_live_dispatch_claim(
+        claim_id=claim_id, round_id=round_id, candidate_id=candidate_id,
+        candidate_version="atomic-outcome.v1", attempt_id=attempt,
+        render_outbox_id=outbox_id, idempotency_key=f"atomic:{attempt}",
+        expected_engine=AuthorityEngine.LANGCHAO, created_at=NOW,
+    )
+    connection.execute(
+        """INSERT INTO action_attempts
+           (attempt_id,candidate_id,state,intent,created_at,updated_at,committed_at,outbox_id,
+            dispatch_scope_key,dispatch_claim_id)
+           VALUES (%s,%s,'committed','atomic-outcome',%s,%s,%s,%s,%s,%s)""",
+        (attempt, candidate_id, NOW, NOW, NOW, outbox_id, scope, claim_id),
+    )
+    connection.execute(
+        """INSERT INTO outbox
+           (outbox_id,kind,payload_json,status,priority,created_at,dispatch_scope_key,dispatch_claim_id)
+           VALUES (%s,'render',%s::jsonb,'pending',100,%s,%s,%s)""",
+        (outbox_id, json.dumps({"attempt_id": attempt, "decision_id": round_id}), NOW, scope, claim_id),
+    )
     live = LangchaoLiveRepository(connection, scope_key=scope)
     live.save_commit(LangchaoLiveCommit(
-        scope_key=scope, round_id=_id("round"), langchao_candidate_id=_id("candidate"),
+        scope_key=scope, round_id=round_id, langchao_candidate_id=candidate_id,
         candidate_revision=1, source_candidate_id=_id("source"),
         reward_contract_id=reward, reward_revision=1, expected_tokens=(expected,),
-        attempt_id=attempt, render_outbox_id=_id("outbox"), claim_id=_id("claim"),
+        attempt_id=attempt, render_outbox_id=outbox_id, claim_id=claim_id,
         committed_at=NOW,
     ))
     connection.execute(
