@@ -379,20 +379,23 @@ python scripts/blackbox_user_simulation.py --base-dir ./bb --fault leak   # 注�
 | 路径 | 说明 |
 |---|---|
 | `runtime/src/companion_runtime/` | Runtime 全部代码（`api.py` 原生路由、`api_v1.py` 插件协议层） |
-| `runtime/docs/PATCH_V0.2_MAPPING.md` | 设计章节 → 代码位置 → 状态的对照，含**诚实缺口清单** |
-| `runtime/docs/BUSINESS_LOGIC_AUDIT.md` | **主业务逻辑**的三个已复现缺陷（回复长度绝对阈值 / 硬边界可被同义词绕过 / 情绪时宜性硬编码），含实测数字、可达性分析与修法方向。**未修**，复现：`runtime/.venv/bin/python scripts/business_logic_probes.py` |
 | `runtime/README.md` | 运维手册：配置项、API、降级、蓝屏恢复 |
+| `runtime/docs/` | 只留上线记录与回滚手册；**设计与审查材料已从公开仓库移除** |
 | `framework/` | **外接测试框架**：可控虚拟时钟 + OpenAI 兼容 mock 端点 + 变量日志 + `cf` 命令行。不改原程序，见 `framework/README.md` |
 | `scripts/` | 验证与运维脚本（**四个**仿真：黑盒 / 韧性 / 记忆质量 / 关系递进，外加 `runtime_bench.py`、`backup.ps1`、`dead_code_inventory.py`、`mutation_design_conformance.py`、`mutation_assistant_report.py`、`inspect_runtime_backend.py`、`send_test_message.py`） |
-| `docs/SIMULATION_INTEGRATION.md` | `framework/` 与 `scripts/` **该不该合并**的书面评估：结论是「不合并套件、只共享机械件」，含两侧能力对比与全部 `file:line` 证据；§9 是父代理的独立复核 |
 | `archive/` | 已放弃的本地模型路线（留档，不参与构建，包名是历史遗留） |
 | `RECOVERY.md` | 备份 / 恢复 / 权重位置 |
 
+> **本文件是流水账**：下面第 8 节及以后按时间记录了从 0.1 到 0.4 的每一步，
+> 里面会引用**已经不在仓库里**的设计与审计文件名——那是当时的事实，没有回改，点进去会 404。
+> 想知道"现在长什么样"，看第 1–7 节与 `README.md`。
+
 ### 7.1 framework/ 与 scripts/ 的区别
 
-> **要决定「要不要把它们合并」之前，先读 `docs/SIMULATION_INTEGRATION.md`** —— 那是这件事的书面
-> 评估（结论：不合并套件，只把 `free_port`、时钟重绑、源码快照、插件配置这四类无行为语义的机械件
-> 抽出来共享）。下面这段是结论的浓缩版。
+> **要决定「要不要把它们合并」之前，先看下面这段结论** —— 完整的书面评估
+> （含两侧能力对比与全部 `file:line` 证据）已随设计材料移除。
+> 结论是：不合并套件，只把 `free_port`、时钟重绑、源码快照、插件配置这四类无行为语义的机械件
+> 抽出来共享。下面这段是结论的浓缩版。
 
 两者都在测 Runtime，但定位不同，别搞混：
 

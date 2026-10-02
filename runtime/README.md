@@ -44,7 +44,8 @@
 
 > **主 LLM 管"现在这一刻怎么活"；Runtime 管"活过以后留下什么"。**
 
-章节映射（补丁 §0–§33 → 代码 → 测试 → 状态）另见 `docs/PATCH_V0.2_MAPPING.md`，其中"未实现"条目被逐条诚实标注。
+设计与审查材料（补丁 v0.2 章节映射、业务逻辑审计、上线前大审查清单与报告）**已从公开仓库移除**，
+所以本文不再指向它们；机制本身以本文与代码为准。
 
 ---
 
@@ -55,7 +56,7 @@ runtime/
 ├── pyproject.toml                 打包与 pytest 配置（src 布局）
 ├── README.md                      本文件
 ├── docs/
-│   └── PATCH_V0.2_MAPPING.md      补丁 v0.2 章节 → 代码/测试/状态 映射表
+│   └── 浪潮决策引擎_上线记录与回滚手册_20261002.md   上线记录、监控、一键回滚
 ├── src/companion_runtime/
 │   ├── __init__.py                版本号与 API 版本
 │   ├── typing.py                  全部枚举与跨模块记录（RawEvent / CandidateIntent / ...）
@@ -236,7 +237,6 @@ retry_backoff_seconds = 0   # 0 = nack 后立即可再领取（推荐；节流�
 # 也就是说 send 是「至少一次」：宿主在「平台已发出 / 回执未上报」之间崩溃，消息最多被发
 # max_attempts 次。`POST /v1/outbox/lease` 的每个 item 会回 `attempts` 与 `redelivery`
 # （`attempts > 1`），宿主据此可以记录歧义、或配合自己的落盘「已发出」表实现至多一次。
-# 详见 docs/REDELIVERY.md。
 
 [semantic]                    # 【v0.2】两个时间尺度的策略（全部有默认值）
 provider = "disabled"         # disabled | remote_api
@@ -1395,7 +1395,7 @@ v0.2 之后仍然刻意简化但**不省略主要模块**，并且把"还没接�
 - 后台巩固目前由调用方驱动（`memory.consolidate()`），未内置常驻 worker 线程
 - 尚无 Prometheus 指标导出（`/health`、`/maintenance/verify`、`/outbox` 已提供足够的数据结构）
 
-`docs/PATCH_V0.2_MAPPING.md` 里给出了逐章节（§0–§33）的代码位置、测试文件与状态标注。
+上面每一条都能在代码与测试里找到对应物；逐章节的设计→代码对照表已随设计材料一并从公开仓库移除。
 
 ---
 
