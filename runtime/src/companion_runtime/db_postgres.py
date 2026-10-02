@@ -377,6 +377,42 @@ def quote_identifier(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
+def _owned_connection_class() -> Any:
+    """Return a psycopg ``Connection`` subclass that honours the template's ownership.
+
+    One PostgreSQL session has exactly one transaction, but two owners were using it:
+    the Runtime's own ``BEGIN``/``SAVEPOINT`` template, and every repository that opens
+    a *driver-native* ``connection.transaction()`` block on the same shared connection.
+    The native block's ``COMMIT`` ended the template's transaction behind its back and
+    destroyed its savepoints, so the next nested level failed with either
+
+        psycopg.errors.NoActiveSqlTransaction: SAVEPOINT can only be used in transaction blocks
+
+    or a missing ``RELEASE SAVEPOINT`` — surfacing as failed v1 lease/context calls and
+    failed scheduler rounds.
+
+    Routing ``transaction()`` through the template makes the connection have one owner
+    again, while keeping every existing call site unchanged (and keeping the object a
+    real psycopg connection, so ``is`` checks and ``%s`` SQL still work).
+    """
+    if psycopg is None or not hasattr(psycopg, "Connection"):
+        return None
+
+    class TemplateOwnedConnection(psycopg.Connection):  # type: ignore[misc, valid-type]
+        """A psycopg connection whose ``transaction()`` defers to the Runtime template."""
+
+        #: The bound ``Database.transaction`` of the store that owns this session.
+        _template_transaction: Any = None
+
+        def transaction(self, *args: Any, **kwargs: Any) -> Any:
+            owner = getattr(self, "_template_transaction", None)
+            if owner is not None and not args and not kwargs:
+                return owner()
+            return super().transaction(*args, **kwargs)
+
+    return TemplateOwnedConnection
+
+
 class TranslatingConnection:
     """The connection the transaction template hands to a projection.
 
@@ -576,6 +612,7 @@ class PostgresDatabase(DatabaseBase):
                     row_factory=dict_row,
                     connect_timeout=self.connect_timeout_s,
                     application_name=self.application_name,
+                    connection_class=_owned_connection_class(),
                 )
                 # Legacy projections pass ISO timestamps and compact JSON as Python
                 # strings.  The default psycopg string dumper advertises VARCHAR,
@@ -584,6 +621,8 @@ class PostgresDatabase(DatabaseBase):
                 # column perform its native input conversion, preserving one set of
                 # projection statements without weakening those columns to TEXT.
                 raw.adapters.register_dumper(str, StrDumperUnknown)
+                # Hand the session its single transaction owner before anything can run.
+                raw._template_transaction = self.transaction
                 self._apply_session_settings(raw)
             except Exception as error:
                 # `from None` keeps a libpq message from being echoed in a chained
