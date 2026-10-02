@@ -332,7 +332,7 @@ def _seed_atomic_user_settlement(connection, *, scope: str, attempt: str):
     assert prepared is not None
     _seed_reward_and_exposure(
         connection, scope=scope, reward=reward, goal=goal, episode=episode,
-        exposure_id=_id("unrelated-exposure"),
+        exposure_id=str(uuid.uuid4()),
     )
     expected = OutcomeToken(
         token_id=_id("expected"), scope_key=scope, goal_id=goal, episode_id=episode,
