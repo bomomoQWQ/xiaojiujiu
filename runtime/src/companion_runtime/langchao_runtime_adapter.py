@@ -511,9 +511,21 @@ def build_shadow_round(*, snapshot: RuntimeFactSnapshot, inputs: tuple[RuntimeCa
         } for item in built
     ))
     working_set = tuple(sorted(item.candidate.candidate_id for item in built))
-    round_id = _stable_id("round", snapshot.scope_key, snapshot.source_cursor, candidate_hash, prediction_hash)
-    previous_readiness = dict(previous_state.readiness) if previous_state is not None else {}
-    same_working_set = previous_state is not None and previous_state.working_set == working_set
+    round_id = _stable_id(
+        "round", snapshot.scope_key, snapshot.source_cursor,
+        candidate_hash, prediction_hash, permission_version,
+    )
+    permission_compatible = (
+        previous_state is not None
+        and previous_state.permission_version == permission_version
+    )
+    previous_readiness = (
+        dict(previous_state.readiness) if permission_compatible else {}
+    )
+    same_working_set = (
+        permission_compatible
+        and previous_state.working_set == working_set
+    )
     readiness = tuple((item, previous_readiness.get(item, 0.0)) for item in working_set)
     value_profile = value_profile_from_runtime(snapshot.values)
     attention = all_one_attention()
