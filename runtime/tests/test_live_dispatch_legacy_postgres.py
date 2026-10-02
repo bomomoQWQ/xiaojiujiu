@@ -50,6 +50,34 @@ def _attempt(connection, *, attempt_id: str, state: str = "sent") -> None:
     )
 
 
+def _seed_pre_witness_row(connection, *, attempt_id: str, state: str = "sent") -> None:
+    """Create a row exactly as history did: before the witness trigger existed.
+
+    Production rows carry ``dispatch_claim_id IS NULL`` because they were written
+    before v18 installed the trigger.  The only faithful way to reproduce that state is
+    to disable the trigger for the seed; every later write goes through it again.
+    """
+    connection.execute("ALTER TABLE action_attempts DISABLE TRIGGER action_attempts_require_live_dispatch_claim")
+    try:
+        with connection.transaction():
+            _attempt(connection, attempt_id=attempt_id, state=state)
+    finally:
+        connection.execute("ALTER TABLE action_attempts ENABLE TRIGGER action_attempts_require_live_dispatch_claim")
+    connection.commit()
+
+
+def _seed_pre_witness_outbox(
+    connection, *, outbox_id: str, attempt_id: str, status: str = "delivered"
+) -> None:
+    connection.execute("ALTER TABLE outbox DISABLE TRIGGER outbox_require_live_dispatch_claim")
+    try:
+        with connection.transaction():
+            _outbox(connection, outbox_id=outbox_id, status=status, attempt_id=attempt_id)
+    finally:
+        connection.execute("ALTER TABLE outbox ENABLE TRIGGER outbox_require_live_dispatch_claim")
+    connection.commit()
+
+
 def _outbox(connection, *, outbox_id: str, status: str, attempt_id: str) -> None:
     connection.execute(
         """INSERT INTO outbox (outbox_id,kind,payload_json,status,priority,created_at)
@@ -68,8 +96,7 @@ def test_new_attempt_without_a_claim_is_still_rejected(connection) -> None:
 
 def test_legacy_attempt_rewrite_is_allowed_and_never_claims_identity(connection) -> None:
     attempt_id = "att:legacy-rewrite"
-    with connection.transaction():
-        _attempt(connection, attempt_id=attempt_id)
+    _seed_pre_witness_row(connection, attempt_id=attempt_id)
     assert connection.execute(
         "SELECT dispatch_claim_id, dispatch_scope_key FROM action_attempts WHERE attempt_id=%s",
         (attempt_id,),
@@ -93,8 +120,7 @@ def test_legacy_attempt_cannot_become_dispatchable(connection) -> None:
     import psycopg.errors
 
     attempt_id = "att:legacy-escalate"
-    with connection.transaction():
-        _attempt(connection, attempt_id=attempt_id)
+    _seed_pre_witness_row(connection, attempt_id=attempt_id)
     for state in ("committed", "rendering", "ready_to_send"):
         with pytest.raises(psycopg.errors.ForeignKeyViolation):
             with connection.transaction():
@@ -106,9 +132,8 @@ def test_legacy_outbox_can_be_recorded_terminal_but_never_requeued(connection) -
 
     attempt_id = "att:legacy-outbox"
     outbox_id = "obx:legacy-send"
-    with connection.transaction():
-        _attempt(connection, attempt_id=attempt_id)
-        _outbox(connection, outbox_id=outbox_id, status="delivered", attempt_id=attempt_id)
+    _seed_pre_witness_row(connection, attempt_id=attempt_id)
+    _seed_pre_witness_outbox(connection, outbox_id=outbox_id, attempt_id=attempt_id)
 
     with connection.transaction():
         _outbox(connection, outbox_id=outbox_id, status="delivered", attempt_id=attempt_id)
