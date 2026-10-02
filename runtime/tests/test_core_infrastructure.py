@@ -247,6 +247,26 @@ def test_load_config_parses_list_overrides_as_json_and_fails_closed() -> None:
             load_config(env={"CR_LANGCHAO__LIVE_SCOPE_ALLOWLIST": bad})
 
 
+def test_load_config_string_fields_keep_their_textual_value() -> None:
+    """A string setting must never be re-typed from its text.
+
+    ``off`` is the documented default for the attention recipe; the scalar guesser used
+    to turn it into ``False`` and every production Runtime refused to start.
+    """
+    config = load_config(env={
+        "CR_LANGCHAO__ATTENTION_RECIPE": "off",
+        "CR_SEMANTIC__PROVIDER": "remote_api",
+    })
+    assert config.langchao.attention_recipe == "off"
+    assert config.semantic.provider == "remote_api"
+    assert config.langchao.attention_recipe_for_scope("scope:a") == "off"
+
+    # Declared types stay enforced: a boolean field rejects nonsense instead of
+    # silently becoming a truthy string.
+    with pytest.raises(ValueError):
+        load_config(env={"CR_LANGCHAO__LIVE_ENABLED": "maybe"})
+
+
 def test_load_config_rejects_unknown_extension(tmp_path) -> None:
     """An unsupported config format fails loudly."""
     path = tmp_path / "config.yaml"
