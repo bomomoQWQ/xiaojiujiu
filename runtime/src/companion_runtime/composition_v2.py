@@ -119,6 +119,9 @@ class V2Composition:
     authority_round_router: Any | None = None
     goal_lifecycle_service: Any | None = None
     social_service: Any | None = None
+    privacy_deletion_repository: Any | None = None
+    privacy_deletion_coordinator: Any | None = None
+    privacy_deletion_authorize: Callable[[str, str], bool] | None = None
     owns_database: bool = True
 
     def close(self) -> None:
@@ -237,6 +240,27 @@ def build_v2_composition(
                 connection=connection, scope_key=scope_key, runtime=legacy_bridge.runtime,
             )
             legacy_bridge.social_service = social_service
+
+        privacy_deletion_repository = None
+        privacy_deletion_coordinator = None
+        privacy_deletion_authorize = None
+        if config.privacy_deletion.enabled:
+            from .privacy_deletion_api import bearer_digest_authorizer
+            from .privacy_deletion_repository import PrivacyDeletionRepository
+            from .privacy_deletion_service import PrivacyDeletionCoordinator
+
+            # Invalid/missing authorization configuration fails composition before an
+            # HTTP route can be mounted. Disabled configurations construct nothing.
+            privacy_deletion_authorize = bearer_digest_authorizer(
+                config.privacy_deletion.bearer_token_sha256
+            )
+            privacy_deletion_repository = PrivacyDeletionRepository(
+                connection, scope_key=scope_key
+            )
+            privacy_deletion_coordinator = PrivacyDeletionCoordinator(
+                privacy_deletion_repository,
+                worker_id=f"privacy-deletion:{config.runtime_id}",
+            )
         from .langchao_live_wiring import active_authority_coordinates
 
         active_engine, active_mode, active_may_dispatch = active_authority_coordinates(
@@ -355,6 +379,9 @@ def build_v2_composition(
             authority_round_router=authority_round_router,
             goal_lifecycle_service=goal_lifecycle_service,
             social_service=social_service,
+            privacy_deletion_repository=privacy_deletion_repository,
+            privacy_deletion_coordinator=privacy_deletion_coordinator,
+            privacy_deletion_authorize=privacy_deletion_authorize,
             owns_database=effective_owns_database,
         )
     except BaseException:
