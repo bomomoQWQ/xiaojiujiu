@@ -10,7 +10,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from .langchao_outcome_repository import LangchaoOutcomeRepository
 from .langchao_types import MotivationDirection, OutcomeStatus, OutcomeToken, SettlementType
-from .user_model_v2_service import canonical_exposure_id
+from .exposure_identity import canonical_exposure_id
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -27,7 +27,7 @@ from .runtime_v2 import (
 )
 from .typing import CandidateIntent
 from .user_model_v2_labels import TargetObservationV2
-from .user_model_v2_service import canonical_exposure_id
+from .exposure_identity import canonical_exposure_id
 from .user_model_v2_types import Target
 from .utility import ensure_aware, utcnow
 
