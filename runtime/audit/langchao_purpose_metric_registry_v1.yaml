@@ -1,0 +1,280 @@
+schema_version: langchao.purpose-metric-registry.v1
+reviewed_scope: "runtime/src/companion_runtime 中浪潮收益、用户预测、训练/参数激活、影子比较、live 结算与运营证据"
+review_date: "2026-10-01"
+format_note: "纯 YAML；本文件是治理登记，不被运行时代码读取。"
+global_rules:
+  - "指标不能替代硬边界、权限或发送能力检查。"
+  - "未知、未覆盖、不可归因不得转换为零或负例；例外仅限目标契约明确规定的完整观察窗口缺失。"
+  - "所有高值必须能回到 scope、candidate/exposure、版本、时间窗和证据引用。"
+  - "训练参数激活目前是 CAS 发布，不是经离线选模获胜后发布。"
+metrics:
+  - id: reply_probability
+    purpose: "估计一次已确认曝光在固定 reply 窗口内获得用户回复的概率，为保守用户收益提供正向项。"
+    subject: "scope × exposure/candidate；目标是用户可观察 reply 事件，不是关系满意度。"
+    proxy: "Target.REPLY 的 point/lower/upper；浪潮取 lower，模板基础金额 1.0。"
+    legitimate_low: "用户忙、窗口短、消息无需回复、样本少导致区间宽，或缺特征/参数而 unavailable。"
+    false_high: "把无法归因的回复、多曝光碰撞、窗口外回复或仅有旧版 soft label 当正例；只报 point 不报区间。"
+    attribution: "仅用户来源、窗口内、唯一 exposure 归因；完整窗口无回复才可 R=false。"
+    exit: "缺特征或无参数/先验时 unavailable；硬边界和 repeat hard limit 仍可直接退出候选。"
+    parameter_authority: "用户模型 v2 活跃参数快照；训练由 maintenance_v2 定期重拟合并 CAS 激活。浪潮只读 lower。"
+    conclusion: "已接入收益；保守下界消费正确，但当前无独立校准/选模门槛。"
+    evidence:
+      - "runtime/src/companion_runtime/user_model_v2_labels.py:162-184,207-250"
+      - "runtime/src/companion_runtime/motivation_v2.py:199-215"
+      - "runtime/src/companion_runtime/langchao_runtime_adapter.py:319-339"
+
+  - id: continuation_probability
+    purpose: "估计已回复条件下继续对话的概率，奖励真正延续而非只收到一个回复。"
+    subject: "scope × replied exposure；语义为 P(continue | reply)。"
+    proxy: "Target.CONTINUE 的 lower；v2 utility 用 p_reply_lower × p_continue_lower，浪潮适配器也先相乘；模板基础金额 0.5。"
+    legitimate_low: "一次性通知、用户只需确认、回复后自然结束；无 reply 时 continuation 应 unknown 而非负例。"
+    false_high: "将所有继续消息归给最近曝光；把无回复当 continuation=false 训练；二次误乘或漏乘 reply。"
+    attribution: "必须先唯一归因 reply，且观察完整、窗口到期后才结算 continuation。"
+    exit: "无 reply 时 unknown；unavailable 时浪潮 outcome 保持 None，不以模板猜用户结果。"
+    parameter_authority: "独立 continue 头及其活跃参数；消费公式固定在 motivation_v2/adapter。"
+    conclusion: "条件语义和联合概率接线一致；应监控 unknown/unattributable 比例。"
+    evidence:
+      - "runtime/src/companion_runtime/user_model_v2_labels.py:257-299"
+      - "runtime/src/companion_runtime/motivation_v2.py:208-215"
+      - "runtime/src/companion_runtime/langchao_runtime_adapter.py:324-329"
+
+  - id: explicit_negative_probability
+    purpose: "估计固定窗口内用户明确负面反馈，作为发送风险成本。"
+    subject: "scope × exposure；仅明确用户负面事件，不等同沉默、不满意推断或边界许可本身。"
+    proxy: "Target.NEGATIVE upper；v2 无条件直接扣 c_negative × upper；浪潮基础金额 -1.5。"
+    legitimate_low: "用户未明确表达负面；完整覆盖窗口内确实无负面事件。"
+    false_high: "把未回复、模糊语气、内部情绪或边界存在本身当负面；重复记录同一反馈。"
+    attribution: "必须 user origin、explicit=true、窗口内且唯一 exposure；完整窗口缺失才 N=false。"
+    exit: "缺支持时 v2 按 upper=1 fail-closed；浪潮未知保持 None。硬边界不编码成成本。"
+    parameter_authority: "独立 negative 头；c_negative 属候选效用系数，浪潮模板金额属 adapter 版本常量。"
+    conclusion: "语义防混淆较强；v2 与浪潮对未知的数值策略不同，比较时必须披露。"
+    evidence:
+      - "runtime/src/companion_runtime/user_model_v2_labels.py:219-228"
+      - "runtime/src/companion_runtime/motivation_v2.py:199-215"
+      - "runtime/src/companion_runtime/langchao_reward.py:223-229"
+
+  - id: delivery_execution_witness
+    purpose: "证明发送执行结果并支撑 exposure 创建、exactly-once 结算与运营可靠性。"
+    subject: "round/attempt/outbox/ack；不是用户收益预测。"
+    proxy: "delivery token 预期值固定 probability=0、base_amount=0；terminal ack 后写 actual confirmed/censored。"
+    legitimate_low: "候选 defer/rest、发送失败、仍待 ack；低 delivery 不说明内容价值低。"
+    false_high: "把 accepted 冒充 delivered/read；重复 ack 重复计数；把 commit 当发送成功。"
+    attribution: "ack 必须匹配 round 和 attempt；delivery_basis 明确 accepted/delivered/read。"
+    exit: "失败标 censored 且 amount=0；重复 ack 幂等；无 durable snapshot 禁止 live dispatch。"
+    parameter_authority: "平台/legacy bridge 提供 ack；LangchaoLiveRepository 只结算本地可观察 token。"
+    conclusion: "已与用户结果分离；运营报表必须按 delivery_basis 分层。"
+    evidence:
+      - "runtime/src/companion_runtime/langchao_runtime_adapter.py:340-352"
+      - "runtime/src/companion_runtime/langchao_live_repository.py:86-138"
+      - "runtime/src/companion_runtime/user_model_v2_types.py:60-65"
+
+  - id: expression_delivered
+    purpose: "给表达型候选的本地可完成结果定价，避免必须等待用户反馈才能承认表达动作完成。"
+    subject: "expression.v1 candidate/attempt；主体是角色表达已送达，不是用户接受。"
+    proxy: "模板策略把 expression_delivered 的未知 forecast 置先验 1.0，基础金额 0.25；send ack 后 actual。"
+    legitimate_low: "没有合格 memory/social ref、未发送或发送失败；表达不应为每轮默认高值。"
+    false_high: "把草稿/渲染当送达；把表达送达冒充用户喜欢、回复或关系改善。"
+    attribution: "必须 expression 模板且有 memory_ref/social_ref；actual 绑定 attempt ack。"
+    exit: "发送失败为 censored/0；边界、权限、hard repeat 仍可淘汰。"
+    parameter_authority: "adapter 的显式 expression_delivered_policy；模板金额/概率由版本化常量控制。"
+    conclusion: "已实现但属于自有动作完成 proxy，不能用于训练用户满意度。"
+    evidence:
+      - "runtime/src/companion_runtime/langchao_runtime_adapter.py:293-300,354-370"
+      - "runtime/src/companion_runtime/langchao_live_repository.py:112-137"
+
+  - id: rest_realized
+    purpose: "让内部休息/暂缓成为可竞争方案，防止系统只有发送动作。"
+    subject: "internal_rest.v1 / defer_or_rest candidate；主体是内部自我调节。"
+    proxy: "rest_realized 模板先验 1.0、基础金额 0.25，方向 REST；live 决策命中后不发送。"
+    legitimate_low: "当前无需休息或其他候选收益更高；低值不代表必须发送。"
+    false_high: "大量 synthetic rest 造成表面安全但实际系统停摆；把 defer 当用户价值已实现。"
+    attribution: "必须 self_regulation_ref；synthetic rest 在 shadow wiring 中有明确来源。"
+    exit: "命中 DEFER_OR_REST 返回 internal_rest，永不创建外部发送。"
+    parameter_authority: "adapter/template policy 与价值画像 REST 权重；无用户结果训练权限。"
+    conclusion: "安全替代项已存在；需单独观察 rest/defer 率，不能以高 agreement 掩盖停摆。"
+    evidence:
+      - "runtime/src/companion_runtime/langchao_shadow_wiring.py:226-244"
+      - "runtime/src/companion_runtime/langchao_live.py:95-108"
+
+  - id: value_profile_weights
+    purpose: "表达稳定人格在八个动机方向上的相对定价。"
+    subject: "scope/persona；八轴映射到 approach/expression/exploration/care/commitment/repair/autonomy/rest。"
+    proxy: "runtime 八轴非负值归一化到固定总和 8；原始总和为 0 时全 1。"
+    legitimate_low: "某方向对该人格确实次要；归一化下一个轴低可能只是其他轴更高。"
+    false_high: "通过缩放某轴挤压其余轴；配置与持久状态漂移；把人格偏好当用户许可。"
+    attribution: "严格要求恰好八轴、一对一映射和版本号。"
+    exit: "负数、缺轴、多轴、非有限值拒绝；硬边界不受画像抵消。"
+    parameter_authority: "Runtime 配置/实例画像所有者；浪潮 adapter 只规范化，不在线学习。"
+    conclusion: "已进入 reward weighted_terms；属于治理参数，不是业务 KPI。"
+    evidence:
+      - "runtime/src/companion_runtime/langchao_runtime_adapter.py:242-274"
+      - "runtime/src/companion_runtime/langchao_reward.py:121-143,316-323"
+
+  - id: attention_weights
+    purpose: "表达当前时刻对八个方向的动态注意定价。"
+    subject: "decision round × direction。"
+    proxy: "AttentionProfile.direction_weights；当前生产 adapter 固定 all-one。"
+    legitimate_low: "未来明确抑制暂不相关方向；当前不存在自然低值，因为全为 1。"
+    false_high: "宣称已实现动态注意、或用注意权重绕过价值画像/边界。"
+    attribution: "状态保存 attention 与 attention_version；编译逐方向相乘。"
+    exit: "非负且全方向完整；版本变化必须进入输入/audit hash。"
+    parameter_authority: "当前仅代码常量 langchao.attention.all-one.v1；无运营在线调参入口。"
+    conclusion: "结构已接线、语义尚未实现；应标记 constant/not-yet-informative。"
+    evidence:
+      - "runtime/src/companion_runtime/langchao_runtime_adapter.py:277-279,486-495"
+      - "runtime/src/companion_runtime/langchao_reward.py:146-161,295-319"
+
+  - id: repeat_cost
+    purpose: "对短窗联系负担和同一事项无进展重复施加软成本，并以硬上限阻断骚扰式重复。"
+    subject: "prospective candidate × acknowledged send history × matter identity。"
+    proxy: "6h recent contacts、24h same-matter count；默认软成本 0.45/0.75，硬限制第 5 次联系或第 4 次同事项。"
+    legitimate_low: "近期无已确认发送、用户新进展/明确 reopen 重置同事项 run，或事项不同。"
+    false_high: "把评估/渲染也计入历史；错误 matter identity 合并不同事项；重复 exposure 未去重。"
+    attribution: "只接受 SendAcknowledgedExposureV2；同事项可由 concern_id/action_goal_id，reset 仅用户来源。"
+    exit: "hard_limit_reasons 直接 dropped/blocked，软成本从 utility 扣除且不能替代边界。"
+    parameter_authority: "DecisionConfigV2.repeat / RepeatPolicyConfigV2；浪潮 wiring 只搬运 breakdown。"
+    conclusion: "已完整接入 v2 与浪潮；应同时报成本分解和 hard-limit 命中率。"
+    evidence:
+      - "runtime/src/companion_runtime/repeat_v2.py:101-145,183-276"
+      - "runtime/src/companion_runtime/runtime_v2.py:550-579"
+      - "runtime/src/companion_runtime/langchao_runtime_adapter.py:402-405,433-444"
+
+  - id: reward_total_utility_and_attraction
+    purpose: "把结果概率、方向价值、注意与成本汇成候选吸引力，驱动 readiness 动力学。"
+    subject: "langchao candidate × reward contract revision。"
+    proxy: "total_utility=sum(value×attention×direction_total)-cost；attraction=utility/utility_scale。"
+    legitimate_low: "用户结果未知、负面上界高、价值方向低或重复成本高；低值可以是健康克制。"
+    false_high: "未知结果套乐观模板；utility_scale 任意缩小；遗漏负成本；重复/重叠 reward token。"
+    attribution: "forecast 必须精确覆盖 expected token，token/idempotency 唯一，所有版本与 source_refs 入审计。"
+    exit: "未知且无显式模板则不贡献数值；硬边界不得转成成本。"
+    parameter_authority: "reward/value/attention/template/utility_scale 各自版本化；调用方供应 utility_scale。"
+    conclusion: "可复算分解充分；utility_scale 缺少集中配置与批准流程，是治理缺口。"
+    evidence:
+      - "runtime/src/companion_runtime/langchao_reward.py:210-344"
+
+  - id: readiness
+    purpose: "将持续吸引力、泄漏和候选竞争随真实时间积分，表示候选接近决定边界的程度。"
+    subject: "decision round × candidate；范围 [0,1]。"
+    proxy: "readiness_before/after 与 attraction 的冻结小步轨迹。"
+    legitimate_low: "吸引力低/负、竞争强、刚进入工作集或工作集变化；低 readiness 不是服务故障。"
+    false_high: "跨不同 working set 错继承；时钟跳跃；只采样临界点造成幸存者偏差。"
+    attribution: "同 working set 才继承已有 readiness；新候选从 0；每步全候选从同一 before 快照计算。"
+    exit: "达到 threshold 立即停并决策；预算耗尽返回 defer_reason；工作集变化开启新 round。"
+    parameter_authority: "LangchaoParameters + state CAS；参数版本固定 langchao.parameters.v1。默认 wiring 为 leak=0.2、competition_gain=0、threshold=0.99、time_scale=10s、max_step=0.5s。"
+    conclusion: "数值轨迹可审计；默认是无竞争简化配方，运营应报分布/首次越界时间与长期不越界率，而非追求整体高值。"
+    evidence:
+      - "runtime/src/companion_runtime/langchao_engine.py:209-247,295-389"
+      - "runtime/src/companion_runtime/langchao_runtime_adapter.py:481-503"
+      - "runtime/src/companion_runtime/langchao_shadow_wiring.py:37-45"
+
+  - id: decision_threshold
+    purpose: "定义 readiness 首次越界即形成决定的边界。"
+    subject: "浪潮积分器全局参数（每次 run 显式提供）。"
+    proxy: "LangchaoParameters.decision_threshold，约束 (0,1]；同刻多候选由 tie_break_order。"
+    legitimate_low: "实验中为缩短等待但仍受 authority/permission/repeat/boundary；不能解释为质量提高。"
+    false_high: "通过降低阈值制造更多决定/发送；比较不同阈值的决策率却不分层。"
+    attribution: "audit 保存完整 parameters、crossing candidates、decision_at。"
+    exit: "首次越界停止；并列而无完整 tie order 时拒绝。"
+    parameter_authority: "由 shadow/live 组合根调用方供应；代码仅校验，当前缺少集中批准表。"
+    conclusion: "是控制参数不是 KPI；必须版本化分层观察，禁止自动优化发送量。"
+    evidence:
+      - "runtime/src/companion_runtime/langchao_engine.py:53-87,295-366"
+      - "runtime/src/companion_runtime/langchao_shadow.py:62-72,443-457"
+
+  - id: shadow_coverage
+    purpose: "衡量 runtime-v2 决策审计中有多少行拥有对应浪潮 shadow witness。"
+    subject: "scope × as_of 之前的 runtime_v2 decision audits。"
+    proxy: "covered_rows / candidate_rows；分母独立来自 v2 audit，而不是 shadow 表自身。"
+    legitimate_low: "尚未启用 shadow、历史缺 witness、离线回放严格截止；coverage=0 是诚实结果。"
+    false_high: "只用已存在 shadow 行作分母得到伪 100%；遗漏未覆盖行；跨 scope/as_of 拼接。"
+    attribution: "通过 runtime-v2:<decision_id> 稳定 key 对齐；缺行记 unknown。"
+    exit: "coverage=0 时 agreement 必须 None；回放要求 allowlisted host、隔离 marker、authority 不变与保护表 delta=0。"
+    parameter_authority: "只读 replay 代码定义；不能触发发送/基线 commit。"
+    conclusion: "定义正确且防自分母；上线门槛应先规定最小覆盖率，再看 agreement。"
+    evidence:
+      - "runtime/src/companion_runtime/langchao_shadow_replay.py:193-273,320-385"
+
+  - id: shadow_agreement
+    purpose: "在有独立 witness 的决策上比较浪潮与 runtime-v2 是否选择相同 candidate/defer 语义。"
+    subject: "covered decision row。"
+    proxy: "agreements / covered_rows；同时要求 candidate_id 与 defer_reason 相等。"
+    legitimate_low: "两个策略目标/时间动力学不同；低一致不自动说明浪潮错误。"
+    false_high: "coverage 很低、共同都 defer、候选 ID 映射错误、忽略 defer_reason 时造成虚高。"
+    attribution: "使用 shadow comparison 中冻结 baseline 语义；候选计数和 defer 数同时披露。"
+    exit: "无 covered row 时 agreement=None；不得凭 agreement 自动切 live authority。"
+    parameter_authority: "只读 replay 计算；authority 切换另由持久 CAS pointer 和 allowlist 控制。"
+    conclusion: "适合作为差异诊断，不是单一选模指标。需联合 coverage、defer率、分层样本审查。"
+    evidence:
+      - "runtime/src/companion_runtime/langchao_shadow_replay.py:214-273,357-384"
+
+  - id: training_support_and_fit_diagnostics
+    purpose: "说明每个 reply/acceptance/continue/negative 头用了多少有效证据、权重和优化状态。"
+    subject: "scope × target × parameter snapshot。"
+    proxy: "sample_count、weight_sum、objective、converged、iterations、support、training_exposure_ids。"
+    legitimate_low: "冷启动、严格过滤 unknown/censored/unattributable、半衰期衰减导致低 weight_sum。"
+    false_high: "重复 exposure、未来信息、把 pending/unknown 当标签；sample_count 高但单类/低权重；objective 不可跨样本规模比较。"
+    attribution: "只取 active observed labels，与冻结 exposure features 一一对齐；按 observed_at/exposure_id 排序。"
+    exit: "零正权重退回 prior_only；优化失败抛错；缺任一 feature 预测整包 unavailable。"
+    parameter_authority: "maintenance_v2 的 half_life/prior_precision/fit cadence；estimator 固定 MAP+Laplace。"
+    conclusion: "训练诊断已持久化，但没有 holdout、Brier/log-loss、校准曲线或候选模型比较。"
+    evidence:
+      - "runtime/src/companion_runtime/user_model_v2_service.py:274-357"
+      - "runtime/src/companion_runtime/user_model_v2_estimator.py:139-222"
+      - "runtime/src/companion_runtime/maintenance_v2.py:223-262"
+
+  - id: model_selection_and_activation
+    purpose: "决定哪组用户模型参数成为在线预测的活跃快照。"
+    subject: "scope × 四 target heads × activation pointer。"
+    proxy: "当前仅 save_parameter_snapshot_and_activate 的 CAS 成功与 activation_version；没有质量评分胜者。"
+    legitimate_low: "fit_activated=false 可由 CAS 竞争或未到 cadence；不代表模型质量差。"
+    false_high: "把 fit_activated=true 称为模型胜出；每小时无条件重拟合覆盖更优旧模型。"
+    attribution: "provenance 仅记录 maintenance_v2_map_laplace、fit_time、targets、active_labels_only。"
+    exit: "CAS expected_snapshot_id 不匹配则不激活；预测严格校验 feature fingerprint/matrix。"
+    parameter_authority: "maintenance_v2 自动任务拥有发布权；目前无人工审批、champion/challenger 或回滚门槛。"
+    conclusion: "现状是重训练+原子发布，不是选模。应明确禁止用激活率冒充效果指标。"
+    evidence:
+      - "runtime/src/companion_runtime/maintenance_v2.py:201-218,223-262"
+      - "runtime/src/companion_runtime/user_model_v2_prediction.py:167-232"
+
+  - id: operational_shadow_side_effect_counts
+    purpose: "证明 shadow 评估不发送、不奖励、不训练、不占额度。"
+    subject: "shadow run。"
+    proxy: "sent_count/reward_count/training_count/quota_count 全 0，outbox_id=null；input/audit SHA-256 可复核。"
+    legitimate_low: "这些计数必须永远为 0；不是业务低绩效。"
+    false_high: "任何非零都表示能力泄漏或数据损坏，不存在正当高值。"
+    attribution: "持久化读写双重校验零副作用不变量。"
+    exit: "非零或 outbox 非空立即拒绝/报错；hash 不匹配拒绝读取。"
+    parameter_authority: "Shadow repository protocol 无 execution/learning capability；authority 只允许合法模式。"
+    conclusion: "是安全不变量，不是优化目标。"
+    evidence:
+      - "runtime/src/companion_runtime/langchao_shadow.py:165-228,258-323"
+      - "runtime/src/companion_runtime/langchao_shadow_service.py:112-136"
+
+  - id: reply_duration
+    purpose: "衡量从确认曝光到首个唯一归因回复的时长，用于体验与响应时间分析，而非直接奖励快回复。"
+    subject: "exposure × first attributable reply。"
+    proxy: "建议值 observed_at - exposure.occurred_at，并按 reply horizon/censoring 分层；当前代码未定义、未持久化该派生指标。"
+    legitimate_low: "用户恰好在线或消息紧急相关；低时长不必然代表内容更好。"
+    false_high: "只统计有回复样本造成幸存者偏差；把处理时间当事件时间；多曝光时错归因；用短时长刺激频繁打扰。"
+    attribution: "只能使用 settle_target_label 已接受的 user-origin、窗口内、唯一 exposure reply observation。"
+    exit: "无回复应记 censored/无值而非 horizon 秒；ambiguous/unknown/invalidation 不进入点估计。"
+    parameter_authority: "尚无运行参数或消费者；新增前需指标治理批准，禁止直接进入 reward/threshold。"
+    conclusion: "明确缺失。现有窗口保存足以离线安全派生，但不得声称当前系统已监控 reply duration。"
+    evidence:
+      - "runtime/src/companion_runtime/user_model_v2_types.py:200-269"
+      - "runtime/src/companion_runtime/user_model_v2_labels.py:207-320"
+
+  - id: live_authority_and_dispatch
+    purpose: "控制哪个引擎在某 scope 可进行 live dispatch，并确保 shadow/disabled 不越权。"
+    subject: "scope × authority revision/pointer × dispatch claim。"
+    proxy: "engine_key、mode、may_dispatch、revision/pointer_version、live feature switch 与 scope allowlist。"
+    legitimate_low: "may_dispatch=false 是 shadow/disabled 的预期安全状态；低 live 覆盖不代表失败。"
+    false_high: "仅开配置即宣称有权发送；旧 revision、错误 scope 或无 claim 仍 dispatch。"
+    attribution: "authority revision 不可变，active pointer CAS；live 还需配置双重 deny-by-default 和 exact scope。"
+    exit: "非 langchao/live/true 拒绝执行；rest/defer 不发送；发送前再次校验边界、版本、能力和 durable snapshot。"
+    parameter_authority: "运维配置所有者 + 持久 authority CAS 管理者；数值核和 shadow 无权切换。"
+    conclusion: "权限分层清楚；任何运营 dashboard 都应把 authority 状态作为解释维度。"
+    evidence:
+      - "runtime/src/companion_runtime/config.py:477-491"
+      - "runtime/src/companion_runtime/langchao_authority.py:16-31"
+      - "runtime/src/companion_runtime/langchao_live.py:75-153"
