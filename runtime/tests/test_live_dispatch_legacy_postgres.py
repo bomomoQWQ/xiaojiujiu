@@ -42,10 +42,15 @@ def connection():
 
 
 def _attempt(connection, *, attempt_id: str, state: str = "sent") -> None:
+    """Mirror ``AttemptProjection.upsert``: an insert that resolves to an update."""
     connection.execute(
         """INSERT INTO action_attempts
            (attempt_id,candidate_id,state,intent,created_at,updated_at,outbox_id)
-           VALUES (%s,'candidate:legacy',%s,'pre-witness',%s,%s,'obx:legacy')""",
+           VALUES (%s,'candidate:legacy',%s,'pre-witness',%s,%s,'obx:legacy')
+           ON CONFLICT(attempt_id) DO UPDATE SET
+               candidate_id=excluded.candidate_id, state=excluded.state,
+               intent=excluded.intent, updated_at=excluded.updated_at,
+               outbox_id=excluded.outbox_id""",
         (attempt_id, state, NOW, NOW),
     )
 
@@ -79,9 +84,11 @@ def _seed_pre_witness_outbox(
 
 
 def _outbox(connection, *, outbox_id: str, status: str, attempt_id: str) -> None:
+    """Mirror the outbox enqueue path: an insert that may resolve to an update."""
     connection.execute(
         """INSERT INTO outbox (outbox_id,kind,payload_json,status,priority,created_at)
-           VALUES (%s,'send',%s::jsonb,%s,100,%s)""",
+           VALUES (%s,'send',%s::jsonb,%s,100,%s)
+           ON CONFLICT(outbox_id) DO UPDATE SET status=excluded.status""",
         (outbox_id, '{"attempt_id":"%s"}' % attempt_id, status, NOW),
     )
 
@@ -104,10 +111,6 @@ def test_legacy_attempt_rewrite_is_allowed_and_never_claims_identity(connection)
 
     # The v1 ingest reconciliation path re-upserts the same historical row.
     with connection.transaction():
-        connection.execute(
-            "UPDATE action_attempts SET state='sent', updated_at=%s WHERE attempt_id=%s",
-            (NOW, attempt_id),
-        )
         _attempt(connection, attempt_id=attempt_id)
     row = connection.execute(
         "SELECT state, dispatch_claim_id, dispatch_scope_key FROM action_attempts WHERE attempt_id=%s",
