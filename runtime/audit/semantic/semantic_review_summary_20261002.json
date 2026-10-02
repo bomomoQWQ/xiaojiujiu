@@ -1,0 +1,25 @@
+{
+  "evidence_type": "S",
+  "dataset": "langchao_semantic_gold_v1",
+  "dataset_items": 30,
+  "requirements": ["T07", "T09", "T17", "T21", "T22", "T24", "T25", "T28", "T31", "T32"],
+  "review_protocol": "two independent blinded reviewers; permitted fields only; frozen gold hidden until both sheets completed",
+  "external_judge_called": false,
+  "real_user_content": false,
+  "reviewer_a": {"rows": 30, "choices": {"A": 20, "B": 10, "TIE": 0, "U": 0}},
+  "reviewer_b": {"rows": 30, "choices": {"A": 20, "B": 10, "TIE": 0, "U": 0}},
+  "inter_reviewer_agreement": {"agreements": 30, "denominator": 30, "rate": 1.0},
+  "frozen_gold_agreement": {
+    "reviewer_a": {"agreements": 30, "denominator": 30, "rate": 1.0},
+    "reviewer_b": {"agreements": 30, "denominator": 30, "rate": 1.0}
+  },
+  "adjudication_required": 0,
+  "status": "passed_limited",
+  "limitations": [
+    "synthetic paired-text semantic rubric only",
+    "does not evaluate generated production text distribution",
+    "does not provide real-user-effect evidence",
+    "small curated set can verify rubric usability but not prevalence"
+  ],
+  "release_authorization": false
+}

@@ -1,0 +1,52 @@
+{
+  "fixture_version": "offline-ablation-input.v1",
+  "fixture_id": "synthetic-competition-v1",
+  "versions": {
+    "candidate_supply": "candidates.synthetic.v1",
+    "forecasts": "forecasts.synthetic.v1",
+    "values": "values.synthetic.v1",
+    "time": "time.synthetic.v1",
+    "permissions": "permissions.synthetic.v1",
+    "attention": "attention.synthetic.v1",
+    "competition_edges": "edges.synthetic.v1",
+    "parameters": "parameters.synthetic.v1"
+  },
+  "candidates": [
+    {"candidate_id": "care", "internal_utility": 0.15, "runtime_user_utility": 0.55, "repeat_cost": 0.05},
+    {"candidate_id": "express", "internal_utility": 0.25, "runtime_user_utility": 0.35, "repeat_cost": 0.02},
+    {"candidate_id": "blocked", "internal_utility": 3.0, "runtime_user_utility": 2.0, "repeat_cost": 0.0}
+  ],
+  "forecasts": {
+    "care": [
+      {"outcome_id": "care.reply", "probability": 0.7, "amount": 1.0, "directions": {"care": 1.0}},
+      {"outcome_id": "care.unknown", "probability": null, "amount": -1.0, "directions": {"rest": 1.0}}
+    ],
+    "express": [
+      {"outcome_id": "express.reply", "probability": 0.65, "amount": 1.0, "directions": {"expression": 1.0}}
+    ],
+    "blocked": [
+      {"outcome_id": "blocked.reply", "probability": 1.0, "amount": 5.0, "directions": {"approach": 1.0}}
+    ]
+  },
+  "values": {
+    "direction_weights": {"approach": 1.0, "expression": 1.0, "exploration": 1.0, "care": 1.0, "commitment": 1.0, "repair": 1.0, "autonomy": 1.0, "rest": 1.0}
+  },
+  "attention": {"approach": 1.0, "expression": 0.4, "exploration": 1.0, "care": 1.6, "commitment": 1.0, "repair": 1.0, "autonomy": 1.0, "rest": 1.0},
+  "time": {
+    "now": "2026-10-02T12:00:00Z",
+    "runtime_v2_baseline": {"version": "tempo.runtime-baseline.v1", "utility_threshold": 0.0, "hazard_base": 0.00003, "hazard_beta": 4.0, "elapsed_allowed_seconds": 60.0},
+    "matched_tempo": {"version": "tempo.matched.v1", "utility_threshold": 0.0, "hazard_base": 0.00003, "hazard_beta": 4.0, "elapsed_allowed_seconds": 3600.0, "decision_budget_seconds": 40.0},
+    "initial_readiness": {"care": 0.0, "express": 0.0, "blocked": 0.0},
+    "langchao_parameters": {"leak": 0.2, "competition_gain": 1.0, "decision_threshold": 0.6, "time_scale_seconds": 10.0, "max_step_seconds": 0.1, "crossing_tolerance": 0.0000001, "tie_tolerance": 0.000001, "utility_scale": 1.0}
+  },
+  "permissions": {
+    "care": {"allowed": true, "reasons": []},
+    "express": {"allowed": true, "reasons": []},
+    "blocked": {"allowed": false, "reasons": ["synthetic_hard_boundary"]}
+  },
+  "competition_edges": [
+    {"left": "care", "right": "express", "weight": 0.7},
+    {"left": "express", "right": "care", "weight": 1.2}
+  ],
+  "hazard": {"mode": "report"}
+}
