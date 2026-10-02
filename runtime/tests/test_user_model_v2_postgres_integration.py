@@ -446,7 +446,7 @@ def test_shared_runtime_database_commit_is_atomic_on_real_postgres(outcome: str)
     """The legacy attempt and every v2 witness share one physical PG transaction."""
 
     schema = "langchao_atomic_" + uuid.uuid4().hex[:12]
-    scope = "integration:濞搭亝鐤?
+    scope = "integration:langchao"
     decision_id = f"langchao:{outcome}:{uuid.uuid4()}"
     config = RuntimeConfig()
     config.storage.dsn = _DSN
@@ -474,8 +474,8 @@ def test_shared_runtime_database_commit_is_atomic_on_real_postgres(outcome: str)
         legacy_candidate = CandidateIntent(
             candidate_id=f"langchao-candidate:{uuid.uuid4()}",
             type="share",
-            intent="濞搭亝鐤?,
-            goal="濞搭亝鐤?,
+            intent="langchao integration intent",
+            goal="langchao integration goal",
             internal_need=1.0,
         )
         with runtime.db.transaction() as connection:
