@@ -1,0 +1,30 @@
+{
+  "evidence_type": "T",
+  "executed_at": "2026-10-02",
+  "commit": "32bd8a2fbad167c3f6c66d99e704268208d5fed5",
+  "command": "python -m pytest -q tests/test_langchao_engine.py tests/test_langchao_reward.py tests/test_langchao_types.py tests/test_langchao_runtime_adapter.py tests/test_langchao_outcome_persistence.py tests/test_langchao_state_persistence.py tests/test_langchao_authority.py tests/test_langchao_social_repository.py tests/test_langchao_live_repository.py tests/test_langchao_shadow_replay.py",
+  "result": {
+    "status": "passed_limited",
+    "failures": 0,
+    "skips": 3,
+    "skip_reason": "optional PostgreSQL integration cases lacked their configured external DSN"
+  },
+  "supports": [
+    "bounded numeric integration and budget defer",
+    "unknown outcome separation and reward arithmetic",
+    "contract validation and stable template identity",
+    "outcome idempotency and correction lineage",
+    "state CAS and restart trajectory",
+    "authority claims and scope isolation",
+    "social projection source validation",
+    "live terminal settlement repository behavior",
+    "persisted replay safety gates"
+  ],
+  "does_not_support": [
+    "real user effect",
+    "semantic quality",
+    "all optional PostgreSQL constraints",
+    "T01-T32 complete acceptance",
+    "production launch"
+  ]
+}
