@@ -413,6 +413,17 @@ def _owned_connection_class() -> Any:
     return TemplateOwnedConnection
 
 
+def _owned_connection_class() -> Any:
+    """Deprecated placeholder kept for import compatibility.
+
+    ``psycopg.connect`` in the pinned driver (3.3.x) no longer accepts
+    ``connection_class`` — the kwarg is forwarded to libpq and rejected as an invalid
+    connection option. The session therefore gets its single owner by shadowing the
+    instance's ``transaction`` attribute instead; see :meth:`PostgresDatabase._connect`.
+    """
+    return None
+
+
 class TranslatingConnection:
     """The connection the transaction template hands to a projection.
 
@@ -612,7 +623,6 @@ class PostgresDatabase(DatabaseBase):
                     row_factory=dict_row,
                     connect_timeout=self.connect_timeout_s,
                     application_name=self.application_name,
-                    connection_class=_owned_connection_class(),
                 )
                 # Legacy projections pass ISO timestamps and compact JSON as Python
                 # strings.  The default psycopg string dumper advertises VARCHAR,
@@ -621,8 +631,15 @@ class PostgresDatabase(DatabaseBase):
                 # column perform its native input conversion, preserving one set of
                 # projection statements without weakening those columns to TEXT.
                 raw.adapters.register_dumper(str, StrDumperUnknown)
-                # Hand the session its single transaction owner before anything can run.
-                raw._template_transaction = self.transaction
+                # One session has exactly one transaction, so it must have exactly one
+                # owner.  Repositories built on this shared connection open
+                # driver-native ``connection.transaction()`` blocks, whose BEGIN/COMMIT
+                # used to commit the Runtime's own transaction behind its back and
+                # destroy its savepoints — surfacing as failed v1 lease/context calls
+                # and failed scheduler rounds.  psycopg allows an instance attribute to
+                # shadow the method, so every such block becomes a nested savepoint of
+                # the template instead, with no change at the call sites.
+                raw.transaction = self.transaction
                 self._apply_session_settings(raw)
             except Exception as error:
                 # `from None` keeps a libpq message from being echoed in a chained
