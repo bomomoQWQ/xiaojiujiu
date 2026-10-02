@@ -347,8 +347,10 @@ def _seed_atomic_user_settlement(connection, *, scope: str, attempt: str):
     from companion_runtime.langchao_authority_repository import LangchaoAuthorityRepository
     from companion_runtime.langchao_authority import AuthorityEngine, AuthorityMode
     authority = LangchaoAuthorityRepository(connection, scope_key=scope)
-    authority.initialize(
+    authority.bootstrap(reason="atomic outcome bootstrap", created_at=NOW)
+    authority.switch_authority(
         engine_key=AuthorityEngine.LANGCHAO, mode=AuthorityMode.LIVE,
+        expected_pointer_version=1, in_flight_count=0,
         reason="atomic outcome test", created_at=NOW,
     )
     authority.create_live_dispatch_claim(
