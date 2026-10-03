@@ -30,7 +30,7 @@ from .langchao_attention_recipe import (
     normalize_recipe,
     parameter_version_for_recipe,
 )
-from .langchao_engine import LangchaoParameters
+from .langchao_engine import LangchaoParameters, SendPenaltyWindow
 from .langchao_exploration import ExplorationResultKind, ExplorationWorkSegment
 from .langchao_history import condition_forecasts_from_history, observations_from_rows
 from .langchao_outcome_repository import LangchaoOutcomeRepository
@@ -646,6 +646,7 @@ def build_langchao_shadow_runner(
     transaction_factory: Any | None = None, attention_recipe: str = BASELINE_RECIPE,
     internal_exploration_enabled: bool = True, cold_start_drive: float = 0.0,
     parameters: LangchaoParameters | None = None,
+    send_penalty: SendPenaltyWindow | None = None,
 ) -> LangchaoShadowRunner:
     """Build safe repositories on the same migrated PostgreSQL connection."""
     borrowed = _BorrowedConnection(connection)
@@ -666,6 +667,7 @@ def build_langchao_shadow_runner(
         authority_reader=_ReadOnlyAuthority(authority),
         transaction_factory=transaction_factory or connection.transaction,
         allow_live_evaluation=allow_live_evaluation,
+        send_penalty=send_penalty,
     )
     return LangchaoShadowRunner(scope_key=scope_key, runtime=runtime, service=service,
                                 state_repository=states, outcome_repository=outcomes,

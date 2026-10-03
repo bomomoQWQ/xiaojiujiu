@@ -13,6 +13,8 @@ from datetime import datetime, timedelta
 from .langchao_types import FrozenScores, LangchaoState
 
 LANGCHAO_PARAMETERS_VERSION = "langchao.parameters.v1"
+#: Version of the local-time send-penalty window contract.
+LANGCHAO_SEND_PENALTY_VERSION = "langchao.send-penalty.v1"
 LANGCHAO_COMPETITION_EDGE_VERSION = "langchao.competition-edge.v1"
 LANGCHAO_INTEGRATION_STEP_VERSION = "langchao.integration-step.v1"
 LANGCHAO_ADVANCE_RESULT_VERSION = "langchao.advance-result.v1"
@@ -85,6 +87,63 @@ class LangchaoParameters:
             raise ValueError("tie_tolerance must be non-negative")
         if self.parameter_version != LANGCHAO_PARAMETERS_VERSION:
             raise ValueError(f"parameter_version must be {LANGCHAO_PARAMETERS_VERSION!r}")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SendPenaltyWindow:
+    """A local-time window in which reaching out is heavily discounted.
+
+    The kernel's attraction is what decides whether the character speaks. Scaling it down
+    inside a window is the honest way to say "this hour makes me much less willing to start
+    a conversation": it is a penalty coefficient, not a silence switch, so a genuinely
+    strong impulse can still cross, while an ordinary one cannot.
+    """
+
+    start_hour: int
+    end_hour: int
+    #: Fraction removed from a sending candidate's attraction inside the window.
+    coefficient: float
+    window_version: str = LANGCHAO_SEND_PENALTY_VERSION
+
+    def __post_init__(self) -> None:
+        for name in ("start_hour", "end_hour"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 23:
+                raise ValueError(f"{name} must be an integer hour in [0, 23]")
+        object.__setattr__(self, "coefficient", _number("coefficient", self.coefficient))
+        if not 0.0 <= self.coefficient < 1.0:
+            raise ValueError("coefficient must be in [0, 1)")
+        if self.window_version != LANGCHAO_SEND_PENALTY_VERSION:
+            raise ValueError(
+                f"window_version must be {LANGCHAO_SEND_PENALTY_VERSION!r}"
+            )
+
+    def applies_at(self, moment: datetime) -> bool:
+        """Return whether ``moment``'s *local* hour falls inside the window.
+
+        The kernel is handed UTC instants, but "the small hours" is a local-clock question,
+        so the hour is read after converting to the machine's local zone -- the same
+        conversion the quiet-hours gate uses.
+
+        Args:
+            moment: A timezone-aware moment.
+
+        Returns:
+            ``True`` when the window covers that local hour. An empty window never applies.
+        """
+        if self.coefficient <= 0.0 or self.start_hour == self.end_hour:
+            return False
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            raise ValueError("moment must be timezone-aware")
+        hour = moment.astimezone().hour
+        if self.start_hour < self.end_hour:
+            return self.start_hour <= hour < self.end_hour
+        # A window that crosses midnight, e.g. 22 -> 5.
+        return hour >= self.start_hour or hour < self.end_hour
+
+    def multiplier_at(self, moment: datetime) -> float:
+        """Return the attraction multiplier for ``moment`` (``1.0`` outside the window)."""
+        return 1.0 - self.coefficient if self.applies_at(moment) else 1.0
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -392,6 +451,7 @@ def advance_langchao(
 __all__ = [
     "AdvanceResult", "CompetitionEdge", "IntegrationStep", "LANGCHAO_ADVANCE_RESULT_VERSION",
     "LANGCHAO_COMPETITION_EDGE_VERSION", "LANGCHAO_INTEGRATION_STEP_VERSION",
-    "LANGCHAO_PARAMETERS_VERSION", "LangchaoParameters",
+    "LANGCHAO_PARAMETERS_VERSION", "LANGCHAO_SEND_PENALTY_VERSION",
+    "LangchaoParameters", "SendPenaltyWindow",
     "advance_langchao",
 ]

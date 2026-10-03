@@ -321,6 +321,7 @@ def build_v2_composition(
                 internal_exploration_enabled=config.langchao.internal_exploration_enabled,
                 cold_start_drive=config.langchao.cold_start_drive,
                 parameters=config.langchao.parameters(),
+                send_penalty=config.langchao.send_penalty(),
             )
         live_enabled = bool(config.langchao.live_allowed(scope_key))
         langchao_live_runner = None
@@ -335,6 +336,7 @@ def build_v2_composition(
                 internal_exploration_enabled=config.langchao.internal_exploration_enabled,
                 cold_start_drive=config.langchao.cold_start_drive,
                 parameters=config.langchao.parameters(),
+                send_penalty=config.langchao.send_penalty(),
             )
             from .langchao_user_outcomes import LangchaoUserOutcomeSettler
 

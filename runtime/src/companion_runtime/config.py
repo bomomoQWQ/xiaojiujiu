@@ -27,7 +27,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from .langchao_engine import LangchaoParameters
+from .langchao_engine import LangchaoParameters, SendPenaltyWindow
 from .typing import ValueProfile
 
 LOGGER = logging.getLogger("companion_runtime.config")
@@ -514,6 +514,14 @@ class LangchaoConfig:
     # model is still cold. It never overrides a hard block, and it is the only reason a
     # brand-new scope can send at all; set it to 0 to keep the kernel purely predictive.
     cold_start_drive: float = 2.0
+    # Reaching out in the small hours is much more costly than at any other time. This is a
+    # penalty coefficient on the *sending* candidates' attraction inside the window, not a
+    # silence switch: an ordinary impulse cannot cross there, a genuinely strong one still
+    # can. Hours are local to the Runtime, which is the same zone as the recipients here.
+    # The window is empty when the coefficient is 0 or the hours are equal.
+    night_send_penalty: float = 0.85
+    night_send_penalty_start_hour: int = 0
+    night_send_penalty_end_hour: int = 5
 
     def live_allowed(self, scope_key: str) -> bool:
         return bool(self.live_enabled and scope_key in self.live_scope_allowlist)
@@ -528,6 +536,14 @@ class LangchaoConfig:
             max_step_seconds=self.max_step_seconds,
             crossing_tolerance=self.crossing_tolerance,
             tie_tolerance=self.tie_tolerance,
+        )
+
+    def send_penalty(self) -> SendPenaltyWindow:
+        """Return the validated local-time send-penalty window for this configuration."""
+        return SendPenaltyWindow(
+            start_hour=self.night_send_penalty_start_hour,
+            end_hour=self.night_send_penalty_end_hour,
+            coefficient=self.night_send_penalty,
         )
 
     def validate(self) -> None:
@@ -552,6 +568,8 @@ class LangchaoConfig:
         if not math.isfinite(float(self.cold_start_drive)) or self.cold_start_drive < 0:
             raise ValueError("cold_start_drive must be finite and non-negative")
         self.parameters()
+        # Validates the hour range and the coefficient bound as well.
+        self.send_penalty()
 
     def attention_recipe_for_scope(self, scope_key: str) -> str:
         """Validate the configured recipe and enforce B3's exact-scope gate."""

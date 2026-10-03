@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 import re
 
 import pytest
 
-from companion_runtime.langchao_engine import LangchaoParameters
+from companion_runtime.langchao_engine import LangchaoParameters, SendPenaltyWindow
 from companion_runtime.langchao_reward import AttentionProfile, CandidateCostTerm, OutcomeForecast, ValueProfile
 from companion_runtime.langchao_shadow import (
     FakeLangchaoShadowRepository, LangchaoShadowPostgresRepository,
@@ -146,6 +147,88 @@ def test_same_semantic_input_has_same_hash_even_when_input_tuple_order_is_irrele
     two = run(FakeLangchaoShadowRepository(), run_id="run:2", idempotency_key="idem:2")
     assert one.input_sha256 == two.input_sha256
     assert one.audit_sha256 == two.audit_sha256
+
+
+def test_night_send_penalty_discounts_only_a_sending_candidate_inside_its_window():
+    """A local-time penalty is a coefficient on reaching out, not a silence switch.
+
+    Only candidates that could actually send are discounted, so the internal alternative
+    is never made more attractive by it. The kernel is handed UTC instants, so the window
+    has to read the *local* hour -- the bug this covers.
+    """
+    inside = SendPenaltyWindow(start_hour=0, end_hour=5, coefficient=0.75)
+    outside = SendPenaltyWindow(start_hour=8, end_hour=9, coefficient=0.75)
+    local_zone = datetime.now().astimezone().tzinfo
+    at_night = datetime(2026, 10, 4, 2, 30, tzinfo=local_zone).astimezone(timezone.utc)
+    midday = datetime(2026, 10, 4, 12, 0, tzinfo=local_zone).astimezone(timezone.utc)
+
+    assert inside.applies_at(at_night), "a UTC instant must be read in local time"
+    assert inside.multiplier_at(at_night) == pytest.approx(0.25)
+    assert not inside.applies_at(midday)
+    assert outside.multiplier_at(at_night) == 1.0
+
+    penalised = run(FakeLangchaoShadowRepository(), until=at_night,
+                    send_penalty=inside)
+    unpenalised = run(FakeLangchaoShadowRepository(), run_id="run:2", idempotency_key="idem:2",
+                      until=at_night, send_penalty=outside)
+    night_attraction = dict(penalised.advance_result.state.attraction)["candidate:1"]
+    day_attraction = dict(unpenalised.advance_result.state.attraction)["candidate:1"]
+    assert night_attraction == pytest.approx(day_attraction * 0.25)
+    # The discount is recorded, and it changed the run identity.
+    assert penalised.audit_sha256 != unpenalised.audit_sha256
+    assert penalised.input_sha256 != unpenalised.input_sha256
+
+
+def test_night_send_penalty_leaves_an_internal_candidate_undiscounted():
+    """Resting is not reaching out, so the window must not make internal rest cheaper."""
+    local_zone = datetime.now().astimezone().tzinfo
+    at_night = datetime(2026, 10, 4, 2, 30, tzinfo=local_zone).astimezone(timezone.utc)
+    internal = candidate_input()
+    internal = replace(
+        internal,
+        candidate=replace(internal.candidate, kind=CandidateKind.DEFER_OR_REST),
+    )
+    penalised = run(FakeLangchaoShadowRepository(), until=at_night,
+                    inputs=(internal,), send_penalty=SendPenaltyWindow(
+                        start_hour=0, end_hour=5, coefficient=0.9))
+    unpenalised = run(FakeLangchaoShadowRepository(), run_id="run:2", idempotency_key="idem:2",
+                      until=at_night, inputs=(internal,),
+                      send_penalty=SendPenaltyWindow(start_hour=6, end_hour=7, coefficient=0.9))
+    assert (dict(penalised.advance_result.state.attraction)
+            == dict(unpenalised.advance_result.state.attraction))
+
+
+def test_send_penalty_window_validates_its_hours_and_coefficient():
+    local_zone = datetime.now().astimezone().tzinfo
+
+    def at(hour: int) -> datetime:
+        return datetime(2026, 10, 4, hour, 30, tzinfo=local_zone)
+
+    with pytest.raises(ValueError):
+        SendPenaltyWindow(start_hour=24, end_hour=5, coefficient=0.5)
+    with pytest.raises(ValueError):
+        SendPenaltyWindow(start_hour=0, end_hour=-1, coefficient=0.5)
+    with pytest.raises(ValueError):
+        SendPenaltyWindow(start_hour=0, end_hour=5, coefficient=1.0)
+    with pytest.raises(ValueError):
+        SendPenaltyWindow(start_hour=0, end_hour=5, coefficient=-0.1)
+    # A zero coefficient and an empty window both mean "no penalty at all".
+    assert SendPenaltyWindow(start_hour=0, end_hour=5, coefficient=0.0).multiplier_at(at(2)) == 1.0
+    assert SendPenaltyWindow(start_hour=3, end_hour=3, coefficient=0.9).multiplier_at(at(3)) == 1.0
+    # A naive moment is refused rather than silently read as UTC.
+    with pytest.raises(ValueError):
+        SendPenaltyWindow(start_hour=0, end_hour=5, coefficient=0.5).applies_at(
+            datetime(2026, 10, 4, 2, 30)
+        )
+    # A window that crosses midnight covers both ends and nothing in between.
+    crossing = SendPenaltyWindow(start_hour=22, end_hour=5, coefficient=0.5)
+    assert crossing.applies_at(at(23))
+    assert crossing.applies_at(at(1))
+    assert not crossing.applies_at(at(12))
+    # The boundary hours are half-open: 00:00-05:00 covers 04:59 but not 05:00.
+    half_open = SendPenaltyWindow(start_hour=0, end_hour=5, coefficient=0.5)
+    assert half_open.applies_at(at(4))
+    assert not half_open.applies_at(at(5))
 
 
 def test_unknown_forecast_is_audited_without_becoming_negative_reward():

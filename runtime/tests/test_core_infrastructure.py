@@ -312,6 +312,45 @@ def test_open_database_scopes_the_writer_lock_to_the_configured_schema() -> None
     assert store.describe()["writer_lock_key"] == store._writer_lock_key()
 
 
+def test_night_send_penalty_is_configurable_and_bounded() -> None:
+    """Reaching out in the small hours costs more, as a coefficient rather than a switch."""
+    from datetime import datetime
+
+    from companion_runtime.langchao_engine import SendPenaltyWindow
+
+    default = load_config(env={})
+    assert (default.langchao.night_send_penalty,
+            default.langchao.night_send_penalty_start_hour,
+            default.langchao.night_send_penalty_end_hour) == (0.85, 0, 5)
+    window = default.langchao.send_penalty()
+    assert isinstance(window, SendPenaltyWindow)
+
+    # The window is a local-clock question, so build the moments in local time.
+    local_zone = datetime.now().astimezone().tzinfo
+    night = datetime(2026, 10, 4, 2, 30, tzinfo=local_zone)
+    day = datetime(2026, 10, 4, 12, 30, tzinfo=local_zone)
+    assert window.multiplier_at(night) == pytest.approx(0.15)
+    assert window.multiplier_at(day) == 1.0
+
+    tuned = load_config(env={
+        "CR_LANGCHAO__NIGHT_SEND_PENALTY": "0.5",
+        "CR_LANGCHAO__NIGHT_SEND_PENALTY_START_HOUR": "22",
+        "CR_LANGCHAO__NIGHT_SEND_PENALTY_END_HOUR": "6",
+    })
+    tuned_window = tuned.langchao.send_penalty()
+    assert tuned_window.multiplier_at(datetime(2026, 10, 4, 23, 30, tzinfo=local_zone)) == pytest.approx(0.5)
+    assert tuned_window.multiplier_at(datetime(2026, 10, 4, 3, 0, tzinfo=local_zone)) == pytest.approx(0.5)
+
+    for bad in (
+        {"CR_LANGCHAO__NIGHT_SEND_PENALTY": "1.0"},
+        {"CR_LANGCHAO__NIGHT_SEND_PENALTY": "-0.1"},
+        {"CR_LANGCHAO__NIGHT_SEND_PENALTY_START_HOUR": "24"},
+        {"CR_LANGCHAO__NIGHT_SEND_PENALTY_END_HOUR": "-1"},
+    ):
+        with pytest.raises(ValueError):
+            load_config(env=bad)
+
+
 def test_cold_start_drive_is_configurable_and_can_be_switched_off() -> None:
     """The bounded outreach allowance is an operator dial, including turning it off."""
     default = load_config(env={})

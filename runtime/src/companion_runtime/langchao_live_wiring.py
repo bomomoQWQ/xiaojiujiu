@@ -188,6 +188,7 @@ def build_langchao_live_runner(
     witness_reader: Any | None = None,
     attention_recipe: str = "off", internal_exploration_enabled: bool = True,
     cold_start_drive: float = 0.0, parameters: Any | None = None,
+    send_penalty: Any | None = None,
 ) -> LangchaoLiveRunner:
     evaluator = build_langchao_shadow_runner(
         connection=connection, scope_key=scope_key, runtime=runtime,
@@ -197,6 +198,7 @@ def build_langchao_live_runner(
         internal_exploration_enabled=internal_exploration_enabled,
         cold_start_drive=cold_start_drive,
         parameters=parameters,
+        send_penalty=send_penalty,
     )
     authority = LangchaoAuthorityRepository(connection, scope_key=scope_key)
     contracts = LangchaoRepository(connection, scope_key=scope_key)

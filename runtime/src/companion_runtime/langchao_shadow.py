@@ -15,7 +15,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, ContextManager, Mapping, Protocol, TypeAlias, runtime_checkable
 
-from .langchao_engine import AdvanceResult, CompetitionEdge, LangchaoParameters, advance_langchao
+from .langchao_engine import (
+    AdvanceResult,
+    CompetitionEdge,
+    LangchaoParameters,
+    SendPenaltyWindow,
+    advance_langchao,
+)
 from .langchao_reward import (
     AttentionProfile,
     CandidateCostTerm,
@@ -25,7 +31,13 @@ from .langchao_reward import (
     ValueProfile,
     compile_candidate_reward,
 )
-from .langchao_types import ActionCandidateContract, GoalContract, LangchaoState, RewardContract
+from .langchao_types import (
+    ActionCandidateContract,
+    CandidateKind,
+    GoalContract,
+    LangchaoState,
+    RewardContract,
+)
 
 LANGCHAO_SHADOW_VERSION = "langchao.shadow.v1"
 LANGCHAO_SHADOW_MODE = "shadow"
@@ -283,12 +295,21 @@ class LangchaoShadowPostgresRepository:
             "compilations": audit.get("compilations"),
             "advance_result": audit.get("advance_result"),
             "comparison": dict(comparison),
+            "send_penalty_multiplier": audit.get("send_penalty_multiplier", 1.0),
             "shadow_version": audit.get("shadow_version"),
         }
         audit_digest = _sha256(audit_payload)
         stored_digest = str(value("audit_sha256", 2))
         if audit_digest != stored_digest:
-            raise RuntimeError("persisted shadow audit hash mismatch")
+            # Rows written before the local-time send penalty existed hashed a payload
+            # without its key. Accept that exact older shape rather than invalidate every
+            # already-published audit.
+            legacy_payload = {
+                key: audit_payload[key]
+                for key in ("compilations", "advance_result", "comparison", "shadow_version")
+            }
+            if _sha256(legacy_payload) != stored_digest:
+                raise RuntimeError("persisted shadow audit hash mismatch")
         payload = {
             "scope_key": scope_key,
             "run_id": value("run_id", 0),
@@ -424,6 +445,7 @@ def run_langchao_shadow(
     expected_state_pointer_version: int = 0,
     baseline_candidate_id: str | None = None,
     baseline_defer_reason: str | None = None,
+    send_penalty: SendPenaltyWindow | None = None,
 ) -> ShadowRunResult:
     """Compile attractions, advance 「浪潮」, and atomically persist audit only."""
 
@@ -440,6 +462,11 @@ def run_langchao_shadow(
         raise ValueError("inputs must cover previous_state working_set exactly")
 
     ordered_inputs = tuple(sorted(inputs, key=lambda item: item.candidate.candidate_id))
+    # A local-time penalty discounts *reaching out* inside its window. It scales attraction
+    # only for candidates that could actually send, so the internal alternative is never
+    # made more attractive by it, and it lives here rather than in the contracts so the
+    # immutable reward revisions stay stable across the day.
+    send_multiplier = 1.0 if send_penalty is None else send_penalty.multiplier_at(until)
     input_payload = {
         "source_input_cursor": source_input_cursor,
         "source_input_version": source_input_version,
@@ -454,6 +481,13 @@ def run_langchao_shadow(
         "decision_budget_seconds": decision_budget_seconds,
         "tie_break_order": list(tie_break_order),
         "expected_state_pointer_version": expected_state_pointer_version,
+        "send_penalty": None if send_penalty is None else {
+            "start_hour": send_penalty.start_hour,
+            "end_hour": send_penalty.end_hour,
+            "coefficient": send_penalty.coefficient,
+            "multiplier": send_multiplier,
+            "window_version": send_penalty.window_version,
+        },
     }
     input_sha256 = _sha256(input_payload)
 
@@ -486,7 +520,20 @@ def run_langchao_shadow(
         )
         for item in ordered_inputs
     )
-    attraction = {item.candidate_id: item.attraction for item in compilations}
+    # The penalty scales attraction only for candidates that could actually send, so the
+    # internal alternative is never made more attractive by it.
+    send_multipliers = {
+        item.candidate.candidate_id: (
+            send_multiplier
+            if item.candidate.kind is CandidateKind.EXTERNAL_MESSAGE
+            else 1.0
+        )
+        for item in ordered_inputs
+    }
+    attraction = {
+        item.candidate_id: item.attraction * send_multipliers.get(item.candidate_id, 1.0)
+        for item in compilations
+    }
     prepared_state = replace(
         previous_state,
         attraction=tuple((candidate_id, attraction[candidate_id]) for candidate_id in previous_state.working_set),
@@ -520,6 +567,7 @@ def run_langchao_shadow(
         "compilations": [item.to_dict() for item in compilations],
         "advance_result": _advance_dict(advanced),
         "comparison": comparison.to_dict(),
+        "send_penalty_multiplier": send_multiplier,
         "shadow_version": LANGCHAO_SHADOW_VERSION,
     }
     record = ShadowRunRecord(

@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any, Callable, ContextManager, Mapping, Protocol, runtime_checkable
 
 from .langchao_authority import AuthorityEngine, AuthorityMode
-from .langchao_engine import CompetitionEdge, LangchaoParameters
+from .langchao_engine import CompetitionEdge, LangchaoParameters, SendPenaltyWindow
 from .langchao_runtime_adapter import BuiltCandidateContracts, BuiltShadowRound
 from .langchao_shadow import LangchaoShadowRepository, ShadowRunResult, run_langchao_shadow
 from .langchao_state_repository import LangchaoStateConflictError
@@ -89,6 +89,7 @@ class LangchaoShadowService:
         authority_reader: AuthorityReader,
         transaction_factory: Any | None = None,
         allow_live_evaluation: bool = False,
+        send_penalty: SendPenaltyWindow | None = None,
     ) -> None:
         if not isinstance(authority_reader, AuthorityReader):
             raise TypeError("authority_reader must implement AuthorityReader")
@@ -101,6 +102,7 @@ class LangchaoShadowService:
         self.authority_reader = authority_reader
         self._transaction_factory = transaction_factory
         self._allow_live_evaluation = bool(allow_live_evaluation)
+        self.send_penalty = send_penalty
 
     def _transaction(self) -> ContextManager[Any]:
         if self._transaction_factory is not None:
@@ -299,6 +301,7 @@ class LangchaoShadowService:
                 tie_break_order=tie_break_order, expected_state_pointer_version=pointer,
                 baseline_candidate_id=baseline_candidate_id,
                 baseline_defer_reason=baseline_defer_reason,
+                send_penalty=self.send_penalty,
             )
             # Deliberately after contract/state/evaluation-audit writes and before the
             # single outer transaction exits. Any callback failure rolls all of them
