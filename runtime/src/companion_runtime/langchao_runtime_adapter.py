@@ -686,6 +686,12 @@ def build_shadow_round(*, snapshot: RuntimeFactSnapshot, inputs: tuple[RuntimeCa
         revision=previous_state.revision if same_working_set else 1)
     if same_working_set:
         state = replace(previous_state, event_cursor=snapshot.source_cursor,
+            # The basis must track the version the contracts were just built against. Keeping
+            # the previous round's basis here left the state describing an older runtime
+            # version than its own candidates, so the live path rejected every later round
+            # with "candidate state-version boundary is stale" as soon as the runtime version
+            # moved -- which is how a working engine ends up never sending anything.
+            based_on_state_version=based_on_state_version,
             goal_snapshot_version=goal_hash, reward_snapshot_version=reward_hash,
             candidate_snapshot_version=candidate_hash, prediction_snapshot_version=prediction_hash,
             value_profile_version=value_profile.version, attention=attention.direction_weights,

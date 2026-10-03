@@ -297,6 +297,24 @@ def test_cold_start_drive_is_validated_as_a_finite_non_negative_number():
         facts("c", "contact.v1", cold_start_drive=True)
 
 
+def test_a_reused_working_set_tracks_the_current_state_version_basis():
+    """A carried-over working set must not keep describing an older runtime version.
+
+    The live path compares the candidate's basis with the round state's. Leaving the
+    previous basis on a reused state made every round after a runtime version change fail
+    with "candidate state-version boundary is stale", so nothing could ever be sent.
+    """
+    first = build((source("c"),), (facts("c"),), based_on_state_version=7)
+    assert first.state.based_on_state_version == 7
+
+    second = build((source("c"),), (facts("c"),),
+                   previous_state=first.state, based_on_state_version=8)
+    assert second.state.working_set == first.state.working_set, "the working set is reused"
+    assert second.state.based_on_state_version == 8, "the basis must follow the round"
+    for contract in second.contracts:
+        assert contract.candidate.based_on_state_version == second.state.based_on_state_version
+
+
 def test_value_profile_fixed_total_all_one_attention_and_zero_definition():
     profile = value_profile_from_runtime(VALUES)
     assert sum(dict(profile.direction_weights).values()) == pytest.approx(FIXED_VALUE_TOTAL)
