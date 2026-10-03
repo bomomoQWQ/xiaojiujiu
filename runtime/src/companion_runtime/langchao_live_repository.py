@@ -37,18 +37,24 @@ class LangchaoColdStartBudget:
         self.scope_key = scope_key
 
     def usage(self, *, since: datetime) -> tuple[int, datetime | None]:
-        """Return how many cold-start sends were committed since ``since``, and when last.
+        """Return how many cold-start messages were *delivered* since ``since``.
+
+        The bound exists to limit how often the character actually reaches out, so it
+        counts acknowledgements rather than commits: a round whose delivery never left the
+        building -- a failed render, a refused dispatch -- reached nobody and must not
+        consume the allowance.
 
         Args:
             since: Start of the counting window.
 
         Returns:
-            ``(count, last_committed_at)``; the timestamp is ``None`` when none exist.
+            ``(count, last_delivered_at)``; the timestamp is ``None`` when none exist.
         """
         row = self.connection.execute(
             """SELECT count(*) AS used, max(committed_at) AS last_at
                  FROM langchao_live_commits
                 WHERE scope_key = %s AND committed_at >= %s
+                  AND terminal_ack_kind = 'sent'
                   AND EXISTS (
                         SELECT 1 FROM jsonb_array_elements(snapshot->'tokens') AS token
                          WHERE token->>'outcome_key' = %s)""",

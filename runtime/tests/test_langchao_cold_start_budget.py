@@ -63,6 +63,19 @@ def test_an_unused_budget_permits_the_drive_and_counts_the_right_outcome():
     assert params[2] == COLD_START_DRIVE_OUTCOME
 
 
+def test_the_allowance_counts_delivered_messages_not_mere_commits():
+    """A round that never reached the user must not spend the allowance.
+
+    Counting commits charged the budget for deliveries that failed after the commit --
+    a render that lost its lease, a refused dispatch -- so the user received nothing and
+    the character was still told it had already reached out.
+    """
+    connection = UsageConnection(used=0, last_at=None)
+    budget(connection).available(now=NOW)
+    sql, _params = connection.queries[0]
+    assert "terminal_ack_kind = 'sent'" in sql, sql
+
+
 def test_the_window_limit_stops_further_cold_start_outreach():
     at_limit = UsageConnection(used=COLD_START_EXPLORATION_LIMIT,
                                last_at=NOW - timedelta(hours=9))
