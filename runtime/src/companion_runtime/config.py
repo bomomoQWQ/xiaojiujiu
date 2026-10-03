@@ -373,7 +373,11 @@ class OutboxConfig:
     Runtime should throttle retries itself.
     """
 
-    lease_seconds: float = 45.0
+    #: How long a claim stays valid before the Runtime may hand the row to someone else.
+    #: This must comfortably exceed the longest a host may legitimately spend on one
+    #: action -- the adapter's own render budget is 60s -- or a slow but successful render
+    #: loses its lease and its finished work is discarded. 45s was below that budget.
+    lease_seconds: float = 180.0
     max_attempts: int = 3
     max_batch: int = 20
     retry_backoff_seconds: float = 0.0

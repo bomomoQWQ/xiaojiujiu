@@ -1367,9 +1367,18 @@ def _apply_action_report(
         # lease: an empty fence lets a stale reporter end a newer claim. Only a successful
         # SEND is exempt, because that is an irreversible platform fact whose arrival must
         # terminate the queue rather than be refused.
+        #
+        # A report that *does* name the current claim is that claim's own late word, even
+        # when its lease has since expired and the row went back to pending. Discarding it
+        # threw away work the host had already finished -- a render that outran a 45s lease
+        # while the host was still inside its own 60s render budget. The fence that matters
+        # is the lease id: a re-claimed row has a different attempt count and therefore a
+        # different lease id, which is still refused as stale.
         missing_claim = bool(expected) and not lease_id
         stale_claim = bool(lease_id and expected and lease_id != expected)
-        expired_claim = row.status == OutboxStatus.PENDING.value
+        expired_claim = (
+            row.status == OutboxStatus.PENDING.value and not lease_id
+        )
         if (missing_claim or stale_claim or expired_claim) and not irreversible_send:
             extra: dict[str, Any] = {}
             if _unavailable_marker(result) or _unavailable_marker(data):

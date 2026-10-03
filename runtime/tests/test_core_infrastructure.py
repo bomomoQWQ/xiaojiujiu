@@ -312,6 +312,21 @@ def test_open_database_scopes_the_writer_lock_to_the_configured_schema() -> None
     assert store.describe()["writer_lock_key"] == store._writer_lock_key()
 
 
+def test_outbox_lease_outlives_a_hosts_full_render_budget() -> None:
+    """A successful render must not lose its lease just for being slow.
+
+    The adapter is allowed 60s to render one action, so a lease shorter than that
+    discards finished work: the render report arrives after the row went back to pending
+    and the message is dropped without ever reaching the user.
+    """
+    config = load_config(env={})
+    assert config.outbox.lease_seconds >= 180.0
+    assert config.outbox.lease_seconds > 60.0, "must exceed the adapter's render budget"
+
+    tuned = load_config(env={"CR_OUTBOX__LEASE_SECONDS": "300"})
+    assert tuned.outbox.lease_seconds == 300.0
+
+
 def test_night_send_penalty_is_configurable_and_bounded() -> None:
     """Reaching out in the small hours costs more, as a coefficient rather than a switch."""
     from datetime import datetime

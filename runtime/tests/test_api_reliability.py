@@ -1187,6 +1187,46 @@ def test_outage_reports_stay_retryable_after_the_attempt_budget_is_spent(
     assert runtime.projections.attempts.get(attempt_id).state == AttemptState.SENT.value
 
 
+def test_a_late_render_report_naming_its_own_claim_is_applied(
+    file_runtime: Runtime,
+) -> None:
+    """A slow but successful render must not be thrown away for outliving its lease.
+
+    The adapter is allowed 60s to render, so a render that finishes after the lease
+    expired is ordinary rather than suspicious. The report names the exact claim it
+    answers, which is what proves it belongs to this row; discarding it cost a finished
+    message that then never reached the user.
+    """
+    runtime = file_runtime
+    app = create_app(runtime, runtime.config)
+    with TestClient(app) as client:
+        attempt_id, render_row_id = commit_attempt(runtime)
+        first = lease_v1(client, "render")
+    claimed_attempts = runtime.projections.outbox.get(render_row_id).attempts
+
+    expiry = runtime.projections.outbox.get(render_row_id).lease_expires_at
+    assert expiry is not None
+    with runtime.db.transaction() as conn:
+        assert runtime.projections.outbox.reclaim_expired(
+            conn, expiry + timedelta(microseconds=1)
+        ) == 1
+
+    with TestClient(app) as client:
+        late = client.post(
+            f"/v1/outbox/{render_row_id}/result",
+            json=report_body(first, status="ok", result={"text": TEXT}),
+        ).json()
+
+    assert late["ok"] is True
+    assert runtime.projections.outbox.get(render_row_id) is not None
+    # The rendered work landed: the attempt left the render stage instead of being lost.
+    assert runtime.projections.attempts.get(attempt_id).state in {
+        AttemptState.READY_TO_SEND.value,
+        AttemptState.RENDERING.value,
+    }
+    assert runtime.projections.outbox.get(render_row_id).attempts == claimed_attempts
+
+
 def test_late_successful_send_after_expired_lease_settles_delivered_and_cannot_release_again(
     file_runtime: Runtime,
 ) -> None:
