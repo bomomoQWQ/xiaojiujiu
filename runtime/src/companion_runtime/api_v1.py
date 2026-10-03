@@ -227,6 +227,25 @@ def _terminal_coordinator(runtime: Any, row: Any) -> Any | None:
     return _v2_coordinator(runtime)
 
 
+def _render_coordinator(runtime: Any, row: Any) -> Any | None:
+    """Route a render completion to the engine which committed the row.
+
+    The engine that committed a row owns what a completed render means to it. Asking the
+    v2 coordinator about a langchao decision is not merely wrong, it raises: the v2 audit
+    for that decision does not exist, so every proactive render died on a KeyError and the
+    message never reached the send stage. Send acknowledgements were already routed this
+    way; the render path was the one place that still assumed v2 owned everything.
+    """
+
+    payload = _mapping(getattr(row, "payload", None))
+    if _text(payload.get("engine")).strip() == "langchao":
+        runner = getattr(runtime, "langchao_live_runner", None)
+        if runner is None:
+            raise RuntimeError("langchao live outbox has no installed render hook")
+        return runner
+    return _v2_coordinator(runtime)
+
+
 def _require_v2_hook(coordinator: Any, name: str) -> Callable[..., Any]:
     """Refuse partial production wiring instead of silently dropping v2 facts."""
 
@@ -1474,7 +1493,7 @@ def _apply_action_report(
                     extra["send_outbox_id"] = render.outbox_id
                 if render.applied:
                     decision_id = _v2_decision_id(row)
-                    coordinator = _v2_coordinator(runtime)
+                    coordinator = _render_coordinator(runtime, row)
                     if decision_id and coordinator is not None:
                         _require_v2_hook(coordinator, "after_legacy_rendered")(
                             decision_id=decision_id, outbox_id=action_id, now=now

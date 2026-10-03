@@ -155,3 +155,59 @@ def test_failed_send_terminally_notifies_v2_without_claiming_exposure(wired):
     assert order == ["v2_render", "v2_send"]
     assert len(coordinator.acks) == 1
     assert coordinator.acks[0].sent is False
+
+
+class StrictV2Coordinator(RecordingCoordinator):
+    """Stands in for the real coordinator, which only knows its own decisions."""
+
+    def after_legacy_rendered(self, *, decision_id, **kwargs):
+        if not str(decision_id).startswith("decision:v2"):
+            raise KeyError(f"unknown decision_id: {decision_id}")
+        super().after_legacy_rendered(decision_id=decision_id, **kwargs)
+
+
+class LangchaoRunnerStub:
+    """Records the render hook the langchao engine owns."""
+
+    def __init__(self) -> None:
+        self.renders: list[dict[str, Any]] = []
+
+    def after_legacy_rendered(self, *, decision_id: str, outbox_id: str, now) -> None:
+        self.renders.append({"decision_id": decision_id, "outbox_id": outbox_id})
+
+
+def test_a_render_committed_by_the_langchao_engine_is_answered_by_that_engine(runtime):
+    """The render hook must follow the engine that committed the row.
+
+    A proactive render used to be reported to the v2 coordinator, which has no audit for a
+    langchao decision: it raised KeyError, the Runtime answered ``report_error:KeyError``,
+    the render was silently dropped and the attempt sat at ``committed`` until the sweeper
+    retired it. The message never reached the send stage -- the whole point of the feature.
+    """
+    order: list[str] = []
+    coordinator = StrictV2Coordinator(order)
+    runtime.v2_coordinator = coordinator
+    runner = LangchaoRunnerStub()
+    runtime.langchao_live_runner = runner
+
+    attempt_id, render_id = commit_v2_attempt(runtime)
+    with runtime.db.transaction() as conn:
+        row = runtime.projections.outbox.get(render_id)
+        payload = dict(row.payload)
+        payload.update({"engine": "langchao", "decision_id": "langchao:round-1"})
+        conn.execute(
+            "UPDATE outbox SET payload_json = ? WHERE outbox_id = ?",
+            (json.dumps(payload, ensure_ascii=False), render_id),
+        )
+
+    app = create_app(runtime, runtime.config)
+    with TestClient(app) as client:
+        reply = report(client, lease(client, "render"), result={"text": "在忙什么呢。"})
+
+    assert reply["ok"] is True, reply
+    assert not str(reply.get("reason", "")).startswith("report_error"), reply
+    assert [entry["decision_id"] for entry in runner.renders] == ["langchao:round-1"]
+    assert coordinator.renders == [], "the langchao render must not be reported to v2"
+    assert runtime.projections.attempts.get(attempt_id).state != "committed", (
+        "a completed render must advance the attempt"
+    )
