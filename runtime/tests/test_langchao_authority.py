@@ -170,6 +170,35 @@ def test_switch_uses_advisory_lock_and_cas_and_freezes_inflight_audit():
     assert '"abort_refs":["attempt:2"]' in encoded
 
 
+def test_a_commit_whose_attempt_is_dead_is_no_longer_in_flight():
+    """A round that cannot reach the platform must not block a switch forever.
+
+    A live commit with no terminal acknowledgement is normally unfinished work, which is
+    why it blocks a cut-over. But once its attempt is terminal and the outbox row has
+    failed, nothing can land -- and counting it anyway left every later freeze, stop or
+    rolling restart refusing for good.
+    """
+
+    class PgLike(Connection):
+        # The derivation only trusts a connection that exposes transaction status.
+        info = object()
+
+    conn = PgLike([[], [], []])
+    repository = LangchaoAuthorityRepository(conn, scope_key=SCOPE)
+    assert repository._durable_in_flight_refs() == ()
+    commit_sql = conn.calls[2][0]
+    assert "langchao_live_commits" in commit_sql
+    assert "terminal_ack_kind IS NULL" in commit_sql
+    assert "action_attempts" in commit_sql, "the commit must require a live attempt"
+    assert "proposed" in commit_sql and "ready_to_send" in commit_sql
+
+    # A commit whose attempt is still live is still reported as in flight.
+    live = PgLike([[], [], [{"ref": "round:live"}]])
+    assert LangchaoAuthorityRepository(live, scope_key=SCOPE)._durable_in_flight_refs() == (
+        "live_commit:round:live",
+    )
+
+
 def test_switch_cas_and_inflight_fail_before_publication_and_roll_back():
     with pytest.raises(AuthorityInFlightError):
         LangchaoAuthorityRepository(Connection(), scope_key=SCOPE).switch_authority(

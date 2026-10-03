@@ -217,14 +217,27 @@ class LangchaoAuthorityRepository:
             return self.get_active()
 
     def _durable_in_flight_refs(self) -> tuple[str, ...]:
-        """Derive in-flight identities while the scoped authority lock is held."""
+        """Derive in-flight identities while the scoped authority lock is held.
+
+        A committed round counts as in flight only while its attempt could still deliver.
+        Once the attempt is terminal and its outbox row has failed, nothing can reach the
+        platform, so the commit is not unfinished work -- and treating it as if it were
+        left every later switch (a freeze, an emergency stop, a rolling restart) refusing
+        forever with "durable state has 1".
+        """
         if not hasattr(self.connection, "info"):
             return ()
         refs: list[str] = []
         for statement, prefix in (
             ("SELECT outbox_id AS ref FROM outbox WHERE status IN ('pending','leased') AND dispatch_scope_key=%s FOR UPDATE", "outbox:"),
             ("SELECT attempt_id AS ref FROM action_attempts WHERE state IN ('committed','rendering','ready_to_send') AND dispatch_scope_key=%s FOR UPDATE", "attempt:"),
-            ("SELECT round_id AS ref FROM langchao_live_commits WHERE scope_key=%s AND terminal_ack_kind IS NULL FOR UPDATE", "live_commit:"),
+            ("""SELECT c.round_id AS ref FROM langchao_live_commits c
+                 WHERE c.scope_key=%s AND c.terminal_ack_kind IS NULL
+                   AND EXISTS (
+                         SELECT 1 FROM action_attempts a
+                          WHERE a.attempt_id = c.attempt_id
+                            AND a.state IN ('proposed','committed','rendering','ready_to_send'))
+                 FOR UPDATE""", "live_commit:"),
         ):
             rows = self.connection.execute(statement, (self.scope_key,)).fetchall()
             refs.extend(prefix + str(_row(row, "ref", 0)) for row in rows)
