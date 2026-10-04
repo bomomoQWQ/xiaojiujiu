@@ -13,12 +13,15 @@ N=false, while C/A remain unknown when no user response was observed.
 from __future__ import annotations
 
 import hashlib
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable, Mapping, Protocol, Sequence
 from uuid import NAMESPACE_URL, uuid5
+
+LOGGER = logging.getLogger(__name__)
 
 import numpy as np
 
@@ -120,6 +123,14 @@ class V2MaintenanceResult:
     fit_attempted: bool = False
     fit_activated: bool = False
     fitted_targets: tuple[Target, ...] = ()
+    fit_error: str = ""
+    """Why this cycle could not activate parameters, when that happened.
+
+    A fit that cannot converge is a fact about the data, not a reason to stop deciding:
+    failing the whole round meant the character simply stopped acting for that scope until
+    the numbers behaved. The failure is reported here (and logged with its traceback) while
+    the previously active parameters stay in force.
+    """
 
 
 class V2Maintenance:
@@ -203,19 +214,29 @@ class V2Maintenance:
             )
             activated = False
             fitted: tuple[Target, ...] = ()
+            fit_error = ""
             if fit_due:
                 # Mark attempt before expensive work so repeated failures cannot hot-loop.
                 self._last_fit = tick
-                activated, fitted = self._fit_and_activate(now)
+                try:
+                    activated, fitted = self._fit_and_activate(now)
+                except Exception as exc:  # noqa: BLE001 - the round must not die with the fit
+                    LOGGER.exception(
+                        "v2 parameter fit failed for %s; keeping the active parameters",
+                        self.scope_key,
+                    )
+                    fit_error = f"{type(exc).__name__}: {exc}"
+                    activated, fitted = False, ()
             return V2MaintenanceResult(
                 ran=True,
-                reason="ok",
+                reason="ok" if not fit_error else "fit_failed",
                 exposures_scanned=len(due),
                 label_revisions_written=revisions,
                 expectation_revisions_written=expectation_writes,
                 fit_attempted=fit_due,
                 fit_activated=activated,
                 fitted_targets=fitted,
+                fit_error=fit_error,
             )
         finally:
             self._lock.release()

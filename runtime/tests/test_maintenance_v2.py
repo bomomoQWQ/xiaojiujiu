@@ -142,3 +142,53 @@ def test_fit_uses_active_labels_and_is_interval_limited():
     assert skipped.ran is False and skipped.reason == "interval"
     assert no_refit.ran and not no_refit.fit_attempted
     assert len(repository.snapshots) == 1
+
+
+def test_a_fit_that_cannot_converge_does_not_kill_the_round():
+    """One target's bad fit must not stop the character from acting.
+
+    ``_fit_and_activate`` fits every target into one snapshot, so a single target whose
+    optimiser cannot converge took the whole round down with it: in production the scope
+    with the most data simply stopped deciding, round after round, with
+    "MAP optimisation failed" in the log. The failure is reported and the previously active
+    parameters stay in force.
+    """
+    service_repo = FakeRepository()
+    prepared = prepare(service_repo)
+    reply = next(label for label in prepared.labels if label.target is Target.REPLY)
+    observed = replace(
+        reply, status=LabelStatus.OBSERVED_POSITIVE, value=True,
+        observed_at=NOW + timedelta(seconds=10), updated_at=NOW + timedelta(seconds=10),
+    )
+    from companion_runtime.user_model_v2_service import ActiveTrainingRecordV2
+    service_repo.training = [ActiveTrainingRecordV2(label=observed, features=prepared.features)]
+
+    repository = MaintenanceRepository(service_repo)
+    service = UserModelV2Service(service_repo)
+    calls = {"n": 0}
+    original = service.fit_target
+
+    def flaky_fit(*, dataset, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("MAP optimisation failed: a bad approximation")
+        return original(dataset=dataset, **kwargs)
+
+    service.fit_target = flaky_fit  # type: ignore[method-assign]
+    ticks = iter((100.0, 200.0))
+    runner = V2Maintenance(
+        scope_key=SCOPE, user_model=service, repository=repository,
+        config=V2MaintenanceConfig(
+            minimum_interval_seconds=10, fit_interval_seconds=1, max_fit_targets=4
+        ),
+        monotonic=lambda: next(ticks),
+    )
+
+    result = runner.run_due(now=NOW + timedelta(hours=1))
+
+    assert result.ran is True, "the round must survive a failed fit"
+    assert result.fit_attempted is True
+    assert result.fit_activated is False
+    assert "MAP optimisation failed" in result.fit_error
+    assert result.reason == "fit_failed"
+    assert repository.snapshots == [], "nothing is activated from a failed fit"
