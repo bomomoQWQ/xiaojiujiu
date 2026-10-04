@@ -62,7 +62,7 @@ def test_a_spent_cold_start_budget_refuses_the_dispatch_not_the_contract():
             legacy_bridge=SimpleNamespace(), cold_start_budget=budget,
         )
 
-    for budget, expected_reason in ((Spent(), NoSendReason.COLD_START_BUDGET_EXHAUSTED),
+    for budget, expected_reason in ((Spent(), NoSendReason.DECISION_BUDGET_EXHAUSTED),
                                     (Open(), None)):
         refusal = service_with(budget)._budget_refusal(contract=contract, round_id="round:1", now=NOW)
         if expected_reason is None:
@@ -72,6 +72,9 @@ def test_a_spent_cold_start_budget_refuses_the_dispatch_not_the_contract():
             assert refusal.reason is expected_reason
             assert refusal.stage == "budget"
             assert refusal.round_id == "round:1"
+            # Which allowance it was has to survive somewhere: the ledger's reason is a
+            # closed set, so the specificity lives in the details.
+            assert dict(refusal.details)["allowance"] == COLD_START_DRIVE_OUTCOME
 
     # A contract that never spends the allowance is unaffected by the budget.
     plain = SimpleNamespace(

@@ -126,8 +126,13 @@ class LangchaoLiveService:
             return None
         if self.cold_start_budget.available(now=now):
             return None
+        # ``reason`` is a closed set the ledger enforces, and an allowance running out is
+        # exactly what its budget member means; which allowance it was lives in ``details``.
+        # Inventing a value the constraint does not carry is not an option: the insert is
+        # rejected, so the refusal cannot be recorded and the round fails instead of being
+        # accounted for -- which is what happened in production, 27 times.
         return NoSendResult(
-            reason=NoSendReason.COLD_START_BUDGET_EXHAUSTED, stage="budget",
+            reason=NoSendReason.DECISION_BUDGET_EXHAUSTED, stage="budget",
             round_id=round_id,
             candidate_id=getattr(getattr(contract, "candidate", None), "candidate_id", None),
             details=(("allowance", COLD_START_DRIVE_OUTCOME),),

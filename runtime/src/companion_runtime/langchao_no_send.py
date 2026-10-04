@@ -28,9 +28,10 @@ class NoSendReason(str, Enum):
     INVALIDATED = "invalidated"
     DISPATCH_FAILED = "dispatch_failed"
     DELIVERY_UNKNOWN = "delivery_unknown"
-    #: A cold-start outreach was selected but the bounded budget for it is spent. The
-    #: candidate stays legitimate; only this round's use of the allowance is refused.
-    COLD_START_BUDGET_EXHAUSTED = "cold_start_budget_exhausted"
+    # There is deliberately no member for "the cold-start allowance is spent": the ledger's
+    # ``reason`` is a closed set and an exhausted allowance is what DECISION_BUDGET_EXHAUSTED
+    # means. A member the constraint does not carry can only ever be rejected on insert,
+    # which loses the refusal and fails the round. Which allowance it was goes in ``details``.
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

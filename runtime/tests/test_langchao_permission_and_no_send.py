@@ -19,6 +19,33 @@ NOW = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
 SCOPE = "fixture:user:permission"
 
 
+def test_every_no_send_reason_is_one_the_ledger_accepts():
+    """The enum and the table's CHECK constraint must not drift apart.
+
+    The table accepts a closed set of reasons. Adding ``cold_start_budget_exhausted`` to the
+    enum without widening the constraint meant every cold-start refusal was rejected on
+    insert: the refusal could not be recorded and the round failed instead of being
+    accounted for. It happened 27 times in production before anyone read the logs.
+    """
+    import re
+
+    from companion_runtime.langchao_no_send_schema import (
+        LANGCHAO_NO_SEND_SCHEMA_V24_STATEMENTS,
+    )
+
+    table = LANGCHAO_NO_SEND_SCHEMA_V24_STATEMENTS[0]
+    clause = re.search(r"reason IN \((.*?)\)\)", table, re.S)
+    assert clause is not None, "the ledger's allowed reasons must be discoverable"
+    allowed = set(re.findall(r"'([a-z_]+)'", clause.group(1)))
+    assert allowed, "the constraint must list its reasons"
+
+    undeclared = {reason.value for reason in NoSendReason} - allowed
+    assert not undeclared, (
+        f"these reasons would be rejected on insert: {sorted(undeclared)}; "
+        f"the constraint allows {sorted(allowed)}"
+    )
+
+
 def event(event_id: str, verdict: PermissionVerdict, *, occurred: int, ingested: int,
           revision: int = 1, scope: str = SCOPE) -> PermissionEvent:
     return PermissionEvent(
