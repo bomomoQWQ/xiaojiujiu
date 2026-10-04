@@ -195,9 +195,17 @@ def fit_map_laplace(
     beta_hat = np.asarray(result.x, dtype=np.float64)
     objective, gradient, hessian = evaluate(beta_hat)
     # SciPy can report a precision-loss termination when it is already at a very
-    # accurate optimum.  Do not hide a genuine failure, but accept a verified gradient.
-    gradient_small = np.linalg.norm(gradient, ord=np.inf) <= max(
-        10.0 * gradient_tolerance, 1e-8
+    # accurate optimum.  Do not hide a genuine failure, but accept a verified gradient --
+    # judged against the problem's own scale.  An absolute bound is the wrong ruler here:
+    # the Hessian mixes a unit prior with unit-scale data, so trust-exact lands at a
+    # gradient of about 1e-8, right at an absolute 1e-8 bound, and the same fit flips
+    # between accepted and rejected as the half-life weights drift with the fit time. In
+    # production that flip took a whole round down with it. Comparing with the curvature
+    # makes "stationary" mean stationary for this problem.
+    gradient_norm = float(np.linalg.norm(gradient, ord=np.inf))
+    curvature_norm = float(np.linalg.norm(hessian, ord=np.inf))
+    gradient_small = gradient_norm <= max(
+        10.0 * gradient_tolerance, 1e-8, 1e-6 * max(1.0, curvature_norm)
     )
     converged = bool(result.success or gradient_small)
     if not converged:

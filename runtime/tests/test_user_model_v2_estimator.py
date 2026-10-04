@@ -160,3 +160,67 @@ def test_batch_fit_is_independent_of_sample_order() -> None:
     assert_allclose(shuffled.hessian, original.hessian, rtol=0.0, atol=0.0)
     assert_allclose(shuffled.covariance, original.covariance, rtol=0.0, atol=0.0)
     assert shuffled.objective == original.objective
+
+
+#: The smallest four-observation fit that production actually builds, reproduced: a
+#: 20-feature snapshot, three negative outcomes and one positive, half-life weights just
+#: under one, and the unit prior the deployment uses.
+PRODUCTION_SHAPED_DESIGN = np.array([
+    [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+    [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
+    [1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+    [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+], dtype=np.float64)
+PRODUCTION_SHAPED_LABELS = np.array([0.0, 0.0, 0.0, 1.0])
+PRODUCTION_SHAPED_WEIGHTS = np.array([0.900593, 0.931721, 0.94198, 0.993737])
+
+
+def test_a_precision_loss_termination_at_a_stationary_point_is_not_a_failure() -> None:
+    """The bound on the gradient must scale with the problem, not be an absolute 1e-8.
+
+    This is the fit production builds for the scope with the most data. ``trust-exact``
+    stops after three iterations reporting "A bad approximation caused failure to predict
+    improvement" -- an inner-loop message, not an absent optimum -- having driven the
+    gradient to about 1e-8, which is the floating-point floor for a problem whose Hessian
+    mixes a unit prior with unit-scale data. With an absolute 1e-8 acceptance bound the
+    same fit flipped between accepted and rejected as the half-life weights moved, and a
+    rejection took the whole round down with it.
+    """
+    dimension = PRODUCTION_SHAPED_DESIGN.shape[1]
+    prior = GaussianPrior(
+        mean=np.zeros(dimension), precision=np.eye(dimension) * 1.0
+    )
+
+    fit = fit_map_laplace(
+        PRODUCTION_SHAPED_DESIGN, PRODUCTION_SHAPED_LABELS, PRODUCTION_SHAPED_WEIGHTS, prior
+    )
+
+    assert fit.converged is True
+    _objective, gradient, _hessian = objective_gradient_hessian(
+        fit.map_parameters, PRODUCTION_SHAPED_DESIGN, PRODUCTION_SHAPED_LABELS,
+        PRODUCTION_SHAPED_WEIGHTS, prior,
+    )
+    assert np.linalg.norm(gradient, ord=np.inf) <= 1e-4, "the point must be stationary"
+    assert np.all(np.isfinite(fit.map_parameters))
+
+
+def test_a_genuinely_unconverged_fit_still_raises(monkeypatch) -> None:
+    """A scale-aware ruler must not turn every failure into a success."""
+    from scipy.optimize import OptimizeResult
+
+    import companion_runtime.user_model_v2_estimator as estimator
+
+    def unconverged(*_args, **_kwargs):
+        return OptimizeResult(
+            x=np.full(4, 50.0), success=False, status=2, nit=1,
+            message="A bad approximation caused failure to predict improvement",
+        )
+
+    monkeypatch.setattr(estimator, "minimize", unconverged)
+    rng = np.random.default_rng(5)
+    design = rng.normal(size=(40, 4))
+    labels = rng.integers(0, 2, size=40).astype(float)
+
+    with pytest.raises(RuntimeError, match="MAP optimisation failed"):
+        fit_map_laplace(design, labels, np.ones(40), standard_prior(4))
+
