@@ -346,6 +346,57 @@ def test_send_ack_freezes_expectation_once_and_maintenance_settles_real_postgres
         "SELECT count(*) FROM expectations_v2 WHERE scope_key = %s", (scope,)
     ).fetchone()["count"] == 1
 
+
+def test_a_second_message_in_a_scope_freezes_the_next_expectation_version(pg_schema) -> None:
+    """The expectation version has to advance, or a scope's second message collides.
+
+    ``(scope_key, expectation_version)`` is unique and this insert hardcoded 1, so the
+    second acknowledgement a scope ever froze raised UniqueViolation. In production that
+    meant: the user received the message, the Runtime failed to record it, the outbox row
+    burned all three attempts and the round never settled.
+    """
+    connection, schema = pg_schema
+    _search_path(connection, schema)
+    scope = "scope:second-message"
+    adapter = PostgresUserModelV2ServiceRepository(connection)
+    service = UserModelV2Service(adapter)
+    prediction = UserModelV2PredictionService(
+        PostgresUserModelV2PredictionRepository(adapter.repository)
+    )
+    runtime = PostgresV2RuntimeRepository(
+        connection,
+        prediction_service=prediction,
+        service_repository=adapter,
+        scope_key=scope,
+        state_version_provider=lambda: 17,
+    )
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    horizons = {target: 1 for target in Target}
+
+    for key in ("send-ack:first", "send-ack:second"):
+        runtime.prepare_exposure_and_expectation(
+            user_model=service,
+            scope_key=scope,
+            exposure_id=str(uuid.uuid4()),
+            idempotency_key=key,
+            occurred_at=now,
+            action={"type": "follow_up", "proactive": True},
+            context_provider=lambda: {"busy_probability": 0.2, "recent_contact_count": 1},
+            horizons=horizons,
+            delivery_basis=first_basis(),
+            source_event_ids=(),
+        )
+
+    versions = [
+        row["expectation_version"]
+        for row in connection.execute(
+            "SELECT expectation_version FROM expectations_v2 WHERE scope_key = %s"
+            " ORDER BY expectation_version",
+            (scope,),
+        ).fetchall()
+    ]
+    assert versions == [1, 2], "each message needs its own expectation version"
+
     maintenance = V2Maintenance(
         scope_key=scope,
         user_model=service,

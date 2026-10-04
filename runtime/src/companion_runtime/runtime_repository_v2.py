@@ -468,16 +468,26 @@ class PostgresV2RuntimeRepository:
             ).fetchone()
             if row is not None:
                 return _expectation(_row(row, "expectation", 0))
+            # The version is what tells two expectations of the same scope apart, and the
+            # table enforces it: ``(scope_key, expectation_version)`` is unique. It used to
+            # be the literal 1, which is correct exactly once -- so the *second* message a
+            # scope ever sent collided with the first, the acknowledgement blew up with a
+            # UniqueViolation, and a message the user had already received went unrecorded.
+            # The next free version is read in the same statement; the schema-wide writer
+            # lock serialises these writes, so two acknowledgements cannot pick the same one.
             self.connection.execute(
                 """INSERT INTO expectations_v2
                    (expectation_id, scope_key, idempotency_key, prediction_snapshot_id,
                     exposure_id, due_at, expectation, expected_value, tolerance,
                     expectation_version)
-                   VALUES (%s, %s, %s, NULL, %s, %s, %s::jsonb, %s, 0.0, 1)""",
+                   VALUES (%s, %s, %s, NULL, %s, %s, %s::jsonb, %s, 0.0,
+                           (SELECT COALESCE(MAX(expectation_version), 0) + 1
+                              FROM expectations_v2 AS prior
+                             WHERE prior.scope_key = %s))""",
                 (
                     UUID(expectation_id), self.scope_key, idempotency_key, exposure_id,
                     expectation.window_ends_at, canonical_json(expectation.to_dict()),
-                    0.0,
+                    0.0, self.scope_key,
                 ),
             )
             self.record_acknowledged_exposure(
