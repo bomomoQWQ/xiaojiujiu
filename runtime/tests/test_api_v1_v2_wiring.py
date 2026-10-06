@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -174,6 +175,66 @@ class LangchaoRunnerStub:
 
     def after_legacy_rendered(self, *, decision_id: str, outbox_id: str, now) -> None:
         self.renders.append({"decision_id": decision_id, "outbox_id": outbox_id})
+
+
+class AbandonedRoundRunner:
+    """A langchao runner that reports an unsettled commit and records a settlement."""
+
+    def __init__(self, *, terminal_ack_kind: str | None = None) -> None:
+        self.terminal_ack_kind = terminal_ack_kind
+        self.acks: list[Any] = []
+        self.repository_asked: list[str] = []
+        outer = self
+
+        class _Repository:
+            def get(self, round_id: str):
+                outer.repository_asked.append(round_id)
+                return SimpleNamespace(terminal_ack_kind=outer.terminal_ack_kind)
+
+        self.repository = _Repository()
+
+    def after_legacy_rendered(self, **_kwargs) -> None:
+        return None
+
+    def after_legacy_send_ack(self, ack, *, confirmed: bool = True):
+        self.acks.append((ack, confirmed))
+        return ()
+
+
+def test_a_render_that_failed_for_good_settles_the_round_it_cannot_deliver(runtime):
+    """Failing the render row is not enough: the commit waits for an ack that never comes.
+
+    A round whose render failed terminally left its durable commit unsettled forever -- the
+    user received nothing while the books said ``pending``. Sixteen had accumulated and the
+    only way out was settling them by hand. The report path must close it as a non-delivery.
+    """
+    runtime.v2_coordinator = StrictV2Coordinator([])
+    runner = AbandonedRoundRunner()
+    runtime.langchao_live_runner = runner
+
+    _attempt_id, render_id = commit_v2_attempt(runtime)
+    with runtime.db.transaction() as conn:
+        row = runtime.projections.outbox.get(render_id)
+        payload = dict(row.payload)
+        payload.update({"engine": "langchao", "decision_id": "langchao:round-abandoned"})
+        conn.execute(
+            "UPDATE outbox SET payload_json = ? WHERE outbox_id = ?",
+            (json.dumps(payload, ensure_ascii=False), render_id),
+        )
+
+    app = create_app(runtime, runtime.config)
+    with TestClient(app) as client:
+        replied = report(client, lease(client, "render"), status="failed",
+                         result={"reason": "render timed out"})
+
+    assert replied["ok"] is True, replied
+    assert runner.repository_asked == ["langchao:round-abandoned"]
+    assert len(runner.acks) == 1, "the round must be closed as a non-delivery"
+    ack, confirmed = runner.acks[0]
+    assert ack.sent is False and confirmed is True
+    assert ack.decision_id == "langchao:round-abandoned"
+    assert ack.send_outbox_id == render_id
+    assert runtime.projections.outbox.get(render_id).status == "failed"
 
 
 def test_a_render_committed_by_the_langchao_engine_is_answered_by_that_engine(runtime):

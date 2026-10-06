@@ -1125,6 +1125,54 @@ def _marker_requested_delay_seconds(result: Mapping[str, Any]) -> float | None:
         return None
 
 
+def _settle_abandoned_round(runtime: Any, *, row: Any, now: datetime) -> None:
+    """Close a round whose render can never deliver, instead of leaving it unsettled.
+
+    Failing a render row retires the row and its attempt, but the durable commit waits for a
+    send acknowledgement that will never come -- no send was ever attempted. Rounds sat in
+    that state indefinitely: sixteen had accumulated, each one a message the user never
+    received while the books still said ``pending``, and nothing would ever move them.
+
+    Only a *terminal* failure settles: while the row can still be retried, the message may
+    yet arrive and the round must stay open. Nothing is recorded for a round that already
+    has a terminal acknowledgement, and a settlement that cannot be written is logged
+    rather than raised -- this runs inside the report it belongs to, and losing the report
+    over its bookkeeping would be worse than the gap it closes.
+    """
+    payload = _mapping(getattr(row, "payload", None))
+    if _text(payload.get("engine")).strip() != "langchao":
+        return
+    current = runtime.projections.outbox.get(row.outbox_id)
+    if current is None or current.status != OutboxStatus.FAILED.value:
+        return
+    decision_id = _v2_decision_id(row)
+    coordinator = _terminal_coordinator(runtime, row)
+    if not decision_id or coordinator is None:
+        return
+    repository = getattr(coordinator, "repository", None)
+    commit = repository.get(decision_id) if repository is not None else None
+    if commit is None or getattr(commit, "terminal_ack_kind", None) is not None:
+        return
+    try:
+        coordinator.after_legacy_send_ack(
+            V2WireSendAck(
+                decision_id=decision_id,
+                attempt_id=_text(payload.get("attempt_id")).strip(),
+                send_outbox_id=row.outbox_id,
+                acknowledged_at=now,
+                sent=False,
+                action=_v2_action(runtime, row),
+                context_provider=_v2_context_provider(runtime),
+                actual_action_witness=_mapping(payload.get("actual_action_witness")),
+            ),
+            confirmed=True,
+        )
+    except Exception:  # noqa: BLE001 - the report must not fail with its bookkeeping
+        LOGGER.warning(
+            "could not settle round %s after its render failed", decision_id, exc_info=True
+        )
+
+
 def _requeue_after_authorize_unavailable(
     runtime: Any,
     conn: Any,
@@ -1512,6 +1560,7 @@ def _apply_action_report(
                 runtime.reducer.fail_render(outbox_id=action_id, error=reason, now=now)
                 state = _attempt_state(runtime, row)
                 extra["error"] = reason
+                _settle_abandoned_round(runtime, row=row, now=now)
         else:
             # ---------------------------------------------------------------------
             # authorize_unavailable -- explicit, retryable, non-terminal branch.
