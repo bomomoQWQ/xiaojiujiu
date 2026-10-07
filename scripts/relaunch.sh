@@ -11,7 +11,10 @@
 #   3) AstrBot 起来后要等日志出现「适配器已连接」才让人发消息 —— 那之前的消息会**静默丢失**。
 set -u
 
-STACK=/srv/companion/astrbot_test
+# The stack directory is wherever this script lives (scripts/ is inside it). Override with
+# STACK=... when the stack is not a checkout root -- the old hard-coded path only worked on
+# the author's machine.
+STACK="${STACK:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$STACK" || exit 1
 
 status() {

@@ -19,11 +19,10 @@ range is the only honest form of "open that URL to the LAN".
 
 Usage::
 
-    python3 scripts/build_runtime_fleet.py --people 20001-20010 \\
-        --compose /srv/companion/astrbot_test/astrbot.yml \\
-        --fleet /srv/companion/astrbot_test/fleet.yml \\
-        --data /srv/companion/astrbot_test/fleet-data \\
-        --checkout /srv/companion/astrbot_test/src/xiaojiujiu
+    # Run it from your stack directory; the paths default to that directory,
+    # so nothing points at somebody else's machine. --project names the compose
+    # project and is required: guessing it would attach to another deployment.
+    python3 scripts/build_runtime_fleet.py --people 20001-20010 --project my_stack
 """
 
 from __future__ import annotations
@@ -233,11 +232,21 @@ def main() -> int:
     """Entry point."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--people", required=True, help="ids, e.g. 20001-20010")
-    parser.add_argument("--compose", default="/srv/companion/astrbot_test/astrbot.yml")
-    parser.add_argument("--fleet", default="/srv/companion/astrbot_test/fleet.yml")
-    parser.add_argument("--data", default="/srv/companion/astrbot_test/fleet-data")
-    parser.add_argument("--checkout", default="/srv/companion/astrbot_test/src/xiaojiujiu")
-    parser.add_argument("--project", default="astrbot_test")
+    # Paths default into the directory you run this from. They used to default to the
+    # author's stack, which meant a new deployment either failed obscurely or wrote its
+    # compose somewhere it would never look -- pointing at somebody else's machine is not a
+    # useful default, so there isn't one.
+    parser.add_argument("--compose", default="astrbot.yml",
+                        help="the AstrBot compose to read image/env from (default: ./astrbot.yml)")
+    parser.add_argument("--fleet", default="fleet-v2.yml",
+                        help="the fleet compose to write (default: ./fleet-v2.yml)")
+    parser.add_argument("--data", default="fleet-data",
+                        help="the supervisor's people file directory (default: ./fleet-data)")
+    parser.add_argument("--checkout", default=".",
+                        help="the checkout to mount at /fleet (default: the current directory)")
+    parser.add_argument("--project", required=True,
+                        help="compose project name; required, because guessing it would "
+                             "attach to another deployment's stack")
     parser.add_argument(
         "--publish-people",
         action="store_true",

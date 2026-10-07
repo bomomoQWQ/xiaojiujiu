@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # 现在到底有几个 Runtime 在"真用"：谁有真人消息，谁只是验证残留。
+#
+# 名册路径默认为本仓库下的 fleet-data/，可用 PEOPLE_FILE=... 覆盖。
 set -u
+
+PEOPLE_FILE="${PEOPLE_FILE:-$(cd "$(dirname "$0")/.." && pwd)/fleet-data/people.json}"
 
 echo "=== runtime 相关容器 ==="
 docker ps --format '{{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'xxj-runtime' || true
 
 echo
-echo "=== people.json 名册 ==="
-cat /srv/companion/astrbot_test/fleet-data/people.json 2>/dev/null | python3 -c '
+echo "=== people.json 名册（$PEOPLE_FILE）==="
+cat "$PEOPLE_FILE" 2>/dev/null | python3 -c '
 import json,sys
 d=json.load(sys.stdin)
 people = d.get("people", d) if isinstance(d, dict) else d
