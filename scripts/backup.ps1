@@ -1,6 +1,13 @@
 param(
-  [string]$Source = "C:\path\to\repo",
-  [string]$Destination = "D:\backups\companion-runtime"
+  # Default = the repository root this script lives in (the parent of scripts/). The old
+  # default pointed at the author's own machine, so a copy of this script backed up nothing.
+  # ASCII-only comments on purpose: a no-BOM UTF-8 file with a full-width punctuation mark
+  # right before a newline is misread by a code-page-936 PowerShell, which swallows the
+  # newline and folds the next line into the comment -- the parameter declarations vanish.
+  [string]$Source = (Split-Path -Parent $PSScriptRoot),
+  # -Destination stays required: there is no sane default for where a backup goes, and
+  # guessing one would write to somebody else's disk.
+  [Parameter(Mandatory = $true)][string]$Destination
 )
 $ErrorActionPreference = "Stop"
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"

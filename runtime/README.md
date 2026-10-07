@@ -13,8 +13,10 @@
         → 主 LLM 渲染 → 异步 outbox 投递 → 用户反馈 → 回到起点
 ```
 
-- 版本：`0.1.0`（第一版可完整运行的 long-term companion Runtime）
-- 依赖：Python **3.11+**、`fastapi`、`uvicorn`；存储与算法全部使用标准库（`sqlite3`、`math`、`dataclasses`）
+- 版本：**唯一来源**是 `pyproject.toml` / `companion_runtime/__init__.py`（`GET /health` → `runtime_version`）。
+  在仓库根跑 `python3 scripts/check_versions.py` 会检查它与 `CHANGELOG.md`、插件 `metadata.yaml` 是否一致
+- 依赖：Python **3.11+**、`fastapi`、`uvicorn`、PostgreSQL 驱动（`psycopg[binary]`）；算法与数据结构用标准库
+  （`math`、`dataclasses`）。**存储必须是 PostgreSQL**（`CR_STORAGE__DSN`，见 §10）；SQLite 只被离线 v1 导入器支持
 - 本工程位于 `runtime/`，**不修改也不依赖 `AstrBot/`**；宿主通过 HTTP 接入
 - **本工程不读取、不存储、不记录任何用户 API key。** 密钥属于宿主框架；Runtime 的配置输出经 `redact_tree()` 递归脱敏，即使有人把 `api_key` 塞进 `extras`，它也不会出现在 API 响应或日志里
 
@@ -62,7 +64,10 @@ runtime/
 │   ├── typing.py                  全部枚举与跨模块记录（RawEvent / CandidateIntent / ...）
 │   ├── utility.py                 数学、时间、文本工具（sigmoid / softplus / softmax / decay）
 │   ├── config.py                  分层 dataclass 配置 + TOML/JSON/环境变量 + 脱敏（含 SemanticConfig）
-│   ├── db.py                      SQLite 连接、事务/保存点、全部表结构、列迁移（SCHEMA_VERSION = 2）
+│   ├── db.py                      兼容/离线路径：SQLite 连接与旧表结构（**生产不用**，见 §10）
+│   ├── db_base.py                 存储后端抽象（含 `supports_durability_commands` 闸门）
+│   ├── db_postgres.py             **生产后端**：连接、事务、schema 迁移与投影读写
+│   ├── postgres_ops.py            PostgreSQL 运维助手
 │   ├── eventlog.py                append-only 原始事件日志（+ 可选 JSONL 镜像）
 │   ├── projections.py             当前投影读写（runtime_state / 记忆 / 候选 / outbox / event_semantics ...）
 │   ├── semantic.py                【v0.2】粗粒度语义结算：classify_event / 锚点表 / 歧义否决 / unresolved
@@ -84,7 +89,7 @@ runtime/
 │   ├── context.py                 临时上下文组装 + 主 LLM prompt 块渲染（含 PRIORITY_PREAMBLE）
 │   ├── authorize.py               边界/预算/文本硬门禁
 │   ├── delivery.py                claim → render → send → observe 投递服务
-│   ├── maintenance.py             WAL checkpoint、完整性校验、备份、恢复
+│   ├── maintenance.py             **SQLite-only** 耐久性命令；PostgreSQL 上先拒绝（见 §10）
 │   ├── api.py                     FastAPI 应用
 │   └── cli.py                     命令行入口
 └── tests/                         单元 / 集成 / 耐久性测试
@@ -95,6 +100,19 @@ runtime/
     ├── test_acting_layer_independence.py      【v0.2】ingest 路径不依赖任何生成式模型（结构性证明）
     └── ...
 ```
+
+上面列的是 **v0.2 那批核心模块**。包内实际有 **115 个模块**，其余按前缀分组（要全量就 `ls runtime/src/companion_runtime`）：
+
+| 文件 / 前缀 | 是什么 |
+|---|---|
+| `runtime_v2.py`、`composition_v2.py`、`runtime_core_v2_schema.py`、`runtime_repository_v2.py` | v2 运行时组装，以及各模块的表结构与仓储 |
+| `langchao_*.py`（约 40 个） | **「浪潮」决策引擎**：数值核、三份不可变契约、持久化权威指针、影子模式、社会关系、结果账、no-send 审计、注意力配方 |
+| `user_model_v2_*.py` | 用户模型 v2：schema / 迁移 / 特征 / 标签 / 估计 / 预测 / 服务 |
+| `privacy_deletion_*.py` | 隐私删除协调器（默认关闭、路由未挂载） |
+| `mechanical_history_*.py` | 历史机械投影的导入与审计 |
+| `motivation_v2.py`、`decision_v2_audit.py`、`expectations_v2.py`、`render_plan_v1.py` | 动机与决策审计、期望版本、渲染计划 |
+| `capability_witness*.py`、`actual_action_v21.py`、`exposure_identity.py`、`repeat_v2.py` | 能力/产物见证、实际动作、曝光身份、重复检测 |
+| `api_v1.py`、`api_v2_observability.py`、`offline_ablation.py`、`legacy_bridge_v2.py` | v1/v2 的 HTTP 面与离线工具 |
 
 ---
 
@@ -120,7 +138,9 @@ python -m companion_runtime.cli --base-dir ./data serve --host 127.0.0.1 --port 
     --maintenance-interval 3600 --backup-dir ./data/backups
 ```
 
-`--maintenance-interval > 0` 时，服务运行期间会定期执行 checkpoint + 完整性校验（并可选写快照）；收到中断信号时会先做一次收尾 checkpoint 再退出。安装后也可直接用 `companion-runtime` 命令。
+`--maintenance-interval > 0` 是**SQLite 时代**的后台维护（checkpoint + 完整性校验 + 可选快照）。
+在 PostgreSQL 生产上它会**明确拒绝并打一条警告**（"Automatic SQLite maintenance is disabled for
+PostgreSQL production"），运维请用数据库自己的工具（见 §10）。安装后也可直接用 `companion-runtime` 命令。
 
 ### 命令行
 
@@ -132,11 +152,7 @@ python -m companion_runtime.cli --base-dir ./data serve --host 127.0.0.1 --port 
 | `state --include all\|state\|candidates\|memories\|unfinished\|boundaries\|attempts` | 只读查看当前投影 |
 | `refresh [--now ISO] [--force]` | **【v0.2】** 跑一次低频深层认知刷新，打印触发原因、grounding 违规与落地计数 |
 | `backlog [--limit N]` | **【v0.2】** 列出 Runtime 有意没有解释的 unresolved 事件 |
-| `verify [--json]` | 完整性 + 结构一致性检查（失败退出码 3） |
-| `checkpoint --mode PASSIVE\|FULL\|RESTART\|TRUNCATE` | 把 WAL 合并回主库文件 |
-| `backup [目标] [--keep N]` | 写一份一致快照（`VACUUM INTO`） |
-| `restore <快照>` | 用快照覆盖数据库（先校验，拒绝覆盖运行中的库） |
-| `recover [--backup-dir DIR] [--run]` | 打印恢复方案；`--run` 顺带执行一次维护 |
+| `verify` / `checkpoint` / `backup` / `restore` / `recover` | **SQLite-only**：给离线 v1 导入器与旧库用。PostgreSQL 上会在读写任何东西之前**直接拒绝**（`DurabilityUnsupported`，消息里点名缺的是哪个机制）。存储与恢复见 §10 |
 | `boundaries export <文件\|->` | 把该数据目录的 boundaries **整张表**写成 JSON（含已撤销/已过期；`-` = stdout） |
 | `boundaries import <文件\|-> [--dry-run]` | 把导出装回该数据目录（按 `boundary_id` upsert，可重复跑；`-` = stdin） |
 | `memories import <文件\|-> [--dry-run]` | 装一份**人工挑选**的记忆搬运清单（不是导出、不是全量恢复；按 `key` 幂等；`-` = stdin） |
@@ -188,11 +204,10 @@ port = 8787
 log_level = "INFO"
 
 [storage]
-database_path = "./data/runtime.sqlite3"
+dsn = "postgresql://runtime:<口令>@127.0.0.1:5432/companion"  # 必填；不给就在启动时直接报错（见 §10）
+schema = "companion_runtime"  # 这套表所在的 schema；生产中每人一个 cr_<会话标识>
 raw_log_path = "./data/raw_events.jsonl"
-mirror_raw_events = true      # 额外写一份 append-only JSONL 便于离线查看
-wal = true                    # 保持 true；见第 10 节
-busy_timeout_ms = 5000
+mirror_raw_events = true      # 额外写一份 append-only JSONL 便于离线查看：审计冗余，**不是**权威库
 
 [drive]                       # I / R / P 动力学
 tau_impulse_seconds = 5400
@@ -256,8 +271,8 @@ interpretation_max_age_seconds = 21600.0
 ```powershell
 $env:CR_SERVER__PORT = "9000"
 $env:CR_DRIVE__COOLDOWN_SECONDS = "600"
-$env:CR_STORAGE__DATABASE_PATH = "D:\companion\runtime.sqlite3"
-$env:CR_STORAGE__DATABASE_PATH = ":memory:"     # 内存库（测试/演示）
+$env:CR_STORAGE__DSN = "postgresql://runtime:<口令>@127.0.0.1:5432/companion"  # 必填
+$env:CR_STORAGE__SCHEMA = "companion_runtime"      # 生产中每人一个 cr_<会话标识>
 
 # 【v0.2】语义端口（默认关闭，不写这两行就是零模型运行）
 $env:CR_SEMANTIC__PROVIDER = "disabled"          # 等价于 CR_SEMANTIC_PROVIDER
@@ -991,11 +1006,7 @@ Reducer 侧还有三条安全规则：
 | GET | `/observations` | 交互观察历史 |
 | GET | `/situation` | 工作局势（事实 / 推断 / 未尽之事） |
 | GET | `/config` | 脱敏后的有效配置 |
-| GET | `/maintenance/verify` | **完整性 + 结构一致性检查** |
-| POST | `/maintenance/checkpoint` | **WAL checkpoint**（默认 TRUNCATE） |
-| POST | `/maintenance/backup` | **写一致快照**（`VACUUM INTO`） |
-| GET | `/maintenance/recovery-plan` | **恢复方案** |
-| POST | `/maintenance/tick` | **例行维护**：checkpoint + verify（+ 可选备份与保留策略） |
+| GET / POST | `/maintenance/{verify,checkpoint,backup,recovery-plan,tick}` | **SQLite-only 耐久性端点**：路由还在，但在 PostgreSQL 上会在读写任何东西之前拒绝。**注意 HTTP 上的样子**：拒绝是个 `RuntimeError`，API 层只把 `ValueError` 映射成 422，所以这里拿到的是 **500**，原因要去服务端日志看（CLI 直接跑时消息就在 stdout）。见 §10 |
 
 > v0.2 新增两个端点：`POST /cognition/refresh`（触发一次深层刷新）与 `GET /cognition/backlog`（查看积压）。此外 `GET /health` 的 `semantics` 块给出计数。
 
@@ -1082,150 +1093,76 @@ OpenAPI 文档：`http://127.0.0.1:8787/docs`、`/openapi.json`。
 
 ---
 
-## 10. 持久化、WAL、事务与蓝屏恢复
+## 10. 存储：PostgreSQL、schema 与恢复
 
-> ⚠️ **这一章是 SQLite 时代写的，已经过时。** 运行时存储现在是 **PostgreSQL-only**：
-> 每人一个 schema（`cr_<会话标识>`），迁移版本 v26，不给 `CR_STORAGE__DSN` 会直接拒绝启动
-> （SQLite 只被离线 v1 导入器支持）。下面提到的 `-wal` / `-shm` 文件、文件级备份与恢复演练
-> 都属于那个已经退役的形态，**不要照着做**。
+> **这一章在 2026-10 之前写的是 SQLite**（`-wal`/`-shm` 文件、`VACUUM INTO` 快照、文件级
+> 备份与 `PRAGMA integrity_check`）。那些机械**已经退役**：SQLite 现在只被**离线 v1 导入器**
+> 支持，生产路径上不给 DSN 就直接拒绝启动。下面是当前的事实。
 >
-> 当前口径见 [`docs/部署与运维.md`](../docs/部署与运维.md)（拓扑、部署、升级、回滚、陷阱）。
+> 退役形态的细节看本节在 git 历史里的旧版本——对离线导入器仍有参考价值，但**不要对着
+> 生产环境执行**。部署、升级、回滚、陷阱见 [`docs/部署与运维.md`](../docs/部署与运维.md)。
 
-这一节是**硬约定**，不是建议。
+### 10.1 唯一的存储契约：一个 DSN
 
-### 10.1 运行参数
-
-| 设置 | 值 | 原因 |
+| 设置 | 值 | 说明 |
 |---|---|---|
-| `journal_mode` | **WAL** | 读不阻塞写、写不阻塞读 —— HTTP 服务与认知轮可同时进行 |
-| `synchronous` | **NORMAL** | WAL 下使"已 COMMIT"的事务对**进程崩溃**持久，同时兼顾弱 VPS 的写入开销 |
-| `busy_timeout` | 5000 ms | 短暂争用时等待而不是立刻报错 |
-| 事务 | 每次变更 `BEGIN IMMEDIATE` | 单写者 + 写前取锁，避免升级死锁 |
-| 嵌套 | `SAVEPOINT` | 一个维护操作可以与认知轮处在同一个原子单元里 |
+| `CR_STORAGE__DSN` | **必填** | 空值不是"回退到 SQLite"，是**启动即报错**（`config.require_postgres_dsn()`，消息里点名这个变量） |
+| `CR_STORAGE__SCHEMA` | 一个 schema 名 | 这套表所在的 schema，默认 `companion_runtime`；生产中**每人一个** `cr_<会话标识>` |
+| `CR_STORAGE__RAW_LOG_PATH` | `./data/raw_events.jsonl` | append-only 原始事件**镜像**：审计冗余，**不是**权威库，也不是第二个可写投影 |
+| `CR_STORAGE__MIRROR_RAW_EVENTS` | `true` | 是否写上面那个镜像 |
 
-### 10.2 崩溃与断电语义（明确区分）
+单写者 + 版本号（reducer）的模型没变，只是事务现在由 PostgreSQL 提供。`database_path` 与
+`wal` 两个键**还在但已废弃**：只为解析归档的 v1 配置、供离线导入器使用，
+`db.open_database()` 在生产路径上从不读它们。
 
-实际只有两种情况，**都不是"数据库损坏"**：
+### 10.2 崩溃与断电：现在是数据库服务器的事
 
 | 场景 | 结果 |
 |---|---|
-| **进程被杀 / kill -9 / 服务崩溃**（无断电） | 已 `COMMIT` 的事务**全部保留**。WAL 中的提交记录已落盘，重连时自动回放 |
-| **突然断电 / 蓝屏**（`synchronous=NORMAL`） | 可能丢失**最后若干个已提交事务**；但数据库**永不损坏**。SQLite 校验 WAL 帧校验和，回放到最后一个完整帧，丢弃"被撕开"的尾部 |
-| 半途中断的写入 | 不可能产生"半轮认知结果"：整个认知轮在同一个事务里，要么全在，要么全不在 |
+| **进程被杀 / 服务崩溃** | 已 `COMMIT` 的事务保留——这是 PostgreSQL 自己的保证，不是 Runtime 的机制 |
+| **断电 / 宿主机崩溃** | 丢失窗口由 `synchronous_commit`、WAL 与文件系统共同决定，是**数据库服务器的配置** |
+| 半途中断的写入 | 仍然不可能产生"半轮认知结果"：一个认知轮在同一个事务里，要么全在，要么全不在 |
 
-> 想要断电也零丢失，把 `synchronous` 改成 `FULL`（每次提交都 fsync），代价是写入延迟更高。第一版按架构文档选择 `NORMAL`：**可用性 > 推理速度**，且崩溃恢复总是安全的。
+想在这里做取舍（零丢失 vs 写入延迟），调的是 PostgreSQL，不是 Runtime 的配置项。
 
-### 10.3 自动恢复流程
+### 10.3 checkpoint / backup / restore / verify：在 PostgreSQL 上**故意拒绝**
 
-无需人工干预，下次连接时 SQLite 自动完成：
+CLI 的 `checkpoint` / `backup` / `restore` / `verify` / `drill`，以及 HTTP 的
+`POST /maintenance/{checkpoint,backup,tick}` 与 `GET /maintenance/{verify,recovery-plan}`
+**都还在**——但在 PostgreSQL 上它们会在**读写任何东西之前**抛 `DurabilityUnsupported`，
+消息里点名缺的是哪个机制（`PRAGMA wal_checkpoint`、`VACUUM INTO`、`-wal` 文件的文件级拷贝……），
+并指向数据库服务器自己的工具。
 
-```text
-1. 发现 <db>-wal
-2. 校验每一帧 checksum，回放所有完整帧
-3. 丢弃损坏的尾帧
-4. 数据库停留在最后一个完整事务的状态
-```
+这是**故意的**，两种"温和"的做法都是错的：
 
-因为回放只在 WAL 存在时需要，运维风险点是 **WAL 无限增长**，所以需要定期 checkpoint。
+- 半途失败（让 `PRAGMA` 真的打到 PostgreSQL 上）只给运维一个语法错误，说不出缺什么；
+- 静默什么都不做，会让一个部署**以为自己有快照**。
 
-### 10.4 checkpoint
+闸门是 `DatabaseBase.supports_durability_commands`：SQLite 后端 `True`，PostgreSQL 后端
+`False`。谁实现了这套命令（比如一个基于 `pg_dump` 的实现），把标志位设成 `True` 即被接受。
 
-```powershell
-companion-runtime checkpoint --mode TRUNCATE
-```
+### 10.4 备份与恢复：用 PostgreSQL 自己的工具
 
-- `TRUNCATE`（默认）：合并并**把 WAL 截断到 0 字节**，推荐定期执行
-- `PASSIVE` / `FULL` / `RESTART`：不同强度的合并；有并发读者时可能提前返回（`busy > 0`，无害，下次继续）
-- 任何时候都可以安全执行，包括服务运行期间
-- `serve --maintenance-interval 3600` 会把它作为后台任务自动运行
-- 干净退出时也会自动做一次收尾 checkpoint
+`pg_dump`（逻辑备份，可按 schema 单独导出）、`pg_basebackup` / WAL 归档（物理备份）、流复制。
+本仓库**不包装**这些命令，也不提供"照抄即可"的演练脚本——**没被演练过的步骤不写成文档**。
 
-### 10.5 备份
+### 10.5 schema 迁移：当前 v26，只追加
 
-```powershell
-companion-runtime backup                       # → <数据目录>\backups\runtime-<UTC时间戳>.sqlite3
-companion-runtime backup D:\snap\a.sqlite3 --keep 7
-```
+- 迁移记录在 **`schema_migrations_v2`**（`version` / `checksum` / `applied_at` / `runner_version`），
+  当前代码把 scope 迁到 **v26**（`USER_MODEL_SCHEMA_VERSION`）。
+- **只追加**：已应用迁移的校验和不再改写。库比代码新会**拒绝启动**
+  （`database contains unknown future migrations`）。
+- 一个人的 schema 名由 [`scripts/fleet_naming.py`](../scripts/fleet_naming.py) **唯一**决定
+  （`cr_<slug>`），监督进程与运维工具都从那里取。这条规则漂移的表现就是
+  **"行写进了没人读的 schema"**。
+- 开通一个人时 `fleet_admin.py add` 会**断言** schema 真的迁到了本构建期望的版本：
+  只看"进程健康"会得到"Runtime 活着，但数据写进了另一个 schema"。
 
-- 使用 **`VACUUM INTO`**：单条语句产出**事务一致**的快照，**不需要停止服务**
-- 因为它是透过 WAL 读取的，**尚未 checkpoint 的已提交事务也会被包含**（有专门测试验证）
-- 快照是**自包含**单文件：不含 `-wal`/`-shm` 依赖，可以直接用文件工具复制
-- 默认拒绝覆盖已存在的文件，必须显式 `overwrite`
-- `--keep N` 执行保留策略（`prune_backups()`，按 mtime 保留最新 N 份）
-- 内存库（`:memory:`）无法备份，接口会明确返回 409
+### 10.6 现在能做的校验
 
-### 10.6 恢复演练（可直接照做）
-
-```powershell
-# 0) 先备份（服务运行中也行）
-companion-runtime backup --keep 7
-
-# 1) 看当前该做什么
-companion-runtime recover
-#   recommended_action: stop_runtime_first   ← 有 -wal/-shm，说明库在运行中
-#   recommended_action: restore              ← 已停机，可以恢复
-#   recommended_action: backup_now           ← 还没有任何快照
-
-# 2) 停掉服务（干净退出会自动 checkpoint，-wal/-shm 随之消失）
-
-# 3) 校验快照并安装（会先对快照跑 integrity_check）
-companion-runtime restore D:\data\backups\runtime-20260301T090000Z.sqlite3
-#   旧库会被保留为 <db>.replaced
-
-# 4) 确认恢复结果
-companion-runtime verify
-companion-runtime health
-```
-
-`restore` 的两条安全护栏：
-
-1. **拒绝覆盖运行中的数据库**：目标旁边存在 `-wal`/`-shm` 时直接报错（覆盖活动数据库会损坏它）
-2. **先校验快照**：`integrity_check` 不过就拒绝安装
-
-### 10.7 一致性校验
-
-```powershell
-companion-runtime verify          # 退出码 0 = 通过，3 = 有问题
-```
-
-检查项：
-
-1. `PRAGMA integrity_check` == `ok`
-2. `schema_meta` 中的 schema 版本存在
-3. `runtime_state` 行存在且 `version >= 0`
-4. 任何 `action_attempt.outbox_id` 都必须指向真实 outbox 行
-5. `attempt_events` 引用的 attempt 必须存在
-6. 不允许存在没有过期时间的 lease（那会让一行永远被占住）
-7. 各表行数统计 + journal mode 断言
-
-### 10.8 schema 迁移（v0.2：SCHEMA_VERSION = 2）
-
-`Database.migrate()` 是幂等的：先 `CREATE TABLE IF NOT EXISTS`，再对 `ADDED_COLUMNS` 声明的列用 `ALTER TABLE` 补齐（例如 `runtime_state.epoch_at`、`last_exchange_at`）。**已有数据库可以原地升级，不需要重建。**
-
-v0.2 只新增了一张表：
-
-```sql
-CREATE TABLE IF NOT EXISTS event_semantics (
-    event_id            TEXT PRIMARY KEY,
-    semantic_status     TEXT NOT NULL DEFAULT 'unresolved',   -- resolved | unresolved
-    direction           TEXT,                                 -- + / - / 0 / +-
-    intensity_band      TEXT,                                 -- negligible..high
-    confidence          REAL,
-    settlement_source   TEXT,                                 -- explicit_positive_feedback ...
-    evidence            TEXT,                                 -- 命中的表面形式，留作审计
-    potential_relevance TEXT NOT NULL DEFAULT 'low',
-    unresolved_reason   TEXT,
-    settled_at          TEXT,
-    deep_refresh_id     TEXT,                                 -- 哪次刷新结算了它
-    version             INTEGER NOT NULL DEFAULT 0,
-    created_at          TEXT NOT NULL,
-    updated_at          TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_event_semantics_status
-    ON event_semantics(semantic_status, potential_relevance);
-```
-
-这张表是**派生投影**，不是权威：缺行表示"还没看过"，有行也只是记录"持久层当前相信什么、或者决定暂时什么都不相信"。它可以从 `raw_events` + 规则表重建，所以它自己从不承担权威。**`raw_events` 仍然是唯一不可变的事实来源** —— unresolved 事件永远不会因为"没人理解它"而消失。
+`companion-runtime health` 与 `GET /health` 报 `state_version`、outbox 积压、未结算提交等；
+运维侧逐条体检用 `scripts/fleet_admin.py check [scope]`——每条检查都点名它排除了哪种故障。
+这些**不**等价于 `PRAGMA integrity_check`，也不假装是。
 
 ---
 
@@ -1273,11 +1210,11 @@ python -m pytest -q -m integration      # 只跑端到端场景
 python -m pytest -q --cov=companion_runtime
 ```
 
-规模：实测 **603 项**（`python -m pytest -q` 收集 603 项，全部通过）。测试数量随模块演进持续增长（例如本地模型那一批测试随该路线一起被删除，`test_local_llm.py` 已不在 `tests/` 中），请以你自己那次运行的输出为准，不要以本文数字为准。
+规模：本仓库本地实测收集 **2050 项**（148 个测试文件）。**其中相当一部分需要 `CR_STORAGE__DSN`**：没有 DSN 时它们会在 setUp 阶段直接失败（`PostgreSQL storage is required; set CR_STORAGE__DSN`），**那不是回归**——给了 DSN（或跑在真实部署里）才会真正执行。数字随模块演进持续变化，**请以你自己那次运行的输出为准**。
 
 覆盖范围：
 
-- **基础设施**：数学工具数值性质、配置三层覆盖与脱敏、SQLite 事务/保存点/JSON 列、事件日志 append-only 与过滤
+- **基础设施**：数学工具数值性质、配置三层覆盖与脱敏、PostgreSQL 存储（连接/事务/schema 迁移与 v2 表）以及 SQLite 兼容/离线路径、事件日志 append-only 与过滤
 - **认知模块**：事件评价方向与不确定性、情绪衰减与心境恢复、解释器缓存与 provider 容错、边界检测（含假阳性防护）与生命周期、未尽之事全生命周期、记忆评分/巩固/冲突/去重/检索/激活、用户模型的特征/证据权重/冷启动/学习/漂移/双视图、候选生成与池管理器四种操作、沉默效用、效用分解、危险率（含频率无关性）、softmax 选择、I/R/P 动力学（惯性、饱和、释放）
 - **v0.2 语义结算**（`test_semantic.py`，53 项）：锚点表逐条方向与来源、歧义否决表逐条（含"每个否决标记都必须有负例"）、补丁点名例句必须 unresolved、填充词剥离、强锚点豁免、钝性拒绝 vs 含糊拒绝、强度带与置信度范围、`semantic_label` 恒为 `None`、锚点与否决标记不得冲突、`potential_relevance` 分档、`resolve_backlog` 的 live/stale 切分与排序
 - **v0.2 provider**（`test_providers.py`，65 项）：两种实现的选择与回落、退役的本地名字回落 `disabled` 并打 WARNING、未知名字回落 disabled、构造失败回落 disabled、六个建议字段的类型校验与部分畸形处理、`suggestions` 包装键、超时/连不上/畸形 JSON 全部 fail-open（`None` 或 `degraded`）、`extract_json` / `parse_explanation` 的本地实现、`_grammar_for()` 恒为 `None`、解释缓存与 `state_key` 契约、provider 统计、**密钥永不出现在 `repr`/`health`/错误信息里**
@@ -1285,7 +1222,7 @@ python -m pytest -q --cov=companion_runtime
 - **v0.2 深层认知刷新**（`test_deep_refresh.py`，约 40 项）：八条触发规则各自的优先级与"最紧急者胜出"、阈值来自配置、最小间隔压过所有理由、优先级表与补丁顺序一致；grounding 的六种操作类型可达、编造的来源被拒、缺来源被拒、解释缓存豁免来源、畸形条目被记录而不崩溃、操作数被截断、未知字段被忽略；请求组装的九个段落齐备、**组装请求不写库**、`key_quotes` 来自真实事件；编排层的开关关闭/provider 不可用/无触发/超时抛异常/空建议/全部 grounding 失败/部分坏批次/`force` 只跳过触发不跳过可用性/outcome 可 JSON 序列化；以及"ingest 不触发刷新"与"积压对 health 可见"
 - **v0.2 认知 HTTP 契约**（`test_cognition_api.py`，9 项）：`POST /cognition/refresh` 与 `GET /cognition/backlog` 的响应形状与状态码
 - **协议与并发**：APPLY/REBASE/DISCARD 全部分支、敏感度表、rebase 辅助、五种重协调结果、outbox claim/lease/ack/nack/租约过期回收/优先级/kinds 过滤、action 状态机合法与非法跃迁
-- **耐久性**（`test_durability.py`）：WAL 生效、认知轮原子性、**进程崩溃后已提交事务保留**、**截断 WAL 尾部后不损坏**、缺 sidecar 无害、四种 checkpoint 模式、verify 各类检查（含故意造坏）、备份一致性、备份包含未 checkpoint 事务、不能覆盖已有快照、停机后可读、**完整恢复演练（备份 → 毁库 → 确认不可读 → restore → verify → 继续可用）**、拒绝覆盖运行中的库、保留策略、CLI 全流程
+- **耐久性（SQLite 后端 / 离线路径）**（`test_durability.py`）：WAL 生效、认知轮原子性、**进程崩溃后已提交事务保留**、**截断 WAL 尾部后不损坏**、缺 sidecar 无害、四种 checkpoint 模式、verify 各类检查（含故意造坏）、备份一致性、备份包含未 checkpoint 事务、不能覆盖已有快照、停机后可读、**完整恢复演练（备份 → 毁库 → 确认不可读 → restore → verify → 继续可用）**、拒绝覆盖运行中的库、保留策略、CLI 全流程。**这些是 SQLite 后端的测试**；PostgreSQL 上同一批命令会在读写前拒绝，拒绝本身同样有测试（§10）
 - **HTTP**：全部端点契约、状态码（404/409/422）、OpenAPI 覆盖、outbox 全链路、边界/渲染/投递、维护端点
 - **场景与不变量**：架构文档里的 7 个场景 + 完整"面试"故事 + 10 条不变量 + 降级模式 + 多进程并发写冲突
 
@@ -1344,14 +1281,14 @@ v0.2 之后这条边界多了一句更硬的表述：**主 LLM 就是即时演�
 不再需要任何本地生成式模型之后，弱 VPS 上**只需要跑三件东西**：
 
 ```text
-1. Runtime sidecar（本工程：Python + fastapi/uvicorn + SQLite）
+1. Runtime sidecar（本工程：Python + fastapi/uvicorn + PostgreSQL 客户端）
 2. Bot / 宿主框架（平台接入 + 主 LLM 调用，例如 AstrBot）
-3. 数据库（SQLite 单文件即可；要更稳就上 PostgreSQL）
+3. PostgreSQL（**必需**：一人一个 schema，见 §10）
 
 可选：轻量词法检索（已内置）、可选轻量 embedding（未实现，见第 16 节）
 ```
 
-Runtime 进程内**没有任何本地推理组件、没有模型权重、没有推理队列** —— 这条路线已被整体放弃（见 7.3 与 `archive/README.md`）。这直接换来了"低成本、长期稳定、可维护"：Runtime 常驻内存以 Python 解释器 + SQLite 页缓存为主，磁盘只有数据库文件、WAL 和备份快照。
+Runtime 进程内**没有任何本地推理组件、没有模型权重、没有推理队列** —— 这条路线已被整体放弃（见 7.3 与 `archive/README.md`）。这直接换来了"低成本、长期稳定、可维护"：Runtime 常驻内存以 Python 解释器为主，磁盘上只有可选的原始事件 JSONL 镜像，数据库在 PostgreSQL 那边。
 
 ### 15.2 需要更强语义时：用远端，不要在 VPS 上跑模型
 
@@ -1369,13 +1306,12 @@ Runtime 进程内**没有任何本地推理组件、没有模型权重、没有�
 
 | 事项 | 建议 |
 |---|---|
-| 数据库目录 | 放在持久化盘；`restore` 会拒绝覆盖运行中的库 |
-| WAL | 保持 `wal = true`，用 `serve --maintenance-interval 3600` 或 cron 定时 checkpoint |
-| 备份 | `backup --keep 7`，快照是自包含单文件，可直接拷走 |
-| 内存 | Runtime 内存以 Python 解释器 + SQLite 页缓存为主，没有模型常驻开销 |
+| 连接 | `CR_STORAGE__DSN` 必填；schema 一人一个（`cr_<会话标识>`），别让两个人共用一个 schema（表现是"记忆串了"） |
+| 备份 | 用 PostgreSQL 自己的工具（`pg_dump` / `pg_basebackup` / WAL 归档）。Runtime 的 `backup` / `restore` 在 PostgreSQL 上**会拒绝执行**（§10）——不要以为它做了快照 |
+| 内存 | Runtime 以 Python 解释器为主，没有模型常驻开销；容量看 PostgreSQL 那边 |
 | 启动 | `--host 127.0.0.1`（前面套反代），不要裸奔在公网 |
 | 密钥 | 只放环境变量（`CR_SEMANTIC_API_KEY` 等），**绝不写进 `runtime.toml`**；Runtime 从设计上就拒绝从配置文件读 key |
-| 观测 | `GET /health`（含 `semantics` 与 `semantic_provider`）、`GET /outbox`、`GET /maintenance/verify` 已够用；尚无 Prometheus 导出 |
+| 观测 | `GET /health`（含 `semantics` 与 `semantic_provider`）；运维逐条体检用 `scripts/fleet_admin.py check [scope]`；尚无 Prometheus 导出 |
 
 ---
 

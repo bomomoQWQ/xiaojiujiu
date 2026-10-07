@@ -33,6 +33,23 @@ python3 scripts/check_versions.py
 插件仓库不在本机时它会说明跳过了哪一项；而显式给的 `--plugin-repo` 写错了会**直接拒绝**，
 不会悄悄去查另一个仓库（那会对着没人问过的东西报 "ok"）。
 
+### 另一条门禁：当前工具不许写死作者的本机路径
+
+`runtime/tests/test_ops_scripts_are_portable.py` 逐行扫描**上面那张表里的每个工具**，
+出现 `/srv/companion`、`F:\…`、`E:\…` 这类路径就失败，并指出文件与行号。机器相关的值
+要么做成参数，要么走环境变量，要么从脚本自己的位置推导（`backup.ps1` 现在就是这么做的）。
+
+```bash
+python -m pytest runtime/tests/test_ops_scripts_are_portable.py -q
+```
+
+`scripts/` 里那些**历史 `.sh`** 不在此列——它们是某次事故在某台机器上的记录，按上面的
+约定原样保留。
+
+> 给 `.ps1` 写注释时留个心眼：无 BOM 的 UTF-8 文件里，如果一行以全角标点（`，`、`。`）结尾，
+> 在按 GBK 读文件的 PowerShell 上那个换行会被当成双字节字符的一部分吃掉，**下一行会并进注释**，
+> 参数声明会凭空消失。`backup.ps1` 的注释因此写成纯 ASCII。
+
 完整部署流程见 [`docs/部署与运维.md`](../docs/部署与运维.md)。
 
 ## 历史一次性脚本（保留作当时的证据，不要照着跑）
