@@ -20,6 +20,19 @@
 docker exec -i xxj-runtime-fleet python /fleet/fleet_admin.py list
 ```
 
+### 发版前的一致性检查
+
+`check_versions.py` 不属于运维工具、不进容器，在仓库根目录跑即可。它检查版本号在**四处**
+是否一致（`CHANGELOG.md` 顶部、`runtime/pyproject.toml`、
+`runtime/src/companion_runtime/__init__.py`、插件仓库 `metadata.yaml`），不一致就退出码 1：
+
+```bash
+python3 scripts/check_versions.py
+```
+
+插件仓库不在本机时它会说明跳过了哪一项；而显式给的 `--plugin-repo` 写错了会**直接拒绝**，
+不会悄悄去查另一个仓库（那会对着没人问过的东西报 "ok"）。
+
 完整部署流程见 [`docs/部署与运维.md`](../docs/部署与运维.md)。
 
 ## 历史一次性脚本（保留作当时的证据，不要照着跑）
