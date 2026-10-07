@@ -269,10 +269,11 @@ CR_TEST_PG_DSN='postgresql://...' python -m pytest -q \
 **反证工具**（证明检查会咬人）：`scripts/mutation_design_conformance.py` 把 bug 放回去看测试红不红；
 `dead_code_inventory.py` 找没人读的东西；`business_logic_probes.py` 是已修缺陷的改前/改后对照。
 
-> **`pytest tests` 整体现在不是全绿**：`1998` 个用例里 **194 失败 + 33 错误**。
+> **`pytest tests` 整体现在不是全绿**：`2050` 个用例里 **196 失败 + 33 错误**（2026-10-07 实测）。
 > 原因不是逻辑回归，而是**夹具欠账**——v2 之后存储要求 PostgreSQL，
 > 而一批历史测试仍用 `config.storage.database_path = "….sqlite3"` 直接构造 Runtime，
-> 于是必然抛 `ValueError: PostgreSQL storage is required`；给 DSN 也没用，那些测试不读环境变量。
+> 于是必然抛 `ValueError: PostgreSQL storage is required`；给 DSN 也没用，那些测试不读环境变量
+> （实测：配上连不上的 DSN 再跑，失败数量一模一样）。
 > 修法只有两条：把夹具迁到 PostgreSQL schema，或显式 skip 并写明理由。这件事没做。
 
 ---
