@@ -1210,7 +1210,16 @@ python -m pytest -q -m integration      # 只跑端到端场景
 python -m pytest -q --cov=companion_runtime
 ```
 
-规模：本仓库本地实测收集 **2050 项**（148 个测试文件）。**其中相当一部分需要 `CR_STORAGE__DSN`**：没有 DSN 时它们会在 setUp 阶段直接失败（`PostgreSQL storage is required; set CR_STORAGE__DSN`），**那不是回归**——给了 DSN（或跑在真实部署里）才会真正执行。数字随模块演进持续变化，**请以你自己那次运行的输出为准**。
+规模：本仓库本地实测收集 **2050 项**（148 个测试文件）。跑起来**不是全绿**，而那不是回归：
+
+- v2 之后存储要求 PostgreSQL，一批历史夹具却仍用 `config.storage.database_path = "….sqlite3"`
+  直接构造 Runtime，于是必然抛 `ValueError: PostgreSQL storage is required`；
+- **设 `CR_STORAGE__DSN` 救不了**——2026-10-07 实测：把 `test_api.py` / `test_db_postgres.py`
+  配上（连不上的）DSN 再跑，失败一模一样，**那些夹具不读环境变量**；
+- 修法只有两条：把夹具迁到 PostgreSQL schema，或显式 skip 并写明理由。这件事**没做**
+  （仓库根 `README.md` §7 记着这笔账）。
+
+数字随模块演进变化，**以你自己那次运行的输出为准**。
 
 覆盖范围：
 
