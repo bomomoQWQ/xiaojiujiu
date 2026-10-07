@@ -171,7 +171,8 @@ def cmd_list(args: argparse.Namespace) -> int:
     print(f"fleet: {payload.get('count')} runtime(s); live engine "
           f"{'ENABLED' if live_on else 'DISABLED'}; allowlist {len(allowlist)} scope(s)")
     print()
-    header = f"{'session':<34}{'port':>6}{'health':>10}{'may send':>10}{'in allowlist':>14}{'schema':<40}"
+    header = (f"{'session':<34}{'port':>6}{'health':>10}{'may send':>10}"
+              f"{'in allowlist':>14}  schema")
     print(header)
     for item in people:
         session = str(item.get("session"))
