@@ -210,20 +210,26 @@ CR_LANGCHAO__ATTENTION_RECIPE=off     # 注意力配方：off / B2 / B3
 | 会话→schema 规则只有一份 | `scripts/fleet_naming.py`；监督进程和运维工具都用它，避免两处漂移（漂移的表现是"行写到了没人读的地方"） |
 | 无中断升级 | 换 site-packages 里的包 + `rolling_restart.py --confirm`，逐 scope 滚动；见 [`docs/部署与运维.md`](docs/部署与运维.md) §6.2 |
 | 部署手册 | [`docs/部署与运维.md`](docs/部署与运维.md)：拓扑、首次部署、开通、开关、升级、回滚、陷阱清单 |
+| 版本号不再各说各话 | 一处号、四处同步（`CHANGELOG.md` 顶部 / `runtime/pyproject.toml` / `runtime/src/companion_runtime/__init__.py` / 插件 `metadata.yaml`），`scripts/check_versions.py` 不一致就退出码 1。**查正在跑的是哪个版本**：`GET /health` → `runtime_version` |
+| 有 tag 可回滚 | 两个仓库都打了 `v0.5.0`（此前从无任何 tag）；插件另有按 tag 打的 zip 可直接用 WebUI 上传 |
 
 **还没做：**
 
 | 缺口 | 现状 |
 |---|---|
-| 插件不在 AstrBot 插件市场 | 只能手动 clone，升级靠 `git pull`；没有版本化发布物 |
+| 插件不在 AstrBot 插件市场 | 市场发布**已冻结**（有意，见 `HANDOFF.md` 的「已冻结」一节）。版本化发布物已经有了：tag + zip + 发版流程，只是不走市场 |
 | `scripts/` 里两百多个历史一次性脚本 | 仍写死作者的路径与当时的 QQ 号。**当前工具与历史的区分**写在 [`scripts/README.md`](scripts/README.md)，但没有回改历史 |
 | `runtime/README.md` §10（持久化/WAL/恢复演练） | 是 **SQLite 时代**写的，与现状（PostgreSQL-only、schema v26、fleet）不符；当前口径见部署手册 §1 |
 | `HANDOFF.md` | 2026-09-15 ~ 09-23 的封测期流水账，是当时的事实，**不要当作当前部署指南** |
 | 安装向导 | 仍需手写 `.secrets/` 的库口令与 compose；generator 不会写 `CR_SEMANTIC_API_KEY`（写进生成的 compose 会被下一次重跑抹掉，见手册 §3 的警告） |
 
-| 没有 CI                  | 镜像自己 build，没有 tag、没有镜像仓库                                                      |
-| **不是多租户**     | 状态单租户全局；多人要"一人一个 Runtime"（fleet 就是这么做的），那是运行期做法              |
-| 开关不少                 | 语义端口、时间尺度、价值观轴、心跳间隔、发送权威……默认能用，想调得先理解                  |
+**结构性的事实（是取舍，不是欠账）：**
+
+| 事实 | 说明 |
+|---|---|
+| 没有 CI | 镜像自己 build，没有镜像仓库、没有镜像 tag（git 侧现在有 `v0.5.0`） |
+| **不是多租户** | 状态单租户全局；多人要"一人一个 Runtime"（fleet 就是这么做的），那是运行期做法 |
+| 开关不少 | 语义端口、时间尺度、价值观轴、心跳间隔、发送权威……默认能用，想调得先理解 |
 
 **为什么会这样**：精力一直在"认知机制对不对"——每条机制都要有测试、仿真和反证，
 这部分吃掉了绝大部分时间。部署打磨（向导、发布、文档去本机化）是明确的欠账，**不是有意留的坑**。
