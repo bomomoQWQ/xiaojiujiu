@@ -212,14 +212,14 @@ CR_LANGCHAO__ATTENTION_RECIPE=off     # 注意力配方：off / B2 / B3
 | 部署手册 | [`docs/部署与运维.md`](docs/部署与运维.md)：拓扑、首次部署、开通、开关、升级、回滚、陷阱清单 |
 | 版本号不再各说各话 | 一处号、四处同步（`CHANGELOG.md` 顶部 / `runtime/pyproject.toml` / `runtime/src/companion_runtime/__init__.py` / 插件 `metadata.yaml`），`scripts/check_versions.py` 不一致就退出码 1。**查正在跑的是哪个版本**：`GET /health` → `runtime_version` |
 | 有 tag 可回滚 | 两个仓库都打了 `v0.5.0`（此前从无任何 tag）；插件另有按 tag 打的 zip 可直接用 WebUI 上传 |
+| 文档与现状一致 | `runtime/README.md` §10 从「SQLite 时代」改写为 PostgreSQL 现实（DSN/schema、迁移 v26、备份用 `pg_dump`、Runtime 的耐久性命令在 PG 上**明确拒绝**）；依赖行、模块树、配置示例、环境变量示例、CLI/HTTP 表里的 SQLite 说法一并改掉 |
 
 **还没做：**
 
 | 缺口 | 现状 |
 |---|---|
 | 插件不在 AstrBot 插件市场 | 市场发布**已冻结**（有意，见 `HANDOFF.md` 的「已冻结」一节）。版本化发布物已经有了：tag + zip + 发版流程，只是不走市场 |
-| `scripts/` 里两百多个历史一次性脚本 | 仍写死作者的路径与当时的 QQ 号。**当前工具与历史的区分**写在 [`scripts/README.md`](scripts/README.md)，但没有回改历史 |
-| `runtime/README.md` §10（持久化/WAL/恢复演练） | 是 **SQLite 时代**写的，与现状（PostgreSQL-only、schema v26、fleet）不符；当前口径见部署手册 §1 |
+| `scripts/` 里两百多个历史一次性脚本 | 仍写死作者的路径与当时的 QQ 号。**当前工具与历史的区分**写在 [`scripts/README.md`](scripts/README.md)，而当前工具由 `runtime/tests/test_ops_scripts_are_portable.py` 守着（写死 `/srv/companion`、`F:\…`、`E:\…` 会直接失败）；历史脚本按约定保留原样，没有回改 |
 | `HANDOFF.md` | 2026-09-15 ~ 09-23 的封测期流水账，是当时的事实，**不要当作当前部署指南** |
 | 安装向导 | 仍需手写 `.secrets/` 的库口令与 compose；generator 不会写 `CR_SEMANTIC_API_KEY`（写进生成的 compose 会被下一次重跑抹掉，见手册 §3 的警告） |
 
