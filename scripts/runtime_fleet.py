@@ -45,6 +45,8 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import fleet_naming
+
 LOG_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
 
@@ -59,9 +61,23 @@ def say(message: str) -> None:
 
 
 def slugify(session: str) -> str:
-    """Turn a session into a filesystem- and DNS-safe name."""
-    cleaned = "".join(char if char.isalnum() else "-" for char in session)
-    return cleaned.strip("-").lower()[-40:] or "person"
+    """Turn a session into a filesystem- and DNS-safe name.
+
+    Delegates to :mod:`fleet_naming`, which is the one place this rule lives: the operator
+    tools derive the schema for a session from the same function, so the supervisor and the
+    people looking for a scope's rows can never disagree.
+    """
+    return fleet_naming.slugify(session)
+
+
+def schema_for_session(session: str) -> str:
+    """Return the PostgreSQL schema that belongs to one session.
+
+    One schema per person is the isolation boundary: the retained mechanical projections
+    (memory, candidates, outbox) are not tenant-keyed, so two people in one schema would
+    blend even though the v2 tables carry ``scope_key``.
+    """
+    return fleet_naming.schema_for_session(session)
 
 
 def _port_is_free(port: int) -> bool:
@@ -92,15 +108,7 @@ class RuntimeProcess:
         # tables carry scope_key. Keep the former one-database-per-person invariant
         # as one-schema-per-person and give runtime_state a unique row identity too.
         self.env["CR_RUNTIME_ID"] = f"companion-{self.slug}"
-        # Keep schema identifiers within PostgreSQL's 63-byte limit while retaining
-        # the QQ/session suffix that makes operator diagnostics recognizable.
-        raw_schema = f"cr_{self.slug.replace('-', '_')}"
-        if len(raw_schema.encode("utf-8")) > 63:
-            import hashlib
-
-            suffix = hashlib.sha256(raw_schema.encode("utf-8")).hexdigest()[:12]
-            raw_schema = raw_schema.encode("utf-8")[:50].decode("utf-8", "ignore") + "_" + suffix
-        self.env["CR_STORAGE__SCHEMA"] = raw_schema
+        self.env["CR_STORAGE__SCHEMA"] = schema_for_session(session)
         # v2 is PostgreSQL-only. Every process shares the configured server/schema,
         # while every user-facing table/query is isolated by CR_CONVERSATION_ID.
         # A per-person JSONL mirror remains useful for forensic correlation only.

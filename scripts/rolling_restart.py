@@ -37,7 +37,8 @@ import psycopg
 
 from companion_runtime.langchao_authority import AuthorityEngine, AuthorityMode
 from companion_runtime.langchao_authority_repository import LangchaoAuthorityRepository
-from dispatch_authority import SCOPES, schema_for, slugify
+import fleet_roster
+from dispatch_authority import schema_for, slugify
 
 #: Routing and control surface of the fleet supervisor.
 CONTROL_URL = "http://127.0.0.1:8800"
@@ -165,10 +166,18 @@ def main() -> int:
         "--leave", choices=sorted(FINAL_AUTHORITY), default="live",
         help="authority each scope is left with after a successful restart (default: live)",
     )
+    parser.add_argument(
+        "--scopes", default="",
+        help="comma-separated scopes; defaults to this deployment's roster",
+    )
     args = parser.parse_args()
 
+    # The scopes come from the roster, not from a tuple in the code: a deployment's people
+    # are operator data, and a rollout must never be aimed at another deployment's list.
+    scopes = fleet_roster.resolve_scopes(args.scopes)
+
     if not args.confirm:
-        print(f"dry run: would roll {len(SCOPES)} scopes, leaving each as "
+        print(f"dry run: would roll {len(scopes)} scopes, leaving each as "
               f"{args.leave!r} (dispatch "
               f"{'enabled' if args.leave == 'live' else 'disabled'})")
         print("per scope: freeze -> assert drained -> restart -> health -> schema check "
@@ -176,7 +185,7 @@ def main() -> int:
         print("\npass --confirm to perform it")
         return 0
 
-    print(f"rolling {len(SCOPES)} scopes"
+    print(f"rolling {len(scopes)} scopes"
           + ("" if EXPECTED_SCHEMA_VERSION is None
              else f" to schema v{EXPECTED_SCHEMA_VERSION}")
           + f", leaving each as {args.leave!r}")
@@ -184,22 +193,22 @@ def main() -> int:
         os.environ["CR_STORAGE__DSN"], autocommit=True, row_factory=psycopg.rows.dict_row
     )
     try:
-        for index, session in enumerate(SCOPES, start=1):
+        for index, session in enumerate(scopes, start=1):
             people = _people()
             current = people.get(session)
             if current is None:
-                print(f"[{index}/{len(SCOPES)}] {session}: not in the fleet; stopping")
+                print(f"[{index}/{len(scopes)}] {session}: not in the fleet; stopping")
                 return 1
             schema = schema_for(session)
             state = _drained(connection, schema)
             if state["outbox"] or state["attempts"]:
-                print(f"[{index}/{len(SCOPES)}] {session}: dispatch state is not drained "
+                print(f"[{index}/{len(scopes)}] {session}: dispatch state is not drained "
                       f"{state}; stopping the rollout")
                 return 1
             repository = LangchaoAuthorityRepository(connection, scope_key=session)
             active = repository.get_active()
             if active is None:
-                print(f"[{index}/{len(SCOPES)}] {session}: no active authority; stopping")
+                print(f"[{index}/{len(scopes)}] {session}: no active authority; stopping")
                 return 1
             repository.switch_authority(
                 engine_key=AuthorityEngine.NONE, mode=AuthorityMode.DISABLED,
@@ -208,7 +217,7 @@ def main() -> int:
                 payload={"operation": "rolling_restart", "phase": "freeze"},
             )
             frozen_pointer = int(repository.get_active()["pointer_version"])
-            print(f"[{index}/{len(SCOPES)}] {session}: frozen at pointer {frozen_pointer} "
+            print(f"[{index}/{len(scopes)}] {session}: frozen at pointer {frozen_pointer} "
                   f"(old pid {current['pid']}); restarting", flush=True)
 
             _post("/fleet/restart/" + slugify(session))
@@ -216,12 +225,12 @@ def main() -> int:
 
             version = _schema_version(connection, schema)
             if EXPECTED_SCHEMA_VERSION is not None and version != EXPECTED_SCHEMA_VERSION:
-                print(f"[{index}/{len(SCOPES)}] {session}: schema is v{version}, expected "
+                print(f"[{index}/{len(scopes)}] {session}: schema is v{version}, expected "
                       f"v{EXPECTED_SCHEMA_VERSION}; leaving it disabled")
                 return 1
             state = _drained(connection, schema)
             if state["outbox"] or state["attempts"]:
-                print(f"[{index}/{len(SCOPES)}] {session}: acquired work while frozen "
+                print(f"[{index}/{len(scopes)}] {session}: acquired work while frozen "
                       f"{state}; leaving it disabled")
                 return 1
             repository.switch_authority(
@@ -232,13 +241,13 @@ def main() -> int:
                 payload={"operation": "rolling_restart", "phase": args.leave},
             )
             published = repository.get_active()
-            print(f"[{index}/{len(SCOPES)}] {session}: new pid {healthy['pid']}, "
+            print(f"[{index}/{len(scopes)}] {session}: new pid {healthy['pid']}, "
                   f"schema v{version}, authority "
                   f"{published['engine_key']}/{published['mode']} "
                   f"pointer {published['pointer_version']}", flush=True)
     finally:
         connection.close()
-    print(f"\nROLLING_RESTART_COMPLETE {len(SCOPES)}/{len(SCOPES)}")
+    print(f"\nROLLING_RESTART_COMPLETE {len(scopes)}/{len(scopes)}")
     return 0
 
 

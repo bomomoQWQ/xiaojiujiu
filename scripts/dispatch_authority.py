@@ -28,26 +28,16 @@ import hashlib
 import os
 import sys
 
+import fleet_naming
+import fleet_roster
 import psycopg
 
 from companion_runtime.langchao_authority import AuthorityEngine, AuthorityMode
 from companion_runtime.langchao_authority_repository import LangchaoAuthorityRepository
 
-#: The scopes this deployment serves, in the order the people file lists them.
-SCOPES: tuple[str, ...] = (
-    "default:FriendMessage:1000000001",
-    "default:FriendMessage:1000000002",
-    "default:FriendMessage:1000000003",
-    "default:FriendMessage:1000000004",
-    "default:FriendMessage:1000000005",
-    "default:FriendMessage:1000000006",
-    "default:FriendMessage:1000000007",
-    "default:FriendMessage:1000000008",
-    "default:FriendMessage:1000000009",
-    "default:FriendMessage:1000000010",
-    "default:FriendMessage:1000000011",
-)
-
+#: Which engine and mode each action publishes. The scope list is *not* here: a deployment's
+#: scopes are operator data, resolved from the roster at run time (:mod:`fleet_roster`) so
+#: adding a person never means editing committed code.
 ACTIONS: dict[str, tuple[AuthorityEngine, AuthorityMode]] = {
     # No engine may dispatch; the round still assesses purely and records a router no-send.
     "freeze": (AuthorityEngine.NONE, AuthorityMode.DISABLED),
@@ -67,12 +57,15 @@ def slugify(session: str) -> str:
     Returns:
         The filesystem-safe slug the supervisor uses for this person.
     """
-    cleaned = "".join(char if char.isalnum() else "-" for char in session)
-    return cleaned.strip("-").lower()[-40:] or "person"
+    return fleet_naming.slugify(session)
 
 
 def schema_for(session: str) -> str:
-    """Return the schema the supervisor gives this session, 63-byte limit included.
+    """Return the schema the supervisor gives this session.
+
+    Delegates to the supervisor's own definition rather than repeating it: two copies of
+    this rule drift, and two different answers to "where are this scope's rows" is how an
+    operator ends up inspecting an empty schema and concluding the character never acts.
 
     Args:
         session: The unified session origin.
@@ -80,11 +73,7 @@ def schema_for(session: str) -> str:
     Returns:
         The PostgreSQL schema name holding this scope's rows.
     """
-    raw = f"cr_{slugify(session).replace('-', '_')}"
-    if len(raw.encode("utf-8")) > 63:
-        suffix = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
-        raw = raw.encode("utf-8")[:50].decode("utf-8", "ignore") + "_" + suffix
-    return raw
+    return fleet_naming.schema_for_session(session)
 
 
 def main() -> int:
@@ -96,14 +85,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=[*ACTIONS, "show"], nargs="?", default="show")
     parser.add_argument("reason", nargs="?", default="operator action")
+    parser.add_argument(
+        "--scopes", default="",
+        help="comma-separated scopes; defaults to this deployment's roster",
+    )
     args = parser.parse_args()
+
+    scopes = fleet_roster.resolve_scopes(args.scopes)
 
     connection = psycopg.connect(
         os.environ["CR_STORAGE__DSN"], autocommit=True, row_factory=psycopg.rows.dict_row
     )
     failures = 0
     try:
-        for session in SCOPES:
+        for session in scopes:
             connection.execute(f'SET search_path TO "{schema_for(session)}", public')
             repository = LangchaoAuthorityRepository(connection, scope_key=session)
             active = repository.get_active()
@@ -140,7 +135,7 @@ def main() -> int:
             )
     finally:
         connection.close()
-    print(f"\n{args.action}: {len(SCOPES) - failures}/{len(SCOPES)} scopes ok")
+    print(f"\n{args.action}: {len(scopes) - failures}/{len(scopes)} scopes ok")
     return 1 if failures else 0
 
 

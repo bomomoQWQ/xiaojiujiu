@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import sys
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,13 +11,22 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).parents[2]
-SCRIPT = ROOT / "scripts" / "apply_mechanical_history.py"
+
+# The operator scripts live in ``scripts/`` and import each other by module name. Running
+# one as ``python scripts/x.py`` puts that directory on ``sys.path`` automatically, but
+# loading it by path here does not, so the sibling imports fail. Reproduce what the
+# interpreter would do rather than making the scripts carry a bootstrap for this test.
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+SCRIPT = SCRIPTS / "apply_mechanical_history.py"
 SPEC = importlib.util.spec_from_file_location("apply_mechanical_history", SCRIPT)
 assert SPEC and SPEC.loader
 operator = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(operator)
 
-FLEET_SCRIPT = ROOT / "scripts" / "runtime_fleet.py"
+FLEET_SCRIPT = SCRIPTS / "runtime_fleet.py"
 FLEET_SPEC = importlib.util.spec_from_file_location("runtime_fleet_for_schema_test", FLEET_SCRIPT)
 assert FLEET_SPEC and FLEET_SPEC.loader
 fleet = importlib.util.module_from_spec(FLEET_SPEC)
