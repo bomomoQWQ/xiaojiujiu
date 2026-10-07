@@ -252,7 +252,12 @@ def main() -> int:
         action="store_true",
         help="publish the per-person port range (8787-8829) to the LAN; unauthenticated APIs",
     )
-    parser.add_argument("--no-start", action="store_true")
+    parser.add_argument(
+        "--no-start",
+        action="store_true",
+        help="write the compose and people file but do not run `docker compose up -d "
+             "runtime-fleet`; without this the generator also starts the fleet",
+    )
     args = parser.parse_args()
 
     compose = Path(args.compose)

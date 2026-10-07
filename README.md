@@ -221,7 +221,7 @@ CR_LANGCHAO__ATTENTION_RECIPE=off     # 注意力配方：off / B2 / B3
 | 插件不在 AstrBot 插件市场 | 市场发布**已冻结**（有意，见 `HANDOFF.md` 的「已冻结」一节）。版本化发布物已经有了：tag + zip + 发版流程，只是不走市场 |
 | `scripts/` 里两百多个历史一次性脚本 | 仍写死作者的路径与当时的 QQ 号。**当前工具与历史的区分**写在 [`scripts/README.md`](scripts/README.md)，而当前工具由 `runtime/tests/test_ops_scripts_are_portable.py` 守着（写死 `/srv/companion`、`F:\…`、`E:\…` 会直接失败）；历史脚本按约定保留原样，没有回改 |
 | `HANDOFF.md` | 2026-09-15 ~ 09-23 的封测期流水账，是当时的事实，**不要当作当前部署指南** |
-| 安装向导 | 仍需手写 `.secrets/` 的库口令与 compose；generator 不会写 `CR_SEMANTIC_API_KEY`（写进生成的 compose 会被下一次重跑抹掉，见手册 §3 的警告） |
+| 首次部署仍要手写两样 | `.secrets/runtime-v2-postgres.env`（库口令）与基础 compose `astrbot.yml`（镜像、语义密钥等服务定义都从它复制）。生成器本身会把舰队拉起来（`docker compose up -d`，`--no-start` 可只渲染），所以不会漏步；但"手写 compose"这条还在 |
 
 **结构性的事实（是取舍，不是欠账）：**
 
