@@ -208,7 +208,7 @@ def silence_utility(
         cooldown_active: Whether a post-contact cooldown is in effect.
         hours_since_contact: Hours since the last contact.
         now: Reference time; when given, the local night window adds
-            ``scheduler.night_penalty`` to the silence utility.
+            ``langchao.night_send_penalty`` to the silence utility.
 
     Returns:
         The silence utility (unbounded, typically around ``[-1, 1.5]``).
@@ -225,15 +225,18 @@ def silence_utility(
     )
     # Late night makes silence cheaper, not mandatory: the same window logic as
     # ``scheduler._in_quiet_hours`` (including a window that crosses midnight), but as a
-    # utility term rather than a hard gate, so a strong enough reason still speaks.
-    night = config.scheduler
-    if now is not None and night.night_penalty > 0.0:
-        start, end = night.night_start_hour, night.night_end_hour
+    # utility term rather than a hard gate, so a strong enough reason still speaks. The
+    # window and the coefficient are the ones the 浪潮 engine discounts *sending*
+    # candidates with (``langchao.night_send_penalty``) -- one night knob, whichever
+    # engine is live, so the two can no longer drift apart.
+    night = config.langchao
+    if now is not None and night.night_send_penalty > 0.0:
+        start, end = night.night_send_penalty_start_hour, night.night_send_penalty_end_hour
         if start != end:
             hour = local_now(now).hour
             in_night = start <= hour < end if start < end else (hour >= start or hour < end)
             if in_night:
-                value += night.night_penalty
+                value += night.night_send_penalty
     return value
 
 

@@ -40,7 +40,7 @@
 1. **当前这一轮的即时理解与情感表现，本来就应该由主 LLM 完成。** 主 LLM 在当前轮已经能看到宿主设定、上下文、用户原话和 Runtime 状态，不需要 Runtime 先同步调用一个生成式模型把"这句话是失落 0.46"算出来再喂给它。那条路径既昂贵，又重复了主 LLM 已有的能力。
 2. **本地模型路线已被整体放弃。** 它不只是"不再是标准依赖"，而是连可选实现一起删除了：`providers.py` 只保留两种实现 —— `disabled`（默认，标准配置）与 `remote_api`（可选的低频强语义，见第 7 节）。弱 VPS 上不再需要常驻权重、不再需要本地推理进程、不再需要推理队列。放弃原因与实测数据见 `archive/README.md`。
 
-> **Runtime 不依赖任何生成式模型也能完整运行。** 默认配置（`semantic.provider = "disabled"`）下：显式事件由规则表做粗粒度结算，模糊事件记为 `unresolved`，心理解释退化为确定性代码模板，记忆检索是词法重合，用户模型是在线贝叶斯。以上全部无需任何模型，且都有自动测试守着（`tests/test_acting_layer_independence.py` 会在 ingest 路径上直接拦断 `socket.connect`，证明这一轮不会拨出任何网络连接）。
+> **Runtime 不依赖任何生成式模型也能完整运行。** 没有可用的语义端口时（默认选 `remote_api`，但缺 base_url/model/key 就用不上）：显式事件由规则表做粗粒度结算，模糊事件记为 `unresolved`，心理解释退化为确定性代码模板，记忆检索是词法重合，用户模型是在线贝叶斯。以上全部无需任何模型，且都有自动测试守着（`tests/test_acting_layer_independence.py` 会在 ingest 路径上直接拦断 `socket.connect`，证明这一轮不会拨出任何网络连接）。
 
 主 LLM 与 Runtime 的分工一句话：
 
@@ -254,7 +254,7 @@ retry_backoff_seconds = 0   # 0 = nack 后立即可再领取（推荐；节流�
 # （`attempts > 1`），宿主据此可以记录歧义、或配合自己的落盘「已发出」表实现至多一次。
 
 [semantic]                    # 【v0.2】两个时间尺度的策略（全部有默认值）
-provider = "disabled"         # disabled | remote_api
+provider = "remote_api"       # remote_api（默认）| disabled（拒绝一切外呼）
 settle_on_ingest = true       # 入口处跑粗粒度规则结算（纯规则，无模型）
 deep_refresh_enabled = true   # 允许低频深层认知刷新
 unresolved_backlog_threshold = 8
@@ -274,8 +274,9 @@ $env:CR_DRIVE__COOLDOWN_SECONDS = "600"
 $env:CR_STORAGE__DSN = "postgresql://runtime:<口令>@127.0.0.1:5432/companion"  # 必填
 $env:CR_STORAGE__SCHEMA = "companion_runtime"      # 生产中每人一个 cr_<会话标识>
 
-# 【v0.2】语义端口（默认关闭，不写这两行就是零模型运行）
-$env:CR_SEMANTIC__PROVIDER = "disabled"          # 等价于 CR_SEMANTIC_PROVIDER
+# 【v0.2】语义端口：默认 remote_api，但要 base_url + model + key 三者齐全才可用；
+# 三者不齐时 available=false、整条链安全跳过（行为与 disabled 相同）
+$env:CR_SEMANTIC__PROVIDER = "remote_api"        # 等价于 CR_SEMANTIC_PROVIDER
 $env:CR_SEMANTIC__SETTLE_ON_INGEST = "true"
 ```
 
@@ -738,14 +739,18 @@ health() -> dict[str, Any]
 选择顺序（`resolve_provider_name()`）：
 
 ```text
-1. config 里的 semantic.provider（或 extras['semantic']['provider']）
+1. config 里的 semantic.provider（默认 "remote_api"，或 extras['semantic']['provider']）
 2. 环境变量 CR_SEMANTIC_PROVIDER
-3. disabled
+3. disabled（两处都没有时）
 ```
 
+一处都没有时（连 config 都没有）落到 `disabled`；而**默认 config 选的是 `remote_api`**，
+只是它要 base_url + model + key 三者齐全才 `available()`——不齐就是"选了但不工作"，
+`/health` 会直接这么报。
+
 ```powershell
-# 默认：零模型，什么都不用配
-$env:CR_SEMANTIC_PROVIDER = "disabled"
+# 什么都不配：provider 选了但没有可用端点，行为与零模型相同
+# （想明确拒绝一切外呼就显式设 disabled）
 
 # 远端强语义（key 只放环境变量，绝不写进 config 文件）
 $env:CR_SEMANTIC_PROVIDER = "remote_api"
@@ -1014,12 +1019,13 @@ OpenAPI 文档：`http://127.0.0.1:8787/docs`、`/openapi.json`。
 
 ### 9.1 `GET /health` 响应示例
 
-零模型部署（默认配置）：
+未配语义端点的部署（`provider` 默认选 `remote_api`，缺 base_url / model / key 时就是这个样子——
+行为与 `disabled` 相同，但 `/health` 会告诉你"选了、但不可用"）：
 
 ```json
 {
   "status": "ok",
-  "runtime_version": "0.1.0",
+  "runtime_version": "0.5.0",
   "state_version": 42,
   "runtime_id": "companion",
   "now": "2026-03-01T09:00:00+00:00",
@@ -1031,10 +1037,21 @@ OpenAPI 文档：`http://127.0.0.1:8787/docs`、`/openapi.json`。
   "in_flight_attempts": 0,
   "outbox": {"pending": 0, "leased": 0, "sent": 5, "failed": 0},
   "semantic_provider": {
-    "provider": "disabled",
+    "provider": "remote_api",
     "available": false,
-    "enabled": false,
-    "reason": "disabled"
+    "base_url": "",
+    "model": "",
+    "api_key": "not configured",
+    "stats": {
+      "deep_refresh_calls": 0,
+      "deep_refresh_ok": 0,
+      "deep_refresh_degraded": 0,
+      "explain_calls": 0,
+      "explain_ok": 0,
+      "explain_degraded": 0,
+      "cache_hits": 0
+    },
+    "cache_entries": 0
   },
   "semantics": {
     "by_status": {"resolved": 12, "unresolved": 3},
@@ -1071,7 +1088,7 @@ OpenAPI 文档：`http://127.0.0.1:8787/docs`、`/openapi.json`。
 
 - `semantics.unresolved` 增长是**正常运行**：模糊事件本来就该先挂着。
 - `by_relevance` 里的 `high` 是"以后更值得回头看一眼"的那些。
-- `semantic_provider.available = false` 配上 `provider = "disabled"` 是默认状态，不是故障。
+- `semantic_provider.available = false` 是默认状态（`provider` 默认选 `remote_api`，缺 base_url/model/key 就不可用），不是故障。
 - 只有 `remote_api` 会多出 `base_url`、`model`、`api_key`（只报 `configured` / `not configured`）、`stats`、`cache_entries` 这些字段；`disabled` 的快照只有 `provider` / `available` / `enabled` / `reason`。
 
 ### 9.2 宿主接入顺序（推荐）
@@ -1239,7 +1256,7 @@ python -m pytest -q --cov=companion_runtime
 
 ## 13. 降级模式（Level 0）
 
-**默认就是零模型可运行**（v0.2 之后这不只是"降级"，而是标准形态）：
+**不接模型也完整可运行**（默认选 `remote_api`，没配端点时走的就是这条路，不是降级）：
 
 - 事件评价（粗粒度结算）：规则 + 双语锚点表 + 歧义否决表（`semantic.py`）
 - 事件评价（旧词表路径）：规则 + 双语信号词表（`emotion.appraise_event`）
@@ -1307,7 +1324,7 @@ Runtime 进程内**没有任何本地推理组件、没有模型权重、没有�
 - ✅ 只用于低频的深层刷新与心理解释缓存填充（第 7、8 节）
 - ✅ 保持 `semantic.settle_on_ingest = true`：入口处走纯规则结算，零延迟
 - ✅ 深层刷新是低频任务，`deep_refresh_min_interval_seconds = 3600`、`deep_refresh_idle_hours = 12` 这类旋钮的存在就是为了让这类工作**本来就该慢**
-- ✅ 不配 provider（`disabled`）是完全受支持的标准形态，不是降级告警
+- ✅ 不配端点（或显式 `disabled`）是完全受支持的形态，不是降级告警
 
 当初评估过的本地推理方案及其实测开销（生成速度、常驻内存、量化后仍无法上 1 GB VPS）已整体移入 `archive/README.md`，作为"为什么不做"的留档，本工程不再使用这些数据。
 
@@ -1361,10 +1378,10 @@ python -m companion_runtime.cli --base-dir ./data backup --keep 7
 python -m companion_runtime.cli --base-dir ./data verify
 ```
 
-v0.2 补充的自检（全部应在**零模型**状态下给出正常结果）：
+v0.2 补充的自检（**未配语义端点**时也应给出正常结果）：
 
 ```powershell
-# 1) 确认默认配置就是 disabled，且 Runtime 照常工作
+# 1) 确认没配端点时 provider 不可用（available=false），且 Runtime 照常工作
 python -m companion_runtime.cli --base-dir ./data config | Select-String "semantic" -Context 0,12
 
 # 2) 发一句模糊的话，确认它被诚实记为 unresolved 而不是被猜
@@ -1382,5 +1399,5 @@ python -m companion_runtime.cli --base-dir ./data refresh
 #   → {"ran": false, "reason": "provider_unavailable", "provider": "disabled", ...}
 
 curl -s http://127.0.0.1:8787/health
-#   → semantics.unresolved 增加 1；semantic_provider.provider = "disabled"
+#   → semantics.unresolved 增加 1；semantic_provider.provider = "remote_api"、available = false
 ```

@@ -561,7 +561,7 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
 
     This is the manual form of the pass the endogenous round runs on its own. It
     needs no provider and no key, which is the point: the shipped default
-    deployment (``semantic.provider = "disabled"``) must still form long-term
+    deployment with no usable semantic provider must still form long-term
     memories. A pass that finds nothing due is a normal result, so this exits 0 and
     reports the counts.
     """

@@ -505,19 +505,26 @@ def test_silence_becomes_more_painful_as_pressure_rises() -> None:
 
 
 def test_late_night_makes_silence_cheaper_by_the_configured_penalty() -> None:
-    """Inside 00:00-06:00 local, silence gains ``scheduler.night_penalty``.
+    """Inside the night window, silence gains ``langchao.night_send_penalty``.
 
     Night is a penalty rather than a silence window on purpose: the character may still
     speak if something is genuinely strong, she just has to clear a much higher bar.
     Measured on the first beta, 6 of 14 proactive messages went out between 00:17 and
-    06:30 local. Datetimes are built in the machine's own timezone so the test holds on
-    a UTC box too.
+    06:30 local.
+
+    One knob for both engines: this pre-浪潮 path used to carry its own
+    ``scheduler.night_penalty`` (0.30 over 00:00-06:00) while the live engine used
+    ``langchao.night_send_penalty`` (0.85 over 00:00-05:00). They were merged, so the
+    window asserted here is the live one and the value is the same one the 浪潮 kernel
+    discounts sending candidates with. Datetimes are built in the machine's own timezone
+    so the test holds on a UTC box too.
     """
     config = RuntimeConfig()
     state = RuntimeState()
     state.approach_impulse = 0.6
     state.restraint = 0.5
     local_tz = datetime.now().astimezone().tzinfo
+    penalty = config.langchao.night_send_penalty
 
     def utility_at(hour: int) -> float:
         moment = datetime(2026, 3, 1, hour, 30, tzinfo=local_tz)
@@ -531,8 +538,13 @@ def test_late_night_makes_silence_cheaper_by_the_configured_penalty() -> None:
         )
 
     daytime = utility_at(15)
-    assert utility_at(3) == pytest.approx(daytime + config.scheduler.night_penalty)
-    assert utility_at(0) == pytest.approx(daytime + config.scheduler.night_penalty)
+    assert utility_at(0) == pytest.approx(daytime + penalty)
+    assert utility_at(3) == pytest.approx(daytime + penalty)
+    # ``end_hour`` is exclusive, so 04:59 is the last penalised minute and 05:00 is not:
+    # "00:00-05:00" means four penalised hours, not five. The old window ran to 06:00, and
+    # that hour is exactly what merging changed, so both edges are pinned.
+    assert utility_at(4) == pytest.approx(daytime + penalty)
+    assert utility_at(5) == pytest.approx(daytime)
     assert utility_at(6) == pytest.approx(daytime)
     assert utility_at(23) == pytest.approx(daytime)
     # Without a reference time the term cannot apply, so callers that do not care about
@@ -542,7 +554,7 @@ def test_late_night_makes_silence_cheaper_by_the_configured_penalty() -> None:
         hours_since_contact=6.0,
     ) == pytest.approx(daytime)
     # The knob is honoured, including switching it off.
-    config.scheduler.night_penalty = 0.0
+    config.langchao.night_send_penalty = 0.0
     assert utility_at(3) == pytest.approx(daytime)
 
 

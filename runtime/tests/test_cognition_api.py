@@ -84,7 +84,11 @@ class TestRefreshEndpoint:
     def test_health_exposes_the_provider_and_the_backlog(self, client: TestClient) -> None:
         _post_ambiguous(client)
         health = client.get("/health").json()
-        assert health["semantic_provider"]["provider"] == "disabled"
+        # The default *selection* since 2026-10-07 is the remote provider. With no base URL,
+        # model or key it is unavailable, which is exactly what makes this deployment behave
+        # like the no-model one -- and the name is pinned because this line is where an
+        # operator finds out why nothing is being settled semantically.
+        assert health["semantic_provider"]["provider"] == "remote_api"
         assert health["semantic_provider"]["available"] is False
         assert health["semantics"]["unresolved"] == 1
 

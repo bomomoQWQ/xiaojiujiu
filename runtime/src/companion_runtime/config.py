@@ -396,17 +396,17 @@ class SchedulerConfig:
 
     min_interval_seconds: float = 60.0
     max_interval_seconds: float = 5400.0
+    #: Hard stop: while the local clock is inside ``quiet_hours_start``..``quiet_hours_end``
+    #: the scheduler will not wake a proactive round at all. Off by default (both ``None``).
+    #: This is a *silence* switch, which is why it is not the night knob you usually want:
+    #: "quieter at night, but a strong enough reason may still speak" is
+    #: ``langchao.night_send_penalty``, and that is now the *only* night setting. Until
+    #: 2026-10-07 this group carried a second penalty and window of its own (0.30 over
+    #: 00:00-06:00) read by the pre-浪潮 engine, while the 浪潮 engine read its own
+    #: (0.85 over 00:00-05:00): two knobs for one idea, so tuning one silently left the
+    #: other in place. They are merged into the window the live engine already used.
     quiet_hours_start: int | None = None
     quiet_hours_end: int | None = None
-    #: Silence-utility bonus while the *local* clock sits inside
-    #: ``night_start_hour``..``night_end_hour``. Night is deliberately not silent - a
-    #: real reason can still outbid it - but the bar is much higher: measured on the
-    #: first beta, 6 of 14 proactive messages went out between 00:17 and 06:30 local,
-    #: including a 04:01 "晚上好". With the shipped 0.30 against a typical daytime
-    #: candidate margin of ~0.39, only a genuinely strong drive still clears it.
-    night_penalty: float = 0.30
-    night_start_hour: int = 0
-    night_end_hour: int = 6
     busy_poll_seconds: float = 30.0
     foreground_pause_seconds: float = 60.0
 
@@ -422,13 +422,21 @@ class TaskConfig:
 class SemanticConfig:
     """Two-time-scale policy: acting layer vs persistent cognition (patch v0.2).
 
-    The default configuration assumes **no generative model at all**: explicit
-    events are settled by the coarse rule table, ambiguous ones are recorded as
-    ``unresolved``, and the psychological context falls back to a deterministic
-    template. A semantic provider is an optional accelerator, never a dependency.
+    The runtime never *depends* on a generative model: explicit events are settled by the
+    coarse rule table, ambiguous ones are recorded as ``unresolved``, and the psychological
+    context falls back to a deterministic template.
+
+    The remote provider is the default **selection** (changed 2026-10-07): a deployment that
+    has an API key should not have to discover a second switch before its understanding
+    improves. It is only *available* once base URL, model and key are all present, and until
+    then ``available()`` is ``false``, every call fails open, and the behaviour is exactly the
+    no-model one described above -- so this default changes what you get *when you configure a
+    key*, not what a bare deployment does. ``provider = "disabled"`` remains the explicit
+    way to say "never call out", and it is what the tests that pin the offline behaviour set.
 
     Attributes:
-        provider: Which provider to build. ``disabled`` is the standard setting.
+        provider: Which provider to build. ``remote_api`` by default, ``disabled`` to refuse
+            any outbound call.
         settle_on_ingest: Run the coarse rule settlement on the ingest path.
         deep_refresh_enabled: Whether the low-frequency deep refresh may run.
         unresolved_backlog_threshold: Unresolved events needed to trigger a refresh.
@@ -445,7 +453,10 @@ class SemanticConfig:
             stays valid before it is considered stale.
     """
 
-    provider: str = "disabled"
+    #: ``remote_api`` (the default) or ``disabled``. The default is a *selection*, not a
+    #: promise: with no base URL / model / key the provider reports ``available: false`` and
+    #: fails open, which is the same behaviour the ``disabled`` setting gives.
+    provider: str = "remote_api"
     settle_on_ingest: bool = True
     deep_refresh_enabled: bool = True
     unresolved_backlog_threshold: int = 8

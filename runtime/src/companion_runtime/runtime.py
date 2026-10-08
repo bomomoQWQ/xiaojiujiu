@@ -1677,7 +1677,7 @@ class Runtime:
         transaction and gated on
         :func:`~companion_runtime.memory.needs_consolidation`. It is the only writer
         of the ``memories`` table, so without this step the shipped default
-        deployment (``semantic.provider = "disabled"``) would never form a single
+        deployment with no usable semantic provider would never form a single
         long-term memory; running it last also means the memories it forms can
         inform the *next* round without changing the decision this one just made.
         Like the refresh, a failing pass is logged and reported, never raised.
@@ -2103,7 +2103,7 @@ class Runtime:
 
         This is the unattended writer of the ``memories`` table: it needs no model
         and no operator, which is what makes long-term memory exist in the shipped
-        default deployment (``semantic.provider = "disabled"``). The pass promotes
+        default deployment (no usable semantic provider). The pass promotes
         pending candidates with the summary the rule-based proposal already built,
         merges restatements, records conflicts and archives what has faded.
 
@@ -2142,7 +2142,7 @@ class Runtime:
         ``pending`` forever and the character keeps no long-term memory.
 
         The pass is rule-based and needs no model, so it is safe on a deployment with
-        ``semantic.provider = "disabled"``.  It runs after a decision has been
+        no usable semantic provider.  It runs after a decision has been
         committed, so it can inform the *next* round but can never change this one.
 
         Args:
@@ -2452,7 +2452,7 @@ class Runtime:
 
         Patch v0.2 section 21 lists several reasons to spend on a refresh. Six of
         them are observable from state the Runtime already holds, so requiring the
-        caller to supply them would mean that in the default deployment - no
+        caller to supply them would mean that in an unconfigured deployment - no
         operator, no model - the refresh would simply never fire. The remaining
         two (``history_suspect``, ``user_evidence_overturns``) are judgements the
         Runtime cannot make, and they default to ``False`` rather than being

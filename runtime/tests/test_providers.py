@@ -4,8 +4,9 @@ The whole suite is offline: every provider gets an injected transport, so the
 degradation contracts are proven without a network and without any endpoint at
 all. The suite covers the four things the integration depends on:
 
-* ``disabled`` is the default, and every unknown name or failed construction
-  falls back to it without raising;
+* a missing or unknown selection falls back to ``disabled`` without raising, while the
+  shipped configuration *selects* the remote provider and simply reports it as unavailable
+  until base URL, model and key are all present (changed 2026-10-07);
 * both ``deep_refresh`` and ``explain_state`` fail open on timeout and on
   malformed JSON;
 * ``health()`` and ``repr()`` never leak an API key;
@@ -21,6 +22,7 @@ from typing import Any, Mapping
 
 import pytest
 
+from companion_runtime.config import RuntimeConfig
 from companion_runtime.providers import (
     API_KEY_ENV_VAR,
     DEEP_REFRESH_FIELDS,
@@ -224,7 +226,24 @@ class TestDeepRefreshRequest:
 class TestBuildProvider:
     """Selection must be total: no environment can break the Runtime."""
 
-    def test_default_is_disabled(self) -> None:
+    def test_a_shipped_config_selects_the_remote_provider_and_reports_it_unavailable(self) -> None:
+        """The default *selection* is the remote provider; without a key it is inert.
+
+        Pinned because this one field decides whether a deployment that adds an API key gets
+        stronger understanding without also having to find a switch. Until 2026-10-07 the
+        default was ``disabled``, which is now the explicit opt-out instead.
+        """
+        config = RuntimeConfig()
+        assert config.semantic.provider == "remote_api"
+        provider = build_provider(config, env={})
+        assert provider.name == "remote_api"
+        # No base URL, no model, no key: nothing may leave the host, and a caller that asks
+        # gets ``available: false`` rather than a failed request.
+        assert provider.available() is False
+        assert provider.health()["available"] is False
+
+    def test_nothing_to_read_falls_back_to_disabled(self) -> None:
+        """With no configuration object and no environment there is nothing to select."""
         provider = build_provider(env={})
         assert isinstance(provider, DisabledProvider)
         assert provider.name == "disabled"

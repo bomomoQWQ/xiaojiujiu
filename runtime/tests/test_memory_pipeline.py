@@ -148,7 +148,7 @@ def client(runtime: Runtime) -> Iterator[Any]:
 def test_a_default_deployment_forms_memories_without_any_provider(runtime: Runtime) -> None:
     """An unattended round must promote a candidate with the shipped defaults.
 
-    The shipped default is ``semantic.provider = "disabled"``: if memory formation
+    The shipped default has no usable semantic provider (no base URL, model or key): if memory formation
     depended on a model, ``/memories`` would stay empty forever in every standard
     deployment.
     """

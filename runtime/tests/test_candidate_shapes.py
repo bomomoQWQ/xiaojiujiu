@@ -6,7 +6,7 @@ Two audited gaps are under test here.
 candidate types, but the rule generator only ever produced three of them: ``share``,
 ``repair`` and ``reply`` had no producer at all, and the ``emotion:`` / ``situation:``
 source prefixes had no writer. Patch v0.2 §12's "re-evaluate -> repair candidate" path
-was therefore unreachable with ``semantic.provider = "disabled"``. These tests build the
+was therefore unreachable in the model-free default. These tests build the
 state each new shape needs through the public projections and typing constructors - the
 real ingest path, the memory pipeline, real boundaries and real emotions - and then
 assert that the shape appears, that it names the state it came from, and that it does
