@@ -58,7 +58,7 @@ runtime/
 ├── pyproject.toml                 打包与 pytest 配置（src 布局）
 ├── README.md                      本文件
 ├── docs/
-│   └── 浪潮决策引擎_上线记录与回滚手册_20261002.md   上线记录、监控、一键回滚
+│   └── （空：上线记录与回滚手册含真实 QQ 号，**不入仓库**，仅本机保留同名文件）
 ├── src/companion_runtime/
 │   ├── __init__.py                版本号与 API 版本
 │   ├── typing.py                  全部枚举与跨模块记录（RawEvent / CandidateIntent / ...）

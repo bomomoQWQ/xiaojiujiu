@@ -84,3 +84,9 @@ astrbot_plugin_companion_runtime/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 「浪潮」上线记录与回滚手册：**不入仓库**。
+# 里面是真实用户的 QQ 号（上线记录按 scope 记的），而这份仓库是公开的。
+# 文件仍留在本机（回滚时要用），但不能再被 git 收进来——包括 git add -A。
+# 2026-10-07 之前它是被跟踪的，只是那批提交还没推送出去。
+runtime/docs/浪潮决策引擎_上线记录与回滚手册_20261002.md
