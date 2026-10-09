@@ -748,11 +748,14 @@ health() -> dict[str, Any]
 只是它要 base_url + model + key 三者齐全才 `available()`——不齐就是"选了但不工作"，
 `/health` 会直接这么报。
 
-```powershell
-# 什么都不配：provider 选了但没有可用端点，行为与零模型相同
-# （想明确拒绝一切外呼就显式设 disabled）
+**这三样是部署者填的输入，不是本工程该提供的默认值**：Runtime 不预置任何端点、不预置任何厂商、
+不预置模型名。所以"默认 `remote_api`"的含义只是"**开关默认是开的**"——你填上端点与密钥它就开始工作，
+而不是"我们已经替你接了一个模型"。想明确拒绝一切外呼就显式设 `disabled`。
 
-# 远端强语义（key 只放环境变量，绝不写进 config 文件）
+```powershell
+# 什么都不配：provider 选了但没有可用端点，行为与不接模型完全相同
+
+# 远端强语义：端点与模型名由你选，key 只放环境变量，绝不写进 config 文件
 $env:CR_SEMANTIC_PROVIDER = "remote_api"
 $env:CR_SEMANTIC_BASE_URL = "https://api.example.com/v1"
 $env:CR_SEMANTIC_MODEL    = "some-strong-model"

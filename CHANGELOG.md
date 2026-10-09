@@ -76,10 +76,11 @@
 
 ### 两个默认值改了（2026-10-07）
 
-**① 语义端口默认从 `disabled` 改成 `remote_api`。** 已经拿到 key 的部署不该再去发现第二个开关。
-`available()` 仍然要求 base_url + model + key **三者齐全**，所以没配端点的部署行为与以前**完全相同**
+**① 语义端口默认从 `disabled` 改成 `remote_api`。** 已经拿到端点的部署不该再去发现第二个开关。
+`available()` 仍然要求 base_url + model + key **三者齐全**（而且这三样是**部署者填的输入**：
+本工程不预置端点、不预置厂商、不预置模型名），所以没配端点的部署行为与以前**完全相同**
 （只是 `/health` 会明确报 `provider: remote_api, available: false`，而不是报 `disabled`），
-差别只在"配上 key 就生效"。`disabled` 保留为显式的"绝不外呼"。
+差别只在"把这三样填上就生效"。`disabled` 保留为显式的"绝不外呼"。
 
 **② 夜间静默从两个旋钮合并成一个。** 之前 `scheduler.night_penalty`（0.30，00:00–06:00，旧动机路径读）
 和 `langchao.night_send_penalty`（0.85，00:00–05:00，线上那套读）各管一段——**调一个不会动另一个**。
