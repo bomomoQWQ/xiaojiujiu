@@ -9,7 +9,7 @@
 
 > **它不是一个开箱即用的产品**：PostgreSQL、基础 compose 与库口令仍要你自己准备。但
 > 「别人部署不了」已经不再成立——运维工具、逐条自检、版本化发布与部署手册都在
-> （§6.6 逐条列了做了哪些、还差哪些；差的都是**向导**这类便利，不是能力）。
+> （§6.10 逐条列了做了哪些、还差哪些；差的都是**向导**这类便利，不是能力）。
 > 部署能照着 [`docs/部署与运维.md`](docs/部署与运维.md) 跑通，只是别期待点一下就好。
 
 名字取自"心里的小九九"：它确实整天在打小九九——候选意图、效用打分、危险率、边界成本
@@ -139,67 +139,146 @@ Reward 写"成了算多少"，Candidate 写"做什么、什么时候自己失效
 
 ---
 
-## 6. 快速开始
+## 6. 部署
 
-> 下面 6.2 是**单 Runtime** 的最小演示。生产形态是**一台容器里每人一个 Runtime**（fleet），
-> 开通、体检、开关、升级、回滚的完整流程见 [`docs/部署与运维.md`](docs/部署与运维.md)——
-> 那才是"照着做能跑起来"的那份。
+先按规模选一条路，两条路都只要一个**必填**值（PostgreSQL 的 DSN）：
+
+| 规模 | 用什么 | 容器 |
+|---|---|---|
+| **一个人自己用** | 仓库根目录的 `docker-compose.yml`（Runtime + AstrBot + 插件挂载） | 2 |
+| **几个到十几个人** | fleet：一台容器里**每人一个 Runtime 进程**（监督进程 + `fleet_admin.py` 开通/体检） | 3–4（fleet + PostgreSQL + AstrBot，可选 NapCat） |
+
+单人的每一步在下面 §6.2–§6.6；多人的在 §6.8。**照着做能跑起来的那份完整流程**
+（开通、体检、升级、回滚、陷阱清单）是 [`docs/部署与运维.md`](docs/部署与运维.md)。
 
 ### 6.1 需要什么
 
-Linux + Docker、**PostgreSQL 18**（不再支持 SQLite 作为运行时存储）、
-AstrBot 4.28.x（上游零修改）、一个 OneBot v11 前端（作者用 NapCat）。
+Linux + Docker（含 `docker compose`）、**PostgreSQL 18**（运行时存储**只支持 PostgreSQL**：
+不配 DSN 会在启动时直接报错，而不是退回 SQLite）、AstrBot 4.28.x（上游零修改）、
+一个 OneBot v11 前端（作者用 NapCat）。可选：一个 OpenAI 兼容的远端语义端点（§6.5，不配也能完整运行）。
 
-### 6.2 起 Runtime
+### 6.2 一个人：两个容器
 
 ```bash
 git clone https://github.com/bomomoQWQ/xiaojiujiu.git && cd xiaojiujiu
-docker build -t xiaojiujiu-runtime:v2-test .
+# 插件是独立仓库，compose 从 ./astrbot_plugin_companion_runtime 挂载，必须先 clone 到这个路径
+# （不 clone 的话 Docker 会建一个空目录，AstrBot 起来后"没装插件"，而且不报错）
+git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git
 
-docker run -d --name runtime-one --network <你的网络> \
-  -e CR_STORAGE__DSN='postgresql://user:pass@<pg 主机>:5432/<库>' \
-  -e CR_STORAGE__SCHEMA='cr_default_friendmessage_10001' \
-  -e CR_CONVERSATION_ID='default:FriendMessage:10001' \
-  -e CR_RUNTIME_ID='companion-default-friendmessage-10001' \
-  xiaojiujiu-runtime:v2-test companion-runtime --base-dir /data serve --host 0.0.0.0 --port 8787
-curl http://127.0.0.1:8787/health
+export CR_STORAGE__DSN='postgresql://user:pass@<pg 主机>:5432/<库>'   # 唯一必填
+docker compose up -d --build
+
+curl -s http://127.0.0.1:8787/health | head -c 200   # Runtime
+# AstrBot WebUI：http://127.0.0.1:6185
 ```
 
-### 6.3 装插件
+compose 只把端口发布到 `127.0.0.1`（`8787` Runtime、`6185` WebUI）——**Runtime 没有面向公网的
+鉴权设计，不要暴露出去**；要远程访问就在 WebUI 前面放反代。
+
+### 6.3 让插件找到 Runtime（一次，别跳过）
+
+WebUI 里把插件的 `runtime_base_url` 设成 **`http://runtime:8787`**（compose 里的服务名），
+然后重载插件。插件默认值 `http://127.0.0.1:8787` 只在"插件与 Runtime 同机"时才对，
+在容器里指的是 AstrBot 自己——**症状是状态行显示 `cognition: unavailable`，而她永远不说话**。
+
+### 6.4 让她真的会开口：三道门（默认全关）
+
+新部署默认是**静默**的（这是刻意的 fail-closed）。要她开口，三道门都得过：
+
+```yaml
+# 加在 docker-compose.yml 的 runtime 服务下（或写进 env_file / .env）
+CR_LANGCHAO__LIVE_ENABLED: "true"
+CR_LANGCHAO__LIVE_SCOPE_ALLOWLIST: '["default:FriendMessage:10001"]'  # 必须 JSON 数组
+CR_LANGCHAO__SHADOW_ENABLED: "true"     # 可选：影子推演，零副作用
+CR_LANGCHAO__SOCIAL_ENABLED: "true"     # 可选：社会关系投影
+```
+
+1. **live 引擎开着**（`CR_LANGCHAO__LIVE_ENABLED`，默认 false）；
+2. **你的会话在白名单里**（`..._SCOPE_ALLOWLIST`，默认空）；
+3. **数据库里的权威指针是 live**——它不是配置开关，是持久化的 CAS 指针；用
+   `dispatch_authority.py show` 看、`freeze`/`restore` 改。
+
+缺任何一条都是同一个症状：**"部署成功，她永远沉默"**。所以出问题先跑体检（§6.7），不要猜代码。
+列表型配置必须是 JSON 数组：写成裸字符串会 fail-closed 拒绝启动（那些门禁是精确匹配，
+字符串会退化成子串匹配）。
+
+### 6.5 语义理解（可选；开关默认是开的）
+
+`semantic.provider` 默认 `remote_api`：**"默认开"指的是开关，不是"自带模型"**。
+端点、模型名、密钥是**你**填的输入，本仓库不预置厂商、不预置端点、不预置模型名。
+三样齐全才 `available()`：
 
 ```bash
-git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git \
-  AstrBot/data/plugins/astrbot_plugin_companion_runtime
+CR_SEMANTIC_BASE_URL='https://<你的端点>/v1'
+CR_SEMANTIC_MODEL='<模型名>'
+CR_SEMANTIC_API_KEY='<key：只从环境变量读，绝不写进任何仓库文件>'
 ```
 
-插件尚未提交到 AstrBot 插件市场（搜不到），升级靠 `git pull`。
-装好后在 WebUI 里确认 `runtime_base_url` 指向 Runtime，重启 AstrBot。
+不填 = 行为与"不接模型"完全相同：显式事件由规则表结算，模糊事件记为 `unresolved`，
+心理解释退化为确定性模板，**长期连续性照常成立**（`/health` 会直接报
+`provider: remote_api, available: false`，那不是故障）。想明确拒绝一切外呼就设
+`CR_SEMANTIC_PROVIDER=disabled`。
 
-**多会话部署**：Runtime 的 `conversation_id` 要设成会话的 `unified_msg_origin`
-（如 `default:FriendMessage:10001`），否则主动消息不知道该投给谁。
-
-### 6.4 开关
+### 6.6 夜里安静（一个旋钮，不是两个）
 
 ```bash
-CR_LANGCHAO__SHADOW_ENABLED=true      # 影子推演（零副作用）
-CR_LANGCHAO__SOCIAL_ENABLED=true      # 社会关系投影
-CR_LANGCHAO__LIVE_ENABLED=true        # 允许「浪潮」发送（还需权威指针同意）
-CR_LANGCHAO__LIVE_SCOPE_ALLOWLIST='["default:FriendMessage:10001"]'   # 必须 JSON 数组
-CR_LANGCHAO__ATTENTION_RECIPE=off     # 注意力配方：off / B2 / B3
+CR_LANGCHAO__NIGHT_SEND_PENALTY='0.85'          # 默认
+CR_LANGCHAO__NIGHT_SEND_PENALTY_START_HOUR='0'  # 默认
+CR_LANGCHAO__NIGHT_SEND_PENALTY_END_HOUR='5'    # 默认
 ```
 
-列表型配置**必须是 JSON 数组**：写成裸字符串会 fail-closed 拒绝启动，
-因为那些门禁是精确匹配，字符串会退化成子串匹配。
+窗口是**半开区间** `[start, end)`，所以 `0`–`5` 是**四**个受罚的小时。
+它是**加价**不是硬停（系数被限制在 `< 1`：普通冲动过不去，理由足够强还是能开口）；
+真的想**完全不发**用 `CR_SCHEDULER__QUIET_HOURS_START/END`（默认关，调度器根本不唤醒）。
+"想安静"和"想完全不发"是两件事，所以它们是两个旋钮。
 
-### 6.5 端口与密钥
+### 6.7 装完自检
+
+```bash
+# 单人：Runtime 活着吗、语义端口什么状态、有没有积压
+curl -s http://127.0.0.1:8787/health | python3 -m json.tool | head -30
+
+# fleet：谁在服务、能不能发
+RT() { docker exec xxj-runtime-fleet python "/fleet/$1" "${@:2}"; }
+RT fleet_admin.py list
+RT fleet_admin.py check default:FriendMessage:10001   # 逐条说明"她为什么不主动"
+```
+
+**查正在跑的是哪个版本**：`GET /health` → `runtime_version`（同一个响应里的 `state_version`
+是状态计数器，不是版本号）。仓库侧的版本号在四处保持一致，
+`python3 scripts/check_versions.py` 不一致就退出码 1。
+
+### 6.8 多个人：fleet
+
+一台容器里**每人一个 Runtime 进程**（一个 Runtime 只承载一个角色、一份状态，所以隔离是按进程，
+不是按会话）。生成 compose 与人员名单：
+
+```bash
+python3 scripts/build_runtime_fleet.py --people 10001,10002 --project <项目名>
+# 它同时会把舰队拉起来（--no-start 可只渲染）；端口在 compose 网络内，不发布到宿主机
+```
+
+开通与下线走体检工具（它会**断言** schema 真的迁移到本构建期望的版本）：
+
+```bash
+RT fleet_admin.py add default:FriendMessage:10003   # 建 schema、跑迁移、注册、等健康
+RT fleet_admin.py check default:FriendMessage:10003
+RT fleet_admin.py remove <slug>                     # 默认不删数据；--purge-schema/--purge-data 才删
+```
+
+运行时**每人一个 schema**（`cr_<会话标识>`），规则只有一份定义（`scripts/fleet_naming.py`），
+监督进程与运维工具都从那里取——这条规则漂移的表现就是"行写进了没人读的 schema"。
+
+### 6.9 端口与密钥
 
 端口默认只发布到 `127.0.0.1`。**不要把 Runtime 暴露到公网**：它没有面向公网的鉴权设计，
-远程访问请在 AstrBot WebUI 前放反代。API key 只从环境变量读，不写进仓库文件。
+远程访问请在 AstrBot WebUI 前放反代。语义 key 只从环境变量读（`CR_SEMANTIC_API_KEY`），
+不落盘、不进日志、不进 `/health`（只报 `configured` / `not configured`）。
 
-### 6.6 自部署：现在的状态
+### 6.10 自部署：现在的状态
 
-**定位仍然是"作者自己能长期跑得住"优先**，不是"开箱即用"。但"别人部署不了"这件事正在被逐条消掉，
-据实记录如下。
+**定位仍然是"作者自己能长期跑得住"优先**，不是"开箱即用"。但"别人部署不了"这件事已经被逐条消掉，
+据实记录如下——上面 §6.2–§6.8 就是这些能力的用法。
 
 **已经能做到了：**
 
@@ -282,7 +361,7 @@ CR_TEST_PG_DSN='postgresql://...' python -m pytest -q \
 
 | 边界                               | 影响                                                                                                                                                                                                                                 |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **不是开箱即用**         | 自部署要自己准备 PostgreSQL、基础 compose 与库口令（见 §6.6 的「做了 / 还没做」逐条清单）。运维工具、逐条自检、版本化发布与部署手册都已经有了 |
+| **不是开箱即用**         | 自部署要自己准备 PostgreSQL、基础 compose 与库口令（见 §6.10 的「做了 / 还没做」逐条清单）。运维工具、逐条自检、版本化发布与部署手册都已经有了 |
 | **最终措辞不作为预测特征**   | 进模型的是发送前冻结的「渲染计划」结构（要不要回复、压力等级、长度档、模板/风格版本）；**实际文本只做审计溯源**。所以学的是"计划类型 + 上下文 → 用户反应"，不是"具体句子 → 用户反应"。这是刻意避免 post-treatment 泄漏的代价 |
 | **注意力配方默认 off**       | 全 1 权重、无竞争。B2/B3 已实现且有隔离正控，但未授权给任何作用域                                                                                                                                                                    |
 | 主动消息非常稀疏                   | `hazard ≈ 2.4e-05`，低打扰是设计目标                                                                                                                                                                                              |
