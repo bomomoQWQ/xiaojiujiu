@@ -27,6 +27,12 @@ schema = "companion_runtime"
 raw_log_path = "/data/raw_events.jsonl"
 mirror_raw_events = true
 
+[prompts]
+# 普通聊天每轮注入的补充口吻；边界、记忆、时间与“一轮有效”由代码保留。
+conversation_context = ""
+# 主动消息渲染的补充口吻；代码仍强制时间校正、防复读与只输出正文。
+proactive_render = ""
+
 [semantic]
 # 开关默认打开；base_url/model 由部署者选择。三者与 .env 里的 key 齐全才会外呼。
 provider = "remote_api" # remote_api | disabled
@@ -43,7 +49,7 @@ template_fallback = true
 interpretation_max_age_seconds = 21600.0
 
 [semantic.prompts]
-# custom_prompt 只补充人物口吻/偏好，Runtime 仍会追加内置 JSON 契约、字段约束和安全要求。
+# 这里只补充人物口吻/偏好，Runtime 仍会保留内置 JSON 契约、字段约束和安全要求。
 # 不要把完整系统提示词复制到这里；那样升级后会错过协议修复。
 deep_refresh = """
 保持第一人称、短句、口语；不要替对方找台阶。没有额外人物设定时可留空。

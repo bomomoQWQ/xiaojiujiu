@@ -773,6 +773,16 @@ def test_v1_render_prompt_carries_the_style_contract(client: TestClient, runtime
     assert payload["intent"] == "询问面试结果"
 
 
+def test_v1_render_prompt_appends_operator_voice_before_output_boundary(
+    client: TestClient, runtime: Runtime
+) -> None:
+    runtime.config.prompts.proactive_render = "CUSTOM PROACTIVE VOICE"
+    commit_attempt(runtime)
+    prompt = lease(client)["items"][0]["payload"]["prompt"]
+    assert "部署者补充口吻：\nCUSTOM PROACTIVE VOICE" in prompt
+    assert prompt.index("CUSTOM PROACTIVE VOICE") < prompt.index("只回正文本身")
+
+
 def test_v1_render_prompt_states_the_clock_with_the_task(
     client: TestClient, runtime: Runtime
 ) -> None:

@@ -725,7 +725,7 @@ def _fact_line(fact: str) -> str:
     return f"我确定的事：{text}"
 
 
-def render_block(bundle: ContextBundle) -> str:
+def render_block(bundle: ContextBundle, prompt_addition: str = "") -> str:
     """Render the bundle as the temporary prompt block for the main LLM.
 
     Only the sections the main LLM needs are emitted; internal numbers are hidden
@@ -733,6 +733,8 @@ def render_block(bundle: ContextBundle) -> str:
 
     Args:
         bundle: Context bundle to render.
+        prompt_addition: Optional operator voice guidance appended before the immutable
+            ephemeral-context boundary.
 
     Returns:
         A markdown-ish text block, or an empty string when there is nothing to say.
@@ -842,6 +844,9 @@ def render_block(bundle: ContextBundle) -> str:
     # the clock arrived pre-de-authorised. Measured on the beta: a 17:53 render still
     # greeted the user with 早呀. ``time_context["local_display"]`` is still built, still
     # local rather than UTC, and is what the render states.
+    addition = str(prompt_addition or "").strip()
+    if addition:
+        lines.extend(["", "【部署者补充口吻】", addition])
     lines.append("")
     lines.append(
         "上面这些是我进这句话之前的样子，是我自己脑子里的事，别照着念，也别写进长期记忆 ——"

@@ -464,7 +464,9 @@ def _context_text(
         bundle = context_module.build(runtime=runtime, now=now)
         if conversation_id is not None:
             _scope_matters(runtime, bundle, conversation_id=conversation_id)
-        text = context_module.render_block(bundle).strip()
+        text = context_module.render_block(
+            bundle, runtime.config.prompts.conversation_context
+        ).strip()
         block = text or _fallback_block(bundle).strip()
         clock = str(bundle.time_context.get("local_display") or "")
         return block, clock
@@ -879,6 +881,10 @@ def _render_payload(
         lines.append(RENDER_ALREADY_SAID_HEADER)
         lines.extend("  · " + line for line in already_said)
     lines.extend(RENDER_STYLE_LINES)
+    custom_style = str(settings.prompts.proactive_render or "").strip()
+    if custom_style:
+        lines.extend(["- 部署者补充口吻：", custom_style])
+    # Immutable output boundary stays last, after every operator addition.
     lines.append("- 只回正文本身：别解释、别复述上面的背景、别提这些说明。")
     action = _mapping(payload.get("action"))
     completion_metadata = {
@@ -1743,7 +1749,9 @@ def create_v1_router(runtime: Any, config: RuntimeConfig | None = None) -> APIRo
         try:
             runtime.lazy_tick(now)
             bundle = context_module.build(runtime=runtime, now=now)
-            text = context_module.render_block(bundle).strip()
+            text = context_module.render_block(
+                bundle, runtime.config.prompts.conversation_context
+            ).strip()
             if not text:
                 text = _fallback_block(bundle).strip()
             body: dict[str, Any] = {

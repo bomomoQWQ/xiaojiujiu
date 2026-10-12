@@ -420,6 +420,14 @@ def test_render_block_contains_the_documented_sections(runtime: Runtime) -> None
     assert "我自己脑子里的事" in block
 
 
+def test_render_block_appends_operator_voice_before_the_ephemeral_boundary(runtime: Runtime) -> None:
+    runtime.process_user_message(content="明天下午面试，结束告诉你结果。", timestamp=BASE_TIME)
+    bundle = context_module.build(runtime=runtime, now=BASE_TIME)
+    block = context_module.render_block(bundle, "CUSTOM NORMAL VOICE")
+    assert "【部署者补充口吻】\nCUSTOM NORMAL VOICE" in block
+    assert block.index("CUSTOM NORMAL VOICE") < block.index("别照着念，也别写进长期记忆")
+
+
 def test_render_block_never_contains_raw_numbers_for_emotion(runtime: Runtime) -> None:
     """Psychological context is language, not floats."""
     runtime.process_user_message(content="家里出事了，我很难受", timestamp=BASE_TIME)

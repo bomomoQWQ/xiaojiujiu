@@ -419,6 +419,18 @@ class TaskConfig:
 
 
 @dataclass(slots=True)
+class PromptConfig:
+    """Operator voice additions for host-facing prompts.
+
+    These are appended. Boundary, time, anti-fabrication and output-only constraints remain
+    code-owned and cannot be replaced by deployment configuration.
+    """
+
+    conversation_context: str = ""
+    proactive_render: str = ""
+
+
+@dataclass(slots=True)
 class SemanticPromptConfig:
     """Optional operator additions to the two semantic system prompts.
 
@@ -684,6 +696,7 @@ class RuntimeConfig:
     #: the persistent layer is the Runtime. Nothing here is allowed to make a
     #: generative model mandatory.
     semantic: SemanticConfig = field(default_factory=SemanticConfig)
+    prompts: PromptConfig = field(default_factory=PromptConfig)
     task: TaskConfig = field(default_factory=TaskConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     langchao: LangchaoConfig = field(default_factory=LangchaoConfig)

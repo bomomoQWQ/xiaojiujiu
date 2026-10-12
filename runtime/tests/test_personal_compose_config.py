@@ -21,6 +21,9 @@ def test_the_shipped_template_contains_no_secret_and_exposes_common_knobs() -> N
     assert "CR_SEMANTIC_API_KEY=" not in text
     assert "postgresql://runtime:" not in text
     for marker in (
+        "[prompts]",
+        "conversation_context =",
+        "proactive_render =",
         "[semantic]",
         'base_url = ""',
         'model = ""',

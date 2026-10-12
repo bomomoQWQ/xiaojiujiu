@@ -245,6 +245,16 @@ def test_personal_toml_loads_endpoint_prompts_and_env_wins(tmp_path) -> None:
     assert config.semantic.prompts.explain_state == "private note"
     assert "must-never-enter-config" not in config.dumps()
 
+    host_path = tmp_path / "host-prompts.toml"
+    host_path.write_text(
+        '[prompts]\nconversation_context = "normal-turn voice"\n'
+        'proactive_render = "proactive voice"\n',
+        encoding="utf-8",
+    )
+    host = load_config(host_path, env={})
+    assert host.prompts.conversation_context == "normal-turn voice"
+    assert host.prompts.proactive_render == "proactive voice"
+
 
 def test_legacy_flat_semantic_env_aliases_resolve_into_canonical_config() -> None:
     config = load_config(env={

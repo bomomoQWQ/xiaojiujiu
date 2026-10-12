@@ -323,7 +323,7 @@ def create_app(
         """Render the temporary prompt block the host injects for one turn."""
         runtime.lazy_tick()
         bundle = context_module.build(runtime=runtime, now=utcnow())
-        text = context_module.render_block(bundle)
+        text = context_module.render_block(bundle, settings.prompts.conversation_context)
         return {
             "block": text,
             "ephemeral": True,
