@@ -1,12 +1,14 @@
 """Fleet children may share one non-secret TOML without losing per-person isolation."""
 
 import importlib.util
-import os
+import sys
 from pathlib import Path
 
 
 def _load():
     scripts = Path(__file__).parents[2] / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
     spec = importlib.util.spec_from_file_location("runtime_fleet_config_test", scripts / "runtime_fleet.py")
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
