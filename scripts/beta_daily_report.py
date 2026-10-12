@@ -9,8 +9,8 @@ than the same problem found on day eight. Two inputs, both cheap:
 
 Usage::
 
-    python scripts/beta_daily_report.py --export /srv/companion/beta-data --date 2026-09-18 \\
-        --fleet http://127.0.0.1:8800 --out /srv/companion/beta-data/reports
+    python scripts/beta_daily_report.py --export <export-root> --date 2026-09-18 \\
+        --fleet http://127.0.0.1:8800 --out <export-root>/reports
 """
 
 from __future__ import annotations

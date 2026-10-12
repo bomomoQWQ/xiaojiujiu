@@ -39,8 +39,8 @@ STILL_A_PREFERENCE = "记住，我平时只喝手冲咖啡，不加糖。"
 #: Two corrections while writing this: the first version also said "我不太喜欢被盯着"
 #: (which *is* a preference about the user, so calling it one was right), and the second
 #: still said "不要一直追问" - and `一直` is a *habit* marker ("我总是失眠"), so a directive
-#: that contains one still reads as a habit. That limitation is real and is recorded in
-#: HANDOFF.md rather than papered over here.
+#: that contains one still reads as a habit. That limitation remains explicit here rather
+#: than being papered over by weakening the assertion.
 INSTRUCTION = "有件事想说清楚，别再追问我的工作了。"
 
 

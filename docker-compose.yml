@@ -1,18 +1,17 @@
-# 小九九 (xiaojiujiu) - two containers, one companion.
+# 小九九 / 浪潮：本仓库只运行 Runtime sidecar。
 #
-#   runtime  the persistent cognition sidecar (this repository's core)
-#   astrbot  the chat host, with the thin plugin mounted from this checkout
+# AstrBot 与插件由 AstrBot 自己安装、升级、配置；本仓库不 clone、不挂载、不修改 AstrBot。
+# 在 AstrBot 插件管理里安装 astrbot_plugin_companion_runtime，再把 runtime_base_url 指向：
+#   - AstrBot 与 Runtime 在同一 Docker 网络： http://runtime:8787
+#   - AstrBot 运行在宿主机：              http://127.0.0.1:8787
 #
-# Both ports are published to 127.0.0.1 on purpose: the sidecar has no
-# public-facing authentication, so it must never be reachable from the internet
-# directly. Put a reverse proxy in front of the AstrBot WebUI if you need remote
-# access, and keep 8787 private.
-#
-# Secrets: the optional remote semantic provider reads its key from
-# CR_SEMANTIC_API_KEY only. Pass it through your shell environment or an
-# untracked .env file - never commit it here.
+# 快速开始：
+#   cp config/runtime.example.toml config/runtime.toml
+#   cp .env.example .env
+#   # 编辑两个文件，然后：
+#   docker compose up -d --build
 
-name: xiaojiujiu
+name: xiaojiujiu-runtime
 
 services:
   runtime:
@@ -21,28 +20,20 @@ services:
       dockerfile: Dockerfile
     image: xiaojiujiu-runtime:local
     restart: unless-stopped
+    # ENTRYPOINT 已是 companion-runtime --base-dir /data；这里加载唯一的非秘密配置文件。
+    command: ["--config", "/config/runtime.toml", "serve"]
     environment:
-      # Runtime v2 is PostgreSQL-only; absence of this value is a fail-fast startup
-      # error, never permission to create a local SQLite database.
-      CR_STORAGE__DSN: ${CR_STORAGE__DSN:?set CR_STORAGE__DSN to a PostgreSQL DSN}
-      CR_STORAGE__SCHEMA: ${CR_STORAGE__SCHEMA:-companion_runtime}
-      # The conversation this sidecar belongs to. In a multi-session deployment
-      # set it to the AstrBot session origin, e.g. aiocqhttp:FriendMessage:10001,
-      # otherwise proactive messages can only be routed in a single-session setup.
-      CR_CONVERSATION_ID: ${CR_CONVERSATION_ID:-default}
-      # The endpoint and the model are yours to choose: this repository ships no vendor
-      # default and no endpoint. `remote_api` is the default *switch* (2026-10-07) so
-      # filling in these three is all it takes; leave them empty and nothing leaves the host.
-      CR_SEMANTIC_PROVIDER: ${CR_SEMANTIC_PROVIDER:-remote_api}
-      CR_SEMANTIC_BASE_URL: ${CR_SEMANTIC_BASE_URL:-}
-      CR_SEMANTIC_MODEL: ${CR_SEMANTIC_MODEL:-}
+      # 秘密只能从 .env / 宿主环境进入；RuntimeConfig 与 /health 都拿不到明文 key。
+      CR_STORAGE__DSN: ${CR_STORAGE__DSN:?copy .env.example to .env and set CR_STORAGE__DSN}
       CR_SEMANTIC_API_KEY: ${CR_SEMANTIC_API_KEY:-}
+      # schema / conversation_id /行为 / 提示词统一在 config/runtime.toml 里改。
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
-      # Optional append-only raw-event mirror and migration/replay artefacts. The
-      # authoritative state lives in PostgreSQL.
+      - ./config/runtime.toml:/config/runtime.toml:ro
+      # 可选 JSONL 审计镜像与迁移/回放产物；权威状态在 PostgreSQL。
       - runtime-data:/data
     ports:
+      # Runtime 没有面向公网的鉴权设计，只发布到本机。
       - "127.0.0.1:8787:8787"
     healthcheck:
       test:
@@ -55,23 +46,5 @@ services:
       retries: 3
       start_period: 15s
 
-  astrbot:
-    image: soulter/astrbot:latest
-    restart: unless-stopped
-    depends_on:
-      runtime:
-        condition: service_healthy
-    environment:
-      TZ: ${TZ:-Asia/Shanghai}
-    volumes:
-      # AstrBot's own configuration, plugins and data.
-      - astrbot-data:/AstrBot/data
-      # The thin plugin: the only host-side change this project makes. Mounted
-      # read-write because AstrBot writes plugin caches and config beside it.
-      - ./astrbot_plugin_companion_runtime:/AstrBot/data/plugins/astrbot_plugin_companion_runtime
-    ports:
-      - "127.0.0.1:6185:6185"
-
 volumes:
   runtime-data:
-  astrbot-data:

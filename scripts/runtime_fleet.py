@@ -48,6 +48,18 @@ from pathlib import Path
 import fleet_naming
 
 LOG_FORMAT = "%Y-%m-%dT%H:%M:%S"
+# Optional common non-secret config mounted into the fleet container. Per-person env values
+# below still win for identity, schema, paths and port.
+RUNTIME_CONFIG = os.environ.get("CR_FLEET_RUNTIME_CONFIG", "").strip()
+
+
+def runtime_command(base_dir: Path, port: int) -> list[str]:
+    """Build one child command, adding the common config before the subcommand."""
+    command = ["companion-runtime", "--base-dir", str(base_dir)]
+    if RUNTIME_CONFIG:
+        command.extend(["--config", RUNTIME_CONFIG])
+    command.extend(["serve", "--host", "0.0.0.0", "--port", str(port)])
+    return command
 
 
 def stamp() -> str:
@@ -132,16 +144,7 @@ class RuntimeProcess:
         handle = self.log_path.open("ab", buffering=0)
         handle.write(f"--- {stamp()} starting on port {self.port} ---\n".encode())
         self.process = subprocess.Popen(
-            [
-                "companion-runtime",
-                "--base-dir",
-                str(self.base_dir),
-                "serve",
-                "--host",
-                "0.0.0.0",
-                "--port",
-                str(self.port),
-            ],
+            runtime_command(self.base_dir, self.port),
             stdout=handle,
             stderr=subprocess.STDOUT,
             env=self.env,
@@ -173,16 +176,7 @@ class RuntimeProcess:
         handle = self.log_path.open("ab", buffering=0)
         handle.write(f"--- {stamp()} restarting on port {self.port} ---\n".encode())
         self.process = subprocess.Popen(
-            [
-                "companion-runtime",
-                "--base-dir",
-                str(self.base_dir),
-                "serve",
-                "--host",
-                "0.0.0.0",
-                "--port",
-                str(self.port),
-            ],
+            runtime_command(self.base_dir, self.port),
             stdout=handle,
             stderr=subprocess.STDOUT,
             env=self.env,

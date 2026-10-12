@@ -49,6 +49,22 @@
 配套的运维闸门：`rolling_restart.py` 现在**必须**显式确认才滚动（`a710ce4`），
 此前敲一下 `--help` 就会触发整轮发布。
 
+### 个人部署配置与公开树脱敏（2026-10-08）
+
+- 新增 `config/runtime.example.toml`：会话、行为、语义端点/模型、夜间与提示词集中在一个
+  **非秘密配置文件**；本地副本 `config/runtime.toml` 被 Git 忽略。`.env.example` 只承载
+  PostgreSQL DSN 与语义 API key。
+- `SemanticConfig` 正式拥有 `base_url` / `model` / 请求参数与 `prompts`；环境变量仍覆盖 TOML。
+  旧 flat `CR_SEMANTIC_*` 名字兼容归一到 `CR_SEMANTIC__*`，修掉了此前
+  `CR_SEMANTIC_PROVIDER=disabled` 会被 dataclass 默认值盖掉的优先级 bug。
+- `semantic.prompts.deep_refresh` / `explain_state` 是**追加的人物口吻要求**：内置 JSON 契约、
+  来源约束与防编造规则不能被配置覆盖，避免一次个性化把协议配死。
+- 根 compose 现在**只启动 Runtime**。AstrBot/插件从仓库生命周期中彻底解耦：插件去 AstrBot
+  插件管理安装、升级、配置，本仓库不 clone、不 bind-mount，也不修改 AstrBot 上游。
+- 真正脱敏：含昵称、私聊、健康信息与时间线的封测流水账退出公开树；含真人 roster、私网地址、
+  作者路径或用户专用数据的历史脚本一并移除，通用回放/报告工具改成合成路径后保留。
+  `test_public_tree_is_sanitized.py` 把这些可关联标记做成自动门禁。
+
 ### 自部署：从「只有作者那台机器能部署」到「别人也能」
 
 - `scripts/fleet_naming.py`：slug / schema 名的**单一定义**（此前 `runtime_fleet.py`

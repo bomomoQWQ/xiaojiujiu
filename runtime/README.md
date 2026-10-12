@@ -38,7 +38,7 @@
 两条结论直接改变了部署形态：
 
 1. **当前这一轮的即时理解与情感表现，本来就应该由主 LLM 完成。** 主 LLM 在当前轮已经能看到宿主设定、上下文、用户原话和 Runtime 状态，不需要 Runtime 先同步调用一个生成式模型把"这句话是失落 0.46"算出来再喂给它。那条路径既昂贵，又重复了主 LLM 已有的能力。
-2. **本地模型路线已被整体放弃。** 它不只是"不再是标准依赖"，而是连可选实现一起删除了：`providers.py` 只保留两种实现 —— `disabled`（默认，标准配置）与 `remote_api`（可选的低频强语义，见第 7 节）。弱 VPS 上不再需要常驻权重、不再需要本地推理进程、不再需要推理队列。放弃原因与实测数据见 `archive/README.md`。
+2. **本地模型路线已被整体放弃。** 它不只是"不再是标准依赖"，而是连可选实现一起删除了：`providers.py` 只保留两种选择 —— `remote_api`（默认开关；端点/model/key 由部署者提供）与 `disabled`（显式拒绝外呼）。弱 VPS 上不再需要常驻权重、不再需要本地推理进程、不再需要推理队列。放弃原因与实测数据见 `archive/README.md`。
 
 > **Runtime 不依赖任何生成式模型也能完整运行。** 没有可用的语义端口时（默认选 `remote_api`，但缺 base_url/model/key 就用不上）：显式事件由规则表做粗粒度结算，模糊事件记为 `unresolved`，心理解释退化为确定性代码模板，记忆检索是词法重合，用户模型是在线贝叶斯。以上全部无需任何模型，且都有自动测试守着（`tests/test_acting_layer_independence.py` 会在 ingest 路径上直接拦断 `socket.connect`，证明这一轮不会拨出任何网络连接）。
 
@@ -168,7 +168,7 @@ PostgreSQL production"），运维请用数据库自己的工具（见 §10）�
 > 再纠正的规矩。导入按 `boundary_id` 幂等，并保留 `starts_at`/`expires_at`/`revoked_at` 这条
 > 时间线 —— 用户收回过的限制不会因为搬了一次家就复活。整份文件先校验再写：类型不认识、字段缺失
 > 一律**整份拒绝**（退出码 4），不跳过坏行，因为一条没装上的边界就是一条会被走穿的约束。
-> 清库时用 `scripts/boundaries_carryover.sh export|import|check`（详见 HANDOFF.md 的 runbook）。
+> 清库时直接用上表的 `boundaries export/import`；私密封测 runbook 已退出公开仓库。
 
 > `memories import` 是同一件事的另一半，但**刻意不是导出/恢复**：整库恢复等于把当初清库的理由
 > 一起搬回来（两个半月里攒下的错分类行）。搬的是**人读过后挑出来的几条**：用户自己说过、值得她
@@ -255,6 +255,12 @@ retry_backoff_seconds = 0   # 0 = nack 后立即可再领取（推荐；节流�
 
 [semantic]                    # 【v0.2】两个时间尺度的策略（全部有默认值）
 provider = "remote_api"       # remote_api（默认）| disabled（拒绝一切外呼）
+base_url = ""                 # 部署者选择；非秘密，适合放 TOML
+model = ""                    # 部署者选择；key 仍只走 CR_SEMANTIC_API_KEY
+timeout_s = 30.0
+max_tokens = 1024
+json_mode = true
+
 settle_on_ingest = true       # 入口处跑粗粒度规则结算（纯规则，无模型）
 deep_refresh_enabled = true   # 允许低频深层认知刷新
 unresolved_backlog_threshold = 8
@@ -264,6 +270,10 @@ deep_refresh_idle_hours = 12.0
 max_operations_per_refresh = 12
 template_fallback = true
 interpretation_max_age_seconds = 21600.0
+
+[semantic.prompts]            # 只追加口吻要求，不覆盖内置 JSON/grounding 契约
+deep_refresh = ""
+explain_state = ""
 ```
 
 环境变量（双下划线表示层级）：
@@ -284,7 +294,10 @@ $env:CR_SEMANTIC__SETTLE_ON_INGEST = "true"
 
 | 字段 | 默认值 | 含义 | 生产消费者 |
 |---|---|---|---|
-| `provider` | `"disabled"` | 要构建的 provider，只有两个合法值：`disabled`（标准设置）与 `remote_api`。已退役的本地名字会被显式警告并回落到 `disabled`（见 7.3） | `Runtime.__init__` → `build_provider()` |
+| `provider` | `"remote_api"` | 默认选择远端语义；未配端点/model/key 时 `available=false`，`disabled` 是显式拒绝外呼 | `Runtime.__init__` → `build_provider()` |
+| `base_url` / `model` | `""` | 部署者选择的非秘密端点坐标；适合放独立 TOML | `build_provider()` |
+| `timeout_s` / `max_tokens` / `json_mode` | `30 / 1024 / true` | 远端请求预算与 JSON Output 开关 | `RemoteAPIProvider` |
+| `prompts.deep_refresh` / `prompts.explain_state` | `""` | 追加的人物口吻要求；内置结构/grounding/安全契约不可覆盖 | 两个语义调用的 system prompt |
 | `settle_on_ingest` | `true` | 入口路径上是否跑粗粒度规则结算 | `Runtime.process_user_message` |
 | `deep_refresh_enabled` | `true` | 是否允许低频深层刷新 | `Runtime.deep_refresh`（总开关，关掉就立刻返回 `disabled`） |
 | `unresolved_backlog_threshold` | `8` | 积压多少条 unresolved 才够触发一次刷新 | `deep_refresh.evaluate_triggers`（触发规则 `unresolved_backlog`） |
@@ -295,7 +308,7 @@ $env:CR_SEMANTIC__SETTLE_ON_INGEST = "true"
 | `template_fallback` | `true` | 没有缓存解释时退回确定性模板。**不建议关掉** | **预留**：模板兜底当前无条件生效（不可关） |
 | `interpretation_max_age_seconds` | `21600.0` | 一份心理解释多久后算 stale | **预留**：解释缓存的陈旧判定实际由 `task.explain_cache_ttl_seconds`（1800）承担 |
 
-> 只有 `unresolved_max_age_hours`、`template_fallback`、`interpretation_max_age_seconds` 三项还处于"已进配置层、语义明确、但尚无生产代码读取"的状态；其余七项都在运行时真实生效。
+> 只有 `unresolved_max_age_hours`、`template_fallback` 两项还处于"已进配置层、语义明确、但尚无生产代码读取"的状态；`interpretation_max_age_seconds` 已用于 provider 缓存 TTL，其余字段也都有真实消费者。
 
 全部可用参数见 `config.py` 的 dataclass 定义（每个字段都有说明）。
 
@@ -965,7 +978,7 @@ Reducer 侧还有三条安全规则：
 - ✅ **已实现且已接线**：`SemanticProvider` 端口、`DeepRefreshRequest` / `DeepRefreshSuggestions` 契约、`parse_deep_refresh()` 校验、`DEEP_REFRESH_SYSTEM_PROMPT`、两种 provider 的 `deep_refresh()` 实现（含超时降级与统计）、触发判定（`evaluate_triggers`）、请求组装（`build_request`）、grounding（`ground_suggestions`）、编排（`Runtime.deep_refresh`）、落地端（`Reducer._apply_deep_refresh`）、HTTP 与 CLI 入口，以及 `tests/test_deep_refresh.py` 与 `tests/test_cognition_api.py`。
 - ✅ **内源轮已由 `serve` 自动驱动，深层刷新的节奏仍由轮次决定**：`companion-runtime serve` 会在启动时拉起 `scheduler.Scheduler`，由它按运行时锚点（未尽之事到期、边界到期、前台暂停、上一轮危险率）自动调用 `Runtime.endogenous_round()`，每轮内部再按触发判定调用 `Runtime.deep_refresh()` —— 因此标准部署不需要宿主定时器就会"自己醒来思考"。刷新本身的节流仍由 `evaluate_triggers` 的最小间隔与触发条件决定。宿主或运维仍可显式调用 `POST /cognition/refresh` 或 `companion-runtime refresh` 来强制一次刷新。`endogenous`/`tick` 子命令只跑一次，不启动该循环。
 - ⚠️ **`semantic.resolve_backlog()` 仍无生产调用方**：刷新路径直接用 `SemanticProjection.list_unresolved()`；`resolve_backlog()` 目前只有 `test_semantic.py` 覆盖，`unresolved_max_age_hours` 也只作为它的参数默认值存在 —— 也就是说"超过 72 小时的 unresolved 不再支撑刷新"这条策略**当前没有被刷新路径执行**。
-- ✅ **两个能力都已接线**：`deep_refresh()`（第 8 节）与 `explain_state()`（第 7.7 节）都有真实生产调用方。默认 `disabled` 时两者都安全地不做事。
+- ✅ **两个能力都已接线**：`deep_refresh()`（第 8 节）与 `explain_state()`（第 7.7 节）都有真实生产调用方。provider 不可用（未配端点/key 或显式 `disabled`）时两者都安全地不做事。
 - ⚠️ **`template_fallback` / `interpretation_max_age_seconds` 无消费者**（见第 3.1 节）。
 
 ---
@@ -1273,7 +1286,7 @@ python -m pytest -q --cov=companion_runtime
 三级结构（补丁 §22）在代码里的对应：
 
 ```text
-Level 2  低频深层语义      providers.SemanticProvider + deep_refresh 编排（可选；默认 disabled，未配 provider 时整条链安全跳过）
+Level 2  低频深层语义      providers.SemanticProvider + deep_refresh 编排（可选；默认选 remote_api，未配端点/key 时整条链安全跳过）
 Level 1  廉价认知          规则 / 统计 / 词法检索 / 缓存 / 高置信事件提取
                           → semantic.py、emotion.py、memory.py、user_model.py
 Level 0  确定性 Runtime    时间 / 状态机 / 情绪余波 / I-R-P / 边界 / 未尽之事 / 协议 / 动机决策

@@ -419,6 +419,20 @@ class TaskConfig:
 
 
 @dataclass(slots=True)
+class SemanticPromptConfig:
+    """Optional operator additions to the two semantic system prompts.
+
+    The built-in prompts carry the JSON contract, grounding rules and fail-open safety
+    requirements. These additions are appended instead of replacing that contract, so a
+    personal deployment can tune voice and emphasis without silently making every reply
+    unparsable after an upgrade.
+    """
+
+    deep_refresh: str = ""
+    explain_state: str = ""
+
+
+@dataclass(slots=True)
 class SemanticConfig:
     """Two-time-scale policy: acting layer vs persistent cognition (patch v0.2).
 
@@ -457,6 +471,15 @@ class SemanticConfig:
     #: promise: with no base URL / model / key the provider reports ``available: false`` and
     #: fails open, which is the same behaviour the ``disabled`` setting gives.
     provider: str = "remote_api"
+    #: Non-secret endpoint coordinates belong in the standalone deployment config. The API
+    #: key deliberately does not: providers only read ``CR_SEMANTIC_API_KEY`` from the env.
+    base_url: str = ""
+    model: str = ""
+    timeout_s: float = 30.0
+    max_tokens: int = 1024
+    json_mode: bool = True
+    #: Optional operator additions; the built-in structured-output contract always remains.
+    prompts: SemanticPromptConfig = field(default_factory=SemanticPromptConfig)
     settle_on_ingest: bool = True
     deep_refresh_enabled: bool = True
     unresolved_backlog_threshold: int = 8
@@ -788,7 +811,26 @@ def load_config(
         ValueError: If the file extension is unsupported.
     """
     config = RuntimeConfig()
-    environment = os.environ if env is None else env
+    environment = dict(os.environ if env is None else env)
+
+    # Compatibility aliases from the early provider-only configuration path. Canonical
+    # nested names win when both are present, and the API key is deliberately absent: it
+    # stays provider-owned and never enters RuntimeConfig or a config dump.
+    semantic_aliases = {
+        "CR_SEMANTIC_PROVIDER": "CR_SEMANTIC__PROVIDER",
+        "CR_SEMANTIC_BASE_URL": "CR_SEMANTIC__BASE_URL",
+        "CR_SEMANTIC_MODEL": "CR_SEMANTIC__MODEL",
+        "CR_SEMANTIC_TIMEOUT_S": "CR_SEMANTIC__TIMEOUT_S",
+        "CR_SEMANTIC_MAX_TOKENS": "CR_SEMANTIC__MAX_TOKENS",
+        "CR_SEMANTIC_JSON_MODE": "CR_SEMANTIC__JSON_MODE",
+    }
+    for legacy, canonical in semantic_aliases.items():
+        if canonical not in environment and legacy in environment:
+            environment[canonical] = environment[legacy]
+        environment.pop(legacy, None)
+    # This one value stays provider-owned. Removing it from the generic CR_ pass is what
+    # prevents a credential from ever entering RuntimeConfig or an inspection dump.
+    environment.pop("CR_SEMANTIC_API_KEY", None)
 
     if path is not None:
         file_path = Path(path)

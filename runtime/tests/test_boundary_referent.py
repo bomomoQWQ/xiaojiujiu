@@ -76,5 +76,5 @@ def test_the_matter_link_still_binds_the_subject(runtime: Runtime) -> None:
 #: subject came back `None`. I did not establish whether that is because the matter's
 #: title is the whole sentence rather than a topic noun, or because the overlap threshold
 #: is not reached; rather than keep an assertion I had not verified, the case is removed
-#: and the question is recorded in HANDOFF.md. Steps 1 and 2 are therefore covered by one
+#: and the question remains an explicit test gap. Steps 1 and 2 are therefore covered by one
 #: positive control (the matter link) plus the reported defect (the politeness formula).

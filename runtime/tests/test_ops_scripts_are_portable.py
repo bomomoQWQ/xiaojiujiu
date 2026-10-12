@@ -1,14 +1,12 @@
 """The tools a deployment actually runs must not point at the author's machine.
 
-Every one of these scripts started life on one laptop, with that laptop's paths baked in:
-``/srv/companion/astrbot_test`` for the stack, ``F:\\...`` for the checkout, ``E:\\`` for the
-backup drive. A second deployment that copies such a script does not fail loudly -- it either
+Every one of these scripts started life on one laptop, with private home, checkout and backup
+paths baked in. A second deployment that copies such a script does not fail loudly -- it either
 backs nothing up, or writes its compose file into a directory nothing will ever read, and both
 look like success from the outside.
 
 So the rule is checked rather than remembered. The list below is the "current tools" table in
-``scripts/README.md``; everything else under ``scripts/`` is the historical record of how one
-incident was diagnosed on one machine, documented as such, and deliberately left alone.
+``scripts/README.md``. User-specific historical incident scripts are no longer shipped.
 
 The Windows pattern is deliberately narrow. A first attempt matched any drive letter
 (``[A-Za-z]:\\\\``) and immediately failed on its own material, because inside a Python string
@@ -40,7 +38,7 @@ CURRENT_TOOLS = (
 
 #: Paths that can only mean "this ran on the author's machine".
 AUTHOR_PATTERNS = (
-    re.compile(r"/srv/companion\b"),
+    re.compile(r"/home/(?!runtime\b|deploy\b|user\b)[a-z][a-z0-9_-]*\b"),
     re.compile(r"\b[CDEFG]:\\{1,2}[A-Za-z0-9_.]"),
     re.compile(r"/Users/[a-z]"),
 )

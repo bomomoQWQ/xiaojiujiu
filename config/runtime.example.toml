@@ -1,0 +1,85 @@
+# 小九九 / 浪潮 Runtime —— 个人部署配置模板
+#
+# 用法：
+#   1. 复制为 config/runtime.toml；
+#   2. 修改下面标了「改这里」的项目；
+#   3. 在 .env 里填写 CR_STORAGE__DSN 与 CR_SEMANTIC_API_KEY；
+#   4. docker compose up -d --build。
+#
+# 这个文件只放可以提交/备份的非秘密配置。数据库口令、API key、token 不要写在这里。
+# 环境变量优先级更高，仍可临时覆盖任意字段，例如：
+#   CR_LANGCHAO__LIVE_ENABLED=false docker compose up -d
+
+# ---------- 身份与会话 ----------
+# 改这里：单会话部署可保留 default；多人/fleet 必须使用 AstrBot 的 unified_msg_origin。
+runtime_id = "companion"
+conversation_id = "default"
+
+[server]
+host = "0.0.0.0"
+port = 8787
+log_level = "INFO"
+
+[storage]
+# DSN 是秘密，不写在本文件；由 .env 的 CR_STORAGE__DSN 提供。
+# 改这里（可选）：多人部署每人一个 schema。
+schema = "companion_runtime"
+raw_log_path = "/data/raw_events.jsonl"
+mirror_raw_events = true
+
+[semantic]
+# 开关默认打开；base_url/model 由部署者选择。三者与 .env 里的 key 齐全才会外呼。
+provider = "remote_api" # remote_api | disabled
+base_url = ""            # 改这里，例如 https://api.example.com/v1
+model = ""               # 改这里，例如 your-model-name
+settle_on_ingest = true
+deep_refresh_enabled = true
+unresolved_backlog_threshold = 8
+unresolved_max_age_hours = 72.0
+deep_refresh_min_interval_seconds = 3600.0
+deep_refresh_idle_hours = 12.0
+max_operations_per_refresh = 12
+template_fallback = true
+interpretation_max_age_seconds = 21600.0
+
+[semantic.prompts]
+# custom_prompt 只补充人物口吻/偏好，Runtime 仍会追加内置 JSON 契约、字段约束和安全要求。
+# 不要把完整系统提示词复制到这里；那样升级后会错过协议修复。
+deep_refresh = """
+保持第一人称、短句、口语；不要替对方找台阶。没有额外人物设定时可留空。
+"""
+explain_state = """
+像给自己看的便条，不要写成分析报告。没有额外要求时可留空。
+"""
+
+[langchao]
+# 默认 fail-closed：先 shadow 观察；确认后再打开 live，并把自己的会话加入精确白名单。
+shadow_enabled = true
+live_enabled = false
+social_enabled = true
+internal_exploration_enabled = true
+external_exploration_enabled = false
+live_scope_allowlist = []                # 例：["default:FriendMessage:1000000001"]
+attention_recipe = "off"                 # off | B2 | B3
+attention_b3_scope_allowlist = []
+
+# 常用行为旋钮；不了解含义就保留默认。
+decision_threshold = 0.70
+cold_start_drive = 2.0
+night_send_penalty = 0.85
+night_send_penalty_start_hour = 0
+night_send_penalty_end_hour = 5
+
+[scheduler]
+min_interval_seconds = 60.0
+max_interval_seconds = 5400.0
+# null 不是 TOML 值；不写这两个键就是「不硬停」。要硬停时取消下面注释。
+# quiet_hours_start = 0
+# quiet_hours_end = 7
+busy_poll_seconds = 30.0
+foreground_pause_seconds = 60.0
+
+[observability]
+enabled = true
+# 完整 prompt 文本可能含用户内容；默认不落库，调试时才打开。
+record_context_text = false

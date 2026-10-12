@@ -225,6 +225,42 @@ def test_load_config_environment_override() -> None:
     assert config.drive.cooldown_seconds == 42.0
 
 
+def test_personal_toml_loads_endpoint_prompts_and_env_wins(tmp_path) -> None:
+    """The one personal file carries every non-secret setting, including prompt overlays."""
+    path = tmp_path / "runtime.toml"
+    path.write_text(
+        '[semantic]\nbase_url = "https://file.example/v1"\nmodel = "file-model"\n'
+        'json_mode = false\n[semantic.prompts]\ndeep_refresh = "short voice"\n'
+        'explain_state = "private note"\n',
+        encoding="utf-8",
+    )
+    config = load_config(path, env={
+        "CR_SEMANTIC__MODEL": "env-model",
+        "CR_SEMANTIC_API_KEY": "must-never-enter-config",
+    })
+    assert config.semantic.base_url == "https://file.example/v1"
+    assert config.semantic.model == "env-model"
+    assert config.semantic.json_mode is False
+    assert config.semantic.prompts.deep_refresh == "short voice"
+    assert config.semantic.prompts.explain_state == "private note"
+    assert "must-never-enter-config" not in config.dumps()
+
+
+def test_legacy_flat_semantic_env_aliases_resolve_into_canonical_config() -> None:
+    config = load_config(env={
+        "CR_SEMANTIC_PROVIDER": "disabled",
+        "CR_SEMANTIC_BASE_URL": "https://legacy.example/v1",
+        "CR_SEMANTIC_MODEL": "legacy-model",
+        "CR_SEMANTIC_JSON_MODE": "false",
+        # Canonical wins if both spellings are supplied.
+        "CR_SEMANTIC__MODEL": "canonical-model",
+    })
+    assert config.semantic.provider == "disabled"
+    assert config.semantic.base_url == "https://legacy.example/v1"
+    assert config.semantic.model == "canonical-model"
+    assert config.semantic.json_mode is False
+
+
 def test_load_config_parses_list_overrides_as_json_and_fails_closed() -> None:
     """List-valued settings need an explicit JSON array, never a bare string.
 

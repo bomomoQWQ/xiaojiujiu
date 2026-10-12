@@ -116,26 +116,24 @@ Reward 写"成了算多少"，Candidate 写"做什么、什么时候自己失效
 
 ```text
 .
+├── config/runtime.example.toml # ★ 可复制的个人部署配置（行为 / 语义 / 提示词）
 ├── runtime/                    # ★ 持久认知 sidecar（独立进程，Python 3.11+）
 │   ├── src/companion_runtime/  #   认知机制 + 「浪潮」+ 社会关系 + v1 兼容层
 │   ├── tests/                  #   离线测试（见 §7）
-│   ├── docs/                   #   上线记录与回滚手册
 │   └── README.md               #   ★ 逐机制说明 + 配置 / API / 恢复 / 降级
 ├── framework/                  # 外接测试框架：可控时钟 + OpenAI 兼容 mock
-├── scripts/                    # 验证、仿真、fleet 脚本
-├── AstrBot/                    # 上游 AstrBot，零修改（不进镜像、不进 Git）
+├── scripts/                    # 当前运维工具 + 已脱敏的仿真/回归脚本
 ├── archive/                    # 已放弃的本地模型路线（留档）
-├── CHANGELOG.md / HANDOFF.md   # 改动记录 / 换机器接手手册
-└── LICENSE (AGPL-3.0-or-later) / RECOVERY.md
+└── CHANGELOG.md / LICENSE
 ```
 
 - **存储是 PostgreSQL-only**：每人一个 schema（`cr_<会话标识>`），迁移只追加，已应用的校验和不再改写。
-- **本仓库由两个仓库组成**：这里是主程序；`astrbot_plugin_companion_runtime` 是宿主侧薄插件，
-  **独立仓库、独立许可证**（要单独发插件市场），本地只是克隆副本。
+- **插件是独立产品**：`astrbot_plugin_companion_runtime` 有自己的仓库、许可证与发布物，
+  在 AstrBot 插件管理里安装；本仓库不要求、也不管理它的本地副本。
 - **设计与审查材料不在这个仓库里**：原始架构设计、架构补丁、设计→代码对照、提示词与角色卡、
   上线前大审查的清单与报告都已移除，只留运维手册。所以能复核的是代码、测试和这两份 README
-  （`CHANGELOG`/`HANDOFF` 的历史条目仍会引用那些文件名，点了会 404——那是当时的事实，没有回改）。
-- **`AstrBot/` 任何情况下都不修改**，所有集成走公开 API；升级只需替换该目录。
+  （`CHANGELOG` 的历史条目仍会引用那些文件名，点了会 404——那是当时的事实，没有回改）。
+- **AstrBot 上游任何情况下都不修改**，所有集成走公开 API；插件安装/升级也在 AstrBot 侧完成。
 
 ---
 
@@ -143,10 +141,10 @@ Reward 写"成了算多少"，Candidate 写"做什么、什么时候自己失效
 
 先按规模选一条路，两条路都只要一个**必填**值（PostgreSQL 的 DSN）：
 
-| 规模 | 用什么 | 容器 |
+| 规模 | 本仓库负责什么 | 其他部分 |
 |---|---|---|
-| **一个人自己用** | 仓库根目录的 `docker-compose.yml`（Runtime + AstrBot + 插件挂载） | 2 |
-| **几个到十几个人** | fleet：一台容器里**每人一个 Runtime 进程**（监督进程 + `fleet_admin.py` 开通/体检） | 3–4（fleet + PostgreSQL + AstrBot，可选 NapCat） |
+| **一个人自己用** | `docker-compose.yml` 只运行一个 Runtime | PostgreSQL 自备；AstrBot 与插件在 AstrBot 侧安装/配置 |
+| **几个到十几个人** | fleet：一台容器里**每人一个 Runtime 进程**（监督进程 + `fleet_admin.py` 开通/体检） | PostgreSQL / AstrBot / OneBot 前端仍各自管理 |
 
 单人的每一步在下面 §6.2–§6.6；多人的在 §6.8。**照着做能跑起来的那份完整流程**
 （开通、体检、升级、回滚、陷阱清单）是 [`docs/部署与运维.md`](docs/部署与运维.md)。
@@ -157,62 +155,73 @@ Linux + Docker（含 `docker compose`）、**PostgreSQL 18**（运行时存储**
 不配 DSN 会在启动时直接报错，而不是退回 SQLite）、AstrBot 4.28.x（上游零修改）、
 一个 OneBot v11 前端（作者用 NapCat）。可选：一个 OpenAI 兼容的远端语义端点（§6.5，不配也能完整运行）。
 
-### 6.2 一个人：两个容器
+### 6.2 一个人：复制两个配置文件，启动一个 Runtime
 
 ```bash
 git clone https://github.com/bomomoQWQ/xiaojiujiu.git && cd xiaojiujiu
-# 插件是独立仓库，compose 从 ./astrbot_plugin_companion_runtime 挂载，必须先 clone 到这个路径
-# （不 clone 的话 Docker 会建一个空目录，AstrBot 起来后"没装插件"，而且不报错）
-git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git
+cp config/runtime.example.toml config/runtime.toml
+cp .env.example .env
 
-export CR_STORAGE__DSN='postgresql://user:pass@<pg 主机>:5432/<库>'   # 唯一必填
+# 编辑 config/runtime.toml：会话、行为、语义端点/模型、夜间时间、提示词都在一个文件里
+# 编辑 .env：只放 CR_STORAGE__DSN 与 CR_SEMANTIC_API_KEY（秘密不进 TOML）
 docker compose up -d --build
-
-curl -s http://127.0.0.1:8787/health | head -c 200   # Runtime
-# AstrBot WebUI：http://127.0.0.1:6185
+curl -s http://127.0.0.1:8787/health | python3 -m json.tool | head -30
 ```
 
-compose 只把端口发布到 `127.0.0.1`（`8787` Runtime、`6185` WebUI）——**Runtime 没有面向公网的
-鉴权设计，不要暴露出去**；要远程访问就在 WebUI 前面放反代。
+compose **只运行 Runtime**，并只把 `8787` 发布到 `127.0.0.1`。Runtime 没有面向公网的鉴权设计，
+不要直接暴露出去。
 
-### 6.3 让插件找到 Runtime（一次，别跳过）
+### 6.3 插件在 AstrBot 侧安装（本仓库不管插件生命周期）
 
-WebUI 里把插件的 `runtime_base_url` 设成 **`http://runtime:8787`**（compose 里的服务名），
-然后重载插件。插件默认值 `http://127.0.0.1:8787` 只在"插件与 Runtime 同机"时才对，
-在容器里指的是 AstrBot 自己——**症状是状态行显示 `cognition: unavailable`，而她永远不说话**。
+去 **AstrBot WebUI → 插件管理**安装 `astrbot_plugin_companion_runtime`（市场里没有时，用插件仓库的
+release zip / URL 安装），然后在 AstrBot 的插件配置里填写 `runtime_base_url`：
+
+- AstrBot 与 Runtime 在同一 Docker 网络：`http://runtime:8787`；
+- AstrBot 运行在宿主机：`http://127.0.0.1:8787`；
+- AstrBot 在另一台机器：由你提供一个**仅内网可达**的 Runtime 地址，不要暴露公网。
+
+本仓库不 clone、不挂载、不升级插件，也不修改 `AstrBot/`；两边唯一的耦合是 HTTP 协议。
+地址填错的典型症状是状态行 `cognition: unavailable`，而她永远不说话。
 
 ### 6.4 让她真的会开口：三道门（默认全关）
 
 新部署默认是**静默**的（这是刻意的 fail-closed）。要她开口，三道门都得过：
 
-```yaml
-# 加在 docker-compose.yml 的 runtime 服务下（或写进 env_file / .env）
-CR_LANGCHAO__LIVE_ENABLED: "true"
-CR_LANGCHAO__LIVE_SCOPE_ALLOWLIST: '["default:FriendMessage:10001"]'  # 必须 JSON 数组
-CR_LANGCHAO__SHADOW_ENABLED: "true"     # 可选：影子推演，零副作用
-CR_LANGCHAO__SOCIAL_ENABLED: "true"     # 可选：社会关系投影
+```toml
+# config/runtime.toml
+[langchao]
+live_enabled = true
+live_scope_allowlist = ["default:FriendMessage:1000000001"]
+shadow_enabled = true      # 可选：影子推演，零副作用
+social_enabled = true      # 可选：社会关系投影
 ```
 
-1. **live 引擎开着**（`CR_LANGCHAO__LIVE_ENABLED`，默认 false）；
-2. **你的会话在白名单里**（`..._SCOPE_ALLOWLIST`，默认空）；
+1. **live 引擎开着**（`langchao.live_enabled`，默认 false）；
+2. **你的会话在精确白名单里**（`live_scope_allowlist`，默认空）；
 3. **数据库里的权威指针是 live**——它不是配置开关，是持久化的 CAS 指针；用
    `dispatch_authority.py show` 看、`freeze`/`restore` 改。
 
 缺任何一条都是同一个症状：**"部署成功，她永远沉默"**。所以出问题先跑体检（§6.7），不要猜代码。
-列表型配置必须是 JSON 数组：写成裸字符串会 fail-closed 拒绝启动（那些门禁是精确匹配，
-字符串会退化成子串匹配）。
+TOML 里的列表按上例写；临时用环境变量覆盖时才需要 JSON 数组
+（`CR_LANGCHAO__LIVE_SCOPE_ALLOWLIST='["..."]'`）。裸字符串会 fail-closed 拒绝启动。
 
-### 6.5 语义理解（可选；开关默认是开的）
+### 6.5 语义理解与提示词
 
 `semantic.provider` 默认 `remote_api`：**"默认开"指的是开关，不是"自带模型"**。
-端点、模型名、密钥是**你**填的输入，本仓库不预置厂商、不预置端点、不预置模型名。
-三样齐全才 `available()`：
+端点与模型名在 `config/runtime.toml` 的 `[semantic]` 中填写，key 只放 `.env`：
 
-```bash
-CR_SEMANTIC_BASE_URL='https://<你的端点>/v1'
-CR_SEMANTIC_MODEL='<模型名>'
-CR_SEMANTIC_API_KEY='<key：只从环境变量读，绝不写进任何仓库文件>'
+```toml
+[semantic]
+base_url = "https://<你的端点>/v1"
+model = "<模型名>"
+
+[semantic.prompts]
+deep_refresh = "第一人称、短句、口语；不要替对方找台阶。"
+explain_state = "像给自己看的便条，不要写成分析报告。"
 ```
+
+提示词是**追加要求**，不会覆盖 Runtime 内置的 JSON 字段契约、来源约束和防编造规则；
+这样能改口吻/偏好，又不会因为复制了一份旧系统提示词而在升级后把协议配坏。
 
 不填 = 行为与"不接模型"完全相同：显式事件由规则表结算，模糊事件记为 `unresolved`，
 心理解释退化为确定性模板，**长期连续性照常成立**（`/health` 会直接报
@@ -221,15 +230,21 @@ CR_SEMANTIC_API_KEY='<key：只从环境变量读，绝不写进任何仓库文�
 
 ### 6.6 夜里安静（一个旋钮，不是两个）
 
-```bash
-CR_LANGCHAO__NIGHT_SEND_PENALTY='0.85'          # 默认
-CR_LANGCHAO__NIGHT_SEND_PENALTY_START_HOUR='0'  # 默认
-CR_LANGCHAO__NIGHT_SEND_PENALTY_END_HOUR='5'    # 默认
+```toml
+[langchao]
+night_send_penalty = 0.85       # 默认
+night_send_penalty_start_hour = 0
+night_send_penalty_end_hour = 5
+
+[scheduler]
+# 要硬停时才填写；不写就是关闭硬停
+# quiet_hours_start = 0
+# quiet_hours_end = 7
 ```
 
 窗口是**半开区间** `[start, end)`，所以 `0`–`5` 是**四**个受罚的小时。
 它是**加价**不是硬停（系数被限制在 `< 1`：普通冲动过不去，理由足够强还是能开口）；
-真的想**完全不发**用 `CR_SCHEDULER__QUIET_HOURS_START/END`（默认关，调度器根本不唤醒）。
+真的想**完全不发**就在 `[scheduler]` 填 `quiet_hours_start/end`（默认关，调度器根本不唤醒）。
 "想安静"和"想完全不发"是两件事，所以它们是两个旋钮。
 
 ### 6.7 装完自检
@@ -299,10 +314,12 @@ RT fleet_admin.py remove <slug>                     # 默认不删数据；--pur
 
 | 缺口 | 现状 |
 |---|---|
-| 插件不在 AstrBot 插件市场 | 市场发布**已冻结**（有意，见 `HANDOFF.md` 的「已冻结」一节）。版本化发布物已经有了：tag + zip + 发版流程，只是不走市场 |
-| `scripts/` 里两百多个历史一次性脚本 | 仍写死作者的路径与当时的 QQ 号。**当前工具与历史的区分**写在 [`scripts/README.md`](scripts/README.md)，而当前工具由 `runtime/tests/test_ops_scripts_are_portable.py` 守着（写死 `/srv/companion`、`F:\…`、`E:\…` 会直接失败）；历史脚本按约定保留原样，没有回改 |
-| `HANDOFF.md` | 2026-09-15 ~ 09-23 的封测期流水账，是当时的事实，**不要当作当前部署指南** |
-| 首次部署仍要手写两样 | `.secrets/runtime-v2-postgres.env`（库口令）与基础 compose `astrbot.yml`（镜像、语义密钥等服务定义都从它复制）。生成器本身会把舰队拉起来（`docker compose up -d`，`--no-start` 可只渲染），所以不会漏步；但"手写 compose"这条还在 |
+| 插件不在 AstrBot 插件市场 | 仍需在 AstrBot 插件管理里用 release zip / URL 安装；本仓库不代管插件目录 |
+| 多人 fleet 仍需准备基础 compose | 单人路径已有 `runtime.example.toml` + `.env.example`；fleet 还要定义 PostgreSQL/AstrBot/OneBot 的基础服务，生成器只接管每人 Runtime |
+
+**已经清掉的隐私债：**封测 `HANDOFF.md` 含可关联的昵称、私聊、健康信息和时间线，已退出公开树；
+含真实 roster、作者路径、私网地址或用户专用数据的历史脚本也已移出，只保留当前通用工具和纯仿真/回归脚本。
+`runtime/tests/test_public_tree_is_sanitized.py` 会阻止这些标记再次进入公开树。私密原件留在本机忽略目录，不影响回滚。
 
 **结构性的事实（是取舍，不是欠账）：**
 

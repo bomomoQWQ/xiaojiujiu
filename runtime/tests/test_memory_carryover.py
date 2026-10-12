@@ -37,15 +37,15 @@ from conftest import BASE_TIME, build_config
 #: One carried fact, written the way the operator writes it: her own words, a kind, a key
 #: so a re-run replaces instead of duplicating, and a note saying where it came from.
 AMAN = {
-    "key": "TEST_USER_04-name",
+    "key": "synthetic-user-name",
     "kind": MemoryKind.STABLE_KNOWLEDGE.value,
-    "summary": "用户希望被称呼为「Aneam」或「阿曼」。",
+    "summary": "用户希望被称呼为「示例昵称」。",
     "topics": ["称呼", "名字"],
     "importance": 0.7,
     "confidence": 0.6,
     "activation": 0.9,
-    "note": "她 2026-09-17 自己说的；原话：你可以称呼我Aneam或者阿曼",
-    "source_event_ids": ["evt_1b2d76cbddde466c837bd8e1ab16fbef"],
+    "note": "合成测试数据：用户明确说过希望使用这个称呼",
+    "source_event_ids": ["evt_synthetic_001"],
 }
 
 

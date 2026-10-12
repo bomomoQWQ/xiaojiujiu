@@ -26,6 +26,8 @@ from companion_runtime.config import RuntimeConfig
 from companion_runtime.providers import (
     API_KEY_ENV_VAR,
     DEEP_REFRESH_FIELDS,
+    DEEP_REFRESH_SYSTEM_PROMPT,
+    EXPLAIN_STATE_SYSTEM_PROMPT,
     KNOWN_PROVIDER_NAMES,
     RETIRED_PROVIDER_NAMES,
     DeepRefreshRequest,
@@ -285,18 +287,33 @@ class TestBuildProvider:
             build_provider(env={"CR_SEMANTIC_PROVIDER": "local_cpu"})
         assert any("abandoned" in record.getMessage() for record in caplog.records)
 
-    def test_remote_selection_uses_environment_key(self) -> None:
-        provider = build_provider(
-            env={
-                "CR_SEMANTIC_PROVIDER": "remote_api",
-                "CR_SEMANTIC_BASE_URL": "https://semantic.example.com/v1",
-                "CR_SEMANTIC_MODEL": "strong-model",
-                API_KEY_ENV_VAR: SECRET,
-            }
-        )
+    def test_remote_selection_uses_config_endpoint_and_environment_key(self) -> None:
+        config = RuntimeConfig()
+        config.semantic.base_url = "https://semantic.example.com/v1"
+        config.semantic.model = "strong-model"
+        provider = build_provider(config, env={API_KEY_ENV_VAR: SECRET})
         assert isinstance(provider, RemoteAPIProvider)
         assert provider.available() is True
         assert provider.health()["api_key"] == "configured"
+
+    def test_personal_prompt_additions_are_sent_after_the_immutable_contract(self) -> None:
+        transport = FakeTransport(lambda *_: _reply(GOOD_SUGGESTIONS))
+        config = RuntimeConfig()
+        config.semantic.base_url = "https://semantic.example.com/v1"
+        config.semantic.model = "strong-model"
+        config.semantic.prompts.deep_refresh = "MY CUSTOM VOICE"
+        config.semantic.prompts.explain_state = "MY PRIVATE NOTE STYLE"
+        provider = build_provider(config, env={API_KEY_ENV_VAR: SECRET}, transport=transport)
+        provider.deep_refresh(DeepRefreshRequest())
+        provider.explain_state({"valence": 0.0})
+        deep_prompt = transport.calls[0]["body"]["messages"][0]["content"]
+        explain_prompt = transport.calls[1]["body"]["messages"][0]["content"]
+        assert deep_prompt.startswith(DEEP_REFRESH_SYSTEM_PROMPT)
+        assert "不得编造 id" in deep_prompt
+        assert deep_prompt.endswith("MY CUSTOM VOICE")
+        assert explain_prompt.startswith(EXPLAIN_STATE_SYSTEM_PROMPT)
+        assert '字段固定为 experience' in explain_prompt
+        assert explain_prompt.endswith("MY PRIVATE NOTE STYLE")
 
     def test_remote_without_key_is_unavailable_but_constructed(self) -> None:
         provider = build_provider(
@@ -363,18 +380,18 @@ class TestBuildProvider:
         assert isinstance(build_provider(config, env={}), DisabledProvider)
 
     def test_construction_failure_of_local_endpoint_falls_back(self) -> None:
-        class ExplodingConfig:
-            """A config whose endpoint lookup raises."""
-
-            extras: dict[str, Any] = {}
+        class ExplodingSemantic:
+            provider = "remote_api"
 
             @property
-            def semantic_provider(self) -> str:
-                return "remote_api"
-
-            @property
-            def semantic_base_url(self) -> str:
+            def base_url(self) -> str:
                 raise RuntimeError("endpoint lookup exploded")
+
+        class ExplodingConfig:
+            """A config whose canonical semantic endpoint lookup raises."""
+
+            semantic = ExplodingSemantic()
+            extras: dict[str, Any] = {}
 
         provider = build_provider(ExplodingConfig(), env={})
         assert isinstance(provider, DisabledProvider)
@@ -557,25 +574,17 @@ class TestRemoteAPIProvider:
         provider.deep_refresh(DeepRefreshRequest())
         assert "response_format" not in transport.calls[0]["body"]
 
-    def test_factory_reads_the_json_mode_switch_from_the_environment(self) -> None:
-        """``CR_SEMANTIC_JSON_MODE=0`` disables the field; the default keeps it on."""
-        off = build_provider(
-            env={
-                "CR_SEMANTIC_PROVIDER": "remote_api",
-                "CR_SEMANTIC_BASE_URL": "https://semantic.example.com/v1",
-                "CR_SEMANTIC_MODEL": "strong-model",
-                "CR_SEMANTIC_API_KEY": SECRET,
-                "CR_SEMANTIC_JSON_MODE": "0",
-            }
-        )
-        on = build_provider(
-            env={
-                "CR_SEMANTIC_PROVIDER": "remote_api",
-                "CR_SEMANTIC_BASE_URL": "https://semantic.example.com/v1",
-                "CR_SEMANTIC_MODEL": "strong-model",
-                "CR_SEMANTIC_API_KEY": SECRET,
-            }
-        )
+    def test_factory_reads_json_mode_from_resolved_runtime_config(self) -> None:
+        """Non-secret provider settings use the one defaults/file/env config pipeline."""
+        off_config = RuntimeConfig()
+        off_config.semantic.base_url = "https://semantic.example.com/v1"
+        off_config.semantic.model = "strong-model"
+        off_config.semantic.json_mode = False
+        on_config = RuntimeConfig()
+        on_config.semantic.base_url = "https://semantic.example.com/v1"
+        on_config.semantic.model = "strong-model"
+        off = build_provider(off_config, env={"CR_SEMANTIC_API_KEY": SECRET})
+        on = build_provider(on_config, env={"CR_SEMANTIC_API_KEY": SECRET})
         assert isinstance(off, RemoteAPIProvider) and off.json_mode is False
         assert isinstance(on, RemoteAPIProvider) and on.json_mode is True
 

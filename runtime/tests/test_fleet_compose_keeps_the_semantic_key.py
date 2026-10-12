@@ -86,3 +86,18 @@ def test_rendered_fleet_compose_still_carries_the_key(tmp_path: Path) -> None:
     assert "CR_CONVERSATION_ID" not in text
     # The supervisor's own schema/DSN come from elsewhere; the base DSN is copied as-is.
     assert "CR_STORAGE__DSN: postgresql://runtime:secret@db/runtime" in text
+
+
+def test_rendered_fleet_can_mount_one_common_personal_config(tmp_path: Path) -> None:
+    """Every child reads the same safe TOML; its identity/schema still come from env."""
+    generator = _load_generator()
+    compose = tmp_path / "astrbot.yml"
+    compose.write_text(BASE_COMPOSE, encoding="utf-8")
+    config = tmp_path / "runtime.toml"
+    config.write_text('[langchao]\nshadow_enabled = true\n', encoding="utf-8")
+    image, env = generator.base_environment(compose)
+
+    text = generator.render(image, env, compose, tmp_path, runtime_config=config.resolve())
+
+    assert "CR_FLEET_RUNTIME_CONFIG: /config/runtime.toml" in text
+    assert f"- {config.resolve()}:/config/runtime.toml:ro" in text

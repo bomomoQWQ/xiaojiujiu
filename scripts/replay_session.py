@@ -16,7 +16,7 @@ came back to settle the backlog.
 
 Reads only the export, so it needs neither Docker nor the Runtime to be running::
 
-    python scripts/replay_session.py --export /srv/companion/beta-data/<run>/people/<person>
+    python scripts/replay_session.py --export <export-root>/<run>/people/<person>
     python scripts/replay_session.py --export <dir> --since 2026-09-17 --limit 200
 """
 

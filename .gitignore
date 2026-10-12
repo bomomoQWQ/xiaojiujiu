@@ -5,6 +5,11 @@
 **/*secret*
 **/*api_key*
 
+# Personal deployment config: copy the tracked, sanitized template and edit locally.
+/config/runtime.toml
+# Removed beta diaries/scripts stay recoverable locally but must never return to Git.
+/.private-history/
+
 # Model and training artifacts
 *.safetensors
 *.gguf

@@ -96,6 +96,14 @@ DEEP_REFRESH_FIELDS: Mapping[str, type] = {
 #: Optional key a model may wrap the six collections under.
 DEEP_REFRESH_WRAPPER_KEY = "suggestions"
 
+def _prompt_with_addition(base: str, addition: str) -> str:
+    """Append an operator prompt without letting it replace the wire contract."""
+    text = str(addition or "").strip()
+    if not text:
+        return base
+    return f"{base}\n\n【部署者补充要求】\n{text}"
+
+
 DEEP_REFRESH_SYSTEM_PROMPT = (
     "你是长期陪伴角色的深层认知整理器，只在低频的后台刷新中被调用。"
     "只输出一个 JSON 对象，字段固定为 reinterpretations, psychological_interpretation, "
@@ -556,6 +564,10 @@ class _OpenAICompatibleProvider:
         cache_ttl_s: How long one explanation stays usable in the provider's own
             cache. It is the same number the Runtime uses for its explanation
             cache, so the two caches cannot disagree about what "stale" means.
+        deep_refresh_prompt_addition: Optional operator prose appended to the built-in
+            deep-refresh contract.
+        explain_state_prompt_addition: Optional operator prose appended to the built-in
+            state-explanation contract.
     """
 
     def __init__(
@@ -574,6 +586,8 @@ class _OpenAICompatibleProvider:
         transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]]
         | None = None,
         cache_ttl_s: float = 900.0,
+        deep_refresh_prompt_addition: str = "",
+        explain_state_prompt_addition: str = "",
     ) -> None:
         """Store the endpoint settings and the transport seam."""
         self.name = name
@@ -616,6 +630,12 @@ class _OpenAICompatibleProvider:
         }
         self._cache: dict[str, tuple[float, dict[str, str]]] = {}
         self._cache_ttl_s = max(0.0, float(cache_ttl_s))
+        self.deep_refresh_system_prompt = _prompt_with_addition(
+            DEEP_REFRESH_SYSTEM_PROMPT, deep_refresh_prompt_addition
+        )
+        self.explain_state_system_prompt = _prompt_with_addition(
+            EXPLAIN_STATE_SYSTEM_PROMPT, explain_state_prompt_addition
+        )
 
     # ------------------------------------------------------------------ transport
 
@@ -744,7 +764,7 @@ class _OpenAICompatibleProvider:
             self.stats["deep_refresh_calls"] += 1
         try:
             raw = self._chat(
-                DEEP_REFRESH_SYSTEM_PROMPT,
+                self.deep_refresh_system_prompt,
                 json.dumps(request.to_dict(), ensure_ascii=False, sort_keys=True),
                 timeout=deadline,
                 grammar=self._grammar_for("deep_refresh"),
@@ -811,7 +831,7 @@ class _OpenAICompatibleProvider:
             self.stats["explain_calls"] += 1
         try:
             raw = self._chat(
-                EXPLAIN_STATE_SYSTEM_PROMPT,
+                self.explain_state_system_prompt,
                 json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
                 timeout=self.timeout_s,
                 grammar=self._grammar_for("explanation"),
@@ -964,8 +984,10 @@ class RemoteAPIProvider(_OpenAICompatibleProvider):
         transport: Callable[[str, dict[str, Any], float, dict[str, str]], Mapping[str, Any]]
         | None = None,
         cache_ttl_s: float = 900.0,
+        deep_refresh_prompt_addition: str = "",
+        explain_state_prompt_addition: str = "",
     ) -> None:
-        """Store the endpoint settings; the key is read from the environment."""
+        """Store endpoint/prompt settings; the key alone is read from the environment."""
         source = os.environ if env is None else env
         resolved_key = source.get(API_KEY_ENV_VAR, "") if api_key is None else api_key
         self._grammar = grammar
@@ -982,6 +1004,8 @@ class RemoteAPIProvider(_OpenAICompatibleProvider):
             headers=headers,
             transport=transport,
             cache_ttl_s=cache_ttl_s,
+            deep_refresh_prompt_addition=deep_refresh_prompt_addition,
+            explain_state_prompt_addition=explain_state_prompt_addition,
         )
 
     def available(self) -> bool:
@@ -1061,27 +1085,30 @@ def _build_remote(
     configuration object is deliberately ignored, because the Runtime's config is
     serialisable and must never be able to carry a credential.
     """
-    base_url = _first_str(
-        _config_value(config, "semantic_base_url", "base_url"), env.get("CR_SEMANTIC_BASE_URL")
-    )
-    model = _first_str(
-        _config_value(config, "semantic_model", "model"), env.get("CR_SEMANTIC_MODEL")
-    )
+    semantic = _safe_read(config, "semantic")
+    prompts = _safe_read(semantic, "prompts")
+    base_url = _first_str(_read_semantic(config, "base_url"))
+    model = _first_str(_read_semantic(config, "model"))
+    timeout_s = _first_float(_read_semantic(config, "timeout_s")) or 30.0
+    max_tokens = int(_first_float(_read_semantic(config, "max_tokens")) or 1024)
+    json_mode = _read_semantic(config, "json_mode")
+    if not isinstance(json_mode, bool):
+        json_mode = True
     return RemoteAPIProvider(
         base_url or "",
         model=model or "",
         env=env,
-        timeout_s=_first_float(env.get("CR_SEMANTIC_TIMEOUT_S")) or 30.0,
-        max_tokens=int(_first_float(env.get("CR_SEMANTIC_MAX_TOKENS")) or 1024),
-        # JSON Output: the endpoint is asked for a JSON object, so a reply cannot
-        # come back as prose that has to be scavenged for braces. Default on (both
-        # callers here are structured); `CR_SEMANTIC_JSON_MODE=0` turns it off for a
-        # gateway that rejects the field.
-        json_mode=_bool_setting(_first_str(env.get("CR_SEMANTIC_JSON_MODE")), default=True),
+        timeout_s=timeout_s,
+        max_tokens=max_tokens,
+        # Non-secret settings came through RuntimeConfig, so defaults < TOML < CR_ env is
+        # one real precedence chain. The only direct provider env read left is the API key.
+        json_mode=json_mode,
         # The provider's own explanation cache is paced by the same number the
         # Runtime uses, so the two caches cannot disagree about staleness.
         cache_ttl_s=_first_float(_read_semantic(config, "interpretation_max_age_seconds"))
         or 900.0,
+        deep_refresh_prompt_addition=_first_str(_safe_read(prompts, "deep_refresh")),
+        explain_state_prompt_addition=_first_str(_safe_read(prompts, "explain_state")),
         transport=transport,
     )
 
