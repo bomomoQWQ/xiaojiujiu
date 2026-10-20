@@ -348,6 +348,7 @@ CR_TEST_PG_DSN='postgresql://...' python -m pytest -q \
 ```text
 .
 ├── config/runtime.example.toml    # 个人部署非秘密配置模板
+├── config/README.md               # 参数分级：必须填 / 可自定义 / 运维 / 校准内核 / 内部
 ├── docker-compose.yml             # Runtime-only 单人 compose
 ├── runtime/                       # Runtime 包、机制文档和测试
 ├── scripts/                       # 当前运维工具与脱敏后的通用回放/仿真工具
