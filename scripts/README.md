@@ -16,6 +16,9 @@
 | `runtime_fleet.py` | 每人一个 Runtime 子进程的监督器与控制面 |
 | `build_runtime_fleet.py` | 从基础服务定义生成人员/端口/Runtime fleet compose |
 | `fleet_runtime_usage.sh` | fleet 资源占用快照 |
+| `fleet_blackbox_probe.py` | 只读黑盒验收：`/health` `/state` `/schedule` `/outbox`，不动状态、不投递，输出匿名化报告 |
+| `napcat_notice.py` | AstrBot 停掉之后仍然能发一条 QQ 通知：临时开一个不外发布的 OneBot 接口，发完还原配置 |
+| `pause_service.sh` | 彻底下线测试栈：先收号码 → 停 AstrBot 与 fleet → 发通知 → 停测试 NapCat → 核对 |
 | `relaunch.sh` | 受控重启入口 |
 | `backup.ps1` | Windows 工作区快照 |
 | `check_versions.py` | 检查 CHANGELOG / Runtime / 插件版本一致性 |
