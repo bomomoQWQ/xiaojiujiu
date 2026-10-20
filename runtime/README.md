@@ -1429,11 +1429,23 @@ v0.2 之后仍然刻意简化但**不省略主要模块**，并且把"还没接�
 
 ```powershell
 cd runtime
-python -m pytest -q                                          # 期望：全部通过
+python -m pytest -q                                          # 不需要数据库：测试自带文件库
 python -m companion_runtime.cli --base-dir ./data health
 python -m companion_runtime.cli --base-dir ./data backup --keep 7
 python -m companion_runtime.cli --base-dir ./data verify
 ```
+
+**关于最后剩下的红**：生产 Runtime 只支持 PostgreSQL（没有 `CR_STORAGE__DSN` 直接拒绝启动，这是
+刻意的）。测试套件为此在 `tests/conftest.py` 里开了一个缝：没有 DSN 时 `Runtime(...)` 拿到一个
+临时**文件**库（不是 `:memory:`——耐久性用例要检查 WAL sidecar 和可备份性），有 DSN 时什么都不替换。
+这条缝把「换台干净机器跑 pytest 就 230 红」压到 14 个，剩下这些分三类，**都不是环境噪音**：
+
+| 类别 | 用例 | 怎么处理 |
+|---|---|---|
+| 在**子进程**里跑 CLI，进程内补丁够不到 | `test_durability.py::test_cli_verify_*`（3）、`test_boundary_carryover.py` 两个 CLI 用例、`test_memory_pipeline.py` / `test_memory_carryover.py` 的 CLI 用例、`test_runtime_lifecycle_fixes.py::test_serve_wires_the_endogenous_scheduler`、`test_maintenance_dialect.py::test_selecting_postgres_warns_once...` | 给 `CR_STORAGE__DSN`，它们会连真库跑 |
+| 需要 PostgreSQL schema 迁移 | `test_langchao_shadow_replay.py::test_replay_scope_reports_zero_protected_deltas` | 同上 |
+| 真的红，需要单独判断 | `test_prelaunch_structural_scenarios.py`（读 `runtime/audit/*.json`，文件不在仓库里）、`test_v2_scheduler_consolidation.py`（还在找已被 `authority_round_router.run` 取代的 `decide_endogenous`）、`test_cognition_fixes.py::test_a_settings_read_that_raises_still_falls_back`（`build_provider` 对不可读端点返回“已构造但不可用”，而文档承诺 `DisabledProvider`） | 前两个是过期测试/缺失产物，第三个是契约与实现不一致 |
+
 
 v0.2 补充的自检（**未配语义端点**时也应给出正常结果）：
 

@@ -115,3 +115,57 @@ def harness(config: RuntimeConfig) -> Iterator[Harness]:
         )
     finally:
         runtime_instance.close()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _offline_database_seam():
+    """Let ``Runtime(...)`` run offline instead of demanding a PostgreSQL DSN.
+
+    Production is PostgreSQL-only on purpose: ``open_database`` refuses to start without
+    ``CR_STORAGE__DSN``, and that refusal is a feature, not something to soften for tests.
+    But the suite is built to run offline -- the shared fixtures here always injected their
+    own database -- while three dozen files construct ``Runtime`` on their own without
+    passing one. On a machine with no database those errored during construction, so
+    ``pytest`` reported 230 red for a tree that was fine, while the repo's own README
+    promises "全部通过". A suite that fails because the *developer's machine* lacks a
+    database is a suite defect, not a finding.
+
+    The stand-in is a **file** database, not ``:memory:``, and that detail is the whole
+    point: the durability tests exercise WAL, checkpoint and backup, and an in-memory
+    database has none of those ("cannot back up an in-memory database"). A seam that turns
+    32 errors into 32 failures has not helped anyone.
+
+    With ``CR_STORAGE__DSN`` set, nothing is patched and the real PostgreSQL path is
+    exercised exactly as shipped.
+    """
+    import itertools
+    import os
+    import tempfile
+
+    from companion_runtime import runtime as runtime_module
+
+    if os.environ.get("CR_STORAGE__DSN"):
+        yield
+        return
+
+    session_dir = tempfile.mkdtemp(prefix="cr-test-db-")
+    counter = itertools.count()
+
+    def _file_database(storage) -> Database:
+        # Honour an explicit path first. The durability tests point database_path at a
+        # path they then inspect ("...runtime.sqlite3-wal" must exist next to it), so
+        # handing them a generated file would break the very contract they assert - the
+        # seam is supposed to replace a *missing* database, not override a chosen one.
+        chosen = str(getattr(storage, "database_path", "") or "").strip()
+        if chosen and chosen != ":memory:":
+            return Database(chosen)
+        # One generated file per construction: state must not leak between tests, and a
+        # shared file would let one test's WAL sidecar decide another test's recovery.
+        return Database(os.path.join(session_dir, f"db-{next(counter):04d}.sqlite3"))
+
+    original = runtime_module.open_database
+    runtime_module.open_database = _file_database
+    try:
+        yield
+    finally:
+        runtime_module.open_database = original
