@@ -214,6 +214,17 @@ def test_load_config_from_toml(tmp_path) -> None:
     assert config.drive.cooldown_seconds == 60.0
 
 
+def test_load_config_tolerates_a_byte_order_mark(tmp_path) -> None:
+    """A Windows editor's UTF-8 BOM must not turn into "Invalid statement (line 1, column 1)".
+
+    ``tomllib`` refuses the BOM outright, and the message names neither the BOM nor the file,
+    so a deployer who saved the template from Notepad had no way to tell what was wrong.
+    """
+    path = tmp_path / "config.toml"
+    path.write_bytes('\ufeff[server]\nport = 9876\n'.encode("utf-8"))
+    assert load_config(path).server.port == 9876
+
+
 def test_load_config_from_json(tmp_path) -> None:
     """A JSON file is accepted as well, and unknown keys are ignored."""
     path = tmp_path / "config.json"

@@ -885,10 +885,13 @@ def load_config(
         if not file_path.exists():
             raise FileNotFoundError(f"config file not found: {file_path}")
         if file_path.suffix.lower() == ".toml":
-            with file_path.open("rb") as handle:
-                data = tomllib.load(handle)
+            # ``utf-8-sig``: Windows editors happily write a byte-order mark, and
+            # ``tomllib`` rejects it as "Invalid statement (at line 1, column 1)" - a
+            # message that tells a deployer nothing about the BOM it never typed.
+            with file_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                data = tomllib.loads(handle.read())
         elif file_path.suffix.lower() == ".json":
-            data = json.loads(file_path.read_text(encoding="utf-8"))
+            data = json.loads(file_path.read_text(encoding="utf-8-sig"))
         else:
             raise ValueError(f"unsupported config extension: {file_path.suffix}")
         _apply_mapping(config, data)
