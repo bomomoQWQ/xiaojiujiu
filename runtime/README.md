@@ -183,12 +183,27 @@ PostgreSQL production"），运维请用数据库自己的工具（见 §10）�
 
 三层覆盖，优先级由低到高：**dataclass 默认值 → `--config` 文件 → `CR_` 环境变量**。
 
+不给 `--config` 时，CLI 会从当前目录自动发现 `config/runtime.toml`；文件不存在就使用默认值 + 环境变量，
+不报错。显式传入的 `--config` 路径不存在会直接报错 —— 这样容器和本地都能用同一套默认坐标。
+
 ```toml
 # runtime.toml
 runtime_id = "companion"
 conversation_id = "default"
 
-[values]                    # 价值观：把人格编译成动力学参数
+[persona]                    # 完整 Runtime 人格：普通块/主动渲染/深层刷新/心理解释共用同一份
+identity = "你是谁、如何理解自己。"
+voice = "说话方式、句长、标点、口语程度。"
+relationship = "如何理解这段关系、亲密与边界。"
+shared = "所有阶段共同遵守的人物要求。"
+# 四段全空 = 保留内置兼容人物风格；任何一段非空 = 由部署者接管人物层，
+# 深层刷新那句内置人物风格会被真正移除，而不是在它后面再加一段互相矛盾的要求。
+
+[prompts]                    # 宿主侧两个阶段在 Persona 之上的追加要求
+conversation_context = ""
+proactive_render = ""
+
+[values]                     # 价值观：把人格编译成动力学参数
 autonomy = 0.72
 boundary_respect = 0.88
 emotional_expression = 0.46
@@ -271,7 +286,7 @@ max_operations_per_refresh = 12
 template_fallback = true
 interpretation_max_age_seconds = 21600.0
 
-[semantic.prompts]            # 只追加口吻要求，不覆盖内置 JSON/grounding 契约
+[semantic.prompts]            # 在 Persona 之上追加阶段要求，不覆盖内置 JSON/grounding 契约
 deep_refresh = ""
 explain_state = ""
 ```
@@ -297,7 +312,7 @@ $env:CR_SEMANTIC__SETTLE_ON_INGEST = "true"
 | `provider` | `"remote_api"` | 默认选择远端语义；未配端点/model/key 时 `available=false`，`disabled` 是显式拒绝外呼 | `Runtime.__init__` → `build_provider()` |
 | `base_url` / `model` | `""` | 部署者选择的非秘密端点坐标；适合放独立 TOML | `build_provider()` |
 | `timeout_s` / `max_tokens` / `json_mode` | `30 / 1024 / true` | 远端请求预算与 JSON Output 开关 | `RemoteAPIProvider` |
-| `prompts.deep_refresh` / `prompts.explain_state` | `""` | 追加的人物口吻要求；内置结构/grounding/安全契约不可覆盖 | 两个语义调用的 system prompt |
+| `prompts.deep_refresh` / `prompts.explain_state` | `""` | 在 `[persona]` 之上追加的阶段要求；内置结构/grounding/安全契约不可覆盖 | 两个语义调用的 system prompt |
 | `settle_on_ingest` | `true` | 入口路径上是否跑粗粒度规则结算 | `Runtime.process_user_message` |
 | `deep_refresh_enabled` | `true` | 是否允许低频深层刷新 | `Runtime.deep_refresh`（总开关，关掉就立刻返回 `disabled`） |
 | `unresolved_backlog_threshold` | `8` | 积压多少条 unresolved 才够触发一次刷新 | `deep_refresh.evaluate_triggers`（触发规则 `unresolved_backlog`） |
@@ -310,7 +325,33 @@ $env:CR_SEMANTIC__SETTLE_ON_INGEST = "true"
 
 > 只有 `unresolved_max_age_hours`、`template_fallback` 两项还处于"已进配置层、语义明确、但尚无生产代码读取"的状态；`interpretation_max_age_seconds` 已用于 provider 缓存 TTL，其余字段也都有真实消费者。
 
-全部可用参数见 `config.py` 的 dataclass 定义（每个字段都有说明）。
+全部可用参数见 `config.py` 的 dataclass 定义（每个字段都有说明）。**哪些字段适合个人改、哪些属于
+校准内核不建议动**，按 [`config/README.md`](../config/README.md) 的分类来，不要只看字段是否存在。
+
+### 3.2 人格与提示词分层
+
+Runtime 有四个模型可见阶段，同一个 `[persona]` 全部生效：
+
+| 阶段 | 注入方式 | 追加字段 |
+|---|---|---|
+| 普通认知块 | `RuntimeConfig.host_prompt("conversation_context")` → `context.render_block()` | `prompts.conversation_context` |
+| 主动消息渲染 | `host_prompt("proactive_render")` → 渲染 payload 的 `- 部署者角色与口吻：` | `prompts.proactive_render` |
+| 深层刷新 | `_persona_prompt()` + `_prompt_with_addition()` | `semantic.prompts.deep_refresh` |
+| 心理解释 | 同上 | `semantic.prompts.explain_state` |
+
+规则只有一条：**人物层归部署者，协议层归代码**。
+
+- `[persona]` 四段全空 → 保持历史行为，内置人物风格照旧发送（升级后输出不变）；
+- 任何一段非空 → 内置那句人物风格（深层刷新的短句/口语/第一人称叙述要求）会被**真正移除**，再追加
+  Persona 与阶段要求。不是"两段话都发、靠后一段压前一段"；
+- 主动渲染内置的 `RENDER_STYLE_LINES` 同样只在没有 Persona 时使用；
+- 协议层任何时候都不接受覆盖：用户边界与授权、时间校正、防复读、"只输出正文"、JSON 字段契约、
+  来源 grounding 与防编造。
+
+`[values]` 与 `[persona]` 是两件事：Persona 决定"怎么说、怎么理解关系"，values 决定"怎么算、多容易
+被推动"。values 会在新实例首次创建 `runtime_state` 时播种并持久化，改 TOML 不会静默换人格。
+
+AstrBot 的主 Persona 仍归 AstrBot，Runtime 既不读取也不修改它；两份应表达同一个人物。
 
 ---
 

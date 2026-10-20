@@ -54,6 +54,20 @@ def test_state_and_config_endpoints(client: TestClient) -> None:
     assert "server" in config
 
 
+def test_config_endpoint_redacts_the_storage_dsn(runtime: Runtime) -> None:
+    """``/config`` is a readable surface, so the DSN's inline password must not survive it.
+
+    The pattern that redacted `api_key` / `token` / `password` keys did not match `dsn`, so the
+    one string that carries the database password was printed verbatim.
+    """
+    runtime.config.storage.dsn = "postgresql://runtime:dsn-leak@db/companion"
+    app = create_app(runtime, runtime.config)
+    with TestClient(app) as client:
+        response = client.get("/config")
+    assert "dsn-leak" not in response.text
+    assert response.json()["storage"]["dsn"] == "***redacted***"
+
+
 def test_schedule_endpoint(client: TestClient) -> None:
     """The scheduler plan is visible for debugging."""
     response = client.get("/schedule")

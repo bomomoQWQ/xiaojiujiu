@@ -29,11 +29,13 @@ from companion_runtime.providers import (
     DEEP_REFRESH_SYSTEM_PROMPT,
     EXPLAIN_STATE_SYSTEM_PROMPT,
     KNOWN_PROVIDER_NAMES,
+    PERSONA_MARKER,
     RETIRED_PROVIDER_NAMES,
     DeepRefreshRequest,
     DeepRefreshSuggestions,
     DisabledProvider,
     RemoteAPIProvider,
+    _DEEP_REFRESH_COMPAT_PERSONA,
     build_provider,
     parse_deep_refresh,
     resolve_provider_name,
@@ -301,19 +303,52 @@ class TestBuildProvider:
         config = RuntimeConfig()
         config.semantic.base_url = "https://semantic.example.com/v1"
         config.semantic.model = "strong-model"
-        config.semantic.prompts.deep_refresh = "MY CUSTOM VOICE"
-        config.semantic.prompts.explain_state = "MY PRIVATE NOTE STYLE"
+        config.persona.identity = "MY FULL IDENTITY"
+        config.persona.voice = "MY FULL VOICE"
+        config.semantic.prompts.deep_refresh = "MY CUSTOM DEEP STAGE"
+        config.semantic.prompts.explain_state = "MY PRIVATE NOTE STAGE"
         provider = build_provider(config, env={API_KEY_ENV_VAR: SECRET}, transport=transport)
         provider.deep_refresh(DeepRefreshRequest())
         provider.explain_state({"valence": 0.0})
         deep_prompt = transport.calls[0]["body"]["messages"][0]["content"]
         explain_prompt = transport.calls[1]["body"]["messages"][0]["content"]
-        assert deep_prompt.startswith(DEEP_REFRESH_SYSTEM_PROMPT)
+        # The wire contract is still first and still intact; only the built-in character
+        # voice is gone, because a configured Persona owns that layer.
+        immutable_head = DEEP_REFRESH_SYSTEM_PROMPT.split(_DEEP_REFRESH_COMPAT_PERSONA)[0]
+        assert deep_prompt.startswith(immutable_head)
+        assert _DEEP_REFRESH_COMPAT_PERSONA not in deep_prompt
         assert "不得编造 id" in deep_prompt
-        assert deep_prompt.endswith("MY CUSTOM VOICE")
+        assert PERSONA_MARKER in deep_prompt
+        assert "身份：MY FULL IDENTITY" in deep_prompt
+        assert "说话方式：MY FULL VOICE" in deep_prompt
+        assert deep_prompt.endswith("MY CUSTOM DEEP STAGE")
         assert explain_prompt.startswith(EXPLAIN_STATE_SYSTEM_PROMPT)
         assert '字段固定为 experience' in explain_prompt
-        assert explain_prompt.endswith("MY PRIVATE NOTE STYLE")
+        assert "身份：MY FULL IDENTITY" in explain_prompt
+        assert explain_prompt.endswith("MY PRIVATE NOTE STAGE")
+
+    def test_no_persona_keeps_the_builtin_character_voice(self) -> None:
+        transport = FakeTransport(lambda *_: _reply(GOOD_SUGGESTIONS))
+        config = RuntimeConfig()
+        config.semantic.base_url = "https://semantic.example.com/v1"
+        config.semantic.model = "strong-model"
+        provider = build_provider(config, env={API_KEY_ENV_VAR: SECRET}, transport=transport)
+        provider.deep_refresh(DeepRefreshRequest())
+        deep_prompt = transport.calls[0]["body"]["messages"][0]["content"]
+        # Deployments that never configured a Persona keep the exact historical prompt.
+        assert deep_prompt == DEEP_REFRESH_SYSTEM_PROMPT
+
+    def test_stage_addition_alone_does_not_drop_the_builtin_character_voice(self) -> None:
+        transport = FakeTransport(lambda *_: _reply(GOOD_SUGGESTIONS))
+        config = RuntimeConfig()
+        config.semantic.base_url = "https://semantic.example.com/v1"
+        config.semantic.model = "strong-model"
+        config.semantic.prompts.deep_refresh = "ONLY A STAGE NOTE"
+        provider = build_provider(config, env={API_KEY_ENV_VAR: SECRET}, transport=transport)
+        provider.deep_refresh(DeepRefreshRequest())
+        deep_prompt = transport.calls[0]["body"]["messages"][0]["content"]
+        assert _DEEP_REFRESH_COMPAT_PERSONA in deep_prompt
+        assert deep_prompt.endswith("ONLY A STAGE NOTE")
 
     def test_remote_without_key_is_unavailable_but_constructed(self) -> None:
         provider = build_provider(

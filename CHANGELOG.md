@@ -24,6 +24,52 @@
   （为一个显示字符串停掉 11 个进程不值当）。下次按 `docs/部署与运维.md` 部署时自然变 0.5.0。
   这是一次**已知且有意**的偏差，不是漏做。
 
+### 同一 tag 内补入：把「人格」与「配置」变成真的可配置（2026-10-07 后续）
+
+0.5.0 打 tag 之后又发现两件事：人格提示词实际上只有一半可控，配置层则混着"该改的"和
+"改了会出事"的字段却没有区分。两者都按「部署者只该改人物层」这条线重做，`v0.5.0` 指到包含
+本节的提交（协议版本 `RUNTIME_API_VERSION = "1"` 不变，插件无需跟着升）。
+
+**Runtime Persona 是完整人格，不是追加一句**
+
+- 新增 `[persona]`（`identity` / `voice` / `relationship` / `shared`），四段全空时保持历史行为
+  （内置人物风格照旧发送，升级后输出不变）；任何一段非空时由部署者接管人物层。
+- 修掉一个"看起来生效、其实没生效"的缺陷：深层刷新的内置人物风格原先**内联**在
+  `DEEP_REFRESH_SYSTEM_PROMPT` 里，只能靠后面再加一段话去压它。现在它被抽成
+  `_DEEP_REFRESH_COMPAT_PERSONA`，配置了 Persona 就被**真正移除**，不是在矛盾文本后面补一句。
+  `_prompt_with_addition()` 只认 `PERSONA_MARKER`，不再用模糊的字符串包含判断。
+- 四个模型可见阶段统一吃同一份 Persona：普通认知块（`host_prompt("conversation_context")`）、
+  主动渲染（`host_prompt("proactive_render")`）、深层刷新、心理解释。此前两条生产路径
+  只读 `prompts.*`，配置了 Persona 也不生效。
+- 主动渲染的内置 `RENDER_STYLE_LINES` 只在没有 Persona 时注入；"只回正文本身"仍然是最后一行，
+  协议层（边界/授权/时间/防复读/JSON 契约/来源 grounding/防编造）不接受配置覆盖。
+- `_persona_prompt()` 合并了两个分支：`PersonaConfig.prompt()` 与 mapping 形态现在产出完全相同的
+  抬头，避免同一份人格出现两种措辞。
+
+**配置该改什么、不该改什么，写进仓库而不是靠口口相传**
+
+- 新增 [`config/README.md`](config/README.md)：必须填、适合个人自定义、运维按需、校准内核不建议动、
+  不属于个人配置、values 生效范围，六类分清楚。
+- `config/runtime.example.toml` 重写为可工作的个人模板：完整 `[persona]`、8 个 values 逐条注释、
+  四阶段细化、语义端点、浪潮开关、每日主动预算、记忆开场冷却。模板里明确写了**不建议改什么**
+  （emotion/drive/silence/utility、学习率、candidate bias、浪潮数值内核、outbox lease）。
+- 8 个 `ValueProfile` 轴现在会被校验：任何轴超出 `0–1` 直接拒绝启动，而不是带着越界值跑。
+  已在 `config/README.md` 里写明 values 只在**新实例首次创建 `runtime_state`** 时播种，
+  改 TOML 不会静默改已有实例的人格。
+
+**配置发现与部署**
+
+- `--config` 缺省时自动读取 `config/runtime.toml`；文件不存在就退回默认值 + 环境变量，不报错。
+  显式 `--config` 仍然严格：路径不存在直接报错。
+- `docker-compose.yml` 改为挂载整个 `./config` 目录（`/app/runtime/config:ro`），不再强制
+  `--config /config/runtime.toml`。单文件挂载会让"没有配置文件"变成启动失败。
+
+**一处凭据泄漏**
+
+- CLI `config` 与 `GET /config` 此前会把 `storage.dsn` 原样打印（口令在 URL 里）。
+  `_SECRET_PATTERN` 只匹配 `api_key/token/secret/password` 之类，`dsn` 不在其中。现已覆盖
+  `dsn` 并断言输出为 `***redacted***`。
+
 ### 浪潮决策引擎在生产里被真实使用后暴露并修掉的缺陷
 
 上线之后每一轮「拉 log」都逼出一个真缺陷——不是代码审查找出来的，是真人消息走出来的：

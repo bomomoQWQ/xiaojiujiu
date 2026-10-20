@@ -246,8 +246,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_config(args: argparse.Namespace):
-    """Load and resolve the configuration described by ``args``."""
-    config = load_config(args.config)
+    """Load explicit config, else discover ``config/runtime.toml`` when it exists.
+
+    Discovery is convenience, not a new required file: direct CLI commands outside a checkout
+    keep using dataclass/env defaults, while the documented personal deployment reads the same
+    TOML even when the caller omits ``--config``.
+    """
+    selected = args.config
+    if selected is None:
+        candidate = Path("config/runtime.toml")
+        if candidate.is_file():
+            selected = str(candidate)
+    config = load_config(selected)
     if args.log_level:
         config.server.log_level = args.log_level
     resolve_paths(config, args.base_dir)

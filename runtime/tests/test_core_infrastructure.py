@@ -191,12 +191,16 @@ def test_redact_masks_secret_like_keys() -> None:
 
 
 def test_config_never_exposes_secrets_in_dump() -> None:
-    """``to_dict`` output cannot leak a credential-shaped key."""
+    """``to_dict`` output cannot leak an API key or credential-bearing PostgreSQL DSN."""
     config = RuntimeConfig()
     config.extras["api_key"] = "sk-should-not-appear"
+    config.storage.dsn = "postgresql://runtime:super-secret@db/companion"
     dumped = config.dumps()
     assert "sk-should-not-appear" not in dumped
-    assert json.loads(dumped)["extras"]["api_key"] == "***redacted***"
+    assert "super-secret" not in dumped
+    rendered = json.loads(dumped)
+    assert rendered["extras"]["api_key"] == "***redacted***"
+    assert rendered["storage"]["dsn"] == "***redacted***"
 
 
 def test_load_config_from_toml(tmp_path) -> None:
@@ -247,13 +251,18 @@ def test_personal_toml_loads_endpoint_prompts_and_env_wins(tmp_path) -> None:
 
     host_path = tmp_path / "host-prompts.toml"
     host_path.write_text(
-        '[prompts]\nconversation_context = "normal-turn voice"\n'
-        'proactive_render = "proactive voice"\n',
+        '[persona]\nidentity = "full identity"\nvoice = "full voice"\n'
+        '[prompts]\nconversation_context = "normal-turn stage"\n'
+        'proactive_render = "proactive stage"\n',
         encoding="utf-8",
     )
     host = load_config(host_path, env={})
-    assert host.prompts.conversation_context == "normal-turn voice"
-    assert host.prompts.proactive_render == "proactive voice"
+    assert host.persona.identity == "full identity"
+    assert host.persona.voice == "full voice"
+    assert host.host_prompt("conversation_context") == (
+        "身份：full identity\n说话方式：full voice\n\nnormal-turn stage"
+    )
+    assert host.host_prompt("proactive_render").endswith("proactive stage")
 
 
 def test_legacy_flat_semantic_env_aliases_resolve_into_canonical_config() -> None:
@@ -474,6 +483,8 @@ def test_value_profile_defaults_and_partial_mapping() -> None:
     """A partial value mapping keeps defaults for absent axes."""
     profile = ValueProfile.from_mapping({"autonomy": 0.1, "unknown": 9})
     assert profile.autonomy == 0.1
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        ValueProfile.from_mapping({"user_care": 1.5})
     assert profile.user_care == ValueProfile().user_care
     assert ValueProfile.from_mapping(None).autonomy == ValueProfile().autonomy
 

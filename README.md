@@ -65,7 +65,7 @@ cp .env.example .env
 
 编辑：
 
-- `config/runtime.toml`：会话、行为、浪潮、夜间策略、语义端点/模型、提示词；
+- `config/runtime.toml`：会话、完整 Runtime Persona、8 个价值观轴、行为、浪潮、夜间策略、语义端点/模型与分阶段提示词；
 - `.env`：`CR_STORAGE__DSN` 与 `CR_SEMANTIC_API_KEY`。
 
 本地 `config/runtime.toml` 与 `.env` 都被 Git 忽略；仓库只跟踪脱敏模板。
@@ -99,7 +99,9 @@ curl -s http://127.0.0.1:8787/health | python3 -m json.tool
 代码默认值 < config/runtime.toml < CR_ 环境变量 < 少量 CLI 参数
 ```
 
-常规部署只需改 TOML；环境变量用于秘密、容器坐标和临时覆盖。嵌套环境变量用双下划线，例如：
+Runtime 从仓库根目录启动时会**自动发现** `config/runtime.toml`；没有该文件就使用代码默认值与环境变量。
+显式 `--config <path>` 始终优先，而且路径不存在会直接报错。常规部署只需改 TOML；环境变量用于秘密、
+容器坐标和临时覆盖。嵌套环境变量用双下划线，例如：
 
 ```bash
 CR_LANGCHAO__LIVE_ENABLED=false
@@ -108,7 +110,8 @@ CR_SEMANTIC__MODEL=another-model
 
 旧的 flat `CR_SEMANTIC_PROVIDER`、`CR_SEMANTIC_BASE_URL`、`CR_SEMANTIC_MODEL` 等名字仍兼容；规范写法是 `CR_SEMANTIC__*`。`CR_SEMANTIC_API_KEY` 始终只由 provider 从环境读取，不进入 RuntimeConfig、日志或 `/health`。
 
-完整、安全的起点见 [`config/runtime.example.toml`](config/runtime.example.toml)。
+完整、安全的起点见 [`config/runtime.example.toml`](config/runtime.example.toml)；参数分级与“不建议改”的
+完整清单见 [`config/README.md`](config/README.md)。
 
 ### 语义端点
 
@@ -124,28 +127,80 @@ json_mode = true
 
 `remote_api` 是默认**开关**，不是内置厂商。只有 `base_url + model + CR_SEMANTIC_API_KEY` 三者齐全时才会外呼；否则 `/health` 报 `available: false`，Runtime 继续使用规则与确定性模板。要明确禁止任何语义外呼，设 `provider = "disabled"`。
 
-### 自定义提示词
+### 完整 Persona、阶段提示词与 AstrBot Persona
 
-四个字段覆盖四个不同阶段：
+`[persona]` 是 Runtime 侧的**完整人格设定**，可全部重写：
+
+```toml
+[persona]
+identity = "你是谁、如何理解自己。"
+voice = "说话方式、句长、标点、口语程度。"
+relationship = "如何理解与用户的关系、亲密与边界。"
+shared = "所有阶段共同遵守的人物要求。"
+```
+
+配置了 `[persona]` 后，它取代 Runtime 内置的兼容人物风格，并同时进入：普通认知块、主动消息渲染、
+深层理解、心理解释。AstrBot 主 Persona 仍归 AstrBot 管理，控制即时聊天的主角色；部署者应让两份 Persona
+表达同一个人物，但本仓库不会读取或修改 AstrBot 配置。
+
+四个阶段字段在完整 Persona 上继续细化：
 
 ```toml
 [prompts]
-conversation_context = "普通聊天保持短句、口语。"
-proactive_render = "主动开口不要写成通知或报告。"
+conversation_context = "普通聊天阶段的额外要求。"
+proactive_render = "主动开口阶段的额外要求。"
 
 [semantic.prompts]
-deep_refresh = "第一人称、短句；不要替对方找台阶。"
-explain_state = "像给自己看的便条，不要写成分析报告。"
+deep_refresh = "后台重解释和记忆整理的额外要求。"
+explain_state = "心理状态转成语言的额外要求。"
 ```
 
-它们都是**追加要求**，不能覆盖代码中的安全和协议约束：
+Persona 可以完全自定义，**协议层不能覆盖**：用户边界、来源 grounding、时间校正、防复读、发送权威、
+JSON 字段和“只输出正文”仍由代码强制。参考模板已给出一份可工作的 Persona；不建议把协议、数据库字段
+或工具说明写进 Persona，也不建议复制 Runtime 内置系统提示词。
 
-- 普通回复仍保留边界、记忆来源和“一轮有效”约束；
-- 主动消息仍强制当前时间校正、防复读和“只输出正文”；
-- 深层理解仍强制 JSON 字段、来源 grounding 与防编造；
-- 心理解释仍必须满足固定字段契约。
+### 基础价值观参数
 
-因此可以改口吻与偏好，不需要复制整份系统提示词，也不会因升级后契约变化而把输出配坏。
+8 个轴取值 `0.0–1.0`，影响真实动力学而不只是文风：
+
+```toml
+[values]
+autonomy = 0.72
+boundary_respect = 0.88
+emotional_expression = 0.46
+relationship_maintenance = 0.79
+user_care = 0.85
+conflict_directness = 0.41
+stability_commitment = 0.81
+curiosity = 0.76
+```
+
+| 轴 | 主要影响 |
+|---|---|
+| `autonomy` | 自我推进，以及部分情绪敏感度的抑制 |
+| `boundary_respect` | 边界成本、拒绝后的收敛 |
+| `emotional_expression` | 情绪进入反应与表达的强度 |
+| `relationship_maintenance` | 长期沉默后靠近、关系记忆显著性 |
+| `user_care` | 用户未尽之事对角色的推动力 |
+| `conflict_directness` | 把矛盾挑明或修复的倾向 |
+| `stability_commitment` | 抗单次波动、稳定知识权重 |
+| `curiosity` | 追问和了解的驱动 |
+
+价值观只在**新实例首次创建 Runtime state** 时播种。已有实例已经持久化自己的 values；修改 TOML 不会
+静默改人格，需要显式迁移。Runtime 会校验范围，任何轴超出 `0–1` 都直接拒绝启动。
+
+### 哪些外部参数应该改
+
+- **必须给**：PostgreSQL DSN；多人部署的 `conversation_id` 与 schema；
+- **启用远端语义时给**：base URL、model、API key；
+- **适合个人自定义**：Persona、8 个 values、live 白名单、夜间/quiet hours、每日主动预算、
+  同一记忆开场冷却、观察文本开关；
+- **按运维需要改**：host/port/log level、调度间隔、深层刷新频率；
+- **不建议在个人模板调整**：emotion/drive/silence/utility 的动力学系数、学习率、candidate bias、
+  浪潮 leak/threshold/time scale、outbox lease/attempt 等校准内核。
+
+测试/旧兼容字段、隐私删除凭据摘要和内部实验开关不属于个人配置。完整字段仍可在
+`runtime/src/companion_runtime/config.py` 查看；新增外部字段必须先归入上述类别，不能无说明地暴露。
 
 ### 浪潮与主动发送
 
@@ -253,7 +308,8 @@ python3 scripts/check_versions.py
 
 - PostgreSQL 是权威状态；`/data/raw_events.jsonl` 只是可选审计镜像；
 - 完整 context 文本默认不落库（`observability.record_context_text = false`）；
-- API key 不进入配置对象，不回显，只报告 `configured / not configured`；
+- API key 不进入配置对象；PostgreSQL DSN 在 CLI `config` 与 `GET /config` 中也会被替换为 `***redacted***`；
+- provider 健康信息只报告 key 的 `configured / not configured`；
 - 公开仓库只使用合成用户、文档地址与可移植路径，不包含私人对话、用户画像、健康信息或真实 roster；
 - `runtime/tests/test_public_tree_is_sanitized.py` 扫描所有 tracked 文本，阻止隐私与机器标记进入公开树。
 

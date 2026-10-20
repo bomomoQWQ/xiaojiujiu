@@ -1,17 +1,16 @@
-# 小九九 / 浪潮 Runtime —— 个人部署配置模板
+# 小九九 / 浪潮 Runtime —— 个人部署参考配置
 #
-# 用法：
-#   1. 复制为 config/runtime.toml；
-#   2. 修改下面标了「改这里」的项目；
-#   3. 在 .env 里填写 CR_STORAGE__DSN 与 CR_SEMANTIC_API_KEY；
-#   4. docker compose up -d --build。
+# 复制：cp config/runtime.example.toml config/runtime.toml
+# Runtime 从仓库根目录启动时会自动读取 config/runtime.toml；显式 --config 优先。
+# .env 只放 CR_STORAGE__DSN 与 CR_SEMANTIC_API_KEY，秘密不要写进本文件。
 #
-# 这个文件只放可以提交/备份的非秘密配置。数据库口令、API key、token 不要写在这里。
-# 环境变量优先级更高，仍可临时覆盖任意字段，例如：
-#   CR_LANGCHAO__LIVE_ENABLED=false docker compose up -d
+# 配置分层：
+#   【建议改】persona、values、semantic 端点、live 白名单、夜间/quiet hours。
+#   【按需改】调度频率、深层刷新频率、观测文本。
+#   【不建议改】emotion/drive/silence/utility、学习率、candidate bias、浪潮数值内核、
+#               outbox lease 等校准参数。它们仍可由 config.py / CR_ 覆盖，但不放个人模板。
 
-# ---------- 身份与会话 ----------
-# 改这里：单会话部署可保留 default；多人/fleet 必须使用 AstrBot 的 unified_msg_origin。
+# ---------- 部署身份：多人/fleet 必须使用真实 unified_msg_origin ----------
 runtime_id = "companion"
 conversation_id = "default"
 
@@ -21,27 +20,60 @@ port = 8787
 log_level = "INFO"
 
 [storage]
-# DSN 是秘密，不写在本文件；由 .env 的 CR_STORAGE__DSN 提供。
-# 改这里（可选）：多人部署每人一个 schema。
+# DSN 由 .env 的 CR_STORAGE__DSN 提供。
 schema = "companion_runtime"
 raw_log_path = "/data/raw_events.jsonl"
 mirror_raw_events = true
 
+# ---------- 完整 Runtime Persona：人物层可完全重写 ----------
+# 这里不是“补一句”，而是 Runtime 在普通认知块、主动渲染、深层理解与心理解释中的
+# 人物身份/语气/关系观唯一来源。AstrBot 主 Persona 仍在 AstrBot 配置；建议保持一致。
+#
+# 可以自由修改这四段，但不建议把 JSON 格式、数据库字段、权限、边界、时间校正等协议内容
+# 写进 Persona——那些由代码强制，写在这里既无效又会污染人物口吻。
+[persona]
+identity = """
+你是一个拥有长期记忆和自主判断的陪伴角色。你知道自己不是一次性问答工具，会记得关系如何变化，
+也会承认自己不确定、记错或暂时没想明白。
+"""
+voice = """
+使用第一人称、自然口语和短句。不要写成客服、通知、分析报告或文学旁白；不需要每次总结观点。
+"""
+relationship = """
+你重视这段关系，会惦记、会主动，也尊重用户明确说出的边界。沉默不是拒绝，关心不等于控制。
+"""
+shared = """
+不要虚构没发生过的对话、承诺、现实行动或工具能力。拿不准时保留不确定性，不替事实补剧情。
+"""
+
+# ---------- 基础价值观：0.0–1.0，新实例首次建状态时播种 ----------
+# 这些值进入情绪、记忆、候选、边界成本和浪潮方向权重，不只是文风。
+# 已有实例的 values 已持久化；改本文件不会静默覆盖现有角色，需显式迁移后才改变。
+[values]
+autonomy = 0.72                  # 自主倾向；注意：机械上也会降低部分情绪敏感度
+boundary_respect = 0.88           # 边界观念；越高越会在拒绝/边界前收敛
+emotional_expression = 0.46      # 情感表达；情绪多直接进入表达和情绪反应
+relationship_maintenance = 0.79  # 关系维护；长期沉默后靠近、关系记忆显著性
+user_care = 0.85                 # 用户关怀；用户未尽之事与状态的推动强度
+conflict_directness = 0.41       # 冲突取向；把矛盾挑明/修复的倾向
+stability_commitment = 0.81      # 稳定/承诺；抗单次波动、稳定知识的重要性
+curiosity = 0.76                 # 好奇倾向；追问与了解的驱动
+
+# ---------- 分阶段细化：在完整 Persona 上追加，不必重复 Persona ----------
 [prompts]
-# 普通聊天每轮注入的补充口吻；边界、记忆、时间与“一轮有效”由代码保留。
-conversation_context = ""
-# 主动消息渲染的补充口吻；代码仍强制时间校正、防复读与只输出正文。
-proactive_render = ""
+conversation_context = "" # 普通聊天认知块的额外要求
+proactive_render = ""     # 主动消息渲染的额外要求
 
 [semantic]
-# 开关默认打开；base_url/model 由部署者选择。三者与 .env 里的 key 齐全才会外呼。
 provider = "remote_api" # remote_api | disabled
-base_url = ""            # 改这里，例如 https://api.example.com/v1
-model = ""               # 改这里，例如 your-model-name
+base_url = ""            # 例：https://api.example.com/v1
+model = ""               # 例：your-model-name
+timeout_s = 30.0
+max_tokens = 1024
+json_mode = true
 settle_on_ingest = true
 deep_refresh_enabled = true
 unresolved_backlog_threshold = 8
-unresolved_max_age_hours = 72.0
 deep_refresh_min_interval_seconds = 3600.0
 deep_refresh_idle_hours = 12.0
 max_operations_per_refresh = 12
@@ -49,28 +81,20 @@ template_fallback = true
 interpretation_max_age_seconds = 21600.0
 
 [semantic.prompts]
-# 这里只补充人物口吻/偏好，Runtime 仍会保留内置 JSON 契约、字段约束和安全要求。
-# 不要把完整系统提示词复制到这里；那样升级后会错过协议修复。
-deep_refresh = """
-保持第一人称、短句、口语；不要替对方找台阶。没有额外人物设定时可留空。
-"""
-explain_state = """
-像给自己看的便条，不要写成分析报告。没有额外要求时可留空。
-"""
+deep_refresh = "" # 后台重解释/记忆整理的额外要求
+explain_state = "" # 结构化心理状态转成语言的额外要求
 
 [langchao]
-# 默认 fail-closed：先 shadow 观察；确认后再打开 live，并把自己的会话加入精确白名单。
+# 默认先 shadow；确认行为与路由后再打开 live，并填完整会话 scope。
 shadow_enabled = true
 live_enabled = false
 social_enabled = true
 internal_exploration_enabled = true
-external_exploration_enabled = false
-live_scope_allowlist = []                # 例：["default:FriendMessage:1000000001"]
-attention_recipe = "off"                 # off | B2 | B3
+live_scope_allowlist = [] # 例：["default:FriendMessage:1000000001"]
+attention_recipe = "off" # off | B2 | B3
 attention_b3_scope_allowlist = []
 
-# 常用行为旋钮；不了解含义就保留默认。
-decision_threshold = 0.70
+# 常用产品行为；数值内核 leak/threshold/time scale 等不建议在个人模板调。
 cold_start_drive = 2.0
 night_send_penalty = 0.85
 night_send_penalty_start_hour = 0
@@ -79,13 +103,19 @@ night_send_penalty_end_hour = 5
 [scheduler]
 min_interval_seconds = 60.0
 max_interval_seconds = 5400.0
-# null 不是 TOML 值；不写这两个键就是「不硬停」。要硬停时取消下面注释。
+# 不写 quiet_hours 就是不硬停；需要完全静默窗口时取消注释。
 # quiet_hours_start = 0
 # quiet_hours_end = 7
 busy_poll_seconds = 30.0
 foreground_pause_seconds = 60.0
 
+[drive]
+max_contacts_per_day = 12 # 每日主动接触预算上限；回复不算主动接触
+
+[candidate]
+memory_callback_cooldown_hours = 48.0 # 同一记忆多久内不再拿来主动开场
+
 [observability]
 enabled = true
-# 完整 prompt 文本可能含用户内容；默认不落库，调试时才打开。
+# 完整认知块可能含用户信息；仅排查提示词时短期开启。
 record_context_text = false

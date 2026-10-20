@@ -423,9 +423,10 @@ def test_render_block_contains_the_documented_sections(runtime: Runtime) -> None
 def test_render_block_appends_operator_voice_before_the_ephemeral_boundary(runtime: Runtime) -> None:
     runtime.process_user_message(content="明天下午面试，结束告诉你结果。", timestamp=BASE_TIME)
     bundle = context_module.build(runtime=runtime, now=BASE_TIME)
-    block = context_module.render_block(bundle, "CUSTOM NORMAL VOICE")
-    assert "【部署者补充口吻】\nCUSTOM NORMAL VOICE" in block
-    assert block.index("CUSTOM NORMAL VOICE") < block.index("别照着念，也别写进长期记忆")
+    runtime.config.persona.identity = "CUSTOM FULL IDENTITY"
+    block = context_module.render_block(bundle, runtime.config.host_prompt("conversation_context"))
+    assert "【部署者角色与阶段要求】\n身份：CUSTOM FULL IDENTITY" in block
+    assert block.index("CUSTOM FULL IDENTITY") < block.index("别照着念，也别写进长期记忆")
 
 
 def test_render_block_never_contains_raw_numbers_for_emotion(runtime: Runtime) -> None:

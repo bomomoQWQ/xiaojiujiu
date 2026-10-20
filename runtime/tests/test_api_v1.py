@@ -776,11 +776,16 @@ def test_v1_render_prompt_carries_the_style_contract(client: TestClient, runtime
 def test_v1_render_prompt_appends_operator_voice_before_output_boundary(
     client: TestClient, runtime: Runtime
 ) -> None:
-    runtime.config.prompts.proactive_render = "CUSTOM PROACTIVE VOICE"
+    runtime.config.persona.identity = "CUSTOM FULL IDENTITY"
+    runtime.config.persona.voice = "CUSTOM FULL VOICE"
+    runtime.config.prompts.proactive_render = "CUSTOM PROACTIVE STAGE"
     commit_attempt(runtime)
     prompt = lease(client)["items"][0]["payload"]["prompt"]
-    assert "部署者补充口吻：\nCUSTOM PROACTIVE VOICE" in prompt
-    assert prompt.index("CUSTOM PROACTIVE VOICE") < prompt.index("只回正文本身")
+    assert "身份：CUSTOM FULL IDENTITY" in prompt
+    assert "说话方式：CUSTOM FULL VOICE" in prompt
+    assert "CUSTOM PROACTIVE STAGE" in prompt
+    assert "我说人话，不写作文" not in prompt, "configured Persona replaces fallback voice"
+    assert prompt.index("CUSTOM PROACTIVE STAGE") < prompt.index("只回正文本身")
 
 
 def test_v1_render_prompt_states_the_clock_with_the_task(

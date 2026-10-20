@@ -465,7 +465,7 @@ def _context_text(
         if conversation_id is not None:
             _scope_matters(runtime, bundle, conversation_id=conversation_id)
         text = context_module.render_block(
-            bundle, runtime.config.prompts.conversation_context
+            bundle, runtime.config.host_prompt("conversation_context")
         ).strip()
         block = text or _fallback_block(bundle).strip()
         clock = str(bundle.time_context.get("local_display") or "")
@@ -880,10 +880,14 @@ def _render_payload(
     if already_said:
         lines.append(RENDER_ALREADY_SAID_HEADER)
         lines.extend("  · " + line for line in already_said)
-    lines.extend(RENDER_STYLE_LINES)
-    custom_style = str(settings.prompts.proactive_render or "").strip()
+    persona = settings.persona.prompt()
+    # A configured Persona fully owns character voice. The built-in style remains only as a
+    # backwards-compatible fallback for deployments that have not supplied one yet.
+    if not persona:
+        lines.extend(RENDER_STYLE_LINES)
+    custom_style = settings.host_prompt("proactive_render")
     if custom_style:
-        lines.extend(["- 部署者补充口吻：", custom_style])
+        lines.extend(["- 部署者角色与口吻：", custom_style])
     # Immutable output boundary stays last, after every operator addition.
     lines.append("- 只回正文本身：别解释、别复述上面的背景、别提这些说明。")
     action = _mapping(payload.get("action"))
@@ -1750,7 +1754,7 @@ def create_v1_router(runtime: Any, config: RuntimeConfig | None = None) -> APIRo
             runtime.lazy_tick(now)
             bundle = context_module.build(runtime=runtime, now=now)
             text = context_module.render_block(
-                bundle, runtime.config.prompts.conversation_context
+                bundle, runtime.config.host_prompt("conversation_context")
             ).strip()
             if not text:
                 text = _fallback_block(bundle).strip()

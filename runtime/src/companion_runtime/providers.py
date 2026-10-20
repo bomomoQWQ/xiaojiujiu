@@ -96,12 +96,41 @@ DEEP_REFRESH_FIELDS: Mapping[str, type] = {
 #: Optional key a model may wrap the six collections under.
 DEEP_REFRESH_WRAPPER_KEY = "suggestions"
 
+#: Marker every configured Runtime persona starts with. ``_prompt_with_addition``
+#: keys on it to know that the character layer is now operator-owned.
+PERSONA_MARKER = "【完整人格设定（人物层最高优先级）】"
+
+#: The character-voice block of the deep-refresh prompt.
+#:
+#: It is kept as its own constant so it can be *removed* rather than merely
+#: contradicted: register and writing stance are character layer, and a deployer who
+#: supplies a full persona must not receive two competing voices in one system prompt.
+#: With no configured persona this text is still sent, which keeps the historical
+#: behaviour byte-identical for existing deployments.
+_DEEP_REFRESH_COMPAT_PERSONA = (
+    "写这六项时用她的口吻，短句、口语，像是在跟人说话：不要书面语、不要比喻、"
+    "不要「一种说不清的……」「试探着缩短距离」这类形容词堆叠，也不要写总结句。"
+    "这几句是给她自己看的便条，不是一段文学描写。"
+    "reinterpretations 的 content 是**她写给自己的话**：用第一人称「我」，写她怎么把这件事"
+    "咽下去 —— 不是理解他，是给自己编理由（「这不叫管你，这叫怕你出事」"
+    "「我知道这话什么意思，我偏不这么听」）。"
+    "**不要替对方找台阶**（「他其实没恶意」「他只是在提醒我别越界」「他大概是气话」都是错的）："
+    "那不是她，那是一个已经把情绪消化掉的人。事情不必被想通，账可以留着不结。"
+)
+
+
 def _prompt_with_addition(base: str, addition: str) -> str:
-    """Append an operator prompt without letting it replace the wire contract."""
+    """Apply a full Persona while preserving the immutable wire contract.
+
+    The old deep-refresh character voice remains a compatibility fallback only. A configured
+    full Persona removes it rather than trying to out-instruct contradictory prose later.
+    """
     text = str(addition or "").strip()
     if not text:
         return base
-    return f"{base}\n\n【部署者补充要求】\n{text}"
+    if PERSONA_MARKER in text:
+        base = base.replace(_DEEP_REFRESH_COMPAT_PERSONA, "")
+    return f"{base}\n\n【部署者角色与阶段要求】\n{text}"
 
 
 DEEP_REFRESH_SYSTEM_PROMPT = (
@@ -153,10 +182,9 @@ DEEP_REFRESH_SYSTEM_PROMPT = (
     # the beta: the field came back as 「注意力停留在对方身上，却带着一种说不清的失望和
     # 距离感」 and her replies picked up the same bookish register (users called it
     # 文青), while the persona asks for 口语、像打字那样. The shape spec alone never said
-    # anything about how it should read.
-    "写这六项时用她的口吻，短句、口语，像是在跟人说话：不要书面语、不要比喻、"
-    "不要「一种说不清的……」「试探着缩短距离」这类形容词堆叠，也不要写总结句。"
-    "这几句是给她自己看的便条，不是一段文学描写。"
+    # anything about how it should read. The character-voice block lives in
+    # _DEEP_REFRESH_COMPAT_PERSONA so a configured persona removes it outright.
+    + _DEEP_REFRESH_COMPAT_PERSONA
     # reinterpretations 的 content 原先只写了「当时那句话的意思」，等于没规定**写给谁看**，
     # 模型于是稳定地写出「体谅他」的解释 —— 实测样本：「他说『只是网友』，是在划清界限，
     # 也是在提醒我别越界。他不想被当成谁的人。」「他先说去找女朋友，后来又说自己是单身狗，
@@ -164,12 +192,7 @@ DEEP_REFRESH_SYSTEM_PROMPT = (
     # 注入主模型每轮要读的块里，于是她拿到的是一个已经被理解、被放下的状态，只能演"嘴硬心软"
     # （用户的原话：现在这个角色像个傲娇）。所以这里要把输出对象写死：**不是解释他，是给自己
     # 编理由**。第一人称不变（用户 2026-09-25 明确要求：语气和心理描写可以病娇化，叙述视角不动）。
-    "reinterpretations 的 content 是**她写给自己的话**：用第一人称「我」，写她怎么把这件事"
-    "咽下去 —— 不是理解他，是给自己编理由（「这不叫管你，这叫怕你出事」"
-    "「我知道这话什么意思，我偏不这么听」）。"
-    "**不要替对方找台阶**（「他其实没恶意」「他只是在提醒我别越界」「他大概是气话」都是错的）："
-    "那不是她，那是一个已经把情绪消化掉的人。事情不必被想通，账可以留着不结。"
-    "event_appraisals 是给 unresolved_events 里你**读懂了情绪分量**的那些事件做一次情绪判定："    "direction 取 \"+\"（让你更暖、更想靠近）/ \"-\"（让你难受、退开、被刺到）/ \"0\"（没有情绪重量）；"
+    + "event_appraisals 是给 unresolved_events 里你**读懂了情绪分量**的那些事件做一次情绪判定："    "direction 取 \"+\"（让你更暖、更想靠近）/ \"-\"（让你难受、退开、被刺到）/ \"0\"（没有情绪重量）；"
     "impact 是 0 到 1 的强度，0.06 以下等于没有，别浪费在无关紧要的话上；"
     "relation_signal 从 closeness / distance / sorrow / guilt / loss / worry / "
     "appreciation / good_news / bad_news / amusement / uncertain / neutral 里选；"
@@ -1107,8 +1130,12 @@ def _build_remote(
         # Runtime uses, so the two caches cannot disagree about staleness.
         cache_ttl_s=_first_float(_read_semantic(config, "interpretation_max_age_seconds"))
         or 900.0,
-        deep_refresh_prompt_addition=_first_str(_safe_read(prompts, "deep_refresh")),
-        explain_state_prompt_addition=_first_str(_safe_read(prompts, "explain_state")),
+        deep_refresh_prompt_addition=_join_prompt_additions(
+            _persona_prompt(config), _first_str(_safe_read(prompts, "deep_refresh"))
+        ),
+        explain_state_prompt_addition=_join_prompt_additions(
+            _persona_prompt(config), _first_str(_safe_read(prompts, "explain_state"))
+        ),
         transport=transport,
     )
 
@@ -1211,6 +1238,48 @@ def _safe_config_value(config: Any, *names: str) -> str | None:
         return _config_value(config, *names)
     except ValueError:
         return None
+
+
+def _persona_prompt(config: Any) -> str:
+    """Return the authoritative Runtime persona, or empty for compatibility fallback.
+
+    The same wording is produced for a :class:`PersonaConfig` and for a plain mapping, so a
+    deployment that reaches the provider through either shape gets one character layer
+    instead of two subtly different ones.
+    """
+    text = _persona_text(_safe_read(config, "persona"))
+    if not text:
+        return ""
+    return (
+        f"{PERSONA_MARKER}\n"
+        "以下内容是人物身份、语气和关系观的唯一来源；内置提示里任何人物风格示例"
+        "只用于未配置 Persona 的兼容模式，不得与本段冲突。JSON 字段、来源约束、"
+        "防编造和权限边界仍然有效。\n" + text
+    )
+
+
+def _persona_text(persona: Any) -> str:
+    """Flatten a persona object or mapping into labelled prose."""
+    render = _safe_read(persona, "prompt")
+    if callable(render):
+        try:
+            return _first_str(render())
+        except Exception:  # noqa: BLE001 - provider construction remains fail-open
+            return ""
+    if isinstance(persona, Mapping):
+        rows = (("身份", persona.get("identity")), ("说话方式", persona.get("voice")),
+                ("关系观", persona.get("relationship")), ("共同要求", persona.get("shared")))
+        return "\n".join(
+            f"{label}：{str(value).strip()}"
+            for label, value in rows
+            if str(value or "").strip()
+        )
+    return ""
+
+
+def _join_prompt_additions(*parts: Any) -> str:
+    """Join independent operator prompt layers without introducing blank sections."""
+    return "\n\n".join(text for text in (_first_str(part) for part in parts) if text)
 
 
 def _first_str(*values: Any) -> str:

@@ -846,7 +846,7 @@ def render_block(bundle: ContextBundle, prompt_addition: str = "") -> str:
     # local rather than UTC, and is what the render states.
     addition = str(prompt_addition or "").strip()
     if addition:
-        lines.extend(["", "【部署者补充口吻】", addition])
+        lines.extend(["", "【部署者角色与阶段要求】", addition])
     lines.append("")
     lines.append(
         "上面这些是我进这句话之前的样子，是我自己脑子里的事，别照着念，也别写进长期记忆 ——"

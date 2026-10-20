@@ -5,10 +5,10 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 
 
-def test_personal_compose_mounts_the_runtime_config_and_does_not_manage_astrbot() -> None:
+def test_personal_compose_mounts_the_optional_config_directory_and_does_not_manage_astrbot() -> None:
     text = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-    assert './config/runtime.toml:/config/runtime.toml:ro' in text
-    assert 'command: ["--config", "/config/runtime.toml", "serve"]' in text
+    assert './config:/app/runtime/config:ro' in text
+    assert 'command: ["--config"' not in text
     assert "CR_STORAGE__DSN" in text
     assert "CR_SEMANTIC_API_KEY" in text
     assert "\n  astrbot:" not in text
@@ -21,6 +21,20 @@ def test_the_shipped_template_contains_no_secret_and_exposes_common_knobs() -> N
     assert "CR_SEMANTIC_API_KEY=" not in text
     assert "postgresql://runtime:" not in text
     for marker in (
+        "[persona]",
+        "identity =",
+        "voice =",
+        "relationship =",
+        "shared =",
+        "[values]",
+        "autonomy =",
+        "boundary_respect =",
+        "emotional_expression =",
+        "relationship_maintenance =",
+        "user_care =",
+        "conflict_directness =",
+        "stability_commitment =",
+        "curiosity =",
         "[prompts]",
         "conversation_context =",
         "proactive_render =",

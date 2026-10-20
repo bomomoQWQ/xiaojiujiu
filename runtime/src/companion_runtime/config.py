@@ -32,7 +32,10 @@ from .typing import ValueProfile
 
 LOGGER = logging.getLogger("companion_runtime.config")
 
-_SECRET_PATTERN = re.compile(r"(api[_-]?key|token|secret|password|credential|authorization)", re.I)
+_SECRET_PATTERN = re.compile(
+    r"(api[_-]?key|token|secret|password|credential|authorization|(?:^|[_-])dsn(?:$|[_-]))",
+    re.I,
+)
 
 
 def redact(key: str, value: Any) -> Any:
@@ -419,6 +422,30 @@ class TaskConfig:
 
 
 @dataclass(slots=True)
+class PersonaConfig:
+    """Shared Runtime-side character description used by every model-facing stage.
+
+    AstrBot's main persona still belongs to AstrBot. This copy keeps Runtime semantic work and
+    proactive rendering aligned with it; deployments should edit both intentionally.
+    """
+
+    identity: str = ""
+    voice: str = ""
+    relationship: str = ""
+    shared: str = ""
+
+    def prompt(self) -> str:
+        """Return the non-empty fields as one labelled, operator-owned addition."""
+        rows = (
+            ("身份", self.identity),
+            ("说话方式", self.voice),
+            ("关系观", self.relationship),
+            ("共同要求", self.shared),
+        )
+        return "\n".join(f"{label}：{str(value).strip()}" for label, value in rows if str(value).strip())
+
+
+@dataclass(slots=True)
 class PromptConfig:
     """Operator voice additions for host-facing prompts.
 
@@ -696,6 +723,7 @@ class RuntimeConfig:
     #: the persistent layer is the Runtime. Nothing here is allowed to make a
     #: generative model mandatory.
     semantic: SemanticConfig = field(default_factory=SemanticConfig)
+    persona: PersonaConfig = field(default_factory=PersonaConfig)
     prompts: PromptConfig = field(default_factory=PromptConfig)
     task: TaskConfig = field(default_factory=TaskConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
@@ -703,6 +731,13 @@ class RuntimeConfig:
     privacy_deletion: PrivacyDeletionConfig = field(default_factory=PrivacyDeletionConfig)
     #: Free-form extras; useful for experiments without touching the schema.
     extras: dict[str, Any] = field(default_factory=dict)
+
+    def host_prompt(self, stage: str) -> str:
+        """Join the shared persona with one host-facing stage addition."""
+        if stage not in {"conversation_context", "proactive_render"}:
+            raise ValueError(f"unknown host prompt stage: {stage}")
+        parts = (self.persona.prompt(), str(getattr(self.prompts, stage) or "").strip())
+        return "\n\n".join(part for part in parts if part)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable, secret-redacted view of the config."""

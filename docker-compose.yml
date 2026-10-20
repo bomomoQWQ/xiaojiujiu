@@ -20,8 +20,7 @@ services:
       dockerfile: Dockerfile
     image: xiaojiujiu-runtime:local
     restart: unless-stopped
-    # ENTRYPOINT 已是 companion-runtime --base-dir /data；这里加载唯一的非秘密配置文件。
-    command: ["--config", "/config/runtime.toml", "serve"]
+    # Dockerfile 的 CMD 是 serve；CLI 会自动发现工作目录下 config/runtime.toml。
     environment:
       # 秘密只能从 .env / 宿主环境进入；RuntimeConfig 与 /health 都拿不到明文 key。
       CR_STORAGE__DSN: ${CR_STORAGE__DSN:?copy .env.example to .env and set CR_STORAGE__DSN}
@@ -29,7 +28,8 @@ services:
       # schema / conversation_id /行为 / 提示词统一在 config/runtime.toml 里改。
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
-      - ./config/runtime.toml:/config/runtime.toml:ro
+      # 挂整个目录：没复制 runtime.toml 时仍可用 env/defaults 启动，不会把缺失文件挂成目录。
+      - ./config:/app/runtime/config:ro
       # 可选 JSONL 审计镜像与迁移/回放产物；权威状态在 PostgreSQL。
       - runtime-data:/data
     ports:

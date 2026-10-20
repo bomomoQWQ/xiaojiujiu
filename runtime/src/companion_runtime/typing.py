@@ -333,7 +333,12 @@ class ValueProfile:
         if not data:
             return cls()
         known = {f.name for f in dataclasses.fields(cls)}
-        return cls(**{k: float(v) for k, v in data.items() if k in known})
+        values = {k: float(v) for k, v in data.items() if k in known}
+        invalid = {key: value for key, value in values.items() if not 0.0 <= value <= 1.0}
+        if invalid:
+            rendered = ", ".join(f"{key}={value}" for key, value in sorted(invalid.items()))
+            raise ValueError(f"value axes must be between 0 and 1: {rendered}")
+        return cls(**values)
 
 
 @dataclass(slots=True)
